@@ -229,3 +229,68 @@ def test_keep_isolation_remains_correct_after_approved_apply_back(tmp_path) -> N
     assert result["isolation_cleanup_status"] == "kept"
     assert Path(result["isolated_workspace"]).exists()
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_generated_artifacts_do_not_block_valid_source_apply_back(tmp_path) -> None:
+    init_clean_project(tmp_path, {"scratch_codex_edit.py": "value = 1\n"})
+
+    def edit(isolated: Path) -> None:
+        (isolated / "scratch_codex_edit.py").write_text("value = 2\n", encoding="utf-8")
+        (isolated / "agent_harness.egg-info").mkdir()
+        (isolated / "agent_harness.egg-info" / "SOURCES.txt").write_text("generated\n", encoding="utf-8")
+        (isolated / "harness").mkdir(exist_ok=True)
+        (isolated / "harness" / ".DS_Store").write_text("local\n", encoding="utf-8")
+
+    result = run_edit(tmp_path, FakeEditBackend(default_config().backends["codex_cli"], edit=edit), "approved")
+
+    assert result["status"] == "completed_applied"
+    assert result["applied_files"] == ["scratch_codex_edit.py"]
+    assert result["changed_files"] == ["scratch_codex_edit.py"]
+    assert sorted(result["ignored_generated_artifacts"]) == [
+        "agent_harness.egg-info/SOURCES.txt",
+        "harness/.DS_Store",
+    ]
+    assert (tmp_path / "scratch_codex_edit.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert not (tmp_path / "agent_harness.egg-info").exists()
+    run_dir = tmp_path / ".harness" / "runs" / result["run_id"]
+    patch = (run_dir / "isolated_unified_diff.patch").read_text(encoding="utf-8")
+    assert "scratch_codex_edit.py" in patch
+    assert "agent_harness.egg-info" not in patch
+    assert ".DS_Store" not in patch
+
+
+def test_generated_only_changes_have_no_apply_back_and_no_policy_violation(tmp_path) -> None:
+    init_clean_project(tmp_path)
+
+    def edit(isolated: Path) -> None:
+        (isolated / ".DS_Store").write_text("local\n", encoding="utf-8")
+        (isolated / "agent_harness.egg-info").mkdir()
+        (isolated / "agent_harness.egg-info" / "PKG-INFO").write_text("generated\n", encoding="utf-8")
+
+    before = (tmp_path / "app.py").read_bytes()
+    result = run_edit(tmp_path, FakeEditBackend(default_config().backends["codex_cli"], edit=edit), "approved")
+
+    assert result["status"] == "completed"
+    assert result["changed_files"] == []
+    assert result["applied_files"] == []
+    assert result["policy_violations"] == []
+    assert sorted(result["ignored_generated_artifacts"]) == [".DS_Store", "agent_harness.egg-info/PKG-INFO"]
+    assert (tmp_path / "app.py").read_bytes() == before
+
+
+def test_true_blocked_paths_still_block_apply_back_even_with_generated_artifacts(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    before = (tmp_path / "app.py").read_bytes()
+
+    def edit(isolated: Path) -> None:
+        (isolated / "app.py").write_text("value = 2\n", encoding="utf-8")
+        (isolated / ".env").write_text("SECRET=value\n", encoding="utf-8")
+        (isolated / ".DS_Store").write_text("local\n", encoding="utf-8")
+
+    result = run_edit(tmp_path, FakeEditBackend(default_config().backends["codex_cli"], edit=edit), "approved")
+
+    assert result["status"] == "policy_violation"
+    assert result["applied_files"] == []
+    assert any(violation["path"] == ".env" for violation in result["policy_violations"])
+    assert result["ignored_generated_artifacts"] == [".DS_Store"]
+    assert (tmp_path / "app.py").read_bytes() == before

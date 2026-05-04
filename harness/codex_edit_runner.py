@@ -175,6 +175,7 @@ class CodexCodeEditRunner:
                 {
                     "changed_files": diff_result.changed_files,
                     "allowed_changed_files": diff_result.allowed_changed_files,
+                    "ignored_generated_artifacts": diff_result.ignored_generated_artifacts,
                     "diff_stat": diff_result.diff_stat,
                     "violations": [violation.to_dict() for violation in diff_result.violations],
                 },
@@ -277,6 +278,7 @@ class CodexCodeEditRunner:
             "isolation_cleanup_status": cleanup_status,
             "changed_files": diff_result.changed_files,
             "policy_violations": [violation.to_dict() for violation in diff_result.violations],
+            "ignored_generated_artifacts": diff_result.ignored_generated_artifacts,
             "apply_back_decision": apply_back_decision.decision,
             "freshness_result": {
                 "ok": freshness_result.ok,
@@ -486,7 +488,9 @@ class CodexCodeEditRunner:
             ),
             f"- Changed files: {diff_result.changed_files}",
             f"- Allowed changed files: {diff_result.allowed_changed_files}",
+            f"- Ignored generated artifacts: {diff_result.ignored_generated_artifacts}",
             f"- Policy violations: {[violation.to_dict() for violation in diff_result.violations]}",
+            f"- Apply-back eligibility: {diff_result.valid and bool(diff_result.allowed_changed_files)}",
             f"- Apply-back approval decision: {apply_back_decision.decision}",
             f"- Apply-back decision reason: {apply_back_decision.reason or ''}",
             f"- Freshness result: {freshness_result.ok}",

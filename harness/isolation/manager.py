@@ -21,6 +21,13 @@ class ActiveRepoDirtyError(RuntimeError):
 
 TEXT_CLASSIFICATION = "text"
 BINARY_CLASSIFICATION = "binary"
+GENERATED_ARTIFACT_DIR_NAMES = {
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    "dist",
+    "build",
+}
 
 
 @dataclass(frozen=True)
@@ -76,6 +83,7 @@ class DiffInspectionResult:
     unified_diff: str
     diff_stat: str
     violations: list[FileChangeViolation]
+    ignored_generated_artifacts: list[str] = field(default_factory=list)
 
     @property
     def valid(self) -> bool:
@@ -180,7 +188,7 @@ def create_baseline_manifest(project_root: Path, excluded_patterns: list[str] | 
         if path == root:
             continue
         rel = path.relative_to(root).as_posix()
-        if _is_policy_blocked_path(rel, patterns):
+        if _is_generated_artifact_path(rel) or _is_policy_blocked_path(rel, patterns):
             continue
         if path.is_symlink() or not path.is_file():
             continue
@@ -205,14 +213,21 @@ def inspect_isolated_diff(isolated_workspace: Path, baseline_manifest: BaselineM
     violations: list[FileChangeViolation] = []
     changed_files: set[str] = set()
     allowed_changed_files: list[str] = []
+    ignored_generated_artifacts: set[str] = set()
     diff_parts: list[str] = []
     seen_paths = _walk_existing_paths(root)
     for rel in sorted(seen_paths - set(baseline_manifest.entries)):
         if rel == ".git" or rel.startswith(".git/"):
             continue
+        if _is_generated_artifact_path(rel):
+            ignored_generated_artifacts.add(rel)
+            continue
         changed_files.add(rel)
         violations.append(_violation(rel, "creation", "File creation is not supported in this phase."))
     for rel, entry in sorted(baseline_manifest.entries.items()):
+        if _is_generated_artifact_path(rel):
+            ignored_generated_artifacts.add(rel)
+            continue
         path = root / rel
         if not path.exists() and not path.is_symlink():
             changed_files.add(rel)
@@ -247,6 +262,7 @@ def inspect_isolated_diff(isolated_workspace: Path, baseline_manifest: BaselineM
         unified_diff=unified_diff,
         diff_stat=_diff_stat(unified_diff),
         violations=violations,
+        ignored_generated_artifacts=sorted(ignored_generated_artifacts),
     )
 
 
@@ -272,6 +288,22 @@ def _walk_existing_paths(root: Path) -> set[str]:
         if path.is_file() or path.is_symlink():
             paths.add(rel)
     return paths
+
+
+def _is_generated_artifact_path(relative_path: str) -> bool:
+    rel = relative_path.strip("/")
+    if not rel:
+        return False
+    path = Path(rel)
+    parts = path.parts
+    name = path.name
+    if name == ".DS_Store":
+        return True
+    if name.endswith(".pyc"):
+        return True
+    if any(part in GENERATED_ARTIFACT_DIR_NAMES for part in parts):
+        return True
+    return any(part.endswith(".egg-info") for part in parts)
 
 
 def _unified_diff(relative_path: str, old_text: str, new_text: str) -> str:

@@ -117,6 +117,61 @@ def test_diff_inspection_allows_existing_text_file_modification(tmp_path) -> Non
     assert "1 file changed" in result.diff_stat
 
 
+def test_diff_inspection_ignores_generated_artifacts_without_blocking_valid_source_change(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "scratch_codex_edit.py").write_text("value = 1\n", encoding="utf-8")
+    (project / "agent_harness.egg-info").mkdir()
+    (project / "agent_harness.egg-info" / "PKG-INFO").write_text("old\n", encoding="utf-8")
+    (project / "harness").mkdir()
+    (project / "harness" / ".DS_Store").write_text("old\n", encoding="utf-8")
+    baseline = create_baseline_manifest(project)
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    (isolated / "scratch_codex_edit.py").write_text("value = 2\n", encoding="utf-8")
+    (isolated / "agent_harness.egg-info").mkdir()
+    (isolated / "agent_harness.egg-info" / "PKG-INFO").write_text("new\n", encoding="utf-8")
+    (isolated / "harness").mkdir()
+    (isolated / "harness" / ".DS_Store").write_text("new\n", encoding="utf-8")
+    (isolated / "__pycache__").mkdir()
+    (isolated / "__pycache__" / "x.pyc").write_bytes(b"\x00\x01")
+
+    result = inspect_isolated_diff(isolated, baseline)
+
+    assert result.valid
+    assert result.changed_files == ["scratch_codex_edit.py"]
+    assert result.allowed_changed_files == ["scratch_codex_edit.py"]
+    assert sorted(result.ignored_generated_artifacts) == [
+        "__pycache__/x.pyc",
+        "agent_harness.egg-info/PKG-INFO",
+        "harness/.DS_Store",
+    ]
+    assert "scratch_codex_edit.py" in result.unified_diff
+    assert "agent_harness.egg-info" not in result.unified_diff
+
+
+def test_diff_inspection_generated_only_changes_are_not_policy_violations(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text("value = 1\n", encoding="utf-8")
+    baseline = create_baseline_manifest(project)
+    isolated = tmp_path / "isolated"
+    isolated.mkdir()
+    (isolated / "app.py").write_text("value = 1\n", encoding="utf-8")
+    (isolated / ".DS_Store").write_text("local\n", encoding="utf-8")
+    (isolated / "agent_harness.egg-info").mkdir()
+    (isolated / "agent_harness.egg-info" / "SOURCES.txt").write_text("local\n", encoding="utf-8")
+
+    result = inspect_isolated_diff(isolated, baseline)
+
+    assert result.valid
+    assert result.changed_files == []
+    assert result.allowed_changed_files == []
+    assert result.violations == []
+    assert sorted(result.ignored_generated_artifacts) == [".DS_Store", "agent_harness.egg-info/SOURCES.txt"]
+    assert result.unified_diff == ""
+
+
 @pytest.mark.parametrize(
     ("path", "kind"),
     [
