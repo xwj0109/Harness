@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from harness.sandbox import (
+    CommandValidationError,
+    DockerImageMissingError,
+    DockerRunResult,
+    DockerSandboxConfig,
+    DockerSandboxRunner,
+    DockerUnavailableError,
+    validate_test_command,
+)
+
+
+def completed(args, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_docker_missing_returns_setup_guidance(monkeypatch) -> None:
+    def fake_run(args, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(DockerUnavailableError) as exc:
+        DockerSandboxRunner(DockerSandboxConfig()).preflight()
+    assert "Docker is not installed" in str(exc.value)
+
+
+def test_docker_image_missing_returns_pull_guidance(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(args)
+        if args == ["docker", "--version"]:
+            return completed(args, stdout="Docker version")
+        if args[:3] == ["docker", "image", "inspect"]:
+            return completed(args, returncode=1, stderr="missing")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(DockerImageMissingError) as exc:
+        DockerSandboxRunner(DockerSandboxConfig(image="python:3.12-slim")).preflight()
+    assert "docker pull python:3.12-slim" in str(exc.value)
+    assert not any(args[:2] == ["docker", "run"] for args in calls)
+
+
+def test_docker_command_construction_is_safe(tmp_path) -> None:
+    runner = DockerSandboxRunner(DockerSandboxConfig())
+    args = runner.build_docker_command(tmp_path, ["python", "-m", "pytest", "-q"])
+    assert isinstance(args, list)
+    assert args[:3] == ["docker", "run", "--rm"]
+    assert ["--network", "none"] == args[args.index("--network") : args.index("--network") + 2]
+    assert "--memory" in args
+    assert "--cpus" in args
+    assert ["--workdir", "/workspace"] == args[args.index("--workdir") : args.index("--workdir") + 2]
+    assert ["-v", f"{tmp_path.resolve()}:/workspace"] == args[args.index("-v") : args.index("-v") + 2]
+    assert "--privileged" not in args
+    assert "host" not in args
+    assert "/bin/sh" not in args
+    assert "-c" not in args
+    assert not any("docker.sock" in arg for arg in args)
+
+
+@pytest.mark.parametrize("command", [["python -m pytest -q"], ["pytest", "-q;"], ["pytest", "&&", "echo"], []])
+def test_command_validation_rejects_shell_strings_and_metacharacters(command) -> None:
+    with pytest.raises(CommandValidationError):
+        validate_test_command(command)
+
+
+def test_command_validation_accepts_token_list() -> None:
+    validate_test_command(["python", "-m", "pytest", "-q"])
+
+
+def test_sanitized_workspace_excludes_sensitive_and_generated_paths_and_skips_symlink_escape(tmp_path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "app.py").write_text("ok\n", encoding="utf-8")
+    (project / ".env").write_text("SECRET=x\n", encoding="utf-8")
+    (project / "secret.pem").write_text("pem\n", encoding="utf-8")
+    (project / "cache.db").write_text("db\n", encoding="utf-8")
+    (project / ".harness").mkdir()
+    (project / ".harness" / "config.yaml").write_text("x\n", encoding="utf-8")
+    (project / "node_modules").mkdir()
+    (project / "node_modules" / "pkg.js").write_text("x\n", encoding="utf-8")
+    (project / "agent_harness.egg-info").mkdir()
+    (project / "agent_harness.egg-info" / "PKG-INFO").write_text("x\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside\n", encoding="utf-8")
+    (project / "escape").symlink_to(outside)
+    (project / "inside_target.txt").write_text("inside\n", encoding="utf-8")
+    (project / "inside_link").symlink_to(project / "inside_target.txt")
+
+    workspace = DockerSandboxRunner(DockerSandboxConfig()).create_workspace(project)
+    try:
+        assert (workspace.path / "app.py").exists()
+        assert not (workspace.path / ".env").exists()
+        assert not (workspace.path / "secret.pem").exists()
+        assert not (workspace.path / "cache.db").exists()
+        assert not (workspace.path / ".harness").exists()
+        assert not (workspace.path / "node_modules").exists()
+        assert not (workspace.path / "agent_harness.egg-info").exists()
+        assert not (workspace.path / "escape").exists()
+        assert not (workspace.path / "inside_link").exists()
+    finally:
+        workspace.cleanup()
+
+
+def test_timeout_records_partial_output(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, timeout=1, output="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz", stderr="partial")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    workspace = DockerSandboxRunner(DockerSandboxConfig()).create_workspace(tmp_path)
+    try:
+        result = DockerSandboxRunner(DockerSandboxConfig(timeout_seconds=1)).run(workspace, ["pytest", "-q"])
+    finally:
+        workspace.cleanup()
+    assert result.timed_out
+    assert result.exit_code is None
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in result.stdout
+    assert "[REDACTED_SECRET]" in result.stdout
+
+
+def test_exit_codes_map_to_result_ok(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):
+        return completed(args, returncode=1, stdout="missing pytest", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    workspace = DockerSandboxRunner(DockerSandboxConfig()).create_workspace(tmp_path)
+    try:
+        result = DockerSandboxRunner(DockerSandboxConfig()).run(workspace, ["pytest", "-q"])
+    finally:
+        workspace.cleanup()
+    assert isinstance(result, DockerRunResult)
+    assert not result.ok
+    assert result.exit_code == 1
+    assert result.stdout == "missing pytest"

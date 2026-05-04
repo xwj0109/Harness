@@ -24,14 +24,18 @@ from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
 from harness.paths import resolve_project_root
 from harness.runner import ReadOnlyRepoSummaryRunner
+from harness.sandbox import CommandValidationError, DockerImageMissingError, DockerUnavailableError
+from harness.test_runner import DockerTestRunner, TestExecutionDecision
 
 app = typer.Typer(help="Local-first agent harness.")
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
 backends_app = typer.Typer(help="Configured backend metadata and preflight checks.", invoke_without_command=True)
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
+tests_app = typer.Typer(help="Docker-sandboxed test execution.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
+app.add_typer(tests_app, name="tests")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
 
@@ -319,6 +323,29 @@ def approvals_revoke(approval_id: str, project: ProjectOption = Path(".")) -> No
     typer.echo(f"Revoked approval {approval_id}")
 
 
+@tests_app.command(
+    "run",
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True},
+)
+def tests_run(ctx: typer.Context, project: ProjectOption = Path(".")) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    command = list(ctx.args)
+    cfg = load_config(project_root)
+    store = SQLiteStore(project_root)
+    runner = DockerTestRunner(project_root, cfg, store, CliTestExecutionApprovalProvider())
+    try:
+        result = runner.run(command)
+    except CommandValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Created run {result['run_id']}")
+    typer.echo(f"Status: {result['status']}")
+    typer.echo(f"Approval decision: {result['approval_decision']}")
+    typer.echo("Artifacts:")
+    for kind, path in result["artifacts"].items():
+        typer.echo(f"  {kind}: {path}")
+
+
 @dev_app.command("create-run")
 def dev_create_run(
     goal: Annotated[str, typer.Option("--goal")],
@@ -450,6 +477,22 @@ class CliApplyBackApprovalProvider:
                 return ApplyBackDecision(decision="denied")
             if normalized in {"v", "view", "view full diff"}:
                 typer.echo(diff_artifact.read_text(encoding="utf-8") if diff_artifact.exists() else full_diff)
+                continue
+            typer.echo("Invalid choice. Use a, d, or v.")
+
+
+class CliTestExecutionApprovalProvider:
+    def decide(self, details: str) -> TestExecutionDecision:
+        typer.echo(details)
+        while True:
+            choice = typer.prompt("Choose [a] approve, [d] deny, [v] view details", default="d")
+            normalized = choice.strip().lower()
+            if normalized in {"a", "approve"}:
+                return TestExecutionDecision(decision="approved")
+            if normalized in {"d", "deny"}:
+                return TestExecutionDecision(decision="denied")
+            if normalized in {"v", "view", "view details"}:
+                typer.echo(details)
                 continue
             typer.echo("Invalid choice. Use a, d, or v.")
 

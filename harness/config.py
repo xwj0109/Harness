@@ -40,6 +40,15 @@ DEFAULT_ISOLATION_COPY_EXCLUDES = [
 ]
 
 
+class SandboxConfig(BaseModel):
+    image: str = "python:3.12-slim"
+    network: bool = False
+    timeout_seconds: int = 120
+    memory_limit: str = "2g"
+    cpu_limit: float = 2.0
+    workdir: str = "/workspace"
+
+
 class HarnessConfig(BaseModel):
     project_name: str = "agent-harness-project"
     context_excludes: list[str] = Field(default_factory=lambda: list(DEFAULT_CONTEXT_EXCLUDES))
@@ -50,6 +59,7 @@ class HarnessConfig(BaseModel):
         "Future LocalOpenAICompatibleBackend may be treated as local_only only when "
         "base_url is localhost, 127.0.0.1, or an explicitly approved local/LAN endpoint."
     )
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     backends: dict[str, BackendConfig]
 
 
