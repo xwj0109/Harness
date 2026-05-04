@@ -222,6 +222,7 @@ def test_install_failure_is_tests_failed_with_hint_and_summaries(tmp_path) -> No
     )
     assert result["status"] == "tests_failed"
     assert result["failure_hint"] == "install_failed"
+    assert "build tooling" in result["failure_guidance"]
     assert "installing" in result["stdout_summary"]
     assert "pip failed" in result["stderr_summary"]
     payload = (tmp_path / ".harness" / "runs" / result["run_id"] / "test_result.json").read_text(encoding="utf-8")
@@ -245,6 +246,7 @@ def test_missing_pytest_maps_to_pytest_missing(tmp_path) -> None:
     )
     assert result["status"] == "tests_failed"
     assert result["failure_hint"] == "pytest_missing"
+    assert "harness tests image build" in result["failure_guidance"]
 
 
 def test_missing_dependency_maps_to_dependency_missing(tmp_path) -> None:
@@ -263,6 +265,7 @@ def test_missing_dependency_maps_to_dependency_missing(tmp_path) -> None:
         ),
     )
     assert result["failure_hint"] == "dependency_missing"
+    assert "Phase 4 does not install dependencies during test execution" in result["failure_guidance"]
 
 
 def test_local_package_import_failure_maps_to_package_import_failed(tmp_path) -> None:

@@ -217,6 +217,7 @@ class DockerTestRunner:
             docker_result.stdout if docker_result else "",
             docker_result.stderr if docker_result else error,
         )
+        failure_hint = _failure_hint(status, docker_result.stdout if docker_result else "", docker_result.stderr if docker_result else error)
         result_payload = {
             "status": status,
             "command": command,
@@ -238,7 +239,8 @@ class DockerTestRunner:
             "error": error,
             "stdout_summary": stdout_summary,
             "stderr_summary": stderr_summary,
-            "failure_hint": _failure_hint(status, docker_result.stdout if docker_result else "", docker_result.stderr if docker_result else error),
+            "failure_hint": failure_hint,
+            "failure_guidance": _failure_guidance(failure_hint, self.sandbox_config.image),
             "stdout_artifact": str(stdout_path),
             "stderr_artifact": str(stderr_path),
             "result_artifact": str(result_path),
@@ -341,6 +343,7 @@ class DockerTestRunner:
             f"- Timed out: {payload['timed_out']}",
             f"- Approval decision: {payload['approval_decision']}",
             f"- Failure hint: {payload['failure_hint']}",
+            f"- Failure guidance: {payload['failure_guidance']}",
             f"- Error: {sanitize_for_logging(str(payload['error']))}",
             "",
             "## Output Summary",
@@ -439,3 +442,27 @@ def _failure_hint(status: str, stdout: str, stderr: str) -> str:
     if "== failures ==" in lowered or "short test summary info" in lowered or " failed" in lowered:
         return "pytest_failures"
     return "unknown_test_failure"
+
+
+def _failure_guidance(failure_hint: str, image: str) -> str:
+    guidance = {
+        "install_failed": (
+            "Editable install failed inside the container. Ensure the configured image has build tooling and set "
+            "sandbox.install_project_no_build_isolation: true when dependencies are already installed in the image."
+        ),
+        "pytest_missing": (
+            f"The configured image `{image}` does not include pytest. Build a managed test image with "
+            "`harness tests image build --project .` or configure sandbox.image to an image that contains pytest."
+        ),
+        "package_import_failed": (
+            "The local package could not be imported. Set sandbox.install_project: true or run tests with a cwd/command "
+            "that exposes the package in the sanitized workspace."
+        ),
+        "dependency_missing": (
+            f"A Python dependency is missing from `{image}`. Add the dependency to the configured test image and rebuild "
+            "with `harness tests image build --project .`; Phase 4 does not install dependencies during test execution."
+        ),
+        "pytest_failures": "Pytest ran and reported test failures. Inspect the summarized failure output and full artifacts.",
+        "unknown_test_failure": "The test command exited nonzero. Inspect stdout/stderr artifacts for details.",
+    }
+    return guidance.get(failure_hint, "")

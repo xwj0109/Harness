@@ -65,6 +65,7 @@ Recommended `.harness/config.yaml` sandbox section for local harness validation:
 ```yaml
 sandbox:
   image: "harness-test:local"
+  image_build_file: "Dockerfile.harness-test"
   network: false
   timeout_seconds: 120
   memory_limit: "2g"
@@ -75,6 +76,19 @@ sandbox:
 ```
 
 Build the local test image:
+
+```bash
+harness tests image build --project .
+```
+
+The managed build command validates the configured Dockerfile and runs `docker build` with subprocess argument lists. It is a direct CLI operation only; test execution never auto-builds images. To create or validate the managed Dockerfile:
+
+```bash
+harness tests image generate --project .
+harness tests image validate --project .
+```
+
+The equivalent raw Docker command is:
 
 ```bash
 docker build -f Dockerfile.harness-test -t harness-test:local .
@@ -139,10 +153,13 @@ Troubleshooting:
 
 - Docker not on `PATH`: verify `docker --version` works in the same terminal environment.
 - Image missing: run `docker build -f Dockerfile.harness-test -t harness-test:local .` or `docker pull <configured-image>`.
+- Managed image missing: run `harness tests image build --project .`; the harness does not auto-build during test execution.
 - `pytest` missing in `python:3.12-slim`: use a project-specific image such as `harness-test:local`; the default Python image does not include project test dependencies.
 - Editable install build isolation requiring network: set `install_project: true` and `install_project_no_build_isolation: true`; the generated in-container helper runs `python -m pip install -e . --no-deps --no-build-isolation`.
 - Missing Git in the test image: temporary test repositories need `git`; `Dockerfile.harness-test` installs Git.
 - Pytest collection warnings: collection warnings are test output, not sandbox errors. They appear in stdout/stderr summaries and artifacts.
+
+The `failure_guidance` field in `test_result.json` gives short operator hints for common dependency cases such as missing `pytest`, missing project imports, missing dependencies, and editable install failures.
 
 Artifacts for each run include:
 

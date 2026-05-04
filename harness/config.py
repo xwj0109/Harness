@@ -42,6 +42,7 @@ DEFAULT_ISOLATION_COPY_EXCLUDES = [
 
 class SandboxConfig(BaseModel):
     image: str = "python:3.12-slim"
+    image_build_file: str = "Dockerfile.harness-test"
     network: bool = False
     timeout_seconds: int = 120
     memory_limit: str = "2g"

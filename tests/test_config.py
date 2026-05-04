@@ -10,6 +10,7 @@ def test_default_config_has_exclusions_and_backends() -> None:
     assert cfg.backends["local_openai_compatible"].metadata.data_boundary == DataBoundary.LOCAL_ONLY
     assert cfg.sandbox.install_project is False
     assert cfg.sandbox.install_project_no_build_isolation is True
+    assert cfg.sandbox.image_build_file == "Dockerfile.harness-test"
 
 
 def test_write_and_load_config(tmp_path) -> None:
@@ -19,3 +20,4 @@ def test_write_and_load_config(tmp_path) -> None:
     assert loaded.backends["paid_openai_compatible"].settings["enabled"] is False
     assert loaded.sandbox.install_project is False
     assert loaded.sandbox.install_project_no_build_isolation is True
+    assert loaded.sandbox.image_build_file == "Dockerfile.harness-test"

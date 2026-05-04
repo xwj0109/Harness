@@ -9,6 +9,12 @@ from harness.sandbox.docker_runner import (
     SanitizedWorkspace,
     validate_test_command,
 )
+from harness.sandbox.image_manager import (
+    DockerfileValidationResult,
+    DockerImageBuildResult,
+    DockerImageManager,
+    MANAGED_TEST_DOCKERFILE,
+)
 
 __all__ = [
     "CommandValidationError",
@@ -20,4 +26,8 @@ __all__ = [
     "DockerUnavailableError",
     "SanitizedWorkspace",
     "validate_test_command",
+    "DockerfileValidationResult",
+    "DockerImageBuildResult",
+    "DockerImageManager",
+    "MANAGED_TEST_DOCKERFILE",
 ]

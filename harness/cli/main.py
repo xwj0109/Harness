@@ -24,7 +24,7 @@ from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
 from harness.paths import resolve_project_root
 from harness.runner import ReadOnlyRepoSummaryRunner
-from harness.sandbox import CommandValidationError, DockerImageMissingError, DockerUnavailableError
+from harness.sandbox import CommandValidationError, DockerImageManager
 from harness.test_runner import DockerTestRunner, TestRunDecision
 
 app = typer.Typer(help="Local-first agent harness.")
@@ -32,10 +32,12 @@ dev_app = typer.Typer(help="Phase 1A development diagnostics.")
 backends_app = typer.Typer(help="Configured backend metadata and preflight checks.", invoke_without_command=True)
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
 tests_app = typer.Typer(help="Docker-sandboxed test execution.")
+tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
+tests_app.add_typer(tests_image_app, name="image")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
 
@@ -351,6 +353,70 @@ def tests_run(ctx: typer.Context, project: ProjectOption = Path(".")) -> None:
     typer.echo("Artifacts:")
     for kind, path in result["artifacts"].items():
         typer.echo(f"  {kind}: {path}")
+
+
+@tests_image_app.command("validate")
+def tests_image_validate(project: ProjectOption = Path(".")) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    try:
+        result = DockerImageManager(project_root, cfg).validate_dockerfile()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Dockerfile: {result.dockerfile}")
+    typer.echo(f"Image: {result.image}")
+    typer.echo(f"Valid: {result.ok}")
+    if result.issues:
+        typer.echo("Issues:")
+        for issue in result.issues:
+            typer.echo(f"  - {issue}")
+    if result.warnings:
+        typer.echo("Warnings:")
+        for warning in result.warnings:
+            typer.echo(f"  - {warning}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@tests_image_app.command("generate")
+def tests_image_generate(
+    project: ProjectOption = Path("."),
+    force: Annotated[bool, typer.Option("--force", help="Overwrite the configured Dockerfile if it exists.")] = False,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    try:
+        path = DockerImageManager(project_root, cfg).generate_dockerfile(force=force)
+    except (ValueError, FileExistsError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Generated managed Docker test image file: {path}")
+
+
+@tests_image_app.command("build")
+def tests_image_build(project: ProjectOption = Path(".")) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    try:
+        result = DockerImageManager(project_root, cfg).build_image()
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"Image: {result.image}")
+    typer.echo(f"Dockerfile: {result.dockerfile}")
+    typer.echo(f"Command: {' '.join(result.command)}")
+    typer.echo(f"Built: {result.ok}")
+    if result.stdout:
+        typer.echo("stdout:")
+        typer.echo(result.stdout)
+    if result.stderr:
+        typer.echo("stderr:")
+        typer.echo(result.stderr)
+    if result.guidance:
+        typer.echo(f"Guidance: {result.guidance}")
+    if not result.ok:
+        raise typer.Exit(code=1)
 
 
 @dev_app.command("create-run")

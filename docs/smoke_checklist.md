@@ -18,6 +18,13 @@ pytest -q
 ## Build Local Docker Test Image
 
 ```bash
+harness tests image validate --project .
+harness tests image build --project .
+```
+
+Equivalent raw Docker build command:
+
+```bash
 docker build -f Dockerfile.harness-test -t harness-test:local .
 ```
 
