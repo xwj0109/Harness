@@ -1,0 +1,6 @@
+# Harness local artifacts
+.harness/runs/
+.harness/harness.sqlite
+.harness/approvals.yaml
+.harness/tmp/
+*.egg-info/
