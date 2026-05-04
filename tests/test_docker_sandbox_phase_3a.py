@@ -109,12 +109,26 @@ def test_install_project_true_generates_safe_python_runner_script(tmp_path) -> N
     assert args[-2:] == ["python", ".harness_docker_run_tests.py"]
     script = tmp_path / ".harness_docker_run_tests.py"
     text = script.read_text(encoding="utf-8")
-    assert 'INSTALL_COMMAND = [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"]' in text
+    assert (
+        'INSTALL_COMMAND = [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps", "--no-build-isolation"]'
+        in text
+    )
     assert 'TEST_COMMAND = ["python", "-m", "pytest", "-q"]' in text
     assert "subprocess.run(INSTALL_COMMAND, shell=False)" in text
     assert "subprocess.run(TEST_COMMAND, shell=False)" in text
     assert "/bin/sh" not in text
     assert "shell=True" not in text
+
+
+def test_install_project_can_disable_no_build_isolation_flag(tmp_path) -> None:
+    runner = DockerSandboxRunner(
+        DockerSandboxConfig(install_project=True, install_project_no_build_isolation=False)
+    )
+    runner.build_docker_command(tmp_path, ["python", "-m", "pytest", "-q"])
+
+    text = (tmp_path / ".harness_docker_run_tests.py").read_text(encoding="utf-8")
+    assert 'INSTALL_COMMAND = [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"]' in text
+    assert "--no-build-isolation" not in text
 
 
 @pytest.mark.parametrize("command", [["python -m pytest -q"], ["pytest", "-q;"], ["pytest", "&&", "echo"], []])

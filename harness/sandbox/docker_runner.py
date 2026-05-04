@@ -39,6 +39,7 @@ class DockerSandboxConfig(BaseModel):
     cpu_limit: float = 2.0
     workdir: str = "/workspace"
     install_project: bool = False
+    install_project_no_build_isolation: bool = True
 
 
 class DockerRunResult(BaseModel):
@@ -196,7 +197,11 @@ class DockerSandboxRunner:
         validate_test_command(command)
         container_command = command
         if self.config.install_project:
-            _write_test_runner_script(workspace, command)
+            _write_test_runner_script(
+                workspace,
+                command,
+                no_build_isolation=self.config.install_project_no_build_isolation,
+            )
             container_command = ["python", ".harness_docker_run_tests.py"]
         args = [
             self.docker_binary,
@@ -292,14 +297,17 @@ def _assert_safe_docker_args(args: list[str]) -> None:
         raise CommandValidationError("Shell execution is not allowed.")
 
 
-def _write_test_runner_script(workspace: Path, command: list[str]) -> Path:
+def _write_test_runner_script(workspace: Path, command: list[str], no_build_isolation: bool) -> Path:
     script_path = workspace / ".harness_docker_run_tests.py"
+    install_args = ["-m", "pip", "install", "-e", ".", "--no-deps"]
+    if no_build_isolation:
+        install_args.append("--no-build-isolation")
     script = f'''from __future__ import annotations
 
 import subprocess
 import sys
 
-INSTALL_COMMAND = [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"]
+INSTALL_COMMAND = [sys.executable, {", ".join(json.dumps(arg) for arg in install_args)}]
 TEST_COMMAND = {json.dumps(command)}
 
 
