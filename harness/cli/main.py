@@ -18,7 +18,7 @@ from harness.backends.codex_cli import (
 from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAICompatibleBackend
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
 from harness.codex_runner import HostedBoundaryApprovalRequired, HostedSecretBlocked, CodexRepoPlanningRunner
-from harness.codex_edit_runner import ActiveProjectModifiedError, CodexCodeEditRunner
+from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
@@ -178,7 +178,13 @@ def run(
         backend = CodexCliBackend(backend_config)
         approvals = ApprovalStore(project_root)
         approval = approvals.find_valid("codex_cli", "hosted_provider", task_type)
-        runner = CodexCodeEditRunner(project_root, store, backend, approvals)
+        runner = CodexCodeEditRunner(
+            project_root,
+            store,
+            backend,
+            approvals,
+            apply_back_approval_provider=CliApplyBackApprovalProvider(),
+        )
         try:
             result = runner.run(
                 goal=goal,
@@ -206,7 +212,11 @@ def run(
         typer.echo(
             f"Changed files: {', '.join(result['changed_files']) if result['changed_files'] else 'none'}"
         )
-        typer.echo("Apply-back is not implemented in C2; active project was not modified.")
+        typer.echo(f"Apply-back decision: {result['apply_back_decision']}")
+        if result["applied_files"]:
+            typer.echo(f"Applied files: {', '.join(result['applied_files'])}")
+        if result["apply_back_failure"]:
+            typer.echo(f"Apply-back failure: {result['apply_back_failure']}")
         typer.echo("Artifacts:")
         for kind, path in result["artifacts"].items():
             typer.echo(f"  {kind}: {path}")
@@ -423,6 +433,23 @@ class CliPatchApprovalProvider:
                 return PatchApprovalDecision(decision="denied")
             if normalized in {"v", "view", "view full patch"}:
                 typer.echo(patch)
+                continue
+            typer.echo("Invalid choice. Use a, d, or v.")
+
+
+class CliApplyBackApprovalProvider:
+    def decide(self, diff_summary: str, full_diff: str, diff_artifact: Path) -> ApplyBackDecision:
+        typer.echo("Apply-back approval required:")
+        typer.echo(diff_summary)
+        while True:
+            choice = typer.prompt("Choose [a] approve all changes, [d] deny all changes, [v] view full diff", default="d")
+            normalized = choice.strip().lower()
+            if normalized in {"a", "approve", "approve all", "approve all changes"}:
+                return ApplyBackDecision(decision="approved")
+            if normalized in {"d", "deny", "deny all", "deny all changes"}:
+                return ApplyBackDecision(decision="denied")
+            if normalized in {"v", "view", "view full diff"}:
+                typer.echo(diff_artifact.read_text(encoding="utf-8") if diff_artifact.exists() else full_diff)
                 continue
             typer.echo("Invalid choice. Use a, d, or v.")
 

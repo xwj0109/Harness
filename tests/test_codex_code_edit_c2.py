@@ -13,7 +13,7 @@ from harness.backends.codex_cli import (
     CodexRunResult,
     NETWORK_NOT_ENFORCEABLE,
 )
-from harness.codex_edit_runner import CodexCodeEditRunner
+from harness.codex_edit_runner import ApplyBackDecision, CodexCodeEditRunner
 from harness.codex_runner import HostedBoundaryApprovalRequired
 from harness.config import default_config, write_default_config
 from harness.memory.sqlite_store import SQLiteStore
@@ -102,6 +102,14 @@ class FakeEditBackend(CodexCliBackend):
         )
 
 
+class StaticApplyBackApproval:
+    def __init__(self, decision: str):
+        self.decision = decision
+
+    def decide(self, diff_summary: str, full_diff: str, diff_artifact: Path) -> ApplyBackDecision:
+        return ApplyBackDecision(decision=self.decision)
+
+
 def test_missing_hosted_approval_profile_fails_closed(tmp_path) -> None:
     init_clean_project(tmp_path)
     write_default_config(tmp_path)
@@ -131,7 +139,7 @@ def test_codex_code_edit_runs_in_isolated_workspace_and_reports_diff(tmp_path) -
         approval(tmp_path),
     )
 
-    assert result["status"] == "completed"
+    assert result["status"] == "completed_denied"
     assert result["changed_files"] == ["app.py"]
     assert backend.seen_project_root != tmp_path
     assert tmp_path not in backend.seen_project_root.parents
@@ -140,7 +148,7 @@ def test_codex_code_edit_runs_in_isolated_workspace_and_reports_diff(tmp_path) -
     run_dir = tmp_path / ".harness" / "runs" / result["run_id"]
     assert "+value = 2" in (run_dir / "isolated_unified_diff.patch").read_text(encoding="utf-8")
     report = (run_dir / "final_report.md").read_text(encoding="utf-8")
-    assert "Apply-back is not implemented in C2; active project was not modified." in report
+    assert "Codex completed but changes were denied." in report
 
 
 def test_keep_isolation_preserves_workspace(tmp_path) -> None:
@@ -333,11 +341,12 @@ def test_codex_code_edit_does_not_use_local_or_paid_backend(monkeypatch, tmp_pat
     result = CliRunner().invoke(
         app,
         ["run", "change value", "--project", str(tmp_path), "--task-type", "codex_code_edit"],
+        input="d\n",
     )
 
     assert result.exit_code == 0
     assert calls == {"local": 0, "codex": 1}
-    assert "Apply-back is not implemented in C2" in result.output
+    assert "Apply-back decision: denied" in result.output
 
 
 def test_existing_repo_planning_route_still_uses_read_only(monkeypatch, tmp_path) -> None:
@@ -383,4 +392,4 @@ def test_environment_does_not_need_openai_api_key_for_code_edit(tmp_path, monkey
         FakeEditBackend(default_config().backends["codex_cli"]),
         ApprovalStore(tmp_path),
     ).run("change value", "codex_code_edit", approval(tmp_path))
-    assert result["status"] == "completed"
+    assert result["status"] == "completed_denied"

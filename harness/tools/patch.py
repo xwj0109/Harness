@@ -148,15 +148,15 @@ def validate_file_patch_target(
 
 
 def apply_planned_updates(updates: list[PlannedFileUpdate]) -> None:
-    originals = {update.path: read_patch_target(update.path) for update in updates}
+    originals = {update.path: update.path.read_bytes() for update in updates}
     written: list[Path] = []
     try:
         for update in updates:
-            update.path.write_text(update.content, encoding="utf-8", newline="")
             written.append(update.path)
+            update.path.write_bytes(update.content.encode("utf-8"))
     except Exception:
-        for path in written:
-            path.write_text(originals[path], encoding="utf-8", newline="")
+        for path in originals:
+            path.write_bytes(originals[path])
         raise
 
 
