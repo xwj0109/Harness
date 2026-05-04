@@ -5,7 +5,10 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from harness.cli.main import app
+from harness.config import default_config
+from harness.memory.sqlite_store import SQLiteStore
 from harness.sandbox import DockerRunResult, DockerSandboxConfig
+from harness.test_runner import DockerTestRunner, TestExecutionDecision
 
 
 runner = CliRunner()
@@ -17,7 +20,12 @@ class FakeDockerRunner:
     preflight_calls = 0
 
     def __init__(self, config):
-        self.config = config if isinstance(config, DockerSandboxConfig) else DockerSandboxConfig.model_validate(config)
+        if isinstance(config, DockerSandboxConfig):
+            self.config = config
+        elif hasattr(config, "model_dump"):
+            self.config = DockerSandboxConfig.model_validate(config.model_dump())
+        else:
+            self.config = DockerSandboxConfig.model_validate(config)
 
     def preflight(self):
         FakeDockerRunner.preflight_calls += 1
@@ -134,3 +142,130 @@ def test_cli_tests_run_does_not_instantiate_codex_or_paid_or_local(tmp_path, mon
         input="d\n",
     )
     assert result.exit_code == 0
+
+
+class StaticApproval:
+    def __init__(self, decision: str = "approved"):
+        self.decision = decision
+
+    def decide(self, details: str) -> TestExecutionDecision:
+        return TestExecutionDecision(decision=self.decision)
+
+
+class ResultDockerRunner(FakeDockerRunner):
+    def __init__(self, config, result: DockerRunResult):
+        super().__init__(config)
+        self.result = result
+
+    def run(self, workspace, command, timeout_seconds=None):
+        return self.result
+
+
+def run_with_result(tmp_path, docker_result: DockerRunResult):
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    cfg = default_config()
+    return DockerTestRunner(
+        tmp_path,
+        cfg,
+        store,
+        StaticApproval("approved"),
+        docker_runner=ResultDockerRunner(cfg.sandbox, docker_result),
+    ).run(["python", "-m", "pytest", "-q"])
+
+
+def test_install_failure_is_tests_failed_with_hint_and_summaries(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0.1'\n", encoding="utf-8")
+    result = run_with_result(
+        tmp_path,
+        DockerRunResult(
+            ok=False,
+            exit_code=1,
+            stdout="installing\n",
+            stderr="HARNESS_INSTALL_FAILED\npip failed\n",
+            duration_seconds=0.1,
+            timed_out=False,
+            image="python:3.12-slim",
+            command=["python", "-m", "pytest", "-q"],
+            workdir="/workspace",
+        ),
+    )
+    assert result["status"] == "tests_failed"
+    assert result["failure_hint"] == "install_failed"
+    assert "installing" in result["stdout_summary"]
+    assert "pip failed" in result["stderr_summary"]
+    payload = (tmp_path / ".harness" / "runs" / result["run_id"] / "test_result.json").read_text(encoding="utf-8")
+    assert '"failure_hint": "install_failed"' in payload
+
+
+def test_missing_pytest_maps_to_pytest_missing(tmp_path) -> None:
+    result = run_with_result(
+        tmp_path,
+        DockerRunResult(
+            ok=False,
+            exit_code=1,
+            stdout="",
+            stderr="/usr/local/bin/python: No module named pytest\n",
+            duration_seconds=0.1,
+            timed_out=False,
+            image="python:3.12-slim",
+            command=["python", "-m", "pytest", "-q"],
+            workdir="/workspace",
+        ),
+    )
+    assert result["status"] == "tests_failed"
+    assert result["failure_hint"] == "pytest_missing"
+
+
+def test_missing_dependency_maps_to_dependency_missing(tmp_path) -> None:
+    result = run_with_result(
+        tmp_path,
+        DockerRunResult(
+            ok=False,
+            exit_code=1,
+            stdout="ModuleNotFoundError: No module named 'numpy'\n",
+            stderr="",
+            duration_seconds=0.1,
+            timed_out=False,
+            image="python:3.12-slim",
+            command=["python", "-m", "pytest", "-q"],
+            workdir="/workspace",
+        ),
+    )
+    assert result["failure_hint"] == "dependency_missing"
+
+
+def test_local_package_import_failure_maps_to_package_import_failed(tmp_path) -> None:
+    result = run_with_result(
+        tmp_path,
+        DockerRunResult(
+            ok=False,
+            exit_code=1,
+            stdout="ModuleNotFoundError: No module named 'harness'\n",
+            stderr="",
+            duration_seconds=0.1,
+            timed_out=False,
+            image="python:3.12-slim",
+            command=["python", "-m", "pytest", "-q"],
+            workdir="/workspace",
+        ),
+    )
+    assert result["failure_hint"] == "package_import_failed"
+
+
+def test_pytest_failures_map_to_pytest_failures(tmp_path) -> None:
+    result = run_with_result(
+        tmp_path,
+        DockerRunResult(
+            ok=False,
+            exit_code=1,
+            stdout="================== FAILURES ==================\nFAILED tests/test_demo.py::test_demo\nshort test summary info\n",
+            stderr="",
+            duration_seconds=0.1,
+            timed_out=False,
+            image="python:3.12-slim",
+            command=["python", "-m", "pytest", "-q"],
+            workdir="/workspace",
+        ),
+    )
+    assert result["failure_hint"] == "pytest_failures"

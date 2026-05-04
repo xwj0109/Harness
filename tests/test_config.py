@@ -8,6 +8,7 @@ def test_default_config_has_exclusions_and_backends() -> None:
     assert set(DEFAULT_CONTEXT_EXCLUDES).issubset(set(cfg.context_excludes))
     assert {"codex_cli", "local_openai_compatible", "paid_openai_compatible"} <= set(cfg.backends)
     assert cfg.backends["local_openai_compatible"].metadata.data_boundary == DataBoundary.LOCAL_ONLY
+    assert cfg.sandbox.install_project is False
 
 
 def test_write_and_load_config(tmp_path) -> None:
@@ -15,4 +16,4 @@ def test_write_and_load_config(tmp_path) -> None:
     loaded = load_config(tmp_path)
     assert loaded.backends["codex_cli"].metadata.billing_mode.value == "subscription"
     assert loaded.backends["paid_openai_compatible"].settings["enabled"] is False
-
+    assert loaded.sandbox.install_project is False

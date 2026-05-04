@@ -92,6 +92,29 @@ def test_docker_command_construction_is_safe(tmp_path) -> None:
     assert "-e" not in args
     assert "--env" not in args
     assert "--env-file" not in args
+    assert args[-4:] == ["python", "-m", "pytest", "-q"]
+
+
+def test_install_project_false_keeps_direct_requested_command(tmp_path) -> None:
+    runner = DockerSandboxRunner(DockerSandboxConfig(install_project=False))
+    args = runner.build_docker_command(tmp_path, ["python", "-m", "pytest", "-q"])
+    assert args[-4:] == ["python", "-m", "pytest", "-q"]
+    assert not (tmp_path / ".harness_docker_run_tests.py").exists()
+
+
+def test_install_project_true_generates_safe_python_runner_script(tmp_path) -> None:
+    runner = DockerSandboxRunner(DockerSandboxConfig(install_project=True))
+    args = runner.build_docker_command(tmp_path, ["python", "-m", "pytest", "-q"])
+
+    assert args[-2:] == ["python", ".harness_docker_run_tests.py"]
+    script = tmp_path / ".harness_docker_run_tests.py"
+    text = script.read_text(encoding="utf-8")
+    assert 'INSTALL_COMMAND = [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"]' in text
+    assert 'TEST_COMMAND = ["python", "-m", "pytest", "-q"]' in text
+    assert "subprocess.run(INSTALL_COMMAND, shell=False)" in text
+    assert "subprocess.run(TEST_COMMAND, shell=False)" in text
+    assert "/bin/sh" not in text
+    assert "shell=True" not in text
 
 
 @pytest.mark.parametrize("command", [["python -m pytest -q"], ["pytest", "-q;"], ["pytest", "&&", "echo"], []])

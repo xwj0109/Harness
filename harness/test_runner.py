@@ -163,6 +163,7 @@ class DockerTestRunner:
             "memory_limit": self.sandbox_config.memory_limit,
             "cpu_limit": self.sandbox_config.cpu_limit,
             "workdir": self.sandbox_config.workdir,
+            "install_project": self.sandbox_config.install_project,
             "temp_workspace": temp_workspace,
             "cleanup_status": cleanup_status,
             "exit_code": docker_result.exit_code if docker_result else None,
@@ -171,6 +172,9 @@ class DockerTestRunner:
             "approval_decision": approval.decision,
             "approval_reason": approval.reason,
             "error": error,
+            "stdout_summary": _summarize_text(docker_result.stdout if docker_result else ""),
+            "stderr_summary": _summarize_text(docker_result.stderr if docker_result else error),
+            "failure_hint": _failure_hint(status, docker_result.stdout if docker_result else "", docker_result.stderr if docker_result else error),
             "stdout_artifact": str(stdout_path),
             "stderr_artifact": str(stderr_path),
         }
@@ -243,12 +247,25 @@ class DockerTestRunner:
             f"- Memory limit: {payload['memory_limit']}",
             f"- CPU limit: {payload['cpu_limit']}",
             f"- Working directory: {payload['workdir']}",
+            f"- Install project: {payload['install_project']}",
             f"- Temp workspace cleanup status: {payload['cleanup_status']}",
             f"- Exit code: {payload['exit_code']}",
             f"- Duration seconds: {payload['duration_seconds']}",
             f"- Timed out: {payload['timed_out']}",
             f"- Approval decision: {payload['approval_decision']}",
+            f"- Failure hint: {payload['failure_hint']}",
             f"- Error: {sanitize_for_logging(str(payload['error']))}",
+            "",
+            "## Output Summary",
+            "",
+            "### stdout",
+            "```",
+            str(sanitize_for_logging(payload["stdout_summary"])),
+            "```",
+            "### stderr",
+            "```",
+            str(sanitize_for_logging(payload["stderr_summary"])),
+            "```",
             "",
             "## Artifacts",
             "",
@@ -258,3 +275,30 @@ class DockerTestRunner:
             f"- final_report: {report_path}",
         ]
         report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _summarize_text(text: str, limit: int = 1200) -> str:
+    sanitized = str(sanitize_for_logging(text or "")).strip()
+    if len(sanitized) <= limit:
+        return sanitized
+    head = sanitized[: limit // 2].rstrip()
+    tail = sanitized[-limit // 2 :].lstrip()
+    return f"{head}\n...[truncated]...\n{tail}"
+
+
+def _failure_hint(status: str, stdout: str, stderr: str) -> str:
+    if status != "tests_failed":
+        return ""
+    combined = f"{stdout}\n{stderr}"
+    lowered = combined.lower()
+    if "harness_install_failed" in lowered:
+        return "install_failed"
+    if "no module named pytest" in lowered:
+        return "pytest_missing"
+    if "no module named 'harness'" in lowered or 'no module named "harness"' in lowered:
+        return "package_import_failed"
+    if "modulenotfounderror" in lowered or "importerror" in lowered:
+        return "dependency_missing"
+    if "== failures ==" in lowered or "short test summary info" in lowered or " failed" in lowered:
+        return "pytest_failures"
+    return "unknown_test_failure"

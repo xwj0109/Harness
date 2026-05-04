@@ -47,6 +47,7 @@ class SandboxConfig(BaseModel):
     memory_limit: str = "2g"
     cpu_limit: float = 2.0
     workdir: str = "/workspace"
+    install_project: bool = False
 
 
 class HarnessConfig(BaseModel):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ class DockerSandboxConfig(BaseModel):
     memory_limit: str = "2g"
     cpu_limit: float = 2.0
     workdir: str = "/workspace"
+    install_project: bool = False
 
 
 class DockerRunResult(BaseModel):
@@ -192,6 +194,10 @@ class DockerSandboxRunner:
 
     def build_docker_command(self, workspace: Path, command: list[str]) -> list[str]:
         validate_test_command(command)
+        container_command = command
+        if self.config.install_project:
+            _write_test_runner_script(workspace, command)
+            container_command = ["python", ".harness_docker_run_tests.py"]
         args = [
             self.docker_binary,
             "run",
@@ -212,7 +218,7 @@ class DockerSandboxRunner:
                 self.config.image,
             ]
         )
-        args.extend(command)
+        args.extend(container_command)
         _assert_safe_docker_args(args)
         return args
 
@@ -284,6 +290,33 @@ def _assert_safe_docker_args(args: list[str]) -> None:
             raise CommandValidationError("Docker socket mounts are not allowed.")
     if "/bin/sh" in args or "-c" in args:
         raise CommandValidationError("Shell execution is not allowed.")
+
+
+def _write_test_runner_script(workspace: Path, command: list[str]) -> Path:
+    script_path = workspace / ".harness_docker_run_tests.py"
+    script = f'''from __future__ import annotations
+
+import subprocess
+import sys
+
+INSTALL_COMMAND = [sys.executable, "-m", "pip", "install", "-e", ".", "--no-deps"]
+TEST_COMMAND = {json.dumps(command)}
+
+
+def main() -> int:
+    install = subprocess.run(INSTALL_COMMAND, shell=False)
+    if install.returncode != 0:
+        print("HARNESS_INSTALL_FAILED", file=sys.stderr)
+        return install.returncode
+    test = subprocess.run(TEST_COMMAND, shell=False)
+    return test.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    script_path.write_text(script, encoding="utf-8")
+    return script_path
 
 
 def _timeout_output_to_text(value: str | bytes | None) -> str:
