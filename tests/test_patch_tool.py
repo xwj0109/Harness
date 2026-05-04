@@ -185,7 +185,8 @@ def test_patch_preserves_crlf_when_adding_lines(tmp_path) -> None:
     patch = patch.replace("++++", "+++")
     result = ApplyPatchTool().run({"patch": patch}, ToolContext(project_root=tmp_path))
     assert result.ok
-    assert (tmp_path / "app.py").read_text(encoding="utf-8", newline="") == "a\r\ninserted\r\nb\r\n"
+    with (tmp_path / "app.py").open("r", encoding="utf-8", newline="") as handle:
+        assert handle.read() == "a\r\ninserted\r\nb\r\n"
 
 
 def test_patch_rejects_context_excluded_paths(tmp_path) -> None:
