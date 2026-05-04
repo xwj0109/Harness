@@ -164,11 +164,7 @@ class CodexCliBackend:
             capabilities.supports_full_auto
             and capabilities.supports_full_auto_workspace_write_on_request
         )
-        if not can_use_direct_approval and not can_use_full_auto:
-            raise CodexEditCommandUnavailable(
-                "Codex edit execution requires approval-gated workspace-write mode; refusing to run. "
-                + _edit_capability_diagnostics(capabilities)
-            )
+        can_use_workspace_write_without_internal_approval = capabilities.supports_workspace_write_sandbox
         command = [self.command_name, "exec"]
         if can_use_direct_approval:
             command.extend(["--sandbox", "workspace-write"])
@@ -179,8 +175,21 @@ class CodexCliBackend:
             command.extend(["--ask-for-approval", "on-request"])
             approval_mode = "on-request via --ask-for-approval"
         else:
-            command.append("--full-auto")
-            approval_mode = "on-request via --full-auto"
+            if can_use_full_auto:
+                command.append("--full-auto")
+                approval_mode = "on-request via --full-auto"
+                internal_approval_enforceable = True
+            elif can_use_workspace_write_without_internal_approval:
+                command.extend(["--sandbox", "workspace-write"])
+                approval_mode = "not available in codex exec; harness apply-back approval required"
+                internal_approval_enforceable = False
+            else:
+                raise CodexEditCommandUnavailable(
+                    "Codex edit execution requires workspace-write mode; refusing to run. "
+                    + _edit_capability_diagnostics(capabilities)
+                )
+        if can_use_direct_approval:
+            internal_approval_enforceable = True
         command.extend(["--cd", str(isolated_workspace)])
         model = self.config.settings.get("model")
         if model and capabilities.supports_model_arg:
@@ -198,6 +207,8 @@ class CodexCliBackend:
         )
         self.config.settings["last_codex_approval_mode"] = approval_mode
         self.config.settings["last_codex_sandbox_mode"] = "workspace-write"
+        self.config.settings["last_codex_internal_command_approval_enforceable"] = internal_approval_enforceable
+        self.config.settings["last_apply_back_approval_required"] = True
         return command, capabilities, network_status
 
     def run_read_only(self, project_root: Path, prompt: str, final_message_path: Path | None) -> CodexRunResult:

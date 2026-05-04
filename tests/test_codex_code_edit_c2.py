@@ -246,6 +246,38 @@ def test_policy_violations_in_isolated_diff_are_reported_without_active_change(t
     assert (tmp_path / "app.py").read_bytes() == before
 
 
+def test_report_states_when_codex_internal_approval_is_not_enforceable(tmp_path) -> None:
+    init_clean_project(tmp_path)
+
+    class WorkspaceWriteOnlyBackend(FakeEditBackend):
+        def run_edit(self, isolated_workspace, prompt, final_message_path):
+            self.config.settings["last_codex_approval_mode"] = (
+                "not available in codex exec; harness apply-back approval required"
+            )
+            self.config.settings["last_codex_sandbox_mode"] = "workspace-write"
+            self.config.settings["last_codex_internal_command_approval_enforceable"] = False
+            self.config.settings["last_apply_back_approval_required"] = True
+            return super().run_edit(isolated_workspace, prompt, final_message_path)
+
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    result = CodexCodeEditRunner(
+        tmp_path,
+        store,
+        WorkspaceWriteOnlyBackend(default_config().backends["codex_cli"]),
+        ApprovalStore(tmp_path),
+    ).run("change value", "codex_code_edit", approval(tmp_path))
+
+    report = tmp_path / ".harness" / "runs" / result["run_id"] / "final_report.md"
+    text = report.read_text(encoding="utf-8")
+    assert "Codex internal command approval enforceable: False" in text
+    assert "Apply-back approval required: True" in text
+    assert (
+        "Codex exec did not expose an internal approval flag. The harness relied on isolated workspace "
+        "execution and explicit apply-back approval."
+    ) in text
+
+
 def test_build_edit_command_detects_ask_for_approval_and_uses_isolated_cd(monkeypatch, tmp_path) -> None:
     def fake_run(args, **kwargs):
         if args == ["codex", "--help"]:
@@ -269,12 +301,12 @@ def test_build_edit_command_detects_ask_for_approval_and_uses_isolated_cd(monkey
     assert network_status == NETWORK_NOT_ENFORCEABLE
 
 
-def test_build_edit_command_fails_closed_without_approval_gating(monkeypatch, tmp_path) -> None:
+def test_build_edit_command_fails_closed_without_workspace_write(monkeypatch, tmp_path) -> None:
     def fake_run(args, **kwargs):
         if args == ["codex", "--help"]:
             return completed(args, stdout="Commands:\n  exec\n")
         if args == ["codex", "exec", "--help"]:
-            return completed(args, stdout=EDIT_HELP.replace("--ask-for-approval", "--no-approval"))
+            return completed(args, stdout="--cd --sandbox read-only")
         if args == ["codex", "login", "--help"]:
             return completed(args, stdout="status")
         return completed(args)
@@ -309,7 +341,7 @@ def test_build_edit_command_uses_documented_full_auto_when_direct_approval_absen
     assert backend.config.settings["last_codex_sandbox_mode"] == "workspace-write"
 
 
-def test_build_edit_command_rejects_undocumented_full_auto(monkeypatch, tmp_path) -> None:
+def test_build_edit_command_uses_workspace_write_when_full_auto_is_undocumented(monkeypatch, tmp_path) -> None:
     def fake_run(args, **kwargs):
         if args == ["codex", "--help"]:
             return completed(args, stdout="Commands:\n  exec\nOptions:\n  --ask-for-approval <POLICY>\n")
@@ -321,10 +353,55 @@ def test_build_edit_command_rejects_undocumented_full_auto(monkeypatch, tmp_path
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    with pytest.raises(CodexEditCommandUnavailable) as exc:
-        CodexCliBackend(default_config().backends["codex_cli"]).build_edit_command(tmp_path, "change", None)
-    assert "supports_full_auto=True" in str(exc.value)
-    assert "full_auto_documents_workspace_write_on_request=False" in str(exc.value)
+    backend = CodexCliBackend(default_config().backends["codex_cli"])
+    command, capabilities, _network_status = backend.build_edit_command(tmp_path, "change", None)
+
+    assert capabilities.supports_full_auto
+    assert not capabilities.supports_full_auto_workspace_write_on_request
+    assert ["--sandbox", "workspace-write"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
+    assert ["--cd", str(tmp_path)] == command[command.index("--cd") : command.index("--cd") + 2]
+    assert "--full-auto" not in command
+    assert backend.config.settings["last_codex_approval_mode"] == (
+        "not available in codex exec; harness apply-back approval required"
+    )
+    assert backend.config.settings["last_codex_internal_command_approval_enforceable"] is False
+    assert backend.config.settings["last_apply_back_approval_required"] is True
+
+
+def test_build_edit_command_uses_workspace_write_when_only_sandbox_and_cd_supported(monkeypatch, tmp_path) -> None:
+    exec_help = """
+Usage: codex exec [OPTIONS] [PROMPT]
+  --cd <DIR>
+  --sandbox <SANDBOX_MODE> [possible values: read-only, workspace-write, danger-full-access]
+"""
+
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=exec_help)
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = CodexCliBackend(default_config().backends["codex_cli"])
+    command, capabilities, _network_status = backend.build_edit_command(tmp_path, "change", None)
+
+    assert capabilities.supports_workspace_write_sandbox
+    assert capabilities.supports_cd
+    assert not capabilities.supports_ask_for_approval
+    assert not capabilities.supports_full_auto
+    assert ["--sandbox", "workspace-write"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
+    assert ["--cd", str(tmp_path)] == command[command.index("--cd") : command.index("--cd") + 2]
+    assert "--full-auto" not in command
+    assert "--ask-for-approval" not in command
+    assert backend.config.settings["last_codex_approval_mode"] == (
+        "not available in codex exec; harness apply-back approval required"
+    )
+    assert backend.config.settings["last_codex_sandbox_mode"] == "workspace-write"
+    assert backend.config.settings["last_codex_internal_command_approval_enforceable"] is False
+    assert backend.config.settings["last_apply_back_approval_required"] is True
 
 
 def test_danger_full_access_sandbox_is_rejected() -> None:

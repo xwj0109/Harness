@@ -474,7 +474,16 @@ class CodexCodeEditRunner:
             f"- Codex network status: {network_status}",
             f"- Codex approval mode: {self.backend.config.settings.get('last_codex_approval_mode', 'unknown')}",
             f"- Codex command sandbox mode: {self.backend.config.settings.get('last_codex_sandbox_mode', 'unknown')}",
+            "- Codex internal command approval enforceable: "
+            f"{self.backend.config.settings.get('last_codex_internal_command_approval_enforceable', 'unknown')}",
+            f"- Apply-back approval required: {self.backend.config.settings.get('last_apply_back_approval_required', True)}",
             f"- Direct --ask-for-approval available: {self.backend.config.capabilities.supports_ask_for_approval}",
+            (
+                "- Codex exec did not expose an internal approval flag. The harness relied on isolated workspace "
+                "execution and explicit apply-back approval."
+                if self.backend.config.settings.get("last_codex_internal_command_approval_enforceable") is False
+                else "- Codex internal command approval was available for this run."
+            ),
             f"- Changed files: {diff_result.changed_files}",
             f"- Allowed changed files: {diff_result.allowed_changed_files}",
             f"- Policy violations: {[violation.to_dict() for violation in diff_result.violations]}",
