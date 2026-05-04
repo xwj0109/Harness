@@ -25,7 +25,7 @@ from harness.memory.sqlite_store import SQLiteStore
 from harness.paths import resolve_project_root
 from harness.runner import ReadOnlyRepoSummaryRunner
 from harness.sandbox import CommandValidationError, DockerImageMissingError, DockerUnavailableError
-from harness.test_runner import DockerTestRunner, TestExecutionDecision
+from harness.test_runner import DockerTestRunner, TestRunDecision
 
 app = typer.Typer(help="Local-first agent harness.")
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
@@ -482,15 +482,15 @@ class CliApplyBackApprovalProvider:
 
 
 class CliTestExecutionApprovalProvider:
-    def decide(self, details: str) -> TestExecutionDecision:
+    def decide(self, details: str) -> TestRunDecision:
         typer.echo(details)
         while True:
             choice = typer.prompt("Choose [a] approve, [d] deny, [v] view details", default="d")
             normalized = choice.strip().lower()
             if normalized in {"a", "approve"}:
-                return TestExecutionDecision(decision="approved")
+                return TestRunDecision(decision="approved")
             if normalized in {"d", "deny"}:
-                return TestExecutionDecision(decision="denied")
+                return TestRunDecision(decision="denied")
             if normalized in {"v", "view", "view details"}:
                 typer.echo(details)
                 continue

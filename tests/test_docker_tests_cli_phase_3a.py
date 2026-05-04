@@ -8,7 +8,7 @@ from harness.cli.main import app
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
 from harness.sandbox import DockerRunResult, DockerSandboxConfig
-from harness.test_runner import DockerTestRunner, TestExecutionDecision
+from harness.test_runner import DockerTestRunner, TestRunDecision
 
 
 runner = CliRunner()
@@ -148,8 +148,8 @@ class StaticApproval:
     def __init__(self, decision: str = "approved"):
         self.decision = decision
 
-    def decide(self, details: str) -> TestExecutionDecision:
-        return TestExecutionDecision(decision=self.decision)
+    def decide(self, details: str) -> TestRunDecision:
+        return TestRunDecision(decision=self.decision)
 
 
 class ResultDockerRunner(FakeDockerRunner):
