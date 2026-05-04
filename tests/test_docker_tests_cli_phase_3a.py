@@ -8,7 +8,7 @@ from harness.cli.main import app
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
 from harness.sandbox import DockerRunResult, DockerSandboxConfig
-from harness.test_runner import DockerTestRunner, TestRunDecision
+from harness.test_runner import DockerTestRunner, TestRunDecision, summarize_test_output_for_model
 
 
 runner = CliRunner()
@@ -299,3 +299,38 @@ def test_pytest_failures_map_to_pytest_failures(tmp_path) -> None:
         ),
     )
     assert result["failure_hint"] == "pytest_failures"
+
+
+def test_model_summary_retains_pytest_failure_context_and_bounds_output() -> None:
+    long_noise = "\n".join(f"setup noise line {index}" for index in range(200))
+    stdout = f"""{long_noise}
+============================= FAILURES =============================
+____________________________ test_important_case ____________________________
+
+    def test_important_case():
+>       assert compute() == 4
+E       assert 3 == 4
+
+tests/test_demo.py:12: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/test_demo.py::test_important_case - assert 3 == 4
+"""
+
+    stdout_summary, stderr_summary = summarize_test_output_for_model(stdout, "", limit=500)
+
+    assert stderr_summary == ""
+    assert len(stdout_summary) <= 520
+    assert "FAILURES" in stdout_summary
+    assert "test_important_case" in stdout_summary
+    assert "assert 3 == 4" in stdout_summary
+    assert "short test summary info" in stdout_summary
+
+
+def test_model_summary_sanitizes_secret_values() -> None:
+    stdout_summary, _ = summarize_test_output_for_model(
+        "FAILED tests/test_secret.py::test_secret\nOPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n",
+        "",
+    )
+
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in stdout_summary
+    assert "[REDACTED_SECRET]" in stdout_summary

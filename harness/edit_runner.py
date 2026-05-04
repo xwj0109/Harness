@@ -90,6 +90,7 @@ class NativeEditRunner:
         invalid_count = 0
         final_answer = ""
         failed = False
+        loop_limit_reached = False
         for step in range(self.max_steps):
             raw = self.backend.complete(messages)
             append_jsonl(transcript_path, sanitize_for_logging({"role": "assistant", "content": raw, "step": step}))
@@ -144,8 +145,21 @@ class NativeEditRunner:
             self.store.append_event(run.id, "info", "tool_executed", "Executed native tool.", tool_payload)
             append_jsonl(transcript_path, sanitize_for_logging({"role": "tool", **tool_payload}))
             messages.append({"role": "user", "content": self._tool_result_message(tool_payload, tool_results)})
+        else:
+            loop_limit_reached = True
         if not final_answer:
-            final_answer = "Run ended without a final model answer."
+            if loop_limit_reached:
+                final_answer = "Run stopped after reaching the model command loop limit."
+                failed = True
+                self.store.append_event(
+                    run.id,
+                    "warning",
+                    "model_command_loop_limit_reached",
+                    "Stopped simple edit loop after reaching the model command loop limit.",
+                    {"max_steps": self.max_steps, "tools_executed": tools_executed},
+                )
+            else:
+                final_answer = "Run ended without a final model answer."
         post_status = self._git_status_porcelain()
         diff_stat = self._git_diff_stat()
         changed_files = self._git_changed_files(pre_status, post_status, applied_patch_files)
@@ -257,7 +271,11 @@ class NativeEditRunner:
                     f"per response. Allowed commands are: {allowed}. Patches must be unified diffs. "
                     "The harness will preview and ask for approval before applying any patch. "
                     "Do not request shell execution, network access, secrets, or paths outside the project. "
-                    "Use run_tests only with a JSON command token list; tests run only in a Docker sandbox."
+                    "You may use run_tests after applying a patch; it accepts "
+                    '{"command":["python","-m","pytest","-q"],"cwd":"optional/relative/dir"}. '
+                    "Tests run only in a Docker sandbox, may be denied or unavailable, and never provide "
+                    "generic shell execution. Use test observations to make targeted patches, then call "
+                    "final_answer when done."
                 ),
             },
             {
@@ -369,6 +387,7 @@ class NativeEditRunner:
         ]
         if test_runs:
             lines.extend(["## Test Executions", ""])
+            lines.extend([f"Latest test outcome: {test_runs[-1].get('status', '')}", ""])
             for index, test_run in enumerate(test_runs, start=1):
                 lines.extend(
                     [
@@ -430,22 +449,37 @@ def _run_tests_tool_result(record: dict[str, Any]) -> ToolResult:
         "stderr": record.get("stderr_artifact", ""),
         "result": record.get("result_artifact", ""),
     }
+    status = str(record.get("status") or "sandbox_error")
     observation = {
         "tool": "run_tests",
-        "status": record.get("status"),
+        "status": status,
         "exit_code": record.get("exit_code"),
         "timed_out": record.get("timed_out"),
         "failure_hint": record.get("failure_hint", ""),
         "stdout_summary": record.get("stdout_summary", ""),
         "stderr_summary": record.get("stderr_summary", ""),
         "artifacts": artifacts,
+        "next_guidance": _run_tests_next_guidance(status),
     }
-    status = str(record.get("status") or "sandbox_error")
+    sanitized_observation = sanitize_for_logging(observation)
     return ToolResult(
         name="run_tests",
         ok=status == "tests_passed",
-        output=json.dumps(sanitize_for_logging(observation), sort_keys=True),
-        data=observation,
+        output=json.dumps(sanitized_observation),
+        data=sanitized_observation,
         artifacts=[path for path in artifacts.values() if path],
         error_type=None if status == "tests_passed" else status,
     )
+
+
+def _run_tests_next_guidance(status: str) -> str:
+    guidance = {
+        "tests_passed": "Tests passed. Provide final_answer unless more changes are required.",
+        "tests_failed": "Tests failed. Inspect the summaries and either propose a targeted apply_patch or explain why no safe fix is possible.",
+        "tests_timed_out": "Tests timed out. Prefer a narrower test command or explain the timeout.",
+        "execution_denied": "Test execution was denied. Continue without test results or provide final_answer with that limitation.",
+        "docker_unavailable": "Docker is unavailable. Do not attempt host execution. Continue without test results or explain the limitation.",
+        "docker_image_missing": "Docker image is missing. Do not pull images automatically. Continue without test results or explain the limitation.",
+        "sandbox_error": "Sandbox error. Do not attempt host execution. Continue without test results or explain the limitation.",
+    }
+    return guidance.get(status, "Continue without test results or explain the limitation.")

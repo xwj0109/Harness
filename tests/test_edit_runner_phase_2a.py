@@ -4,7 +4,7 @@ import subprocess
 
 from harness.backends.local_openai import LocalOpenAICompatibleBackend
 from harness.config import default_config
-from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
+from harness.edit_runner import NativeEditRunner, PatchApprovalDecision, _run_tests_tool_result
 from harness.memory.sqlite_store import SQLiteStore
 from harness.test_runner import TestRunDecision
 
@@ -297,9 +297,11 @@ def test_native_edit_accepts_run_tests_and_returns_json_observation(tmp_path) ->
     transcript = (run_dir / "transcript.jsonl").read_text(encoding="utf-8")
     assert '"tool": "run_tests"' in transcript
     assert '"status": "tests_passed"' in transcript
+    assert "Tests passed. Provide final_answer unless more changes are required." in transcript
     assert "sk-abcdefghijklmnopqrstuvwxyz" not in transcript
     report = (run_dir / "final_report.md").read_text(encoding="utf-8")
     assert "## Test Executions" in report
+    assert "Latest test outcome: tests_passed" in report
     assert "python -m pytest -q" in report
 
 
@@ -367,6 +369,9 @@ def test_native_edit_multiple_run_tests_use_non_clobbering_artifacts(tmp_path) -
     ]
     assert (run_dir / "test_result.json").exists()
     assert (run_dir / "test_result_2.json").exists()
+    report = (run_dir / "final_report.md").read_text(encoding="utf-8")
+    assert report.index("### Test Execution 1") < report.index("### Test Execution 2")
+    assert "Latest test outcome: tests_passed" in report
 
 
 def test_native_edit_run_tests_failure_statuses_are_observations(tmp_path) -> None:
@@ -426,3 +431,98 @@ def test_native_edit_run_tests_failure_statuses_are_observations(tmp_path) -> No
         assert result["final_answer"] == "observed"
         assert result["test_runs"][0]["status"] == status
         assert result["test_runs"][0]["timed_out"] is timed_out
+
+
+def test_run_tests_observation_exact_keys_and_guidance() -> None:
+    base_record = {
+        "status": "tests_passed",
+        "exit_code": 0,
+        "timed_out": False,
+        "failure_hint": "",
+        "stdout_summary": "passed",
+        "stderr_summary": "",
+        "stdout_artifact": "/tmp/test_stdout.txt",
+        "stderr_artifact": "/tmp/test_stderr.txt",
+        "result_artifact": "/tmp/test_result.json",
+    }
+    expected_keys = [
+        "tool",
+        "status",
+        "exit_code",
+        "timed_out",
+        "failure_hint",
+        "stdout_summary",
+        "stderr_summary",
+        "artifacts",
+        "next_guidance",
+    ]
+
+    passed = json.loads(_run_tests_tool_result(base_record).output)
+    assert list(passed) == expected_keys
+    assert passed["next_guidance"] == "Tests passed. Provide final_answer unless more changes are required."
+
+    guidance_by_status = {
+        "tests_failed": "Tests failed. Inspect the summaries and either propose a targeted apply_patch or explain why no safe fix is possible.",
+        "tests_timed_out": "Tests timed out. Prefer a narrower test command or explain the timeout.",
+        "execution_denied": "Test execution was denied. Continue without test results or provide final_answer with that limitation.",
+        "docker_unavailable": "Docker is unavailable. Do not attempt host execution. Continue without test results or explain the limitation.",
+        "docker_image_missing": "Docker image is missing. Do not pull images automatically. Continue without test results or explain the limitation.",
+        "sandbox_error": "Sandbox error. Do not attempt host execution. Continue without test results or explain the limitation.",
+    }
+    for status, guidance in guidance_by_status.items():
+        record = {**base_record, "status": status, "exit_code": 1 if status == "tests_failed" else None}
+        observation = json.loads(_run_tests_tool_result(record).output)
+        assert list(observation) == expected_keys
+        assert observation["next_guidance"] == guidance
+
+
+def test_run_tests_observation_sanitizes_secret_summaries() -> None:
+    result = _run_tests_tool_result(
+        {
+            "status": "tests_failed",
+            "exit_code": 1,
+            "timed_out": False,
+            "failure_hint": "pytest_failures",
+            "stdout_summary": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+            "stderr_summary": "",
+            "stdout_artifact": "",
+            "stderr_artifact": "",
+            "result_artifact": "",
+        }
+    )
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in result.output
+    assert "[REDACTED_SECRET]" in result.output
+
+
+def test_native_edit_run_tests_counts_toward_loop_limit(tmp_path) -> None:
+    reset_fake_docker_tests()
+    setup_repo(tmp_path)
+    cfg = default_config()
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = LocalOpenAICompatibleBackend(
+        cfg.backends["local_openai_compatible"],
+        FakeHttpClient(
+            [
+                '{"command":"run_tests","arguments":{"command":["pytest","-q"]}}',
+                '{"command":"run_tests","arguments":{"command":["pytest","tests/test_x.py"]}}',
+            ]
+        ),
+    )
+
+    result = NativeEditRunner(
+        tmp_path,
+        cfg,
+        store,
+        backend,
+        StaticApproval("denied"),
+        test_approval_provider=StaticTestApproval("approved"),
+        docker_test_runner_factory=FakeModelDockerTestRunner,
+        max_steps=2,
+    ).run("run tests until limit", "simple_code_edit")
+
+    assert result["final_answer"] == "Run stopped after reaching the model command loop limit."
+    assert [record["command"] for record in result["test_runs"]] == [["pytest", "-q"], ["pytest", "tests/test_x.py"]]
+    assert store.get_run(result["run_id"]).status == "failed"
+    events = store.list_events(result["run_id"])
+    assert any(event.event_type == "model_command_loop_limit_reached" for event in events)

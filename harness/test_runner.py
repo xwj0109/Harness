@@ -213,6 +213,10 @@ class DockerTestRunner:
         if workspace is not None and workspace.cleanup_status == "not_cleaned":
             workspace.cleanup()
             cleanup_status = workspace.cleanup_status
+        stdout_summary, stderr_summary = summarize_test_output_for_model(
+            docker_result.stdout if docker_result else "",
+            docker_result.stderr if docker_result else error,
+        )
         result_payload = {
             "status": status,
             "command": command,
@@ -232,8 +236,8 @@ class DockerTestRunner:
             "approval_decision": approval.decision,
             "approval_reason": approval.reason,
             "error": error,
-            "stdout_summary": _summarize_text(docker_result.stdout if docker_result else ""),
-            "stderr_summary": _summarize_text(docker_result.stderr if docker_result else error),
+            "stdout_summary": stdout_summary,
+            "stderr_summary": stderr_summary,
             "failure_hint": _failure_hint(status, docker_result.stdout if docker_result else "", docker_result.stderr if docker_result else error),
             "stdout_artifact": str(stdout_path),
             "stderr_artifact": str(stderr_path),
@@ -360,12 +364,62 @@ class DockerTestRunner:
         report_path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def summarize_test_output_for_model(stdout: str, stderr: str, limit: int = 1200) -> tuple[str, str]:
+    return _summarize_text(stdout, limit=limit), _summarize_text(stderr, limit=limit)
+
+
 def _summarize_text(text: str, limit: int = 1200) -> str:
     sanitized = str(sanitize_for_logging(text or "")).strip()
     if len(sanitized) <= limit:
         return sanitized
+    focused = _focused_failure_summary(sanitized, limit=limit)
+    if focused:
+        return focused
     head = sanitized[: limit // 2].rstrip()
     tail = sanitized[-limit // 2 :].lstrip()
+    return f"{head}\n...[truncated]...\n{tail}"
+
+
+def _focused_failure_summary(text: str, limit: int) -> str:
+    lines = text.splitlines()
+    selected: set[int] = set()
+    markers = (
+        "failures",
+        "errors",
+        "short test summary info",
+        "traceback (most recent call last)",
+        "assert ",
+        "assertionerror",
+        "modulenotfounderror",
+        "importerror",
+        "no module named",
+    )
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        lowered = stripped.lower()
+        if (
+            any(marker in lowered for marker in markers)
+            or stripped.startswith(("FAILED ", "ERROR ", "E   ", "> "))
+            or "::" in stripped and ("test" in lowered or "failed" in lowered or "error" in lowered)
+        ):
+            for offset in range(-3, 5):
+                candidate = index + offset
+                if 0 <= candidate < len(lines):
+                    selected.add(candidate)
+    if not selected:
+        return ""
+    pieces: list[str] = []
+    last_index: int | None = None
+    for index in sorted(selected):
+        if last_index is not None and index > last_index + 1:
+            pieces.append("...[omitted]...")
+        pieces.append(lines[index])
+        last_index = index
+    summary = "\n".join(pieces).strip()
+    if len(summary) <= limit:
+        return summary
+    head = summary[: limit // 2].rstrip()
+    tail = summary[-limit // 2 :].lstrip()
     return f"{head}\n...[truncated]...\n{tail}"
 
 
