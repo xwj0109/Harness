@@ -55,6 +55,9 @@ class BackendCapabilities(BaseModel):
     supports_output_last_message: bool = False
     supports_output_schema: bool = False
     supports_login_status: bool = False
+    supports_workspace_write_sandbox: bool = False
+    supports_ask_for_approval: bool = False
+    supports_network_control: bool = False
 
 
 class BackendStatus(BaseModel):

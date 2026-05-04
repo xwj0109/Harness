@@ -7,11 +7,20 @@ from typing import Annotated
 import typer
 
 from harness.approvals import ApprovalProfile, ApprovalStore
-from harness.backends.codex_cli import AUTH_ERROR, CodexCliBackend, CodexSandboxUnavailable, CodexUnavailable
+from harness.backends.codex_cli import (
+    AUTH_ERROR,
+    CodexCliBackend,
+    CodexDangerousFlagError,
+    CodexEditCommandUnavailable,
+    CodexSandboxUnavailable,
+    CodexUnavailable,
+)
 from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAICompatibleBackend
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
 from harness.codex_runner import HostedBoundaryApprovalRequired, HostedSecretBlocked, CodexRepoPlanningRunner
+from harness.codex_edit_runner import ActiveProjectModifiedError, CodexCodeEditRunner
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
+from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
 from harness.paths import resolve_project_root
 from harness.runner import ReadOnlyRepoSummaryRunner
@@ -141,6 +150,10 @@ def run(
         bool,
         typer.Option("--approve-secret-context", help="Approve sending redacted secret-flagged context to Codex."),
     ] = False,
+    keep_isolation: Annotated[
+        bool,
+        typer.Option("--keep-isolation", help="Preserve isolated workspace for codex_code_edit runs."),
+    ] = False,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
@@ -156,6 +169,44 @@ def run(
             raise typer.BadParameter(str(exc)) from exc
         typer.echo(f"Created run {result['run_id']}")
         typer.echo(result["final_summary"])
+        typer.echo("Artifacts:")
+        for kind, path in result["artifacts"].items():
+            typer.echo(f"  {kind}: {path}")
+        return
+    if task_type == "codex_code_edit":
+        backend_config = cfg.backends["codex_cli"]
+        backend = CodexCliBackend(backend_config)
+        approvals = ApprovalStore(project_root)
+        approval = approvals.find_valid("codex_cli", "hosted_provider", task_type)
+        runner = CodexCodeEditRunner(project_root, store, backend, approvals)
+        try:
+            result = runner.run(
+                goal=goal,
+                task_type=task_type,
+                approval=approval,
+                keep_isolation=keep_isolation,
+            )
+        except (
+            CodexUnavailable,
+            CodexSandboxUnavailable,
+            CodexEditCommandUnavailable,
+            CodexDangerousFlagError,
+            HostedBoundaryApprovalRequired,
+            ActiveProjectModifiedError,
+            ActiveRepoDirtyError,
+        ) as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        typer.echo(f"Created run {result['run_id']}")
+        typer.echo(f"Status: {result['status']}")
+        typer.echo(f"Approval id: {result['approval_id']}")
+        typer.echo(f"Isolation strategy: {result['isolation_strategy']}")
+        typer.echo(f"Isolation cleanup status: {result['isolation_cleanup_status']}")
+        if keep_isolation:
+            typer.echo(f"Isolated workspace: {result['isolated_workspace']}")
+        typer.echo(
+            f"Changed files: {', '.join(result['changed_files']) if result['changed_files'] else 'none'}"
+        )
+        typer.echo("Apply-back is not implemented in C2; active project was not modified.")
         typer.echo("Artifacts:")
         for kind, path in result["artifacts"].items():
             typer.echo(f"  {kind}: {path}")
@@ -204,7 +255,9 @@ def run(
         for kind, path in result["artifacts"].items():
             typer.echo(f"  {kind}: {path}")
         return
-    raise typer.BadParameter("Supported task types are read_only_repo_summary, repo_planning, and simple_code_edit.")
+    raise typer.BadParameter(
+        "Supported task types are read_only_repo_summary, repo_planning, simple_code_edit, and codex_code_edit."
+    )
 
 
 @approvals_app.callback()

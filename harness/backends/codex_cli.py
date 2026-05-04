@@ -23,6 +23,18 @@ class CodexSandboxUnavailable(RuntimeError):
     pass
 
 
+class CodexEditCommandUnavailable(RuntimeError):
+    pass
+
+
+class CodexDangerousFlagError(ValueError):
+    pass
+
+
+NETWORK_NOT_ENFORCEABLE = "network isolation is not enforceable by the harness for Codex subprocesses"
+DANGEROUS_CODEX_FLAGS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo"}
+
+
 @dataclass
 class CodexRunResult:
     command: list[str]
@@ -63,6 +75,9 @@ class CodexCliBackend:
             supports_output_last_message="--output-last-message" in exec_help.stdout,
             supports_output_schema="--output-schema" in exec_help.stdout,
             supports_login_status="status" in login_help.stdout,
+            supports_workspace_write_sandbox="--sandbox" in exec_help.stdout and "workspace-write" in exec_help.stdout,
+            supports_ask_for_approval="--ask-for-approval" in exec_help.stdout,
+            supports_network_control=_detect_network_control(exec_help.stdout),
         )
 
     def preflight(self) -> BackendStatus:
@@ -120,7 +135,45 @@ class CodexCliBackend:
         if final_message_path and capabilities.supports_output_last_message:
             command.extend(["--output-last-message", str(final_message_path)])
         command.append(prompt)
+        validate_no_dangerous_codex_flags(command)
         return command
+
+    def build_edit_command(
+        self,
+        isolated_workspace: Path,
+        prompt: str,
+        final_message_path: Path | None,
+    ) -> tuple[list[str], BackendCapabilities, str]:
+        capabilities = self.detect_capabilities()
+        if not capabilities.supports_cd:
+            raise CodexEditCommandUnavailable("Codex edit execution requires `--cd`; refusing to run.")
+        if not capabilities.supports_workspace_write_sandbox:
+            raise CodexEditCommandUnavailable(
+                "Codex edit execution requires an edit-capable workspace-write sandbox; refusing to run."
+            )
+        if not capabilities.supports_ask_for_approval:
+            raise CodexEditCommandUnavailable(
+                "Codex edit execution requires `--ask-for-approval` support; refusing to run."
+            )
+        command = [self.command_name, "exec"]
+        if capabilities.supports_json_events:
+            command.append("--json")
+        command.extend(["--cd", str(isolated_workspace)])
+        model = self.config.settings.get("model")
+        if model and capabilities.supports_model_arg:
+            command.extend(["--model", str(model)])
+        command.extend(["--sandbox", "workspace-write"])
+        command.extend(["--ask-for-approval", str(self.config.settings.get("ask_for_approval", "on-request"))])
+        if final_message_path and capabilities.supports_output_last_message:
+            command.extend(["--output-last-message", str(final_message_path)])
+        command.append(prompt)
+        validate_no_dangerous_codex_flags(command)
+        network_status = (
+            "Codex CLI exposes network-control capability; selected most restrictive supported configuration."
+            if capabilities.supports_network_control
+            else NETWORK_NOT_ENFORCEABLE
+        )
+        return command, capabilities, network_status
 
     def run_read_only(self, project_root: Path, prompt: str, final_message_path: Path | None) -> CodexRunResult:
         command = self.build_read_only_command(project_root, prompt, final_message_path)
@@ -148,6 +201,36 @@ class CodexCliBackend:
             final_message=final_message,
         )
 
+    def run_edit(self, isolated_workspace: Path, prompt: str, final_message_path: Path | None) -> tuple[CodexRunResult, BackendCapabilities, str]:
+        command, capabilities, network_status = self.build_edit_command(isolated_workspace, prompt, final_message_path)
+        result = subprocess.run(
+            command,
+            cwd=isolated_workspace,
+            text=True,
+            capture_output=True,
+            timeout=float(self.config.settings.get("timeout_seconds", 900)),
+            env=_codex_env(),
+        )
+        final_message = None
+        if final_message_path and final_message_path.exists():
+            final_message = str(
+                sanitize_for_logging(final_message_path.read_text(encoding="utf-8", errors="replace"))
+            )
+            final_message_path.write_text(final_message, encoding="utf-8")
+        events = _parse_jsonl_events(result.stdout)
+        return (
+            CodexRunResult(
+                command=command,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_status=result.returncode,
+                json_events=events,
+                final_message=final_message,
+            ),
+            capabilities,
+            network_status,
+        )
+
     def _run_help(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, text=True, capture_output=True, timeout=15, env=_codex_env())
 
@@ -168,6 +251,17 @@ def _codex_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("OPENAI_API_KEY", None)
     return env
+
+
+def validate_no_dangerous_codex_flags(command: list[str]) -> None:
+    present = sorted(DANGEROUS_CODEX_FLAGS.intersection(command))
+    if present:
+        raise CodexDangerousFlagError(f"Dangerous Codex flags are not allowed: {', '.join(present)}")
+
+
+def _detect_network_control(help_text: str) -> bool:
+    lowered = help_text.lower()
+    return "--network" in lowered or "network" in lowered and ("disable" in lowered or "off" in lowered)
 
 
 def write_codex_artifacts(run_dir: Path, result: CodexRunResult) -> dict[str, Path]:
