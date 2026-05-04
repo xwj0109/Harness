@@ -30,6 +30,27 @@ Usage: codex exec [OPTIONS] [PROMPT]
   --output-last-message <FILE>
 """
 
+EXEC_HELP_FULL_AUTO = """
+Usage: codex exec [OPTIONS] [PROMPT]
+  --json
+  --cd <DIR>
+  --model <MODEL>
+  --sandbox <SANDBOX_MODE> [possible values: read-only, workspace-write, danger-full-access]
+  --full-auto
+          Convenience alias for -a on-request, --sandbox workspace-write
+  --output-last-message <FILE>
+  --output-schema <FILE>
+"""
+
+EXEC_HELP_FULL_AUTO_UNDOCUMENTED = """
+Usage: codex exec [OPTIONS] [PROMPT]
+  --json
+  --cd <DIR>
+  --sandbox <SANDBOX_MODE> [possible values: read-only, workspace-write, danger-full-access]
+  --full-auto
+          Run with automatic behavior
+"""
+
 
 def completed(args, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
@@ -261,6 +282,56 @@ def test_build_edit_command_fails_closed_without_approval_gating(monkeypatch, tm
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(CodexEditCommandUnavailable):
         CodexCliBackend(default_config().backends["codex_cli"]).build_edit_command(tmp_path, "change", None)
+
+
+def test_build_edit_command_uses_documented_full_auto_when_direct_approval_absent(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\nOptions:\n  --ask-for-approval <POLICY>\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=EXEC_HELP_FULL_AUTO)
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = CodexCliBackend(default_config().backends["codex_cli"])
+    command, capabilities, _network_status = backend.build_edit_command(tmp_path, "change", tmp_path / "final.md")
+
+    assert capabilities.supports_full_auto
+    assert capabilities.supports_full_auto_workspace_write_on_request
+    assert not capabilities.supports_ask_for_approval
+    assert command[:4] == ["codex", "exec", "--full-auto", "--cd"]
+    assert command[4] == str(tmp_path)
+    assert "--ask-for-approval" not in command
+    assert "--sandbox" not in command
+    assert backend.config.settings["last_codex_approval_mode"] == "on-request via --full-auto"
+    assert backend.config.settings["last_codex_sandbox_mode"] == "workspace-write"
+
+
+def test_build_edit_command_rejects_undocumented_full_auto(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\nOptions:\n  --ask-for-approval <POLICY>\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=EXEC_HELP_FULL_AUTO_UNDOCUMENTED)
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(CodexEditCommandUnavailable) as exc:
+        CodexCliBackend(default_config().backends["codex_cli"]).build_edit_command(tmp_path, "change", None)
+    assert "supports_full_auto=True" in str(exc.value)
+    assert "full_auto_documents_workspace_write_on_request=False" in str(exc.value)
+
+
+def test_danger_full_access_sandbox_is_rejected() -> None:
+    from harness.backends.codex_cli import validate_no_dangerous_codex_flags
+
+    with pytest.raises(ValueError):
+        validate_no_dangerous_codex_flags(["codex", "exec", "--sandbox", "danger-full-access", "prompt"])
 
 
 def test_run_edit_removes_openai_api_key_and_uses_isolated_cwd(monkeypatch, tmp_path) -> None:

@@ -33,6 +33,8 @@ class CodexDangerousFlagError(ValueError):
 
 NETWORK_NOT_ENFORCEABLE = "network isolation is not enforceable by the harness for Codex subprocesses"
 DANGEROUS_CODEX_FLAGS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo"}
+SANDBOX_FLAG = "--sandbox"
+DANGER_FULL_ACCESS = "danger-full-access"
 
 
 @dataclass
@@ -78,6 +80,8 @@ class CodexCliBackend:
             supports_workspace_write_sandbox="--sandbox" in exec_help.stdout and "workspace-write" in exec_help.stdout,
             supports_ask_for_approval="--ask-for-approval" in exec_help.stdout,
             supports_network_control=_detect_network_control(exec_help.stdout),
+            supports_full_auto="--full-auto" in exec_help.stdout,
+            supports_full_auto_workspace_write_on_request=_full_auto_documents_workspace_write_on_request(exec_help.stdout),
         )
 
     def preflight(self) -> BackendStatus:
@@ -146,24 +150,43 @@ class CodexCliBackend:
     ) -> tuple[list[str], BackendCapabilities, str]:
         capabilities = self.detect_capabilities()
         if not capabilities.supports_cd:
-            raise CodexEditCommandUnavailable("Codex edit execution requires `--cd`; refusing to run.")
+            raise CodexEditCommandUnavailable(
+                "Codex edit execution requires `--cd`; refusing to run. "
+                + _edit_capability_diagnostics(capabilities)
+            )
         if not capabilities.supports_workspace_write_sandbox:
             raise CodexEditCommandUnavailable(
-                "Codex edit execution requires an edit-capable workspace-write sandbox; refusing to run."
+                "Codex edit execution requires an edit-capable workspace-write sandbox; refusing to run. "
+                + _edit_capability_diagnostics(capabilities)
             )
-        if not capabilities.supports_ask_for_approval:
+        can_use_direct_approval = capabilities.supports_ask_for_approval
+        can_use_full_auto = (
+            capabilities.supports_full_auto
+            and capabilities.supports_full_auto_workspace_write_on_request
+        )
+        if not can_use_direct_approval and not can_use_full_auto:
             raise CodexEditCommandUnavailable(
-                "Codex edit execution requires `--ask-for-approval` support; refusing to run."
+                "Codex edit execution requires approval-gated workspace-write mode; refusing to run. "
+                + _edit_capability_diagnostics(capabilities)
             )
         command = [self.command_name, "exec"]
-        if capabilities.supports_json_events:
-            command.append("--json")
+        if can_use_direct_approval:
+            command.extend(["--sandbox", "workspace-write"])
+            approval_policy = str(self.config.settings.get("ask_for_approval", "on-request"))
+            if approval_policy != "on-request":
+                validate_no_dangerous_codex_flags([approval_policy])
+                raise CodexEditCommandUnavailable("Codex edit execution requires on-request approval policy.")
+            command.extend(["--ask-for-approval", "on-request"])
+            approval_mode = "on-request via --ask-for-approval"
+        else:
+            command.append("--full-auto")
+            approval_mode = "on-request via --full-auto"
         command.extend(["--cd", str(isolated_workspace)])
         model = self.config.settings.get("model")
         if model and capabilities.supports_model_arg:
             command.extend(["--model", str(model)])
-        command.extend(["--sandbox", "workspace-write"])
-        command.extend(["--ask-for-approval", str(self.config.settings.get("ask_for_approval", "on-request"))])
+        if capabilities.supports_json_events:
+            command.append("--json")
         if final_message_path and capabilities.supports_output_last_message:
             command.extend(["--output-last-message", str(final_message_path)])
         command.append(prompt)
@@ -173,6 +196,8 @@ class CodexCliBackend:
             if capabilities.supports_network_control
             else NETWORK_NOT_ENFORCEABLE
         )
+        self.config.settings["last_codex_approval_mode"] = approval_mode
+        self.config.settings["last_codex_sandbox_mode"] = "workspace-write"
         return command, capabilities, network_status
 
     def run_read_only(self, project_root: Path, prompt: str, final_message_path: Path | None) -> CodexRunResult:
@@ -257,11 +282,36 @@ def validate_no_dangerous_codex_flags(command: list[str]) -> None:
     present = sorted(DANGEROUS_CODEX_FLAGS.intersection(command))
     if present:
         raise CodexDangerousFlagError(f"Dangerous Codex flags are not allowed: {', '.join(present)}")
+    for index, part in enumerate(command[:-1]):
+        if part == SANDBOX_FLAG and command[index + 1] == DANGER_FULL_ACCESS:
+            raise CodexDangerousFlagError("Dangerous Codex sandbox mode is not allowed: danger-full-access")
 
 
 def _detect_network_control(help_text: str) -> bool:
     lowered = help_text.lower()
     return "--network" in lowered or "network" in lowered and ("disable" in lowered or "off" in lowered)
+
+
+def _full_auto_documents_workspace_write_on_request(help_text: str) -> bool:
+    lowered = " ".join(help_text.lower().replace(",", " ").split())
+    if "--full-auto" not in lowered:
+        return False
+    return (
+        "-a on-request" in lowered
+        and "--sandbox workspace-write" in lowered
+    )
+
+
+def _edit_capability_diagnostics(capabilities: BackendCapabilities) -> str:
+    return (
+        "Detected edit capabilities: "
+        f"supports_full_auto={capabilities.supports_full_auto}, "
+        f"supports_workspace_write_sandbox={capabilities.supports_workspace_write_sandbox}, "
+        f"supports_ask_for_approval={capabilities.supports_ask_for_approval}, "
+        f"supports_cd={capabilities.supports_cd}, "
+        "full_auto_documents_workspace_write_on_request="
+        f"{capabilities.supports_full_auto_workspace_write_on_request}."
+    )
 
 
 def write_codex_artifacts(run_dir: Path, result: CodexRunResult) -> dict[str, Path]:

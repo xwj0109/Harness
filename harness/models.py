@@ -58,6 +58,8 @@ class BackendCapabilities(BaseModel):
     supports_workspace_write_sandbox: bool = False
     supports_ask_for_approval: bool = False
     supports_network_control: bool = False
+    supports_full_auto: bool = False
+    supports_full_auto_workspace_write_on_request: bool = False
 
 
 class BackendStatus(BaseModel):
