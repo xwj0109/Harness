@@ -6,7 +6,7 @@ from harness.backends.local_openai import LocalOpenAICompatibleBackend
 from harness.config import default_config
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision, _run_tests_tool_result
 from harness.memory.sqlite_store import SQLiteStore
-from harness.test_runner import TestRunDecision
+from harness.test_runner import RunTestsDecision
 
 
 class FakeHttpClient:
@@ -34,7 +34,7 @@ class StaticTestApproval:
         self.decision = decision
 
     def decide(self, details):
-        return TestRunDecision(decision=self.decision)
+        return RunTestsDecision(decision=self.decision)
 
 
 class FakeModelDockerTestRunner:

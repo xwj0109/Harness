@@ -21,7 +21,7 @@ from harness.security import sanitize_for_logging
 
 
 @dataclass
-class TestRunDecision:
+class RunTestsDecision:
     decision: str
     reason: str | None = None
 
@@ -31,7 +31,7 @@ class TestRunDecision:
 
 
 class TestExecutionApprovalProvider(Protocol):
-    def decide(self, details: str) -> TestRunDecision:
+    def decide(self, details: str) -> RunTestsDecision:
         ...
 
 
@@ -119,7 +119,7 @@ class DockerTestRunner:
             path.touch(exist_ok=True)
             self.store.register_artifact(run_id, kind=kind, path=path)
         workspace = None
-        approval = TestRunDecision(decision="not_requested")
+        approval = RunTestsDecision(decision="not_requested")
         docker_result: DockerRunResult | None = None
         cleanup_status = "not_created"
         status = "sandbox_error"
@@ -198,7 +198,7 @@ class DockerTestRunner:
         command: list[str],
         cwd: str | None,
         container_workdir: str,
-        approval: TestRunDecision,
+        approval: RunTestsDecision,
         docker_result: DockerRunResult | None,
         stdout_path: Path,
         stderr_path: Path,
