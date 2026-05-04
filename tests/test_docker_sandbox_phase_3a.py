@@ -21,6 +21,8 @@ def completed(args, returncode=0, stdout="", stderr=""):
 
 
 def test_docker_missing_returns_setup_guidance(monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: None)
+
     def fake_run(args, **kwargs):
         raise FileNotFoundError("docker")
 
@@ -28,16 +30,19 @@ def test_docker_missing_returns_setup_guidance(monkeypatch) -> None:
     with pytest.raises(DockerUnavailableError) as exc:
         DockerSandboxRunner(DockerSandboxConfig()).preflight()
     assert "Docker is not installed" in str(exc.value)
+    assert "docker_path" in str(exc.value)
+    assert "path_present" in str(exc.value)
 
 
 def test_docker_image_missing_returns_pull_guidance(monkeypatch) -> None:
     calls = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/local/bin/docker")
 
     def fake_run(args, **kwargs):
-        calls.append(args)
-        if args == ["docker", "--version"]:
+        calls.append((args, kwargs))
+        if args == ["/usr/local/bin/docker", "--version"]:
             return completed(args, stdout="Docker version")
-        if args[:3] == ["docker", "image", "inspect"]:
+        if args[:3] == ["/usr/local/bin/docker", "image", "inspect"]:
             return completed(args, returncode=1, stderr="missing")
         raise AssertionError(args)
 
@@ -45,14 +50,35 @@ def test_docker_image_missing_returns_pull_guidance(monkeypatch) -> None:
     with pytest.raises(DockerImageMissingError) as exc:
         DockerSandboxRunner(DockerSandboxConfig(image="python:3.12-slim")).preflight()
     assert "docker pull python:3.12-slim" in str(exc.value)
-    assert not any(args[:2] == ["docker", "run"] for args in calls)
+    assert not any(args[:2] == ["/usr/local/bin/docker", "run"] for args, _kwargs in calls)
+    assert all("env" not in kwargs for _args, kwargs in calls)
+
+
+def test_docker_preflight_uses_resolved_binary_and_inherits_cli_environment(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr("shutil.which", lambda name: "/opt/homebrew/bin/docker")
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs))
+        if args == ["/opt/homebrew/bin/docker", "--version"]:
+            return completed(args, stdout="Docker version")
+        if args == ["/opt/homebrew/bin/docker", "image", "inspect", "python:3.12-slim"]:
+            return completed(args, stdout="[]")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    DockerSandboxRunner(DockerSandboxConfig()).preflight()
+
+    assert calls[0][0] == ["/opt/homebrew/bin/docker", "--version"]
+    assert calls[1][0] == ["/opt/homebrew/bin/docker", "image", "inspect", "python:3.12-slim"]
+    assert all("env" not in kwargs for _args, kwargs in calls)
 
 
 def test_docker_command_construction_is_safe(tmp_path) -> None:
     runner = DockerSandboxRunner(DockerSandboxConfig())
     args = runner.build_docker_command(tmp_path, ["python", "-m", "pytest", "-q"])
     assert isinstance(args, list)
-    assert args[:3] == ["docker", "run", "--rm"]
+    assert args[1:3] == ["run", "--rm"]
     assert ["--network", "none"] == args[args.index("--network") : args.index("--network") + 2]
     assert "--memory" in args
     assert "--cpus" in args
@@ -63,6 +89,9 @@ def test_docker_command_construction_is_safe(tmp_path) -> None:
     assert "/bin/sh" not in args
     assert "-c" not in args
     assert not any("docker.sock" in arg for arg in args)
+    assert "-e" not in args
+    assert "--env" not in args
+    assert "--env-file" not in args
 
 
 @pytest.mark.parametrize("command", [["python -m pytest -q"], ["pytest", "-q;"], ["pytest", "&&", "echo"], []])

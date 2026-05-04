@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import shutil
 import subprocess
 import tempfile
@@ -91,33 +92,54 @@ SHELL_METACHARACTERS = (";", "&&", "||", "|", "`", "$(", "<", ">", ">>", "2>", "
 class DockerSandboxRunner:
     def __init__(self, config: DockerSandboxConfig) -> None:
         self.config = config
+        self.docker_binary = shutil.which("docker") or "docker"
 
     def preflight(self) -> None:
+        docker_binary = shutil.which("docker")
+        self.docker_binary = docker_binary or "docker"
         try:
             version = subprocess.run(
-                ["docker", "--version"],
+                [self.docker_binary, "--version"],
                 text=True,
                 capture_output=True,
                 timeout=15,
-                env={},
             )
         except FileNotFoundError as exc:
-            raise DockerUnavailableError("Docker is not installed or not on PATH. Install Docker, then retry.") from exc
+            raise DockerUnavailableError(
+                "Docker is not installed or not on PATH. Install Docker, then retry. "
+                + _docker_diagnostics(docker_binary=docker_binary, error_type=type(exc).__name__)
+            ) from exc
         except subprocess.SubprocessError as exc:
-            raise DockerUnavailableError(f"Docker preflight failed: {exc}") from exc
+            raise DockerUnavailableError(
+                f"Docker preflight failed: {exc}. "
+                + _docker_diagnostics(docker_binary=docker_binary, error_type=type(exc).__name__)
+            ) from exc
         if version.returncode != 0:
             detail = (version.stderr or version.stdout).strip()
-            raise DockerUnavailableError(f"Docker is unavailable. Start Docker, then retry. {detail}")
+            raise DockerUnavailableError(
+                f"Docker is unavailable. Start Docker, then retry. {detail} "
+                + _docker_diagnostics(
+                    docker_binary=docker_binary,
+                    error_type="CompletedProcess",
+                    stdout=version.stdout,
+                    stderr=version.stderr,
+                )
+            )
         image = subprocess.run(
-            ["docker", "image", "inspect", self.config.image],
+            [self.docker_binary, "image", "inspect", self.config.image],
             text=True,
             capture_output=True,
             timeout=30,
-            env={},
         )
         if image.returncode != 0:
             raise DockerImageMissingError(
-                f"Docker image is missing: {self.config.image}. Run `docker pull {self.config.image}`."
+                f"Docker image is missing: {self.config.image}. Run `docker pull {self.config.image}`. "
+                + _docker_diagnostics(
+                    docker_binary=docker_binary,
+                    error_type="CompletedProcess",
+                    stdout=image.stdout,
+                    stderr=image.stderr,
+                )
             )
 
     def create_workspace(self, project_root: Path) -> SanitizedWorkspace:
@@ -137,7 +159,6 @@ class DockerSandboxRunner:
                 text=True,
                 capture_output=True,
                 timeout=timeout,
-                env={},
             )
             duration = time.monotonic() - started
             stdout = str(sanitize_for_logging(completed.stdout))
@@ -172,7 +193,7 @@ class DockerSandboxRunner:
     def build_docker_command(self, workspace: Path, command: list[str]) -> list[str]:
         validate_test_command(command)
         args = [
-            "docker",
+            self.docker_binary,
             "run",
             "--rm",
         ]
@@ -271,3 +292,20 @@ def _timeout_output_to_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _docker_diagnostics(
+    docker_binary: str | None,
+    error_type: str,
+    stdout: str | None = None,
+    stderr: str | None = None,
+) -> str:
+    path = os.environ.get("PATH")
+    diagnostics = {
+        "docker_path": docker_binary,
+        "path_present": bool(path),
+        "error_type": error_type,
+        "stdout": stdout or "",
+        "stderr": stderr or "",
+    }
+    return f"Diagnostics: {sanitize_for_logging(diagnostics)}"
