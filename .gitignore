@@ -12,3 +12,6 @@ __pycache__/
 .mypy_cache/
 *.egg-info/
 .DS_Store
+
+# Harness project-local state
+.harness/
