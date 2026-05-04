@@ -14,6 +14,13 @@ This phase includes only local infrastructure:
 - Path traversal protection.
 - Secret-path blocking and secret scanner primitives.
 
-It does not implement model calls, Codex execution, paid API execution, editing,
-Docker execution, workflows, plugins, MCP, or any agent loop.
+Later phases added supervised Codex editing and Docker-sandboxed test execution.
+Paid API execution, generic shell execution, workflows, plugins, and MCP remain
+outside the current implemented scope.
 
+## Operator Docs
+
+Current operator-facing flows are documented in:
+
+- [docs/operator_guide.md](docs/operator_guide.md)
+- [docs/smoke_checklist.md](docs/smoke_checklist.md)
