@@ -95,6 +95,14 @@ def test_docker_command_construction_is_safe(tmp_path) -> None:
     assert args[-4:] == ["python", "-m", "pytest", "-q"]
 
 
+def test_docker_command_supports_project_relative_workdir_without_extra_mounts(tmp_path) -> None:
+    runner = DockerSandboxRunner(DockerSandboxConfig())
+    args = runner.build_docker_command(tmp_path, ["pytest", "-q"], workdir="/workspace/tests")
+    assert ["--workdir", "/workspace/tests"] == args[args.index("--workdir") : args.index("--workdir") + 2]
+    assert ["-v", f"{tmp_path.resolve()}:/workspace"] == args[args.index("-v") : args.index("-v") + 2]
+    assert args.count("-v") == 1
+
+
 def test_install_project_false_keeps_direct_requested_command(tmp_path) -> None:
     runner = DockerSandboxRunner(DockerSandboxConfig(install_project=False))
     args = runner.build_docker_command(tmp_path, ["python", "-m", "pytest", "-q"])

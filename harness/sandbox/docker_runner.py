@@ -151,10 +151,17 @@ class DockerSandboxRunner:
         _copy_allowed_tree(source, destination)
         return SanitizedWorkspace(path=destination)
 
-    def run(self, workspace: SanitizedWorkspace, command: list[str], timeout_seconds: int | None = None) -> DockerRunResult:
+    def run(
+        self,
+        workspace: SanitizedWorkspace,
+        command: list[str],
+        timeout_seconds: int | None = None,
+        workdir: str | None = None,
+    ) -> DockerRunResult:
         validate_test_command(command)
         timeout = timeout_seconds or self.config.timeout_seconds
-        docker_command = self.build_docker_command(workspace.path, command)
+        container_workdir = workdir or self.config.workdir
+        docker_command = self.build_docker_command(workspace.path, command, workdir=container_workdir)
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -175,7 +182,7 @@ class DockerSandboxRunner:
                 timed_out=False,
                 image=self.config.image,
                 command=command,
-                workdir=self.config.workdir,
+                workdir=container_workdir,
             )
         except subprocess.TimeoutExpired as exc:
             duration = time.monotonic() - started
@@ -190,11 +197,12 @@ class DockerSandboxRunner:
                 timed_out=True,
                 image=self.config.image,
                 command=command,
-                workdir=self.config.workdir,
+                workdir=container_workdir,
             )
 
-    def build_docker_command(self, workspace: Path, command: list[str]) -> list[str]:
+    def build_docker_command(self, workspace: Path, command: list[str], workdir: str | None = None) -> list[str]:
         validate_test_command(command)
+        container_workdir = workdir or self.config.workdir
         container_command = command
         if self.config.install_project:
             _write_test_runner_script(
@@ -217,7 +225,7 @@ class DockerSandboxRunner:
                 "--cpus",
                 str(self.config.cpu_limit),
                 "--workdir",
-                self.config.workdir,
+                container_workdir,
                 "-v",
                 f"{workspace.resolve()}:{self.config.workdir}",
                 self.config.image,

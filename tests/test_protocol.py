@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from harness.protocol import CommandValidationError, parse_model_command
@@ -106,3 +108,71 @@ def test_apply_patch_allowed_when_enabled_for_edit_tasks() -> None:
         allow_apply_patch=True,
     )
     assert command.command == "apply_patch"
+
+
+def test_run_tests_parses_when_enabled() -> None:
+    command = parse_model_command(
+        '{"command":"run_tests","arguments":{"command":["python","-m","pytest","-q"]}}',
+        allow_run_tests=True,
+    )
+    assert command.command == "run_tests"
+    assert command.arguments == {"command": ["python", "-m", "pytest", "-q"]}
+
+
+def test_run_tests_rejected_by_default() -> None:
+    with pytest.raises(CommandValidationError):
+        parse_model_command('{"command":"run_tests","arguments":{"command":["pytest","-q"]}}')
+
+
+def test_allow_run_tests_does_not_allow_apply_patch() -> None:
+    with pytest.raises(CommandValidationError):
+        parse_model_command(
+            '{"command":"apply_patch","arguments":{"patch":"--- a/x\\n+++ b/x\\n"}}',
+            allow_run_tests=True,
+        )
+
+
+def test_allow_apply_patch_does_not_allow_run_tests() -> None:
+    with pytest.raises(CommandValidationError):
+        parse_model_command(
+            '{"command":"run_tests","arguments":{"command":["pytest","-q"]}}',
+            allow_apply_patch=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"command": []},
+        {"command": "python -m pytest -q"},
+        {"command": ["pytest", "&&", "echo"]},
+        {"command": ["pytest", "-q;"]},
+    ],
+)
+def test_run_tests_rejects_invalid_commands(arguments) -> None:
+    with pytest.raises(CommandValidationError):
+        parse_model_command(
+            json.dumps({"command": "run_tests", "arguments": arguments}),
+            allow_run_tests=True,
+        )
+
+
+def test_run_tests_accepts_valid_cwd_inside_project(tmp_path) -> None:
+    (tmp_path / "tests").mkdir()
+    command = parse_model_command(
+        '{"command":"run_tests","arguments":{"command":["pytest","-q"],"cwd":"tests"}}',
+        allow_run_tests=True,
+        project_root=tmp_path,
+    )
+    assert command.arguments["cwd"] == "tests"
+
+
+@pytest.mark.parametrize("cwd", ["../outside", "/tmp", "missing", "file.txt"])
+def test_run_tests_rejects_invalid_cwd(tmp_path, cwd) -> None:
+    (tmp_path / "file.txt").write_text("x\n", encoding="utf-8")
+    with pytest.raises(CommandValidationError):
+        parse_model_command(
+            json.dumps({"command": "run_tests", "arguments": {"command": ["pytest", "-q"], "cwd": cwd}}),
+            allow_run_tests=True,
+            project_root=tmp_path,
+        )

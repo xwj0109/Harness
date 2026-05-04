@@ -131,3 +131,36 @@ def test_read_only_repo_summary_rejects_apply_patch_command(tmp_path) -> None:
         and "apply_patch is not allowed" in event.payload["error"]
         for event in events
     )
+
+
+def test_read_only_repo_summary_rejects_run_tests_command(tmp_path, monkeypatch) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    cfg = default_config()
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = LocalOpenAICompatibleBackend(
+        cfg.backends["local_openai_compatible"],
+        FakeHttpClient(
+            [
+                '{"command":"run_tests","arguments":{"command":["pytest","-q"]}}',
+                '{"command":"final_answer","arguments":{"answer":"Tests rejected."}}',
+            ]
+        ),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read_only_repo_summary must not construct Docker test runners.")
+
+    monkeypatch.setattr("harness.runner.DockerTestRunner", forbidden, raising=False)
+    result = ReadOnlyRepoSummaryRunner(tmp_path, cfg, store, backend).run(
+        "inspect this repo",
+        "read_only_repo_summary",
+    )
+
+    assert result["invalid_model_command_count"] == 1
+    events = store.list_events(result["run_id"])
+    assert any(
+        event.event_type == "invalid_model_command"
+        and "run_tests is not allowed" in event.payload["error"]
+        for event in events
+    )

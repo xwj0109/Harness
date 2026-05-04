@@ -257,7 +257,14 @@ def run(
         backend_config = cfg.backends["local_openai_compatible"]
         backend = LocalOpenAICompatibleBackend(backend_config)
         approval_provider = CliPatchApprovalProvider()
-        runner = NativeEditRunner(project_root, cfg, store, backend, approval_provider)
+        runner = NativeEditRunner(
+            project_root,
+            cfg,
+            store,
+            backend,
+            approval_provider,
+            test_approval_provider=CliTestExecutionApprovalProvider(),
+        )
         try:
             result = runner.run(goal=goal, task_type=task_type)
         except LocalEndpointUnavailable as exc:

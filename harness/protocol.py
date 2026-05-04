@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from harness.paths import PathSecurityError, relative_to_project, resolve_under_project
+from harness.sandbox import CommandValidationError as TestCommandValidationError
+from harness.sandbox import validate_test_command
 
-ALLOWED_COMMANDS = {"list_files", "read_file", "git_status", "git_diff", "apply_patch", "final_answer"}
+ALLOWED_COMMANDS = {"list_files", "read_file", "git_status", "git_diff", "apply_patch", "run_tests", "final_answer"}
 
 
 class CommandValidationError(ValueError):
@@ -14,7 +18,7 @@ class CommandValidationError(ValueError):
 
 
 class ModelCommand(BaseModel):
-    command: Literal["list_files", "read_file", "git_status", "git_diff", "apply_patch", "final_answer"]
+    command: Literal["list_files", "read_file", "git_status", "git_diff", "apply_patch", "run_tests", "final_answer"]
     arguments: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -38,6 +42,15 @@ class ModelCommand(BaseModel):
                 raise ValueError("apply_patch requires only patch.")
             if not isinstance(self.arguments["patch"], str) or not self.arguments["patch"].strip():
                 raise ValueError("apply_patch patch must be a non-empty string.")
+        elif self.command == "run_tests":
+            if not keys <= {"command", "cwd"} or "command" not in self.arguments:
+                raise ValueError("run_tests requires command and optional cwd.")
+            try:
+                validate_test_command(self.arguments["command"])
+            except TestCommandValidationError as exc:
+                raise ValueError(str(exc)) from exc
+            if "cwd" in self.arguments and not isinstance(self.arguments["cwd"], str):
+                raise ValueError("run_tests cwd must be a string.")
         elif self.command == "final_answer":
             if not keys <= {"answer", "summary"}:
                 raise ValueError("final_answer accepts answer or summary.")
@@ -50,7 +63,12 @@ class ModelCommand(BaseModel):
         return str(self.arguments.get("answer") or self.arguments.get("summary") or "")
 
 
-def parse_model_command(raw: str, allow_apply_patch: bool = False) -> ModelCommand:
+def parse_model_command(
+    raw: str,
+    allow_apply_patch: bool = False,
+    allow_run_tests: bool = False,
+    project_root: Path | None = None,
+) -> ModelCommand:
     try:
         data = json.loads(_extract_json(raw))
     except json.JSONDecodeError as exc:
@@ -62,7 +80,29 @@ def parse_model_command(raw: str, allow_apply_patch: bool = False) -> ModelComma
         raise CommandValidationError(f"Invalid command schema: {exc}") from exc
     if command.command == "apply_patch" and not allow_apply_patch:
         raise CommandValidationError("apply_patch is not allowed for this task type.")
+    if command.command == "run_tests":
+        if not allow_run_tests:
+            raise CommandValidationError("run_tests is not allowed for this task type.")
+        if project_root is not None and "cwd" in command.arguments:
+            command.arguments["cwd"] = _validate_run_tests_cwd(project_root, command.arguments["cwd"])
     return command
+
+
+def _validate_run_tests_cwd(project_root: Path, cwd: str) -> str:
+    if not cwd.strip():
+        raise CommandValidationError("run_tests cwd must be a non-empty project-relative path.")
+    raw = Path(cwd)
+    if raw.is_absolute():
+        raise CommandValidationError("run_tests cwd must be project-relative.")
+    try:
+        resolved = resolve_under_project(project_root, raw)
+    except PathSecurityError as exc:
+        raise CommandValidationError(str(exc)) from exc
+    if not resolved.exists():
+        raise CommandValidationError(f"run_tests cwd does not exist: {cwd}")
+    if not resolved.is_dir():
+        raise CommandValidationError(f"run_tests cwd is not a directory: {cwd}")
+    return "." if resolved == project_root.resolve() else relative_to_project(project_root, resolved)
 
 
 def _normalize_command_shorthand(data: Any) -> Any:

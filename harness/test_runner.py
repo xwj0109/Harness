@@ -7,6 +7,7 @@ from typing import Protocol
 
 from harness.config import HarnessConfig
 from harness.memory.sqlite_store import SQLiteStore
+from harness.paths import PathSecurityError, relative_to_project, resolve_under_project
 from harness.sandbox import (
     CommandValidationError,
     DockerImageMissingError,
@@ -50,8 +51,9 @@ class DockerTestRunner:
         self.sandbox_config = DockerSandboxConfig.model_validate(config.sandbox.model_dump())
         self.docker_runner = docker_runner or DockerSandboxRunner(self.sandbox_config)
 
-    def run(self, command: list[str]) -> dict[str, object]:
+    def run(self, command: list[str], cwd: str | None = None) -> dict[str, object]:
         validate_test_command(command)
+        container_workdir = self._container_workdir(cwd)
         run = self.store.create_run(
             goal=" ".join(command),
             task_type="docker_run_tests",
@@ -60,17 +62,62 @@ class DockerTestRunner:
         paths = self.store.initialize_run_artifacts(run.id)
         for kind, path in paths.items():
             self.store.register_artifact(run.id, kind=kind, path=path)
-        run_dir = self.store.runs_dir / run.id
-        stdout_path = run_dir / "test_stdout.txt"
-        stderr_path = run_dir / "test_stderr.txt"
-        result_path = run_dir / "test_result.json"
+        return self._execute_in_run(
+            run_id=run.id,
+            command=command,
+            cwd=cwd,
+            container_workdir=container_workdir,
+            artifact_index=1,
+            approval_provider=self.approval_provider,
+            update_run_status=True,
+            write_final_report=True,
+        )
+
+    def run_in_existing_run(
+        self,
+        run_id: str,
+        command: list[str],
+        cwd: str | None = None,
+        artifact_index: int = 1,
+        approval_provider: TestExecutionApprovalProvider | None = None,
+    ) -> dict[str, object]:
+        validate_test_command(command)
+        container_workdir = self._container_workdir(cwd)
+        return self._execute_in_run(
+            run_id=run_id,
+            command=command,
+            cwd=cwd,
+            container_workdir=container_workdir,
+            artifact_index=artifact_index,
+            approval_provider=approval_provider or self.approval_provider,
+            update_run_status=False,
+            write_final_report=False,
+        )
+
+    def _execute_in_run(
+        self,
+        run_id: str,
+        command: list[str],
+        cwd: str | None,
+        container_workdir: str,
+        artifact_index: int,
+        approval_provider: TestExecutionApprovalProvider,
+        update_run_status: bool,
+        write_final_report: bool,
+    ) -> dict[str, object]:
+        run_dir = self.store.runs_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        suffix = "" if artifact_index == 1 else f"_{artifact_index}"
+        stdout_path = run_dir / f"test_stdout{suffix}.txt"
+        stderr_path = run_dir / f"test_stderr{suffix}.txt"
+        result_path = run_dir / f"test_result{suffix}.json"
         for kind, path in {
-            "test_stdout": stdout_path,
-            "test_stderr": stderr_path,
-            "test_result": result_path,
+            f"test_stdout{suffix}": stdout_path,
+            f"test_stderr{suffix}": stderr_path,
+            f"test_result{suffix}": result_path,
         }.items():
             path.touch(exist_ok=True)
-            self.store.register_artifact(run.id, kind=kind, path=path)
+            self.store.register_artifact(run_id, kind=kind, path=path)
         workspace = None
         approval = TestRunDecision(decision="not_requested")
         docker_result: DockerRunResult | None = None
@@ -80,21 +127,23 @@ class DockerTestRunner:
         try:
             self.docker_runner.preflight()
             workspace = self.docker_runner.create_workspace(self.project_root)
-            details = self._approval_details(command, workspace.path)
-            approval = self.approval_provider.decide(details)
+            details = self._approval_details(command, workspace.path, container_workdir)
+            approval = approval_provider.decide(details)
             self.store.append_event(
-                run.id,
+                run_id,
                 "info",
                 "test_execution_decision",
                 "Persisted per-run test execution decision.",
-                {"decision": approval.decision, "reason": approval.reason},
+                {"decision": approval.decision, "reason": approval.reason, "command": command, "cwd": cwd},
             )
             if not approval.approved:
                 status = "execution_denied"
                 return self._finish(
-                    run.id,
+                    run_id,
                     status,
                     command,
+                    cwd,
+                    container_workdir,
                     approval,
                     docker_result,
                     stdout_path,
@@ -103,8 +152,10 @@ class DockerTestRunner:
                     cleanup_status,
                     error,
                     workspace,
+                    update_run_status,
+                    write_final_report,
                 )
-            docker_result = self.docker_runner.run(workspace, command)
+            docker_result = self.docker_runner.run(workspace, command, workdir=container_workdir)
             stdout_path.write_text(str(sanitize_for_logging(docker_result.stdout)), encoding="utf-8")
             stderr_path.write_text(str(sanitize_for_logging(docker_result.stderr)), encoding="utf-8")
             if docker_result.timed_out:
@@ -123,9 +174,11 @@ class DockerTestRunner:
             status = "sandbox_error"
             error = str(sanitize_for_logging(str(exc)))
         return self._finish(
-            run.id,
+            run_id,
             status,
             command,
+            cwd,
+            container_workdir,
             approval,
             docker_result,
             stdout_path,
@@ -134,6 +187,8 @@ class DockerTestRunner:
             cleanup_status,
             error,
             workspace,
+            update_run_status,
+            write_final_report,
         )
 
     def _finish(
@@ -141,6 +196,8 @@ class DockerTestRunner:
         run_id: str,
         status: str,
         command: list[str],
+        cwd: str | None,
+        container_workdir: str,
         approval: TestRunDecision,
         docker_result: DockerRunResult | None,
         stdout_path: Path,
@@ -149,6 +206,8 @@ class DockerTestRunner:
         cleanup_status: str,
         error: str,
         workspace,
+        update_run_status: bool,
+        write_final_report: bool,
     ) -> dict[str, object]:
         temp_workspace = str(workspace.path) if workspace is not None else ""
         if workspace is not None and workspace.cleanup_status == "not_cleaned":
@@ -162,7 +221,8 @@ class DockerTestRunner:
             "timeout_seconds": self.sandbox_config.timeout_seconds,
             "memory_limit": self.sandbox_config.memory_limit,
             "cpu_limit": self.sandbox_config.cpu_limit,
-            "workdir": self.sandbox_config.workdir,
+            "workdir": container_workdir,
+            "cwd": cwd,
             "install_project": self.sandbox_config.install_project,
             "temp_workspace": temp_workspace,
             "cleanup_status": cleanup_status,
@@ -177,6 +237,7 @@ class DockerTestRunner:
             "failure_hint": _failure_hint(status, docker_result.stdout if docker_result else "", docker_result.stderr if docker_result else error),
             "stdout_artifact": str(stdout_path),
             "stderr_artifact": str(stderr_path),
+            "result_artifact": str(result_path),
         }
         result_path.write_text(json.dumps(sanitize_for_logging(result_payload), indent=2, sort_keys=True), encoding="utf-8")
         self.store.append_event(
@@ -186,15 +247,17 @@ class DockerTestRunner:
             "Docker test run completed.",
             result_payload,
         )
-        self.store.update_run_status(run_id, status)
-        self._write_report(
-            run_id=run_id,
-            status=status,
-            payload=result_payload,
-            stdout_path=stdout_path,
-            stderr_path=stderr_path,
-            result_path=result_path,
-        )
+        if update_run_status:
+            self.store.update_run_status(run_id, status)
+        if write_final_report:
+            self._write_report(
+                run_id=run_id,
+                status=status,
+                payload=result_payload,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                result_path=result_path,
+            )
         return {
             "run_id": run_id,
             "status": status,
@@ -208,13 +271,13 @@ class DockerTestRunner:
             **result_payload,
         }
 
-    def _approval_details(self, command: list[str], temp_workspace: Path) -> str:
+    def _approval_details(self, command: list[str], temp_workspace: Path, container_workdir: str) -> str:
         return "\n".join(
             [
                 "Test execution approval required:",
                 f"Command: {' '.join(command)}",
                 f"Docker image: {self.sandbox_config.image}",
-                f"Working directory: {self.sandbox_config.workdir}",
+                f"Working directory: {container_workdir}",
                 f"Network: {'enabled' if self.sandbox_config.network else 'disabled'}",
                 f"Timeout: {self.sandbox_config.timeout_seconds} seconds",
                 "Mounts:",
@@ -223,6 +286,26 @@ class DockerTestRunner:
                 f"- {self.project_root} -> sanitized temporary workspace",
             ]
         )
+
+    def _container_workdir(self, cwd: str | None) -> str:
+        if cwd is None:
+            return self.sandbox_config.workdir
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise CommandValidationError("Test cwd must be a non-empty project-relative string.")
+        raw = Path(cwd)
+        if raw.is_absolute():
+            raise CommandValidationError("Test cwd must be project-relative.")
+        try:
+            resolved = resolve_under_project(self.project_root, raw)
+        except PathSecurityError as exc:
+            raise CommandValidationError(str(exc)) from exc
+        if not resolved.exists():
+            raise CommandValidationError(f"Test cwd does not exist: {cwd}")
+        if not resolved.is_dir():
+            raise CommandValidationError(f"Test cwd is not a directory: {cwd}")
+        if resolved == self.project_root:
+            return self.sandbox_config.workdir
+        return f"{self.sandbox_config.workdir.rstrip('/')}/{relative_to_project(self.project_root, resolved)}"
 
     def _write_report(self, run_id: str, status: str, payload: dict[str, object], stdout_path: Path, stderr_path: Path, result_path: Path) -> None:
         report_path = self.store.runs_dir / run_id / "final_report.md"

@@ -17,6 +17,7 @@ runner = CliRunner()
 class FakeDockerRunner:
     created_workspaces: list[Path] = []
     run_calls: list[tuple[Path, list[str]]] = []
+    run_workdirs: list[str | None] = []
     preflight_calls = 0
 
     def __init__(self, config):
@@ -37,8 +38,9 @@ class FakeDockerRunner:
         FakeDockerRunner.created_workspaces.append(workspace.path)
         return workspace
 
-    def run(self, workspace, command, timeout_seconds=None):
+    def run(self, workspace, command, timeout_seconds=None, workdir=None):
         FakeDockerRunner.run_calls.append((workspace.path, list(command)))
+        FakeDockerRunner.run_workdirs.append(workdir)
         (workspace.path / ".pytest_cache").mkdir()
         (workspace.path / ".pytest_cache" / "README").write_text("cache\n", encoding="utf-8")
         (workspace.path / "__pycache__").mkdir()
@@ -60,6 +62,7 @@ class FakeDockerRunner:
 def reset_fake() -> None:
     FakeDockerRunner.created_workspaces = []
     FakeDockerRunner.run_calls = []
+    FakeDockerRunner.run_workdirs = []
     FakeDockerRunner.preflight_calls = 0
 
 
@@ -117,6 +120,33 @@ def test_cli_tests_run_denial_does_not_call_docker_run_and_cleans_workspace(tmp_
     assert "denied" in events
 
 
+def test_run_in_existing_run_writes_suffixed_artifacts_and_uses_cwd(tmp_path) -> None:
+    reset_fake()
+    (tmp_path / "tests").mkdir()
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="edit", task_type="simple_code_edit", status="running")
+    cfg = default_config()
+    runner_obj = DockerTestRunner(
+        tmp_path,
+        cfg,
+        store,
+        StaticApproval("approved"),
+        docker_runner=FakeDockerRunner(cfg.sandbox),
+    )
+
+    first = runner_obj.run_in_existing_run(run.id, ["pytest", "-q"], cwd="tests", artifact_index=1)
+    second = runner_obj.run_in_existing_run(run.id, ["pytest", "-q"], cwd="tests", artifact_index=2)
+
+    run_dir = tmp_path / ".harness" / "runs" / run.id
+    assert first["stdout_artifact"] == str(run_dir / "test_stdout.txt")
+    assert second["stdout_artifact"] == str(run_dir / "test_stdout_2.txt")
+    assert (run_dir / "test_result.json").exists()
+    assert (run_dir / "test_result_2.json").exists()
+    assert FakeDockerRunner.run_workdirs == ["/workspace/tests", "/workspace/tests"]
+    assert store.get_run(run.id).status == "running"
+
+
 def test_cli_tests_run_rejects_empty_and_metacharacters(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     empty = runner.invoke(app, ["tests", "run", "--project", str(tmp_path), "--"])
@@ -157,7 +187,7 @@ class ResultDockerRunner(FakeDockerRunner):
         super().__init__(config)
         self.result = result
 
-    def run(self, workspace, command, timeout_seconds=None):
+    def run(self, workspace, command, timeout_seconds=None, workdir=None):
         return self.result
 
 
