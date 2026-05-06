@@ -83,12 +83,23 @@ def test_cli_dev_create_run_runs_show(tmp_path) -> None:
     events_path = run_dir / "events.jsonl"
     transcript_path = run_dir / "transcript.jsonl"
     report_path = run_dir / "final_report.md"
+    manifest_path = run_dir / "manifest.json"
     assert str(events_path) in show.output
     assert str(transcript_path) in show.output
     assert str(report_path) in show.output
     assert events_path.read_text(encoding="utf-8")
     assert transcript_path.exists()
     assert report_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == "harness.manifest/v1"
+    assert manifest["run_id"] == run_id
+    assert manifest["run_mode"] == "dev"
+    assert {artifact["kind"] for artifact in manifest["artifacts"]} >= {
+        "events",
+        "transcript",
+        "final_report",
+        "manifest",
+    }
 
 
 def test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monkeypatch) -> None:

@@ -35,6 +35,27 @@ class BackendKind(str, Enum):
     NATIVE_MODEL = "native_model"
 
 
+class RunMode(str, Enum):
+    READ_ONLY = "read_only"
+    PLANNING = "planning"
+    LOCAL_EDIT = "local_edit"
+    CODEX_EDIT = "codex_edit"
+    TEST = "test"
+    DEV = "dev"
+
+
+def run_mode_for_task_type(task_type: str | None) -> RunMode:
+    mapping = {
+        "read_only_repo_summary": RunMode.READ_ONLY,
+        "repo_planning": RunMode.PLANNING,
+        "simple_code_edit": RunMode.LOCAL_EDIT,
+        "codex_code_edit": RunMode.CODEX_EDIT,
+        "docker_run_tests": RunMode.TEST,
+        "phase_1a_test": RunMode.DEV,
+    }
+    return mapping.get(task_type or "", RunMode.DEV)
+
+
 class BackendMetadata(BaseModel):
     billing_mode: BillingMode
     execution_location: ExecutionLocation
@@ -69,12 +90,29 @@ class BackendStatus(BaseModel):
     capabilities: BackendCapabilities
 
 
+class BackendDescriptor(BaseModel):
+    name: str
+    kind: BackendKind
+    metadata: BackendMetadata
+    capabilities: BackendCapabilities = Field(default_factory=BackendCapabilities)
+    operator_notes: list[str] = Field(default_factory=list)
+    constraints: list[str] = Field(default_factory=list)
+
+
 class BackendConfig(BaseModel):
     name: str
     kind: BackendKind
     metadata: BackendMetadata
     capabilities: BackendCapabilities = Field(default_factory=BackendCapabilities)
     settings: dict[str, Any] = Field(default_factory=dict)
+
+    def to_descriptor(self) -> BackendDescriptor:
+        return BackendDescriptor(
+            name=self.name,
+            kind=self.kind,
+            metadata=self.metadata,
+            capabilities=self.capabilities,
+        )
 
 
 class RunRecord(BaseModel):
@@ -111,3 +149,25 @@ class ArtifactRecord(BaseModel):
     path: Path
     created_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ManifestArtifact(BaseModel):
+    kind: str
+    path: Path
+    created_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunManifest(BaseModel):
+    schema_version: str = "harness.manifest/v1"
+    run_id: str
+    goal: str | None = None
+    task_type: str | None = None
+    run_mode: RunMode
+    status: str
+    project_root: Path
+    created_at: datetime
+    updated_at: datetime
+    approval_id: str | None = None
+    backend_descriptor: BackendDescriptor | None = None
+    artifacts: list[ManifestArtifact] = Field(default_factory=list)

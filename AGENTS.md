@@ -12,3 +12,8 @@ Hard rules:
 - Preserve local/private data-boundary safeguards.
 - Codex is a supervised external agent backend, not a raw model provider.
 - Existing tests must pass.
+
+Planning workflow:
+- Use `docs/plans/` for roadmap snapshots, implementation plans, and next-step planning artifacts.
+- Treat planning files as repo-tracked documentation only; they do not authorize broad implementation work by themselves.
+- Never use `.harness/`, `.git/`, `.env*`, secret-like files, SQLite files, or `secrets/` as planning or edit targets.

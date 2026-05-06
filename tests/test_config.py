@@ -1,5 +1,16 @@
 from harness.config import DEFAULT_CONTEXT_EXCLUDES, default_config, load_config, write_default_config
-from harness.models import DataBoundary
+from harness.models import BackendDescriptor, BackendKind, DataBoundary, RunMode
+
+
+def test_run_mode_values_are_stable_strings() -> None:
+    assert [mode.value for mode in RunMode] == [
+        "read_only",
+        "planning",
+        "local_edit",
+        "codex_edit",
+        "test",
+        "dev",
+    ]
 
 
 def test_default_config_has_exclusions_and_backends() -> None:
@@ -11,6 +22,45 @@ def test_default_config_has_exclusions_and_backends() -> None:
     assert cfg.sandbox.install_project is False
     assert cfg.sandbox.install_project_no_build_isolation is True
     assert cfg.sandbox.image_build_file == "Dockerfile.harness-test"
+
+
+def test_default_backends_produce_safe_descriptors() -> None:
+    cfg = default_config()
+
+    for backend in cfg.backends.values():
+        descriptor = backend.to_descriptor()
+        dumped = descriptor.model_dump(mode="json")
+
+        assert isinstance(descriptor, BackendDescriptor)
+        assert descriptor.name == backend.name
+        assert descriptor.kind == backend.kind
+        assert descriptor.metadata == backend.metadata
+        assert descriptor.capabilities == backend.capabilities
+        assert descriptor.operator_notes == []
+        assert descriptor.constraints == []
+        assert "settings" not in dumped
+
+
+def test_backend_descriptors_preserve_current_backend_semantics() -> None:
+    cfg = default_config()
+
+    codex = cfg.backends["codex_cli"].to_descriptor()
+    local = cfg.backends["local_openai_compatible"].to_descriptor()
+    paid = cfg.backends["paid_openai_compatible"].to_descriptor()
+
+    assert codex.kind == BackendKind.EXTERNAL_AGENT
+    assert codex.metadata.data_boundary == DataBoundary.HOSTED_PROVIDER
+    assert codex.metadata.allow_network is False
+
+    assert local.kind == BackendKind.NATIVE_MODEL
+    assert local.metadata.data_boundary == DataBoundary.LOCAL_ONLY
+    assert local.metadata.allow_network is False
+
+    assert paid.kind == BackendKind.NATIVE_MODEL
+    assert paid.metadata.data_boundary == DataBoundary.HOSTED_PROVIDER
+    assert paid.metadata.allow_network is True
+    assert cfg.backends["paid_openai_compatible"].settings["enabled"] is False
+    assert "enabled" not in paid.model_dump(mode="json")
 
 
 def test_write_and_load_config(tmp_path) -> None:

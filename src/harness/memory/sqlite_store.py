@@ -10,9 +10,16 @@ from typing import Any
 from harness.events import append_jsonl
 from harness.models import (
     ArtifactRecord,
+    BackendCapabilities,
     BackendConfig,
+    BackendDescriptor,
+    BackendKind,
+    BackendMetadata,
     EventRecord,
+    ManifestArtifact,
+    RunManifest,
     RunRecord,
+    run_mode_for_task_type,
 )
 from harness.security import sanitize_for_logging
 
@@ -94,6 +101,7 @@ class SQLiteStore:
         self.initialize_run_artifacts(run_id)
         if backend:
             self.persist_backend_snapshot(run_id, backend)
+        self.write_run_manifest(run_id)
         return self.get_run(run_id)
 
     def initialize_run_artifacts(self, run_id: str) -> dict[str, Path]:
@@ -103,6 +111,7 @@ class SQLiteStore:
             "events": run_dir / "events.jsonl",
             "transcript": run_dir / "transcript.jsonl",
             "final_report": run_dir / "final_report.md",
+            "manifest": run_dir / "manifest.json",
         }
         for path in paths.values():
             path.touch(exist_ok=True)
@@ -126,6 +135,7 @@ class SQLiteStore:
                 "UPDATE runs SET status = ?, updated_at = ? WHERE id = ?",
                 (status, now_iso(), run_id),
             )
+        self.write_run_manifest(run_id)
 
     def append_event(
         self,
@@ -202,7 +212,7 @@ class SQLiteStore:
                     json.dumps(metadata, sort_keys=True, default=str),
                 ),
             )
-        return ArtifactRecord(
+        record = ArtifactRecord(
             id=artifact_id,
             run_id=run_id,
             kind=kind,
@@ -210,6 +220,8 @@ class SQLiteStore:
             created_at=parse_dt(timestamp),
             metadata=metadata,
         )
+        self.write_run_manifest(run_id)
+        return record
 
     def list_artifacts(self, run_id: str) -> list[ArtifactRecord]:
         with self.connect() as conn:
@@ -280,7 +292,64 @@ class SQLiteStore:
             lines.append("- none")
         lines.extend(["", "## Events", "", f"- Event count: {len(events)}", ""])
         report_path.write_text("\n".join(lines), encoding="utf-8")
+        self.write_run_manifest(run_id)
         return report_path
+
+    def write_run_manifest(self, run_id: str) -> Path:
+        manifest = self._build_run_manifest(run_id)
+        path = self.runs_dir / run_id / "manifest.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def _build_run_manifest(self, run_id: str) -> RunManifest:
+        run = self.get_run(run_id)
+        artifacts = [
+            ManifestArtifact(
+                kind=artifact.kind,
+                path=artifact.path,
+                created_at=artifact.created_at,
+                metadata=artifact.metadata,
+            )
+            for artifact in self.list_artifacts(run_id)
+        ]
+        return RunManifest(
+            run_id=run.id,
+            goal=run.goal,
+            task_type=run.task_type,
+            run_mode=run_mode_for_task_type(run.task_type),
+            status=run.status,
+            project_root=run.project_root,
+            created_at=run.created_at,
+            updated_at=run.updated_at,
+            approval_id=run.approval_id,
+            backend_descriptor=self._latest_backend_descriptor(run_id),
+            artifacts=artifacts,
+        )
+
+    def _latest_backend_descriptor(self, run_id: str) -> BackendDescriptor | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT backend_name, backend_kind, metadata_json, capabilities_json
+                FROM backend_snapshots
+                WHERE run_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return BackendDescriptor(
+            name=row["backend_name"],
+            kind=BackendKind(row["backend_kind"]),
+            metadata=BackendMetadata.model_validate_json(row["metadata_json"]),
+            capabilities=BackendCapabilities.model_validate_json(row["capabilities_json"]),
+        )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
         return RunRecord(
