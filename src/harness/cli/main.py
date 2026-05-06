@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
@@ -41,6 +43,14 @@ tests_app.add_typer(tests_image_app, name="image")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
 
+
+class OutputFormat(str, Enum):
+    TEXT = "text"
+    JSON = "json"
+
+
+OutputOption = Annotated[OutputFormat, typer.Option("--output", help="Output format.")]
+
 GITIGNORE_SECTION = """# Harness local artifacts
 .harness/runs/
 .harness/harness.sqlite
@@ -66,11 +76,14 @@ def init(project: ProjectOption = Path(".")) -> None:
 
 
 @app.command()
-def runs(project: ProjectOption = Path(".")) -> None:
+def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
     records = store.list_runs()
+    if output == OutputFormat.JSON:
+        _emit_json({"runs": [record.model_dump(mode="json") for record in records]})
+        return
     if not records:
         typer.echo("No runs found.")
         return
@@ -82,7 +95,7 @@ def runs(project: ProjectOption = Path(".")) -> None:
 
 
 @app.command()
-def show(run_id: str, project: ProjectOption = Path(".")) -> None:
+def show(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
@@ -91,6 +104,13 @@ def show(run_id: str, project: ProjectOption = Path(".")) -> None:
     except KeyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     run_dir = store.runs_dir / run_id
+    if output == OutputFormat.JSON:
+        manifest_path = run_dir / "manifest.json"
+        if manifest_path.exists():
+            _emit_json(json.loads(manifest_path.read_text(encoding="utf-8")))
+        else:
+            _emit_json(store.build_run_manifest(run_id).model_dump(mode="json"))
+        return
     typer.echo(f"Run: {record.id}")
     typer.echo(f"Status: {record.status}")
     typer.echo(f"Goal: {record.goal or ''}")
@@ -110,37 +130,62 @@ def show(run_id: str, project: ProjectOption = Path(".")) -> None:
 
 
 @backends_app.callback()
-def backends_callback(ctx: typer.Context, project: ProjectOption = Path(".")) -> None:
+def backends_callback(
+    ctx: typer.Context,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
     if ctx.invoked_subcommand is not None:
         return
     project_root = resolve_project_root(project)
     cfg = load_config(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {"backends": [backend.to_descriptor().model_dump(mode="json") for backend in cfg.backends.values()]}
+        )
+        return
     _print_backends(cfg)
 
 
 @backends_app.command("preflight")
-def backends_preflight(project: ProjectOption = Path(".")) -> None:
+def backends_preflight(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     cfg = load_config(project_root)
+    results = []
     for name, backend in cfg.backends.items():
-        typer.echo(f"{name}:")
-        typer.echo(f"  kind: {backend.kind.value}")
-        typer.echo(f"  billing_mode: {backend.metadata.billing_mode.value}")
-        typer.echo(f"  execution_location: {backend.metadata.execution_location.value}")
-        typer.echo(f"  data_boundary: {backend.metadata.data_boundary.value}")
-        typer.echo(f"  allow_network: {backend.metadata.allow_network}")
         if name == "codex_cli":
             status = CodexCliBackend(backend).preflight()
         elif name == "local_openai_compatible":
             status = LocalOpenAICompatibleBackend(backend).preflight()
         else:
             status = None
-        typer.echo(f"  available: {status.available if status else False}")
-        typer.echo(f"  reason: {status.reason if status else 'Paid backend preflight skipped; disabled by default.'}")
-        typer.echo("  detected_capabilities:")
+        reason = status.reason if status else "Paid backend preflight skipped; disabled by default."
         capabilities = status.capabilities if status else backend.capabilities
+        results.append(
+            {
+                "name": name,
+                "kind": backend.kind.value,
+                "metadata": backend.metadata.model_dump(mode="json"),
+                "available": status.available if status else False,
+                "reason": reason,
+                "detected_capabilities": capabilities.model_dump(mode="json"),
+            }
+        )
+        if output == OutputFormat.JSON:
+            continue
+        typer.echo(f"{name}:")
+        typer.echo(f"  kind: {backend.kind.value}")
+        typer.echo(f"  billing_mode: {backend.metadata.billing_mode.value}")
+        typer.echo(f"  execution_location: {backend.metadata.execution_location.value}")
+        typer.echo(f"  data_boundary: {backend.metadata.data_boundary.value}")
+        typer.echo(f"  allow_network: {backend.metadata.allow_network}")
+        typer.echo(f"  available: {status.available if status else False}")
+        typer.echo(f"  reason: {reason}")
+        typer.echo("  detected_capabilities:")
         for key, value in capabilities.model_dump().items():
             typer.echo(f"    {key}: {value}")
+    if output == OutputFormat.JSON:
+        _emit_json({"backends": results})
 
 
 @app.command()
@@ -284,13 +329,20 @@ def run(
 
 
 @approvals_app.callback()
-def approvals_callback(ctx: typer.Context, project: ProjectOption = Path(".")) -> None:
+def approvals_callback(
+    ctx: typer.Context,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
     if ctx.invoked_subcommand is not None:
         return
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = ApprovalStore(project_root)
     approvals = store.list()
+    if output == OutputFormat.JSON:
+        _emit_json({"approvals": [approval.model_dump(mode="json") for approval in approvals]})
+        return
     if not approvals:
         typer.echo("No approvals found.")
         return
@@ -484,6 +536,10 @@ def _print_backends(cfg) -> None:
         typer.echo("  capabilities:")
         for key, value in backend.capabilities.model_dump().items():
             typer.echo(f"    {key}: {value}")
+
+
+def _emit_json(payload) -> None:
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
 def _obtain_hosted_boundary_approval(

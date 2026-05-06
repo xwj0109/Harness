@@ -102,6 +102,68 @@ def test_cli_dev_create_run_runs_show(tmp_path) -> None:
     }
 
 
+def test_cli_runs_and_show_support_json_output(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    created = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "json test run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created.exit_code == 0
+    run_id = created.output.split("Created run ", 1)[1].splitlines()[0]
+
+    runs = runner.invoke(app, ["runs", "--project", str(tmp_path), "--output", "json"])
+    assert runs.exit_code == 0
+    runs_payload = json.loads(runs.output)
+    assert runs_payload["runs"][0]["id"] == run_id
+    assert runs_payload["runs"][0]["status"] == "completed"
+    assert runs_payload["runs"][0]["task_type"] == "phase_1a_test"
+    assert runs_payload["runs"][0]["backend_name"] is None
+
+    show = runner.invoke(app, ["show", run_id, "--project", str(tmp_path), "--output", "json"])
+    assert show.exit_code == 0
+    show_payload = json.loads(show.output)
+    assert show_payload["schema_version"] == "harness.manifest/v1"
+    assert show_payload["run_id"] == run_id
+    assert show_payload["run_mode"] == "dev"
+    assert {artifact["kind"] for artifact in show_payload["artifacts"]} >= {
+        "events",
+        "transcript",
+        "final_report",
+        "manifest",
+    }
+
+
+def test_cli_runs_default_output_remains_text(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    created = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "text test run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created.exit_code == 0
+    runs = runner.invoke(app, ["runs", "--project", str(tmp_path)])
+    assert runs.exit_code == 0
+    assert not runs.output.lstrip().startswith("{")
+    assert "\tcompleted\t" in runs.output
+
+
 def test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 
@@ -253,6 +315,63 @@ def test_cli_backends_preflight_reports_codex_without_paid_preflight(tmp_path, m
     assert "Paid backend preflight skipped" in result.output
 
 
+def test_cli_backends_support_json_output_without_settings(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(app, ["backends", "--project", str(tmp_path), "--output", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    names = {backend["name"] for backend in payload["backends"]}
+
+    assert {"codex_cli", "local_openai_compatible", "paid_openai_compatible"} <= names
+    serialized = json.dumps(payload)
+    assert "settings" not in serialized
+    assert "base_url" not in serialized
+    assert "api_key" not in serialized
+    assert "api_key_env" not in serialized
+
+
+def test_cli_backends_preflight_supports_json_output(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities.model_copy(update={"supports_exec": True}),
+            )
+
+    class FakeLocalBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=False,
+                reason="local unavailable",
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeLocalBackend)
+    result = runner.invoke(app, ["backends", "preflight", "--project", str(tmp_path), "--output", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    by_name = {backend["name"]: backend for backend in payload["backends"]}
+
+    assert by_name["codex_cli"]["available"] is True
+    assert by_name["codex_cli"]["detected_capabilities"]["supports_exec"] is True
+    assert by_name["local_openai_compatible"]["available"] is False
+    assert by_name["local_openai_compatible"]["reason"] == "local unavailable"
+    assert by_name["paid_openai_compatible"]["available"] is False
+    assert by_name["paid_openai_compatible"]["reason"] == "Paid backend preflight skipped; disabled by default."
+
+
 def test_cli_approvals_add_list_revoke(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     add = runner.invoke(
@@ -281,6 +400,40 @@ def test_cli_approvals_add_list_revoke(tmp_path) -> None:
     assert revoked.exit_code == 0
     listed_after = runner.invoke(app, ["approvals", "--project", str(tmp_path)])
     assert "revoked=True" in listed_after.output
+
+
+def test_cli_approvals_support_json_output(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    add = runner.invoke(
+        app,
+        [
+            "approvals",
+            "add",
+            "--backend",
+            "codex_cli",
+            "--data-boundary",
+            "hosted_provider",
+            "--task-types",
+            "repo_planning",
+            "--duration-days",
+            "30",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert add.exit_code == 0
+    approval_id = add.output.split("Created approval ", 1)[1].strip()
+    assert runner.invoke(app, ["approvals", "revoke", approval_id, "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(app, ["approvals", "--project", str(tmp_path), "--output", "json"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+
+    assert payload["approvals"][0]["id"] == approval_id
+    assert payload["approvals"][0]["backend"] == "codex_cli"
+    assert payload["approvals"][0]["data_boundary"] == "hosted_provider"
+    assert payload["approvals"][0]["task_types"] == ["repo_planning"]
+    assert payload["approvals"][0]["revoked"] is True
 
 
 def test_cli_repo_planning_requires_hosted_approval(tmp_path, monkeypatch) -> None:

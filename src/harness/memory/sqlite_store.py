@@ -296,7 +296,7 @@ class SQLiteStore:
         return report_path
 
     def write_run_manifest(self, run_id: str) -> Path:
-        manifest = self._build_run_manifest(run_id)
+        manifest = self.build_run_manifest(run_id)
         path = self.runs_dir / run_id / "manifest.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -305,7 +305,7 @@ class SQLiteStore:
         )
         return path
 
-    def _build_run_manifest(self, run_id: str) -> RunManifest:
+    def build_run_manifest(self, run_id: str) -> RunManifest:
         run = self.get_run(run_id)
         artifacts = [
             ManifestArtifact(
