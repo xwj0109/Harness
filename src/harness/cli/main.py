@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -127,6 +129,21 @@ def show(run_id: str, project: ProjectOption = Path("."), output: OutputOption =
     typer.echo(f"  events: {run_dir / 'events.jsonl'}")
     typer.echo(f"  transcript: {run_dir / 'transcript.jsonl'}")
     typer.echo(f"  final_report: {run_dir / 'final_report.md'}")
+
+
+@app.command()
+def doctor(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = _doctor_result(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+    else:
+        typer.echo(f"Project: {result['project_root']}")
+        typer.echo(f"Overall: {'pass' if result['ok'] else 'fail'}")
+        for check in result["checks"]:
+            typer.echo(f"{check['status']}\t{check['id']}\t{check['message']}")
+    if not result["ok"]:
+        raise typer.Exit(code=1)
 
 
 @backends_app.callback()
@@ -540,6 +557,193 @@ def _print_backends(cfg) -> None:
 
 def _emit_json(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _doctor_result(project_root: Path) -> dict:
+    checks: list[dict] = []
+    harness_dir = project_root / HARNESS_DIR
+    config = None
+
+    _add_check(
+        checks,
+        "initialized",
+        "pass" if (harness_dir / "harness.sqlite").exists() else "fail",
+        "Harness SQLite state exists." if (harness_dir / "harness.sqlite").exists() else "Project is not initialized.",
+        {"path": str(harness_dir / "harness.sqlite")},
+    )
+
+    try:
+        config = load_config(project_root)
+    except Exception as exc:
+        _add_check(
+            checks,
+            "config_loadable",
+            "fail",
+            "Harness config could not be loaded.",
+            {"path": str(harness_dir / "config.yaml"), "error": str(exc)},
+        )
+    else:
+        _add_check(
+            checks,
+            "config_loadable",
+            "pass",
+            "Harness config loaded.",
+            {"path": str(harness_dir / "config.yaml")},
+        )
+
+    required_ignores = [".harness/runs/", ".harness/harness.sqlite", ".harness/approvals.yaml", ".harness/tmp/"]
+    gitignore_path = project_root / ".gitignore"
+    existing_ignores = gitignore_path.read_text(encoding="utf-8").splitlines() if gitignore_path.exists() else []
+    missing_ignores = [entry for entry in required_ignores if entry not in existing_ignores]
+    _add_check(
+        checks,
+        "local_artifact_ignores",
+        "pass" if not missing_ignores else "warn",
+        "Harness local artifact ignores are present." if not missing_ignores else "Some Harness local artifact ignores are missing.",
+        {"path": str(gitignore_path), "missing": missing_ignores},
+    )
+
+    if config is not None:
+        _doctor_backend_descriptors(checks, config)
+        _doctor_backend_preflight(checks, config)
+        _doctor_docker_binary(checks)
+        _doctor_dockerfile_validation(checks, project_root, config)
+        _doctor_sandbox_safety(checks, config)
+
+    return {
+        "project_root": str(project_root),
+        "ok": all(check["status"] != "fail" for check in checks),
+        "checks": checks,
+    }
+
+
+def _add_check(checks: list[dict], check_id: str, status: str, message: str, details: dict | None = None) -> None:
+    checks.append({"id": check_id, "status": status, "message": message, "details": details or {}})
+
+
+def _doctor_backend_descriptors(checks: list[dict], config) -> None:
+    try:
+        descriptors = [backend.to_descriptor().model_dump(mode="json") for backend in config.backends.values()]
+    except Exception as exc:
+        _add_check(
+            checks,
+            "backend_descriptors",
+            "fail",
+            "Backend descriptors could not be built.",
+            {"error": str(exc)},
+        )
+        return
+    _add_check(
+        checks,
+        "backend_descriptors",
+        "pass",
+        "Backend descriptors are available.",
+        {"backends": descriptors},
+    )
+
+
+def _doctor_backend_preflight(checks: list[dict], config) -> None:
+    results = []
+    for name, backend in config.backends.items():
+        if name == "codex_cli":
+            status = CodexCliBackend(backend).preflight()
+            results.append(
+                {
+                    "name": name,
+                    "status": "pass" if status.available else "warn",
+                    "available": status.available,
+                    "reason": status.reason,
+                    "metadata": status.metadata.model_dump(mode="json"),
+                    "detected_capabilities": status.capabilities.model_dump(mode="json"),
+                }
+            )
+        elif name == "local_openai_compatible":
+            status = LocalOpenAICompatibleBackend(backend).preflight()
+            results.append(
+                {
+                    "name": name,
+                    "status": "pass" if status.available else "warn",
+                    "available": status.available,
+                    "reason": status.reason,
+                    "metadata": status.metadata.model_dump(mode="json"),
+                    "detected_capabilities": status.capabilities.model_dump(mode="json"),
+                }
+            )
+        else:
+            results.append(
+                {
+                    "name": name,
+                    "status": "warn",
+                    "available": False,
+                    "reason": "Paid backend preflight skipped; disabled by default.",
+                    "metadata": backend.metadata.model_dump(mode="json"),
+                    "detected_capabilities": backend.capabilities.model_dump(mode="json"),
+                }
+            )
+    _add_check(
+        checks,
+        "backend_preflight",
+        "pass" if all(item["status"] == "pass" for item in results) else "warn",
+        "Backend preflight completed.",
+        {"backends": results},
+    )
+
+
+def _doctor_docker_binary(checks: list[dict]) -> None:
+    docker_binary = shutil.which("docker")
+    if docker_binary is None:
+        _add_check(checks, "docker_binary", "warn", "Docker is not installed or not on PATH.", {})
+        return
+    try:
+        version = subprocess.run([docker_binary, "--version"], text=True, capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        _add_check(checks, "docker_binary", "warn", "Docker version check failed.", {"error": str(exc)})
+        return
+    if version.returncode == 0:
+        _add_check(
+            checks,
+            "docker_binary",
+            "pass",
+            "Docker is available.",
+            {"binary": docker_binary, "version": version.stdout.strip()},
+        )
+    else:
+        _add_check(
+            checks,
+            "docker_binary",
+            "warn",
+            "Docker is installed but unavailable.",
+            {"binary": docker_binary, "stdout": version.stdout, "stderr": version.stderr},
+        )
+
+
+def _doctor_dockerfile_validation(checks: list[dict], project_root: Path, config) -> None:
+    try:
+        validation = DockerImageManager(project_root, config).validate_dockerfile()
+    except ValueError as exc:
+        _add_check(checks, "dockerfile_validation", "fail", "Dockerfile configuration is invalid.", {"error": str(exc)})
+        return
+    status = "pass" if validation.ok else "warn"
+    _add_check(
+        checks,
+        "dockerfile_validation",
+        status,
+        "Dockerfile validation completed." if validation.ok else "Dockerfile validation reported issues.",
+        validation.model_dump(mode="json"),
+    )
+
+
+def _doctor_sandbox_safety(checks: list[dict], config) -> None:
+    issues = []
+    if config.sandbox.network:
+        issues.append("sandbox.network should be false by default.")
+    _add_check(
+        checks,
+        "sandbox_safety",
+        "pass" if not issues else "fail",
+        "Sandbox safety settings are conservative." if not issues else "Sandbox safety settings need review.",
+        {"issues": issues, "network": config.sandbox.network},
+    )
 
 
 def _obtain_hosted_boundary_approval(

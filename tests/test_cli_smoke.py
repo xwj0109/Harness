@@ -164,6 +164,118 @@ def test_cli_runs_default_output_remains_text(tmp_path) -> None:
     assert "\tcompleted\t" in runs.output
 
 
+def test_cli_doctor_reports_initialized_project_without_mutation(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    before = sorted(path.relative_to(tmp_path).as_posix() for path in (tmp_path / ".harness").rglob("*"))
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    class FakeLocalBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeLocalBackend)
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: "/usr/bin/docker" if name == "docker" else None)
+
+    class FakeDockerVersion:
+        returncode = 0
+        stdout = "Docker version test\n"
+        stderr = ""
+
+    monkeypatch.setattr("harness.cli.main.subprocess.run", lambda *args, **kwargs: FakeDockerVersion())
+
+    result = runner.invoke(app, ["doctor", "--project", str(tmp_path)])
+    after = sorted(path.relative_to(tmp_path).as_posix() for path in (tmp_path / ".harness").rglob("*"))
+
+    assert result.exit_code == 0
+    assert not result.output.lstrip().startswith("{")
+    assert "Overall: pass" in result.output
+    assert "pass\tinitialized" in result.output
+    assert "pass\tconfig_loadable" in result.output
+    assert before == after
+
+
+def test_cli_doctor_uninitialized_project_fails_without_creating_harness_dir(tmp_path) -> None:
+    result = runner.invoke(app, ["doctor", "--project", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "fail\tinitialized" in result.output
+    assert "fail\tconfig_loadable" in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_doctor_supports_json_output_without_sensitive_backend_settings(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities.model_copy(update={"supports_exec": True}),
+            )
+
+    class FakeLocalBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=False,
+                reason="local unavailable",
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeLocalBackend)
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+
+    result = runner.invoke(app, ["doctor", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["project_root"] == str(tmp_path.resolve())
+    assert payload["ok"] is True
+    checks = {check["id"]: check for check in payload["checks"]}
+    assert checks["initialized"]["status"] == "pass"
+    assert checks["config_loadable"]["status"] == "pass"
+    assert checks["sandbox_safety"]["status"] == "pass"
+    assert checks["docker_binary"]["status"] == "warn"
+    paid_backend = next(
+        backend
+        for backend in checks["backend_preflight"]["details"]["backends"]
+        if backend["name"] == "paid_openai_compatible"
+    )
+    assert paid_backend["status"] == "warn"
+    assert paid_backend["reason"] == "Paid backend preflight skipped; disabled by default."
+    serialized = json.dumps(payload)
+    assert '"settings"' not in serialized
+    assert "base_url" not in serialized
+    assert "api_key" not in serialized
+    assert "api_key_env" not in serialized
+
+
 def test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 
