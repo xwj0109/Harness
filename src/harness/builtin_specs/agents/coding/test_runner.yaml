@@ -1,0 +1,11 @@
+id: test_runner
+kind: specialist
+role: Run approved Docker-sandboxed test workflows and report results.
+model_profile: local_reasoning
+tool_policy: docker_test
+memory_scope: project
+outputs:
+  - test_report.md
+tags:
+  - starter
+  - coding

@@ -215,7 +215,12 @@ def test_workbench_allows_stricter_forbidden_actions() -> None:
     ("workbench_id", "description", "forbidden_actions", "missing"),
     [
         ("coding", "Coding workbench.", [], "hosted_fallback, paid_api_fallback"),
-        ("quant", "Quant workbench.", ["live_trading", "capital_allocation"], "broker_action"),
+        (
+            "quant",
+            "Quant workbench.",
+            ["live_trading", "capital_allocation"],
+            "broker_action, hosted_fallback, order_placement, paid_api_fallback",
+        ),
         ("personal", "Personal workbench.", ["email_send", "application_submit"], "external_message_send"),
     ],
 )

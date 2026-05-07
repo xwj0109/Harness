@@ -13,6 +13,7 @@ The v0.4 local daemon plan is tracked in [v0_4_local_daemon_plan.md](v0_4_local_
 The v0.4.5 execution adapter decision gate is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md).
 The v0.5 read-only execution adapter plan is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md).
 The v0.5.1 read-only hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md).
+The v0.6 Quant Workbench plan is tracked in [v0_6_quant_workbench_plan.md](v0_6_quant_workbench_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -53,6 +54,8 @@ The first v0.2 schema and registry foundations are in place:
 - v0.5 Slice 1 read-only summary lease adapter for `read_only_summary/read_only_repo_summary`.
 - Version bump to `0.5.0`.
 - v0.5.1 read-only adapter hardening tests for failure, recovery, inspection, and unsafe metadata/backend gates.
+- v0.6 Slice 1 Quant Workbench declarative foundation is implemented.
+- v0.6 Slice 1.5 packaged hierarchical built-in specs are active.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -89,9 +92,9 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is a separate decision plan, not implementation. The default options are read-only adapter hardening follow-up only if a concrete gap remains, the next adapter decision plan, or v0.6 Quant Workbench planning aligned with the master roadmap.
+The immediate next target is v0.6 Quant Workbench Slice 1.5: move built-in registry declarations into packaged hierarchical YAML under `src/harness/builtin_specs/`. This is a registry/spec/docs refactor, not a new execution adapter.
 
-Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, and active repo writes remain unauthorized.
+Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
 ## Later Work
 

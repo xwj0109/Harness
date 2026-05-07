@@ -2060,7 +2060,20 @@ def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path)
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.spec_registry/v1"
     assert {"local_reasoning", "codex_supervised"} <= set(payload["model_profiles"])
-    assert {"repo_inspector", "code_editor", "test_runner", "quant_researcher", "job_researcher"} <= set(
+    quant_agents = {
+        "quant_orchestrator",
+        "quant_researcher",
+        "commodities_researcher",
+        "equities_researcher",
+        "volatility_researcher",
+        "data_engineer",
+        "backtest_engineer",
+        "low_level_optimizer",
+        "risk_reviewer",
+        "leakage_reviewer",
+        "statistical_validity_reviewer",
+    }
+    assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | quant_agents) <= set(
         payload["agents"]
     )
     assert {"coding", "quant", "personal"} <= set(payload["workbenches"])
@@ -2095,6 +2108,56 @@ def test_cli_specs_workbench_supports_json_output() -> None:
     assert payload["workbench"]["id"] == "coding"
     assert payload["workbench"]["default_model_profile"] == "local_reasoning"
     assert {"repo_inspector", "code_editor", "test_runner"} <= set(payload["workbench"]["allowed_agents"])
+
+
+def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runtime_leaks(tmp_path) -> None:
+    quant_agents = {
+        "quant_orchestrator",
+        "quant_researcher",
+        "commodities_researcher",
+        "equities_researcher",
+        "volatility_researcher",
+        "data_engineer",
+        "backtest_engineer",
+        "low_level_optimizer",
+        "risk_reviewer",
+        "leakage_reviewer",
+        "statistical_validity_reviewer",
+    }
+    workbench_result = runner.invoke(app, ["specs", "workbench", "quant", "--output", "json"])
+
+    assert workbench_result.exit_code == 0
+    workbench_payload = json.loads(workbench_result.output)
+    assert workbench_payload["schema_version"] == "harness.workbench_spec/v1"
+    workbench = workbench_payload["workbench"]
+    assert workbench["id"] == "quant"
+    assert quant_agents <= set(workbench["allowed_agents"])
+    assert {
+        "live_trading",
+        "broker_action",
+        "capital_allocation",
+        "order_placement",
+        "paid_api_fallback",
+        "hosted_fallback",
+    } <= set(workbench["forbidden_actions"])
+
+    for agent_id in sorted(quant_agents):
+        agent_result = runner.invoke(app, ["specs", "agent", agent_id, "--output", "json"])
+        assert agent_result.exit_code == 0
+        agent_payload = json.loads(agent_result.output)
+        assert agent_payload["schema_version"] == "harness.agent_spec/v1"
+        agent = agent_payload["agent"]
+        assert agent["id"] == agent_id
+        assert agent["model_profile"] == "local_reasoning"
+        assert agent["tool_policy"] == "read_only"
+        assert agent["memory_scope"] == "quant"
+
+    serialized = workbench_result.output
+    assert "settings" not in serialized
+    assert "base_url" not in serialized
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert not (tmp_path / ".harness").exists()
 
 
 def test_cli_specs_default_outputs_remain_text() -> None:

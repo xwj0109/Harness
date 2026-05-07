@@ -65,9 +65,13 @@ def test_builtin_agent_workbench_and_backend_policy_resolution() -> None:
     registry = builtin_spec_registry()
     agent_policy = resolve_agent_effective_policy(registry, "repo_inspector")
     workbench_policy = resolve_workbench_effective_policy(registry, "coding")
+    quant_policy = resolve_workbench_effective_policy(registry, "quant")
     backend_policy = resolve_backend_effective_policy(default_config().backends["paid_openai_compatible"].to_descriptor())
 
     assert agent_policy.levels["active_repo_write"] == PolicyLevel.FORBIDDEN
     assert workbench_policy.levels["hosted_boundary"] == PolicyLevel.APPROVAL_REQUIRED
+    assert quant_policy.levels["external_network"] == PolicyLevel.FORBIDDEN
+    assert quant_policy.levels["paid_provider"] == PolicyLevel.FORBIDDEN
+    assert quant_policy.levels["hosted_boundary"] == PolicyLevel.APPROVAL_REQUIRED
     assert backend_policy.levels["paid_provider"] == PolicyLevel.FORBIDDEN
     assert backend_policy.levels["external_network"] == PolicyLevel.FORBIDDEN

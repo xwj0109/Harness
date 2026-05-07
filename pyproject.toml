@@ -27,6 +27,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "harness.memory" = ["schema.sql"]
+"harness" = [
+  "builtin_specs/*.yaml",
+  "builtin_specs/agents/**/*.yaml",
+  "builtin_specs/workbenches/*.yaml",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

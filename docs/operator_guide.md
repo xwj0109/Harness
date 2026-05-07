@@ -181,6 +181,8 @@ harness specs agent repo_inspector
 harness specs agent repo_inspector --output json
 harness specs workbench coding
 harness specs workbench coding --output json
+harness specs workbench quant --output json
+harness specs agent quant_orchestrator --output json
 ```
 
 Built-in inspection reads only the in-memory built-in registry. JSON output is schema-versioned:
@@ -188,6 +190,33 @@ Built-in inspection reads only the in-memory built-in registry. JSON output is s
 - `harness.spec_registry/v1`
 - `harness.agent_spec/v1`
 - `harness.workbench_spec/v1`
+
+## v0.6 Quant Workbench Declarations
+
+The v0.6 Quant Workbench is declarative spec metadata. It makes quant roles inspectable, but it does not create tasks, schedule workflows, execute agents, run Docker, call backends, connect to brokers, place orders, or trade.
+
+Inspect the quant workbench and built-in quant agents:
+
+```bash
+harness specs workbench quant --output json
+harness specs agent quant_orchestrator --output json
+harness specs agent quant_researcher --output json
+harness specs agent commodities_researcher --output json
+harness specs agent equities_researcher --output json
+harness specs agent volatility_researcher --output json
+harness specs agent data_engineer --output json
+harness specs agent backtest_engineer --output json
+harness specs agent low_level_optimizer --output json
+harness specs agent risk_reviewer --output json
+harness specs agent leakage_reviewer --output json
+harness specs agent statistical_validity_reviewer --output json
+```
+
+The initial quant workflow templates are planning targets only: paper summary, strategy hypothesis, data checklist, backtest specification, risk review, leakage review, statistical-validity review, and local evidence comparison. A later decision-complete plan must authorize any executable quant workflow.
+
+The built-in `quant` workbench forbids live trading, broker actions, capital allocation, order placement, hosted fallback, and paid fallback. It also inherits the spec inspection safety boundary: no secret reads, no backend settings output, no environment inspection, and no `.harness/` state access.
+
+Built-in specs are packaged as repo-tracked YAML files under `src/harness/builtin_specs/` and loaded through the typed registry. The folder layout mirrors the roadmap workbench tree for maintainability, but it is not runtime auto-discovery and it does not add inheritance behavior. Custom operator bundles remain explicit-path only through `harness specs validate/export/diff/preview`.
 
 ## Read-Only Custom Spec Validation
 

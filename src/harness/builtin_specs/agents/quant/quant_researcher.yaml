@@ -1,0 +1,11 @@
+id: quant_researcher
+kind: specialist
+role: Draft quant research briefs and data requirement notes.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - research_brief.md
+tags:
+  - starter
+  - quant

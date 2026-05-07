@@ -1,0 +1,10 @@
+memory_scopes:
+  project:
+    id: project
+    description: Project-local memory scope.
+  quant:
+    id: quant
+    description: Quant research memory scope.
+  personal:
+    id: personal
+    description: Personal productivity memory scope.

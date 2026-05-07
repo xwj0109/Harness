@@ -1,0 +1,11 @@
+id: code_editor
+kind: specialist
+role: Prepare code edits in controlled isolated workflows.
+model_profile: codex_supervised
+tool_policy: isolated_code_edit
+memory_scope: project
+outputs:
+  - patch_summary.md
+tags:
+  - starter
+  - coding

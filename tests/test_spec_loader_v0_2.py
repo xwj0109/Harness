@@ -316,7 +316,10 @@ def test_quant_workbench_missing_required_forbidden_action_fails_through_registr
 
     assert result["schema_version"] == "harness.spec_validation/v1"
     assert result["ok"] is False
-    assert "Workbench quant forbidden_actions missing required actions: broker_action" in result["errors"][0]
+    assert (
+        "Workbench quant forbidden_actions missing required actions: "
+        "broker_action, hosted_fallback, order_placement, paid_api_fallback"
+    ) in result["errors"][0]
 
 
 def test_personal_workbench_missing_required_forbidden_action_fails_through_registry_validation(tmp_path) -> None:

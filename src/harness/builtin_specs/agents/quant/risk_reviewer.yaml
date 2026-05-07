@@ -1,0 +1,12 @@
+id: risk_reviewer
+kind: reviewer
+role: Review quant hypotheses for risk, operational limits, and unsafe trading assumptions.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - risk_review.md
+tags:
+  - starter
+  - quant
+  - review

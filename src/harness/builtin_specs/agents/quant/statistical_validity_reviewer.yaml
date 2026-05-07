@@ -1,0 +1,12 @@
+id: statistical_validity_reviewer
+kind: reviewer
+role: Review quant research evidence for statistical validity and overfitting risks.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - statistical_validity_review.md
+tags:
+  - starter
+  - quant
+  - review

@@ -1,0 +1,9 @@
+id: personal
+description: Personal productivity workbench for drafts and research only.
+allowed_agents:
+  - job_researcher
+default_model_profile: local_reasoning
+forbidden_actions:
+  - email_send
+  - application_submit
+  - external_message_send

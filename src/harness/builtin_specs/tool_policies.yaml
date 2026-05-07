@@ -1,0 +1,22 @@
+tool_policies:
+  read_only:
+    tools:
+      repo_read: allowed
+      artifact_read: allowed
+    active_repo_write: forbidden
+    hosted_boundary: approval_required
+  isolated_code_edit:
+    tools:
+      artifact_read: allowed
+      artifact_write: allowed
+      isolated_edit: allowed
+      active_repo_apply: approval_required
+    active_repo_write: approval_required
+    hosted_boundary: approval_required
+  docker_test:
+    tools:
+      artifact_read: allowed
+      artifact_write: allowed
+      docker_tests: approval_required
+    active_repo_write: forbidden
+    hosted_boundary: forbidden

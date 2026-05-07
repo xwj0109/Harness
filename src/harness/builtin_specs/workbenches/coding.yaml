@@ -1,0 +1,10 @@
+id: coding
+description: Local-first coding workbench.
+allowed_agents:
+  - repo_inspector
+  - code_editor
+  - test_runner
+default_model_profile: local_reasoning
+forbidden_actions:
+  - paid_api_fallback
+  - hosted_fallback

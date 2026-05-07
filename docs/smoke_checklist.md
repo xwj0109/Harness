@@ -23,6 +23,9 @@ Built-in inspection:
 harness specs --output json
 harness specs agent repo_inspector --output json
 harness specs workbench coding --output json
+harness specs workbench quant --output json
+harness specs agent quant_orchestrator --output json
+harness specs agent statistical_validity_reviewer --output json
 ```
 
 Create a temporary valid custom bundle outside `.harness/`:
@@ -82,6 +85,13 @@ Expected safety properties:
 - Specs commands do not read or write `.harness/`.
 - Custom bundles are explicit-path only and are not persisted.
 - JSON output uses stable `schema_version` wrappers.
+
+v0.6 Quant Workbench expectations:
+
+- `harness specs workbench quant --output json` lists the built-in quant agent set.
+- Quant specs are declarations only; they do not create tasks, schedule workflows, execute agents, run Docker, call backends, connect to brokers, place orders, or trade.
+- The `quant` workbench forbids live trading, broker actions, capital allocation, order placement, hosted fallback, and paid fallback.
+- Built-in specs are packaged YAML loaded through the typed registry; there is no runtime folder auto-discovery outside the repo-packaged built-ins.
 
 ## Verify Manual v0.3 Task Queue
 

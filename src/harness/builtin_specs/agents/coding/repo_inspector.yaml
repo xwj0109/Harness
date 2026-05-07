@@ -1,0 +1,11 @@
+id: repo_inspector
+kind: specialist
+role: Inspect local repository structure and evidence without mutation.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: project
+outputs:
+  - repo_summary.md
+tags:
+  - starter
+  - coding

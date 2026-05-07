@@ -1,0 +1,23 @@
+id: quant
+description: Quant research workbench with no trading or broker actions.
+allowed_agents:
+  - quant_orchestrator
+  - quant_researcher
+  - commodities_researcher
+  - equities_researcher
+  - volatility_researcher
+  - data_engineer
+  - backtest_engineer
+  - low_level_optimizer
+  - risk_reviewer
+  - leakage_reviewer
+  - statistical_validity_reviewer
+  - repo_inspector
+default_model_profile: local_reasoning
+forbidden_actions:
+  - live_trading
+  - broker_action
+  - capital_allocation
+  - order_placement
+  - paid_api_fallback
+  - hosted_fallback

@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+from pathlib import Path
+from typing import Any
+
+import yaml
 from pydantic import BaseModel, Field, model_validator
+from pydantic import ValidationError
 
 from harness.specs import (
-    AgentKind,
     AgentSpec,
     MemoryScope,
     ModelProfile,
-    ModelProfileKind,
-    ToolPermission,
     ToolPolicy,
     WorkbenchSpec,
 )
+
+
+BUILTIN_SPECS_DIR = Path(__file__).with_name("builtin_specs")
+BUILTIN_MAPPING_FILES = {
+    "model_profiles": ("model_profiles.yaml", ModelProfile),
+    "tool_policies": ("tool_policies.yaml", ToolPolicy),
+    "memory_scopes": ("memory_scopes.yaml", MemoryScope),
+}
 
 
 class SpecRegistry(BaseModel):
@@ -73,135 +83,96 @@ def _validate_mapping_ids(kind: str, mapping: dict[str, object]) -> None:
 
 
 def builtin_spec_registry() -> SpecRegistry:
-    model_profiles = {
-        "local_reasoning": ModelProfile(
-            id="local_reasoning",
-            kind=ModelProfileKind.LOCAL,
-            backend="local_openai_compatible",
-            description="Local model profile for private reasoning tasks.",
-            default=True,
-        ),
-        "codex_supervised": ModelProfile(
-            id="codex_supervised",
-            kind=ModelProfileKind.EXTERNAL_AGENT,
-            backend="codex_cli",
-            description="Supervised Codex CLI profile for approved isolated coding work.",
-            constraints=["supervised_external_agent"],
-        ),
+    return load_packaged_spec_registry()
+
+
+def load_packaged_spec_registry(root: Path = BUILTIN_SPECS_DIR) -> SpecRegistry:
+    spec_root = root.resolve()
+    registry_data: dict[str, dict[str, Any]] = {
+        "model_profiles": {},
+        "tool_policies": {},
+        "memory_scopes": {},
+        "agents": {},
+        "workbenches": {},
     }
-    tool_policies = {
-        "read_only": ToolPolicy(
-            tools={
-                "repo_read": ToolPermission.ALLOWED,
-                "artifact_read": ToolPermission.ALLOWED,
-            },
-            active_repo_write=ToolPermission.FORBIDDEN,
-            hosted_boundary=ToolPermission.APPROVAL_REQUIRED,
-        ),
-        "isolated_code_edit": ToolPolicy(
-            tools={
-                "artifact_read": ToolPermission.ALLOWED,
-                "artifact_write": ToolPermission.ALLOWED,
-                "isolated_edit": ToolPermission.ALLOWED,
-                "active_repo_apply": ToolPermission.APPROVAL_REQUIRED,
-            },
-            active_repo_write=ToolPermission.APPROVAL_REQUIRED,
-            hosted_boundary=ToolPermission.APPROVAL_REQUIRED,
-        ),
-        "docker_test": ToolPolicy(
-            tools={
-                "artifact_read": ToolPermission.ALLOWED,
-                "artifact_write": ToolPermission.ALLOWED,
-                "docker_tests": ToolPermission.APPROVAL_REQUIRED,
-            },
-            active_repo_write=ToolPermission.FORBIDDEN,
-            hosted_boundary=ToolPermission.FORBIDDEN,
-        ),
-    }
-    memory_scopes = {
-        "project": MemoryScope(id="project", description="Project-local memory scope."),
-        "quant": MemoryScope(id="quant", description="Quant research memory scope."),
-        "personal": MemoryScope(id="personal", description="Personal productivity memory scope."),
-    }
-    agents = {
-        "repo_inspector": AgentSpec(
-            id="repo_inspector",
-            kind=AgentKind.SPECIALIST,
-            role="Inspect local repository structure and evidence without mutation.",
-            model_profile="local_reasoning",
-            tool_policy="read_only",
-            memory_scope="project",
-            outputs=["repo_summary.md"],
-            tags=["starter", "coding"],
-        ),
-        "code_editor": AgentSpec(
-            id="code_editor",
-            kind=AgentKind.SPECIALIST,
-            role="Prepare code edits in controlled isolated workflows.",
-            model_profile="codex_supervised",
-            tool_policy="isolated_code_edit",
-            memory_scope="project",
-            outputs=["patch_summary.md"],
-            tags=["starter", "coding"],
-        ),
-        "test_runner": AgentSpec(
-            id="test_runner",
-            kind=AgentKind.SPECIALIST,
-            role="Run approved Docker-sandboxed test workflows and report results.",
-            model_profile="local_reasoning",
-            tool_policy="docker_test",
-            memory_scope="project",
-            outputs=["test_report.md"],
-            tags=["starter", "coding"],
-        ),
-        "quant_researcher": AgentSpec(
-            id="quant_researcher",
-            kind=AgentKind.SPECIALIST,
-            role="Draft quant research briefs and data requirement notes.",
-            model_profile="local_reasoning",
-            tool_policy="read_only",
-            memory_scope="quant",
-            outputs=["research_brief.md"],
-            tags=["starter", "quant"],
-        ),
-        "job_researcher": AgentSpec(
-            id="job_researcher",
-            kind=AgentKind.SPECIALIST,
-            role="Draft job research notes without sending applications or messages.",
-            model_profile="local_reasoning",
-            tool_policy="read_only",
-            memory_scope="personal",
-            outputs=["job_research.md"],
-            tags=["starter", "personal"],
-        ),
-    }
-    workbenches = {
-        "coding": WorkbenchSpec(
-            id="coding",
-            description="Local-first coding workbench.",
-            allowed_agents=["repo_inspector", "code_editor", "test_runner"],
-            default_model_profile="local_reasoning",
-            forbidden_actions=["paid_api_fallback", "hosted_fallback"],
-        ),
-        "quant": WorkbenchSpec(
-            id="quant",
-            description="Quant research workbench with no trading or broker actions.",
-            allowed_agents=["quant_researcher", "repo_inspector"],
-            default_model_profile="local_reasoning",
-            forbidden_actions=["live_trading", "broker_action", "capital_allocation"],
-        ),
-        "personal": WorkbenchSpec(
-            id="personal",
-            description="Personal productivity workbench for drafts and research only.",
-            allowed_agents=["job_researcher"],
-            default_model_profile="local_reasoning",
-            forbidden_actions=["email_send", "application_submit", "external_message_send"],
-        ),
-    }
-    return SpecRegistry(
-        model_profiles=model_profiles,
-        tool_policies=tool_policies,
-        memory_scopes=memory_scopes,
-        agents=agents,
-        workbenches=workbenches,
-    )
+    for section, (filename, _model) in BUILTIN_MAPPING_FILES.items():
+        registry_data[section] = _load_mapping_file(spec_root / filename, section=section, root=spec_root)
+    registry_data["agents"] = _load_spec_tree(spec_root / "agents", section="agents")
+    registry_data["workbenches"] = _load_spec_tree(spec_root / "workbenches", section="workbenches")
+    try:
+        return SpecRegistry.model_validate(registry_data)
+    except ValidationError as exc:
+        raise ValueError(f"Packaged built-in specs are invalid: {exc}") from exc
+
+
+def _load_mapping_file(path: Path, *, section: str, root: Path) -> dict[str, Any]:
+    data = _load_yaml_mapping(path, root=root)
+    values = data.get(section, data)
+    if not isinstance(values, dict):
+        raise ValueError(f"Packaged built-in spec section must be a mapping: {section}")
+    if section == "tool_policies":
+        return {key: _validate_mapping_value(key, value, section=section, source=path) for key, value in values.items()}
+    return _collect_id_mapping(values.values(), section=section, source=path)
+
+
+def _load_spec_tree(root: Path, *, section: str) -> dict[str, Any]:
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Packaged built-in spec directory is missing: {root}")
+    collected: dict[str, Any] = {}
+    for path in sorted(root.rglob("*.yaml")):
+        _ensure_packaged_path(path, root)
+        data = _load_yaml_mapping(path, root=root)
+        if path.name == "group.yaml" and "id" not in data:
+            continue
+        for spec_id, spec_data in _collect_id_mapping([data], section=section, source=path).items():
+            if spec_id in collected:
+                raise ValueError(f"Duplicate packaged built-in {section} id: {spec_id}")
+            collected[spec_id] = spec_data
+    return collected
+
+
+def _collect_id_mapping(items, *, section: str, source: Path) -> dict[str, Any]:
+    collected: dict[str, Any] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"Packaged built-in spec entry must be a mapping in {source}")
+        spec_id = item.get("id")
+        if not isinstance(spec_id, str) or not spec_id.strip():
+            raise ValueError(f"Packaged built-in {section} entry missing id in {source}")
+        if spec_id in collected:
+            raise ValueError(f"Duplicate packaged built-in {section} id: {spec_id}")
+        collected[spec_id] = item
+    return collected
+
+
+def _validate_mapping_value(key: str, value: Any, *, section: str, source: Path) -> Any:
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(f"Packaged built-in {section} mapping key must be non-empty in {source}")
+    if not isinstance(value, dict):
+        raise ValueError(f"Packaged built-in {section} entry must be a mapping in {source}")
+    return value
+
+
+def _load_yaml_mapping(path: Path, *, root: Path) -> dict[str, Any]:
+    _ensure_packaged_path(path, root)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(raw)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"Packaged built-in spec could not be loaded: {path}") from exc
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Packaged built-in spec must be a mapping: {path}")
+    return data
+
+
+def _ensure_packaged_path(path: Path, root: Path) -> None:
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    try:
+        resolved_path.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"Packaged built-in spec path is outside the built-in specs directory: {path}") from exc
+    if resolved_path.suffix.lower() not in {".yaml", ".yml"}:
+        raise ValueError(f"Packaged built-in spec has unsupported extension: {path}")

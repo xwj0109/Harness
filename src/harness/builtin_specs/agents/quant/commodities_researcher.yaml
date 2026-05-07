@@ -1,0 +1,12 @@
+id: commodities_researcher
+kind: specialist
+role: Draft commodities market research notes and hypothesis context without trading actions.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - commodities_research_note.md
+tags:
+  - starter
+  - quant
+  - commodities

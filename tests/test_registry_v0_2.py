@@ -1,7 +1,9 @@
+import shutil
+
 import pytest
 from pydantic import ValidationError
 
-from harness.registry import SpecRegistry, builtin_spec_registry
+from harness.registry import BUILTIN_SPECS_DIR, SpecRegistry, builtin_spec_registry, load_packaged_spec_registry
 from harness.specs import (
     AgentKind,
     AgentSpec,
@@ -15,12 +17,35 @@ from harness.specs import (
     WorkbenchSpec,
 )
 
+QUANT_AGENT_IDS = {
+    "quant_orchestrator",
+    "quant_researcher",
+    "commodities_researcher",
+    "equities_researcher",
+    "volatility_researcher",
+    "data_engineer",
+    "backtest_engineer",
+    "low_level_optimizer",
+    "risk_reviewer",
+    "leakage_reviewer",
+    "statistical_validity_reviewer",
+}
+
+QUANT_FORBIDDEN_ACTIONS = {
+    "live_trading",
+    "broker_action",
+    "capital_allocation",
+    "order_placement",
+    "paid_api_fallback",
+    "hosted_fallback",
+}
+
 
 def test_builtin_spec_registry_contains_starter_specs() -> None:
     registry = builtin_spec_registry()
 
     assert {"local_reasoning", "codex_supervised"} <= set(registry.model_profiles)
-    assert {"repo_inspector", "code_editor", "test_runner", "quant_researcher", "job_researcher"} <= set(
+    assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | QUANT_AGENT_IDS) <= set(
         registry.agents
     )
     assert {"coding", "quant", "personal"} <= set(registry.workbenches)
@@ -57,6 +82,71 @@ def test_builtin_registry_preserves_safety_defaults() -> None:
     assert registry.tool_policies["read_only"].active_repo_write == ToolPermission.FORBIDDEN
     for scope in registry.memory_scopes.values():
         assert HARD_FORBIDDEN_PATHS <= set(scope.forbidden_paths)
+
+
+def test_builtin_quant_workbench_contains_v0_6_agent_set_with_safety_boundaries() -> None:
+    registry = builtin_spec_registry()
+    workbench = registry.get_workbench("quant")
+
+    assert QUANT_AGENT_IDS <= set(workbench.allowed_agents)
+    assert QUANT_FORBIDDEN_ACTIONS <= set(workbench.forbidden_actions)
+    for agent_id in QUANT_AGENT_IDS:
+        agent = registry.get_agent(agent_id)
+        policy = registry.tool_policies[agent.tool_policy]
+        assert agent.model_profile == "local_reasoning"
+        assert agent.memory_scope == "quant"
+        assert "quant" in agent.tags
+        assert policy.network == ToolPermission.FORBIDDEN
+        assert policy.active_repo_write != ToolPermission.ALLOWED
+        assert policy.hosted_boundary != ToolPermission.ALLOWED
+
+
+def test_builtin_registry_loads_from_packaged_hierarchical_yaml() -> None:
+    registry = load_packaged_spec_registry()
+
+    assert registry.get_agent("quant_orchestrator").memory_scope == "quant"
+    assert registry.get_agent("statistical_validity_reviewer").kind == AgentKind.REVIEWER
+    assert QUANT_AGENT_IDS <= set(registry.get_workbench("quant").allowed_agents)
+
+
+def test_packaged_registry_rejects_duplicate_agent_ids(tmp_path) -> None:
+    root = tmp_path / "builtin_specs"
+    shutil.copytree(BUILTIN_SPECS_DIR, root)
+    duplicate = root / "agents" / "quant" / "duplicate_quant_researcher.yaml"
+    duplicate.write_text(
+        """
+id: quant_researcher
+kind: specialist
+role: Duplicate quant researcher.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate packaged built-in agents id: quant_researcher"):
+        load_packaged_spec_registry(root)
+
+
+def test_packaged_registry_rejects_malformed_agent_specs(tmp_path) -> None:
+    root = tmp_path / "builtin_specs"
+    shutil.copytree(BUILTIN_SPECS_DIR, root)
+    malformed = root / "agents" / "quant" / "malformed.yaml"
+    malformed.write_text(
+        """
+id: malformed_quant_agent
+kind: specialist
+role: Missing references.
+model_profile: missing_profile
+tool_policy: read_only
+memory_scope: quant
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Packaged built-in specs are invalid"):
+        load_packaged_spec_registry(root)
 
 
 def test_builtin_lookup_helpers_return_specs() -> None:

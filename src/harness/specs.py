@@ -37,7 +37,16 @@ FORBIDDEN_MODEL_BACKEND_TERMS = ("openai", "api", "paid", "hosted")
 FORBIDDEN_MODEL_CONSTRAINT_TERMS = ("openai_api", "paid", "hosted", "fallback", "raw_model_provider")
 REQUIRED_WORKBENCH_FORBIDDEN_ACTIONS = {
     "coding": frozenset({"paid_api_fallback", "hosted_fallback"}),
-    "quant": frozenset({"live_trading", "broker_action", "capital_allocation"}),
+    "quant": frozenset(
+        {
+            "live_trading",
+            "broker_action",
+            "capital_allocation",
+            "order_placement",
+            "paid_api_fallback",
+            "hosted_fallback",
+        }
+    ),
     "personal": frozenset({"email_send", "application_submit", "external_message_send"}),
 }
 

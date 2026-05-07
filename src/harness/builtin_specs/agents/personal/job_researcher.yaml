@@ -1,0 +1,11 @@
+id: job_researcher
+kind: specialist
+role: Draft job research notes without sending applications or messages.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: personal
+outputs:
+  - job_research.md
+tags:
+  - starter
+  - personal

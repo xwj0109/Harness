@@ -1,0 +1,12 @@
+id: backtest_engineer
+kind: specialist
+role: Draft backtest specifications and implementation plans without executing tests or edits.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - backtest_spec.md
+tags:
+  - starter
+  - quant
+  - backtest

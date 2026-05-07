@@ -1,0 +1,12 @@
+id: equities_researcher
+kind: specialist
+role: Draft equities research notes and signal context without trading actions.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - equities_research_note.md
+tags:
+  - starter
+  - quant
+  - equities

@@ -1,0 +1,12 @@
+id: leakage_reviewer
+kind: reviewer
+role: Review strategy and data plans for lookahead, survivorship, and leakage risks.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - leakage_review.md
+tags:
+  - starter
+  - quant
+  - review

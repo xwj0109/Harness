@@ -1,0 +1,12 @@
+id: data_engineer
+kind: specialist
+role: Draft local data requirement checklists and dataset validation plans.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - data_requirements.md
+tags:
+  - starter
+  - quant
+  - data

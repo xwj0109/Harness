@@ -1,0 +1,14 @@
+model_profiles:
+  local_reasoning:
+    id: local_reasoning
+    kind: local
+    backend: local_openai_compatible
+    description: Local model profile for private reasoning tasks.
+    default: true
+  codex_supervised:
+    id: codex_supervised
+    kind: external_agent
+    backend: codex_cli
+    description: Supervised Codex CLI profile for approved isolated coding work.
+    constraints:
+      - supervised_external_agent

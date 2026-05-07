@@ -309,7 +309,7 @@ def _workbench_forbidden_levels(forbidden_actions: list[str]) -> dict[str, Polic
         if action in {"paid_api_fallback", "hosted_fallback"}:
             levels["paid_provider"] = PolicyLevel.FORBIDDEN
             levels["hosted_boundary"] = PolicyLevel.APPROVAL_REQUIRED
-        elif action in {"live_trading", "broker_action", "capital_allocation"}:
+        elif action in {"live_trading", "broker_action", "capital_allocation", "order_placement"}:
             levels["external_network"] = PolicyLevel.FORBIDDEN
         elif action in {"email_send", "application_submit", "external_message_send"}:
             levels["external_network"] = PolicyLevel.FORBIDDEN
