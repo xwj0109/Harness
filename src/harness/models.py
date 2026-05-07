@@ -45,12 +45,48 @@ class RunMode(str, Enum):
 
 
 class TaskStatus(str, Enum):
-    QUEUED = "queued"
+    CREATED = "created"
+    READY = "ready"
     BLOCKED = "blocked"
+    WAITING_APPROVAL = "waiting_approval"
+    LEASED = "leased"
     RUNNING = "running"
-    COMPLETED = "completed"
+    SUCCEEDED = "succeeded"
     FAILED = "failed"
-    CANCELED = "canceled"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "TaskStatus | None":
+        if isinstance(value, str):
+            legacy = {
+                "queued": cls.READY,
+                "completed": cls.SUCCEEDED,
+                "canceled": cls.CANCELLED,
+            }
+            return legacy.get(value)
+        return None
+
+
+class ObjectiveStatus(str, Enum):
+    CREATED = "created"
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class TaskDependencyType(str, Enum):
+    SUCCESS = "success"
+    MANUAL = "manual"
+    APPROVAL = "approval"
+    ARTIFACT = "artifact"
+
+
+class TaskLeaseStatus(str, Enum):
+    ACTIVE = "active"
+    RELEASED = "released"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
 
 
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
@@ -154,12 +190,77 @@ class TaskRecord(BaseModel):
     created_at: datetime
     updated_at: datetime
     priority: int = 0
+    objective_id: str | None = None
     workbench_id: str | None = None
     agent_id: str | None = None
     spec_source_kind: str | None = None
     spec_source_path: Path | None = None
     depends_on: list[str] = Field(default_factory=list)
+    idempotency_key: str | None = None
+    required_approvals: list[str] = Field(default_factory=list)
+    approval_state: str | None = None
     run_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ObjectiveRecord(BaseModel):
+    id: str
+    title: str
+    description: str = ""
+    status: ObjectiveStatus
+    project_root: Path
+    created_at: datetime
+    updated_at: datetime
+    priority: int = 0
+    workbench_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskDependency(BaseModel):
+    id: str
+    upstream_task_id: str
+    downstream_task_id: str
+    dependency_type: TaskDependencyType = TaskDependencyType.SUCCESS
+    required_artifact_kind: str | None = None
+    created_at: datetime
+
+
+class TaskAttempt(BaseModel):
+    id: str
+    task_id: str
+    attempt_number: int
+    status: TaskStatus
+    lease_id: str | None = None
+    run_id: str | None = None
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskLease(BaseModel):
+    id: str
+    task_id: str
+    attempt_id: str | None = None
+    owner: str
+    status: TaskLeaseStatus
+    acquired_at: datetime
+    expires_at: datetime
+    heartbeat_at: datetime | None = None
+    released_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TaskTransitionRecord(BaseModel):
+    id: str
+    task_id: str
+    from_status: TaskStatus | None = None
+    to_status: TaskStatus
+    reason: str
+    actor: str
+    created_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

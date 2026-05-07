@@ -96,7 +96,7 @@ harness tasks run-next --project . --output json
 
 Expected safety properties:
 
-- `run-next` selects and marks one task `running`.
+- `run-next` selects one ready task and marks it `running`.
 - `run-next` does not create a run record or run artifact directory.
 - Task commands do not execute agents, preflight backends, run Docker, start daemons, or schedule work.
 

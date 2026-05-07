@@ -207,7 +207,8 @@ def test_cli_tasks_add_list_inspect_and_status_support_json(tmp_path) -> None:
     assert created_payload["ok"] is True
     task = created_payload["task"]
     assert task["id"].startswith("task_")
-    assert task["status"] == "queued"
+    assert task["status"] == "ready"
+    assert task["idempotency_key"].startswith("task_idem_")
     assert task["title"] == "Inspect repo"
     assert task["agent_id"] == "repo_inspector"
     assert task["workbench_id"] == "coding"
@@ -228,10 +229,10 @@ def test_cli_tasks_add_list_inspect_and_status_support_json(tmp_path) -> None:
 
     updated = runner.invoke(
         app,
-        ["tasks", "status", task["id"], "completed", "--project", str(tmp_path), "--output", "json"],
+        ["tasks", "status", task["id"], "succeeded", "--project", str(tmp_path), "--output", "json"],
     )
     assert updated.exit_code == 0
-    assert json.loads(updated.output)["task"]["status"] == "completed"
+    assert json.loads(updated.output)["task"]["status"] == "succeeded"
 
 
 def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path) -> None:
@@ -248,7 +249,7 @@ def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path
     assert payload["ok"] is True
     assert payload["selected_task"]["id"] == high.id
     assert payload["selected_task"]["status"] == "running"
-    assert store.get_task(low.id).status.value == "queued"
+    assert store.get_task(low.id).status.value == "ready"
     assert store.list_runs() == []
     assert not any((tmp_path / ".harness" / "runs").iterdir())
 

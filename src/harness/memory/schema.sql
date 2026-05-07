@@ -56,11 +56,104 @@ CREATE TABLE IF NOT EXISTS tasks (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 0,
+  objective_id TEXT,
   workbench_id TEXT,
   agent_id TEXT,
   spec_source_kind TEXT,
   spec_source_path TEXT,
   depends_on_json TEXT NOT NULL,
+  idempotency_key TEXT,
+  required_approvals_json TEXT,
+  approval_state TEXT,
   run_id TEXT,
   metadata_json TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS objectives (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  status TEXT NOT NULL,
+  project_root TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  workbench_id TEXT,
+  metadata_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+  id TEXT PRIMARY KEY,
+  upstream_task_id TEXT NOT NULL,
+  downstream_task_id TEXT NOT NULL,
+  dependency_type TEXT NOT NULL,
+  required_artifact_kind TEXT,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(upstream_task_id) REFERENCES tasks(id),
+  FOREIGN KEY(downstream_task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  attempt_number INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  lease_id TEXT,
+  run_id TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  failure_code TEXT,
+  failure_message TEXT,
+  metadata_json TEXT NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id),
+  FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_leases (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  attempt_id TEXT,
+  owner TEXT NOT NULL,
+  status TEXT NOT NULL,
+  acquired_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  heartbeat_at TEXT,
+  released_at TEXT,
+  metadata_json TEXT NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id),
+  FOREIGN KEY(attempt_id) REFERENCES task_attempts(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_transitions (
+  id TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  from_status TEXT,
+  to_status TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created
+  ON tasks(status, priority DESC, created_at ASC);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_objective_status
+  ON tasks(objective_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_downstream
+  ON task_dependencies(downstream_task_id);
+
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_upstream
+  ON task_dependencies(upstream_task_id);
+
+CREATE INDEX IF NOT EXISTS idx_task_attempts_task
+  ON task_attempts(task_id, attempt_number);
+
+CREATE INDEX IF NOT EXISTS idx_task_leases_task_status
+  ON task_leases(task_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_task_transitions_task_created
+  ON task_transitions(task_id, created_at);

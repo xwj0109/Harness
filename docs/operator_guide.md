@@ -336,7 +336,7 @@ Create and inspect tasks:
 harness tasks add --title "Inspect repository" --agent repo_inspector --workbench coding --project . --output json
 harness tasks list --project . --output json
 harness tasks inspect task_abc123def456 --project . --output json
-harness tasks status task_abc123def456 completed --project . --output json
+harness tasks status task_abc123def456 succeeded --project . --output json
 ```
 
 Task commands use stable JSON wrappers:
@@ -359,18 +359,24 @@ Select the next runnable task manually:
 harness tasks run-next --project . --output json
 ```
 
-`run-next` selects the highest-priority, oldest queued task whose dependencies are complete, marks it `running`, and returns it. If no task is runnable, it returns `ok: true` with `selected_task: null`. It does not create a run record, create run artifacts, call a backend, execute tools, or mutate repository files outside the harness SQLite database.
+`run-next` selects the highest-priority, oldest ready task whose dependencies are complete, marks it `running`, and returns it. If no task is runnable, it returns `ok: true` with `selected_task: null`. It does not create a run record, create run artifacts, call a backend, execute tools, or mutate repository files outside the harness SQLite database.
 
 Task statuses are:
 
 ```text
 queued
+ready
 blocked
+waiting_approval
+leased
 running
-completed
+succeeded
 failed
-canceled
+cancelled
+skipped
 ```
+
+Legacy stored or input task statuses are compatibility-mapped as `queued -> ready`, `completed -> succeeded`, and `canceled -> cancelled`.
 
 ## v0.3 Task Queue Safety Boundary
 

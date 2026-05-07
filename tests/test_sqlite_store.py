@@ -106,8 +106,26 @@ def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
 
     with sqlite3.connect(tmp_path / ".harness" / "harness.sqlite") as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
 
-    assert {"runs", "events", "artifacts", "backend_snapshots", "tasks"} <= tables
+    assert {
+        "runs",
+        "events",
+        "artifacts",
+        "backend_snapshots",
+        "tasks",
+        "objectives",
+        "task_dependencies",
+        "task_attempts",
+        "task_leases",
+        "task_transitions",
+    } <= tables
+    assert {
+        "objective_id",
+        "idempotency_key",
+        "required_approvals_json",
+        "approval_state",
+    } <= task_columns
     run = store.create_run(goal="test run", task_type="phase_1a_test")
     assert store.get_run(run.id).id == run.id
 
@@ -120,12 +138,74 @@ def test_store_creates_lists_filters_and_updates_tasks(tmp_path) -> None:
     high = store.create_task(title="High priority", description="Important", priority=5, workbench_id="coding")
 
     assert store.get_task(high.id).description == "Important"
+    assert store.get_task(high.id).status == TaskStatus.READY
+    assert store.get_task(high.id).idempotency_key is not None
+    assert store.get_task(high.id).idempotency_key.startswith("task_idem_")
     assert [task.id for task in store.list_tasks()] == [high.id, low.id]
+    assert [task.id for task in store.list_tasks(status="ready")] == [high.id, low.id]
     assert [task.id for task in store.list_tasks(status="queued")] == [high.id, low.id]
 
-    completed = store.update_task_status(low.id, TaskStatus.COMPLETED)
-    assert completed.status == TaskStatus.COMPLETED
+    succeeded = store.update_task_status(low.id, TaskStatus.SUCCEEDED)
+    assert succeeded.status == TaskStatus.SUCCEEDED
+    assert [task.id for task in store.list_tasks(status="ready")] == [high.id]
     assert [task.id for task in store.list_tasks(status="queued")] == [high.id]
+
+
+def test_store_normalizes_legacy_task_statuses(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    timestamp = "2026-01-01T00:00:00+00:00"
+
+    with store.connect() as conn:
+        for task_id, status in [
+            ("task_queued", "queued"),
+            ("task_completed", "completed"),
+            ("task_canceled", "canceled"),
+        ]:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                  id, title, description, status, project_root, created_at, updated_at,
+                  priority, depends_on_json, metadata_json, idempotency_key,
+                  required_approvals_json
+                ) VALUES (?, ?, '', ?, ?, ?, ?, 0, '[]', '{}', ?, '[]')
+                """,
+                (task_id, task_id, status, str(tmp_path), timestamp, timestamp, f"idem_{task_id}"),
+            )
+
+    assert store.get_task("task_queued").status == TaskStatus.READY
+    assert store.get_task("task_completed").status == TaskStatus.SUCCEEDED
+    assert store.get_task("task_canceled").status == TaskStatus.CANCELLED
+    assert [task.id for task in store.list_tasks(status="queued")] == ["task_queued"]
+    assert [task.id for task in store.list_tasks(status="completed")] == ["task_completed"]
+    assert [task.id for task in store.list_tasks(status="canceled")] == ["task_canceled"]
+
+
+def test_store_task_transitions_are_validated_and_recorded(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(title="Task")
+
+    created_transitions = store.list_task_transitions(task.id)
+    assert len(created_transitions) == 1
+    assert created_transitions[0].from_status is None
+    assert created_transitions[0].to_status == TaskStatus.READY
+    assert created_transitions[0].reason == "task_created"
+
+    updated = store.update_task_status(task.id, TaskStatus.SUCCEEDED)
+    assert updated.status == TaskStatus.SUCCEEDED
+    transitions = store.list_task_transitions(task.id)
+    assert len(transitions) == 2
+    assert transitions[1].from_status == TaskStatus.READY
+    assert transitions[1].to_status == TaskStatus.SUCCEEDED
+    assert transitions[1].reason == "status_updated"
+
+    try:
+        store.update_task_status(task.id, TaskStatus.READY)
+    except ValueError as exc:
+        assert "Invalid task transition: succeeded -> ready" in str(exc)
+    else:
+        raise AssertionError("invalid transition should raise")
 
 
 def test_store_task_errors_are_stable_for_unknown_or_invalid_status(tmp_path) -> None:
@@ -158,19 +238,19 @@ def test_store_select_next_task_uses_priority_and_dependencies(tmp_path) -> None
         depends_on=[dependency.id],
     )
     runnable = store.create_task(title="Runnable", priority=1)
-    canceled = store.create_task(title="Canceled", priority=200)
-    store.update_task_status(canceled.id, TaskStatus.CANCELED)
+    cancelled = store.create_task(title="Canceled", priority=200)
+    store.update_task_status(cancelled.id, TaskStatus.CANCELLED)
 
     selected = store.select_next_task()
 
     assert selected is not None
     assert selected.id == dependency.id
     assert selected.status == TaskStatus.RUNNING
-    assert store.get_task(blocked_by_dependency.id).status == TaskStatus.QUEUED
+    assert store.get_task(blocked_by_dependency.id).status == TaskStatus.READY
 
-    store.update_task_status(dependency.id, TaskStatus.COMPLETED)
+    store.update_task_status(dependency.id, TaskStatus.SUCCEEDED)
     selected_after_dependency = store.select_next_task()
 
     assert selected_after_dependency is not None
     assert selected_after_dependency.id == blocked_by_dependency.id
-    assert store.get_task(runnable.id).status == TaskStatus.QUEUED
+    assert store.get_task(runnable.id).status == TaskStatus.READY

@@ -21,9 +21,49 @@ from harness.models import (
     RunRecord,
     TaskRecord,
     TaskStatus,
+    TaskTransitionRecord,
     run_mode_for_task_type,
 )
 from harness.security import sanitize_for_logging
+
+LEGACY_TASK_STATUS_VALUES = {
+    "queued": TaskStatus.READY,
+    "completed": TaskStatus.SUCCEEDED,
+    "canceled": TaskStatus.CANCELLED,
+}
+
+TASK_STATUS_QUERY_ALIASES = {
+    TaskStatus.READY: ("ready", "queued"),
+    TaskStatus.SUCCEEDED: ("succeeded", "completed"),
+    TaskStatus.CANCELLED: ("cancelled", "canceled"),
+}
+
+ALLOWED_TASK_TRANSITIONS = {
+    TaskStatus.CREATED: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.WAITING_APPROVAL},
+    TaskStatus.READY: {
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.LEASED,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.SKIPPED,
+    },
+    TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.SKIPPED},
+    TaskStatus.WAITING_APPROVAL: {TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.SKIPPED},
+    TaskStatus.LEASED: {TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.RUNNING: {
+        TaskStatus.SUCCEEDED,
+        TaskStatus.FAILED,
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.CANCELLED,
+    },
+    TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.CANCELLED},
+    TaskStatus.SUCCEEDED: set(),
+    TaskStatus.CANCELLED: set(),
+    TaskStatus.SKIPPED: set(),
+}
 
 
 def now_iso() -> str:
@@ -32,6 +72,19 @@ def now_iso() -> str:
 
 def parse_dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def normalize_task_status(status: str | TaskStatus) -> TaskStatus:
+    return TaskStatus(status.value if isinstance(status, TaskStatus) else status)
+
+
+def validate_task_transition(from_status: str | TaskStatus, to_status: str | TaskStatus) -> None:
+    current = normalize_task_status(from_status)
+    next_status = normalize_task_status(to_status)
+    if current == next_status:
+        return
+    if next_status not in ALLOWED_TASK_TRANSITIONS[current]:
+        raise ValueError(f"Invalid task transition: {current.value} -> {next_status.value}")
 
 
 class SQLiteStore:
@@ -52,11 +105,43 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.executescript(schema)
             self._ensure_column(conn, "runs", "approval_id", "TEXT")
+            self._ensure_column(conn, "tasks", "objective_id", "TEXT")
+            self._ensure_column(conn, "tasks", "idempotency_key", "TEXT")
+            self._ensure_column(conn, "tasks", "required_approvals_json", "TEXT")
+            self._ensure_column(conn, "tasks", "approval_state", "TEXT")
+            self._migrate_task_rows(conn)
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _migrate_task_rows(self, conn: sqlite3.Connection) -> None:
+        timestamp = now_iso()
+        for legacy, canonical in LEGACY_TASK_STATUS_VALUES.items():
+            conn.execute("UPDATE tasks SET status = ? WHERE status = ?", (canonical.value, legacy))
+        conn.execute(
+            """
+            UPDATE tasks
+            SET idempotency_key = 'task_idem_' || lower(hex(randomblob(8)))
+            WHERE idempotency_key IS NULL OR idempotency_key = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET required_approvals_json = '[]'
+            WHERE required_approvals_json IS NULL OR required_approvals_json = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET updated_at = ?
+            WHERE updated_at IS NULL OR updated_at = ''
+            """,
+            (timestamp,),
+        )
 
     def connect(self) -> sqlite3.Connection:
         self.harness_dir.mkdir(parents=True, exist_ok=True)
@@ -152,6 +237,7 @@ class SQLiteStore:
         metadata: dict[str, Any] | None = None,
     ) -> TaskRecord:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
+        idempotency_key = f"task_idem_{uuid.uuid4().hex[:16]}"
         timestamp = now_iso()
         depends_on = depends_on or []
         metadata = metadata or {}
@@ -161,14 +247,15 @@ class SQLiteStore:
                 INSERT INTO tasks (
                   id, title, description, status, project_root, created_at, updated_at,
                   priority, workbench_id, agent_id, spec_source_kind, spec_source_path,
-                  depends_on_json, run_id, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  depends_on_json, run_id, metadata_json, idempotency_key,
+                  required_approvals_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
                     title,
                     description,
-                    TaskStatus.QUEUED.value,
+                    TaskStatus.READY.value,
                     str(self.project_root),
                     timestamp,
                     timestamp,
@@ -180,7 +267,19 @@ class SQLiteStore:
                     json.dumps(depends_on, sort_keys=True),
                     None,
                     json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+                    idempotency_key,
+                    "[]",
                 ),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task_id,
+                from_status=None,
+                to_status=TaskStatus.READY,
+                reason="task_created",
+                actor="system",
+                metadata={},
+                created_at=timestamp,
             )
         return self.get_task(task_id)
 
@@ -191,9 +290,16 @@ class SQLiteStore:
                     "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
                 ).fetchall()
             else:
+                query_status = normalize_task_status(status)
+                status_values = TASK_STATUS_QUERY_ALIASES.get(query_status, (query_status.value,))
+                placeholders = ", ".join("?" for _ in status_values)
                 rows = conn.execute(
-                    "SELECT * FROM tasks WHERE status = ? ORDER BY priority DESC, created_at ASC",
-                    (TaskStatus(status).value,),
+                    f"""
+                    SELECT * FROM tasks
+                    WHERE status IN ({placeholders})
+                    ORDER BY priority DESC, created_at ASC
+                    """,
+                    status_values,
                 ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
@@ -211,21 +317,37 @@ class SQLiteStore:
         *,
         run_id: str | None = None,
     ) -> TaskRecord:
-        next_status = TaskStatus(status)
+        next_status = normalize_task_status(status)
         if run_id is not None:
             self.get_run(run_id)
         timestamp = now_iso()
         with self.connect() as conn:
+            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            current_status = normalize_task_status(row["status"])
+            validate_task_transition(current_status, next_status)
             result = conn.execute(
                 "UPDATE tasks SET status = ?, updated_at = ?, run_id = COALESCE(?, run_id) WHERE id = ?",
                 (next_status.value, timestamp, run_id, task_id),
             )
+            if current_status != next_status:
+                self._record_task_transition(
+                    conn,
+                    task_id=task_id,
+                    from_status=current_status,
+                    to_status=next_status,
+                    reason="status_updated",
+                    actor="operator",
+                    metadata={"run_id": run_id} if run_id is not None else {},
+                    created_at=timestamp,
+                )
         if result.rowcount == 0:
             raise KeyError(f"Task not found: {task_id}")
         return self.get_task(task_id)
 
     def select_next_task(self) -> TaskRecord | None:
-        for task in self.list_tasks(status=TaskStatus.QUEUED.value):
+        for task in self.list_tasks(status=TaskStatus.READY.value):
             if self._task_dependencies_completed(task):
                 return self.update_task_status(task.id, TaskStatus.RUNNING)
         return None
@@ -236,9 +358,52 @@ class SQLiteStore:
                 dependency = self.get_task(dependency_id)
             except KeyError:
                 return False
-            if dependency.status != TaskStatus.COMPLETED:
+            if dependency.status != TaskStatus.SUCCEEDED:
                 return False
         return True
+
+    def list_task_transitions(self, task_id: str) -> list[TaskTransitionRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM task_transitions
+                WHERE task_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (task_id,),
+            ).fetchall()
+        return [self._row_to_task_transition(row) for row in rows]
+
+    def _record_task_transition(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task_id: str,
+        from_status: TaskStatus | None,
+        to_status: TaskStatus,
+        reason: str,
+        actor: str,
+        metadata: dict[str, Any],
+        created_at: str,
+    ) -> None:
+        transition_id = f"task_transition_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO task_transitions (
+              id, task_id, from_status, to_status, reason, actor, created_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                transition_id,
+                task_id,
+                from_status.value if from_status is not None else None,
+                to_status.value,
+                reason,
+                actor,
+                created_at,
+                json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+            ),
+        )
 
     def append_event(
         self,
@@ -477,16 +642,34 @@ class SQLiteStore:
             id=row["id"],
             title=row["title"],
             description=row["description"],
-            status=TaskStatus(row["status"]),
+            status=normalize_task_status(row["status"]),
             project_root=Path(row["project_root"]),
             created_at=parse_dt(row["created_at"]),
             updated_at=parse_dt(row["updated_at"]),
             priority=row["priority"],
+            objective_id=row["objective_id"] if "objective_id" in row.keys() else None,
             workbench_id=row["workbench_id"],
             agent_id=row["agent_id"],
             spec_source_kind=row["spec_source_kind"],
             spec_source_path=Path(row["spec_source_path"]) if row["spec_source_path"] else None,
             depends_on=json.loads(row["depends_on_json"]),
+            idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
+            required_approvals=json.loads(row["required_approvals_json"])
+            if "required_approvals_json" in row.keys() and row["required_approvals_json"]
+            else [],
+            approval_state=row["approval_state"] if "approval_state" in row.keys() else None,
             run_id=row["run_id"],
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_task_transition(self, row: sqlite3.Row) -> TaskTransitionRecord:
+        return TaskTransitionRecord(
+            id=row["id"],
+            task_id=row["task_id"],
+            from_status=normalize_task_status(row["from_status"]) if row["from_status"] else None,
+            to_status=normalize_task_status(row["to_status"]),
+            reason=row["reason"],
+            actor=row["actor"],
+            created_at=parse_dt(row["created_at"]),
             metadata=json.loads(row["metadata_json"]),
         )
