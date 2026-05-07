@@ -1,36 +1,50 @@
 # Agent Harness Next Steps
 
-## Immediate Phase
+## Current Phase
 
-The next phase is v0.1 hardening before v0.2 abstractions. The repository is already a safety kernel with local initialization, persistence, approvals, Codex supervision, isolated edits, Docker-sandboxed tests, path protection, and regression coverage. The next work should stabilize those foundations before introducing generic agent and workbench specifications.
+v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-## v0.1 Priorities
+The project has entered v0.2 schema and registry work. The current slice is read-only spec inspection for the built-in registry.
 
-Implement the remaining v0.1 items in this order:
+## Completed v0.2 Foundations
 
-1. Add a `RunMode` enum so run intent is explicit instead of inferred only from task type.
-2. Add a `BackendDescriptor` contract that formalizes backend metadata, capabilities, and routing-relevant behavior.
-3. Add a run-level `manifest.json` for every run so artifacts and key execution metadata have a stable per-run index.
-4. Add stable JSON/JSONL CLI output for machine consumers while preserving human-readable defaults.
-5. Add `SECURITY.md` and a formal threat model covering local/private boundaries, approvals, isolation, and forbidden paths.
-6. Add `harness doctor` to inspect local readiness without mutating project state.
-7. Add golden end-to-end tests for the core safety and artifact flows.
+The first v0.2 schema and registry foundations are in place:
 
-## Deferred Until v0.1 Is Stable
-
-Do not start v0.2 abstractions until the v0.1 hardening work is complete and tested. Deferred v0.2 items include:
-
-- `AgentSpec`.
-- `WorkbenchSpec`.
 - `ModelProfile`.
 - `ToolPolicy`.
 - `MemoryScope`.
-- Agent registry.
-- Built-in starter agents such as `repo_inspector`, `code_editor`, `test_runner`, `quant_researcher`, and `job_researcher`.
+- `AgentSpec`.
+- `WorkbenchSpec`.
+- `SpecRegistry`.
+- `builtin_spec_registry()`.
+- Built-in profiles: `local_reasoning`, `codex_supervised`.
+- Built-in agents: `repo_inspector`, `code_editor`, `test_runner`, `quant_researcher`, `job_researcher`.
+- Built-in workbenches: `coding`, `quant`, `personal`.
+
+These components are declarative and read-only. They do not load user files, write `.harness/`, create tasks, execute agents, preflight backends, or schedule work.
+
+## Immediate v0.2 Slice
+
+Add operator-facing inspection commands for the built-in registry:
+
+```bash
+harness specs
+harness specs --output json
+harness specs agent <agent_id>
+harness specs agent <agent_id> --output json
+harness specs workbench <workbench_id>
+harness specs workbench <workbench_id> --output json
+```
+
+The commands should preserve the same safety boundary: inspect built-in specs only, do not load custom files, do not read or write `.harness/`, and do not execute or preflight anything.
+
+## Later v0.2+ Work
+
+After read-only built-in spec inspection is stable, the next target should be a read-only custom spec-file validator/loader with no execution or persistence. Defer runtime routing, effective permission inheritance, task queues, schedulers, daemons, and autonomous behavior until the schema and validation surfaces are stable.
 
 ## Working Defaults
 
 - Keep changes small, typed, and tested.
-- Preserve the local/private data boundary safeguards.
+- Preserve local/private data-boundary safeguards.
 - Keep Codex modeled as a supervised external agent backend, not a raw model provider.
-- Do not add paid API fallback, hosted fallback, or OpenAI API usage.
+- Do not add paid API fallback, hosted fallback, OpenAI API usage, or automatic execution behavior.

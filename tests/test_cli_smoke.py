@@ -278,6 +278,83 @@ def test_cli_doctor_supports_json_output_without_sensitive_backend_settings(tmp_
     assert "api_key_env" not in serialized
 
 
+def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path) -> None:
+    result = runner.invoke(app, ["specs", "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.spec_registry/v1"
+    assert {"local_reasoning", "codex_supervised"} <= set(payload["model_profiles"])
+    assert {"repo_inspector", "code_editor", "test_runner", "quant_researcher", "job_researcher"} <= set(
+        payload["agents"]
+    )
+    assert {"coding", "quant", "personal"} <= set(payload["workbenches"])
+    serialized = json.dumps(payload)
+    assert "settings" not in serialized
+    assert "base_url" not in serialized
+    assert "api_key" not in serialized
+    assert "api_key_env" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_specs_agent_supports_json_output() -> None:
+    result = runner.invoke(app, ["specs", "agent", "repo_inspector", "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.agent_spec/v1"
+    assert payload["agent"]["id"] == "repo_inspector"
+    assert payload["agent"]["kind"] == "specialist"
+    assert payload["agent"]["model_profile"] == "local_reasoning"
+    assert payload["agent"]["tool_policy"] == "read_only"
+    assert payload["agent"]["memory_scope"] == "project"
+
+
+def test_cli_specs_workbench_supports_json_output() -> None:
+    result = runner.invoke(app, ["specs", "workbench", "coding", "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.workbench_spec/v1"
+    assert payload["workbench"]["id"] == "coding"
+    assert payload["workbench"]["default_model_profile"] == "local_reasoning"
+    assert {"repo_inspector", "code_editor", "test_runner"} <= set(payload["workbench"]["allowed_agents"])
+
+
+def test_cli_specs_default_outputs_remain_text() -> None:
+    registry = runner.invoke(app, ["specs"])
+    agent = runner.invoke(app, ["specs", "agent", "repo_inspector"])
+    workbench = runner.invoke(app, ["specs", "workbench", "coding"])
+
+    assert registry.exit_code == 0
+    assert not registry.output.lstrip().startswith("{")
+    assert "Built-in specs:" in registry.output
+    assert "repo_inspector" in registry.output
+    assert "coding" in registry.output
+
+    assert agent.exit_code == 0
+    assert not agent.output.lstrip().startswith("{")
+    assert "Agent: repo_inspector" in agent.output
+    assert "Kind: specialist" in agent.output
+
+    assert workbench.exit_code == 0
+    assert not workbench.output.lstrip().startswith("{")
+    assert "Workbench: coding" in workbench.output
+    assert "Allowed agents: repo_inspector, code_editor, test_runner" in workbench.output
+
+
+def test_cli_specs_missing_ids_fail_without_creating_harness_dir(tmp_path) -> None:
+    missing_agent = runner.invoke(app, ["specs", "agent", "missing_agent"])
+    missing_workbench = runner.invoke(app, ["specs", "workbench", "missing_workbench"])
+
+    assert missing_agent.exit_code != 0
+    assert "Agent not found: missing_agent" in missing_agent.output
+    assert missing_workbench.exit_code != 0
+    assert "Workbench not found: missing_workbench" in missing_workbench.output
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 

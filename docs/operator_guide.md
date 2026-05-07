@@ -170,6 +170,21 @@ Artifacts for each run include:
 - `transcript.jsonl`
 - `final_report.md`
 
+## Read-Only Built-In Spec Inspection
+
+The v0.2 spec inspection commands expose built-in declarative model profiles, tool policies, memory scopes, agents, and workbenches. They inspect the in-memory built-in registry only.
+
+```bash
+harness specs
+harness specs --output json
+harness specs agent repo_inspector
+harness specs agent repo_inspector --output json
+harness specs workbench coding
+harness specs workbench coding --output json
+```
+
+These commands do not load custom spec files, read or write `.harness/`, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.
+
 ## Model-Visible Docker `run_tests` For `simple_code_edit`
 
 `run_tests` is available only inside the local/native `simple_code_edit` model loop. It is rejected by default in protocol parsing, rejected for `read_only_repo_summary`, unavailable to Codex `repo_planning`, and not exposed to `codex_code_edit`.

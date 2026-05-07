@@ -27,6 +27,7 @@ from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
 from harness.paths import resolve_project_root
+from harness.registry import builtin_spec_registry
 from harness.runner import ReadOnlyRepoSummaryRunner
 from harness.sandbox import CommandValidationError, DockerImageManager
 from harness.test_runner import DockerTestRunner, RunTestsDecision
@@ -37,10 +38,12 @@ backends_app = typer.Typer(help="Configured backend metadata and preflight check
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
 tests_app = typer.Typer(help="Docker-sandboxed test execution.")
 tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
+specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_without_command=True)
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
+app.add_typer(specs_app, name="specs")
 tests_app.add_typer(tests_image_app, name="image")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
@@ -149,6 +152,62 @@ def doctor(project: ProjectOption = Path("."), output: OutputOption = OutputForm
             typer.echo(f"{check['status']}\t{check['id']}\t{check['message']}")
     if not result["ok"]:
         raise typer.Exit(code=1)
+
+
+@specs_app.callback()
+def specs_callback(ctx: typer.Context, output: OutputOption = OutputFormat.TEXT) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    registry = builtin_spec_registry()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.spec_registry/v1",
+                "model_profiles": _dump_spec_mapping(registry.model_profiles),
+                "tool_policies": _dump_spec_mapping(registry.tool_policies),
+                "memory_scopes": _dump_spec_mapping(registry.memory_scopes),
+                "agents": _dump_spec_mapping(registry.agents),
+                "workbenches": _dump_spec_mapping(registry.workbenches),
+            }
+        )
+        return
+    _print_spec_registry(registry)
+
+
+@specs_app.command("agent")
+def specs_agent(agent_id: str, output: OutputOption = OutputFormat.TEXT) -> None:
+    registry = builtin_spec_registry()
+    try:
+        agent = registry.get_agent(agent_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc).strip("'")) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.agent_spec/v1",
+                "agent": agent.model_dump(mode="json"),
+            }
+        )
+        return
+    _print_agent_spec(agent)
+
+
+@specs_app.command("workbench")
+def specs_workbench(workbench_id: str, output: OutputOption = OutputFormat.TEXT) -> None:
+    registry = builtin_spec_registry()
+    try:
+        workbench = registry.get_workbench(workbench_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc).strip("'")) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.workbench_spec/v1",
+                "workbench": workbench.model_dump(mode="json"),
+            }
+        )
+        return
+    _print_workbench_spec(workbench)
 
 
 @backends_app.callback()
@@ -566,6 +625,43 @@ def _print_backends(cfg) -> None:
         typer.echo("  capabilities:")
         for key, value in backend.capabilities.model_dump().items():
             typer.echo(f"    {key}: {value}")
+
+
+def _dump_spec_mapping(mapping: dict) -> dict:
+    return {key: value.model_dump(mode="json") for key, value in mapping.items()}
+
+
+def _print_spec_registry(registry) -> None:
+    typer.echo("Built-in specs:")
+    typer.echo(f"  model_profiles: {', '.join(registry.model_profiles)}")
+    typer.echo(f"  tool_policies: {', '.join(registry.tool_policies)}")
+    typer.echo(f"  memory_scopes: {', '.join(registry.memory_scopes)}")
+    typer.echo(f"  agents: {', '.join(registry.agents)}")
+    typer.echo(f"  workbenches: {', '.join(registry.workbenches)}")
+
+
+def _print_agent_spec(agent) -> None:
+    typer.echo(f"Agent: {agent.id}")
+    typer.echo(f"Kind: {agent.kind.value}")
+    typer.echo(f"Role: {agent.role}")
+    typer.echo(f"Model profile: {agent.model_profile}")
+    typer.echo(f"Tool policy: {agent.tool_policy}")
+    typer.echo(f"Memory scope: {agent.memory_scope}")
+    typer.echo(f"Parent: {agent.parent or 'none'}")
+    typer.echo(f"Outputs: {', '.join(agent.outputs) if agent.outputs else 'none'}")
+    typer.echo(f"Tags: {', '.join(agent.tags) if agent.tags else 'none'}")
+
+
+def _print_workbench_spec(workbench) -> None:
+    typer.echo(f"Workbench: {workbench.id}")
+    typer.echo(f"Description: {workbench.description}")
+    typer.echo(f"Default model profile: {workbench.default_model_profile}")
+    typer.echo(f"Allowed agents: {', '.join(workbench.allowed_agents) if workbench.allowed_agents else 'none'}")
+    typer.echo(
+        "Approval policy: "
+        f"{', '.join(f'{key}={value.value}' for key, value in workbench.approval_policy.items()) if workbench.approval_policy else 'none'}"
+    )
+    typer.echo(f"Forbidden actions: {', '.join(workbench.forbidden_actions) if workbench.forbidden_actions else 'none'}")
 
 
 def _emit_json(payload) -> None:
