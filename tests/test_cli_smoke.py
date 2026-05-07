@@ -358,6 +358,164 @@ def test_cli_tasks_add_list_inspect_and_status_support_json(tmp_path) -> None:
     assert json.loads(updated.output)["task"]["status"] == "succeeded"
 
 
+def test_cli_tasks_support_objective_dependencies_approvals_and_graph(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    objective_result = runner.invoke(
+        app,
+        [
+            "objectives",
+            "add",
+            "--title",
+            "Queue objective",
+            "--workbench",
+            "coding",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert objective_result.exit_code == 0
+    objective_id = json.loads(objective_result.output)["objective"]["id"]
+
+    upstream_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Upstream",
+            "--objective",
+            objective_id,
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert upstream_result.exit_code == 0
+    upstream_id = json.loads(upstream_result.output)["task"]["id"]
+
+    downstream_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Downstream",
+            "--objective",
+            objective_id,
+            "--depends-on",
+            upstream_id,
+            "--requires-approval",
+            "hosted_provider",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert downstream_result.exit_code == 0
+    downstream = json.loads(downstream_result.output)["task"]
+    assert downstream["objective_id"] == objective_id
+    assert downstream["status"] == "waiting_approval"
+    assert downstream["depends_on"] == [upstream_id]
+    assert downstream["required_approvals"] == ["hosted_provider"]
+
+    listed = runner.invoke(
+        app,
+        ["tasks", "list", "--objective", objective_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert listed.exit_code == 0
+    listed_tasks = json.loads(listed.output)["tasks"]
+    assert {task["id"] for task in listed_tasks} == {upstream_id, downstream["id"]}
+
+    graph = runner.invoke(
+        app,
+        ["tasks", "graph", "--objective", objective_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert graph.exit_code == 0
+    graph_payload = json.loads(graph.output)
+    assert graph_payload["schema_version"] == "harness.task_graph/v1"
+    assert graph_payload["ok"] is True
+    assert [objective["id"] for objective in graph_payload["objectives"]] == [objective_id]
+    assert graph_payload["dependencies"][0]["upstream_task_id"] == upstream_id
+    assert graph_payload["dependencies"][0]["downstream_task_id"] == downstream["id"]
+    assert graph_payload["blocked_reasons"][downstream["id"]][0] == {
+        "kind": "unsatisfied_dependency",
+        "task_id": upstream_id,
+        "status": "ready",
+    }
+
+
+def test_cli_tasks_reject_invalid_objective_and_dependency_refs(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Task", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert task.exit_code == 0
+    task_id = json.loads(task.output)["task"]["id"]
+
+    bad_objective = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Bad objective",
+            "--objective",
+            "obj_missing",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    bad_dependency = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Bad dependency",
+            "--depends-on",
+            "task_missing",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    bad_filter = runner.invoke(
+        app,
+        ["tasks", "list", "--objective", "obj_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+    cycle = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Cycle",
+            "--depends-on",
+            task_id,
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert bad_objective.exit_code != 0
+    assert json.loads(bad_objective.output)["errors"] == ["Objective not found: obj_missing"]
+    assert bad_dependency.exit_code != 0
+    assert json.loads(bad_dependency.output)["errors"] == ["Task not found: task_missing"]
+    assert bad_filter.exit_code != 0
+    assert json.loads(bad_filter.output)["errors"] == ["Objective not found: obj_missing"]
+    assert cycle.exit_code == 0
+
+
 def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)

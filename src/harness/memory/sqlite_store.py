@@ -21,6 +21,8 @@ from harness.models import (
     ObjectiveStatus,
     RunManifest,
     RunRecord,
+    TaskDependency,
+    TaskDependencyType,
     TaskRecord,
     TaskStatus,
     TaskTransitionRecord,
@@ -279,37 +281,53 @@ class SQLiteStore:
         title: str,
         description: str = "",
         priority: int = 0,
+        objective_id: str | None = None,
         workbench_id: str | None = None,
         agent_id: str | None = None,
         spec_source_kind: str | None = None,
         spec_source_path: Path | None = None,
         depends_on: list[str] | None = None,
+        required_approvals: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> TaskRecord:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         idempotency_key = f"task_idem_{uuid.uuid4().hex[:16]}"
         timestamp = now_iso()
         depends_on = depends_on or []
+        required_approvals = required_approvals or []
         metadata = metadata or {}
         with self.connect() as conn:
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
+            for dependency_id in depends_on:
+                self._require_task(conn, dependency_id)
+            dependencies_satisfied = self._dependency_ids_completed(conn, depends_on)
+            initial_status = (
+                TaskStatus.WAITING_APPROVAL
+                if required_approvals
+                else TaskStatus.BLOCKED
+                if not dependencies_satisfied
+                else TaskStatus.READY
+            )
             conn.execute(
                 """
                 INSERT INTO tasks (
                   id, title, description, status, project_root, created_at, updated_at,
-                  priority, workbench_id, agent_id, spec_source_kind, spec_source_path,
+                  priority, objective_id, workbench_id, agent_id, spec_source_kind, spec_source_path,
                   depends_on_json, run_id, metadata_json, idempotency_key,
-                  required_approvals_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  required_approvals_json, approval_state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
                     title,
                     description,
-                    TaskStatus.READY.value,
+                    initial_status.value,
                     str(self.project_root),
                     timestamp,
                     timestamp,
                     priority,
+                    objective_id,
                     workbench_id,
                     agent_id,
                     spec_source_kind,
@@ -318,14 +336,24 @@ class SQLiteStore:
                     None,
                     json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
                     idempotency_key,
-                    "[]",
+                    json.dumps(sanitize_for_logging(required_approvals), sort_keys=True, default=str),
+                    "required" if required_approvals else None,
                 ),
             )
+            for dependency_id in depends_on:
+                self._create_task_dependency(
+                    conn,
+                    upstream_task_id=dependency_id,
+                    downstream_task_id=task_id,
+                    dependency_type=TaskDependencyType.SUCCESS,
+                    required_artifact_kind=None,
+                    created_at=timestamp,
+                )
             self._record_task_transition(
                 conn,
                 task_id=task_id,
                 from_status=None,
-                to_status=TaskStatus.READY,
+                to_status=initial_status,
                 reason="task_created",
                 actor="system",
                 metadata={},
@@ -333,24 +361,46 @@ class SQLiteStore:
             )
         return self.get_task(task_id)
 
-    def list_tasks(self, status: str | None = None) -> list[TaskRecord]:
+    def list_tasks(self, status: str | None = None, objective_id: str | None = None) -> list[TaskRecord]:
         with self.connect() as conn:
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
             if status is None:
-                rows = conn.execute(
-                    "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
-                ).fetchall()
+                if objective_id is None:
+                    rows = conn.execute(
+                        "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT * FROM tasks
+                        WHERE objective_id = ?
+                        ORDER BY priority DESC, created_at ASC
+                        """,
+                        (objective_id,),
+                    ).fetchall()
             else:
                 query_status = normalize_task_status(status)
                 status_values = TASK_STATUS_QUERY_ALIASES.get(query_status, (query_status.value,))
                 placeholders = ", ".join("?" for _ in status_values)
-                rows = conn.execute(
-                    f"""
-                    SELECT * FROM tasks
-                    WHERE status IN ({placeholders})
-                    ORDER BY priority DESC, created_at ASC
-                    """,
-                    status_values,
-                ).fetchall()
+                if objective_id is None:
+                    rows = conn.execute(
+                        f"""
+                        SELECT * FROM tasks
+                        WHERE status IN ({placeholders})
+                        ORDER BY priority DESC, created_at ASC
+                        """,
+                        status_values,
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        f"""
+                        SELECT * FROM tasks
+                        WHERE status IN ({placeholders}) AND objective_id = ?
+                        ORDER BY priority DESC, created_at ASC
+                        """,
+                        (*status_values, objective_id),
+                    ).fetchall()
         return [self._row_to_task(row) for row in rows]
 
     def get_task(self, task_id: str) -> TaskRecord:
@@ -397,9 +447,19 @@ class SQLiteStore:
         return self.get_task(task_id)
 
     def select_next_task(self) -> TaskRecord | None:
-        for task in self.list_tasks(status=TaskStatus.READY.value):
-            if self._task_dependencies_completed(task):
-                return self.update_task_status(task.id, TaskStatus.RUNNING)
+        candidates = [
+            task
+            for task in self.list_tasks()
+            if task.status in {TaskStatus.READY, TaskStatus.BLOCKED}
+        ]
+        for task in candidates:
+            if not self._task_dependencies_completed(task):
+                continue
+            if task.required_approvals:
+                continue
+            if task.status == TaskStatus.BLOCKED:
+                task = self.update_task_status(task.id, TaskStatus.READY)
+            return self.update_task_status(task.id, TaskStatus.RUNNING)
         return None
 
     def _task_dependencies_completed(self, task: TaskRecord) -> bool:
@@ -411,6 +471,170 @@ class SQLiteStore:
             if dependency.status != TaskStatus.SUCCEEDED:
                 return False
         return True
+
+    def _dependency_ids_completed(self, conn: sqlite3.Connection, dependency_ids: list[str]) -> bool:
+        for dependency_id in dependency_ids:
+            row = conn.execute("SELECT status FROM tasks WHERE id = ?", (dependency_id,)).fetchone()
+            if row is None or normalize_task_status(row["status"]) != TaskStatus.SUCCEEDED:
+                return False
+        return True
+
+    def create_task_dependency(
+        self,
+        upstream_task_id: str,
+        downstream_task_id: str,
+        dependency_type: TaskDependencyType = TaskDependencyType.SUCCESS,
+        required_artifact_kind: str | None = None,
+    ) -> TaskDependency:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            self._require_task(conn, upstream_task_id)
+            self._require_task(conn, downstream_task_id)
+            return self._create_task_dependency(
+                conn,
+                upstream_task_id=upstream_task_id,
+                downstream_task_id=downstream_task_id,
+                dependency_type=dependency_type,
+                required_artifact_kind=required_artifact_kind,
+                created_at=timestamp,
+            )
+
+    def list_task_dependencies(self, task_id: str | None = None) -> list[TaskDependency]:
+        with self.connect() as conn:
+            if task_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM task_dependencies ORDER BY created_at ASC, id ASC"
+                ).fetchall()
+            else:
+                self._require_task(conn, task_id)
+                rows = conn.execute(
+                    """
+                    SELECT * FROM task_dependencies
+                    WHERE upstream_task_id = ? OR downstream_task_id = ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (task_id, task_id),
+                ).fetchall()
+        return [self._row_to_task_dependency(row) for row in rows]
+
+    def build_task_graph(self, objective_id: str | None = None) -> dict[str, Any]:
+        tasks = self.list_tasks(objective_id=objective_id)
+        task_ids = {task.id for task in tasks}
+        objectives = self.list_objectives()
+        if objective_id is not None:
+            objectives = [objective for objective in objectives if objective.id == objective_id]
+        dependencies = [
+            dependency
+            for dependency in self.list_task_dependencies()
+            if dependency.upstream_task_id in task_ids or dependency.downstream_task_id in task_ids
+        ]
+        blocked_reasons = {task.id: self._blocked_reasons(task) for task in tasks}
+        return {
+            "objectives": [objective.model_dump(mode="json") for objective in objectives],
+            "tasks": [task.model_dump(mode="json") for task in tasks],
+            "dependencies": [dependency.model_dump(mode="json") for dependency in dependencies],
+            "blocked_reasons": blocked_reasons,
+        }
+
+    def _blocked_reasons(self, task: TaskRecord) -> list[dict[str, Any]]:
+        reasons: list[dict[str, Any]] = []
+        for dependency_id in task.depends_on:
+            try:
+                dependency = self.get_task(dependency_id)
+            except KeyError:
+                reasons.append({"kind": "missing_dependency", "task_id": dependency_id})
+                continue
+            if dependency.status != TaskStatus.SUCCEEDED:
+                reasons.append(
+                    {
+                        "kind": "unsatisfied_dependency",
+                        "task_id": dependency_id,
+                        "status": dependency.status.value,
+                    }
+                )
+        if task.required_approvals:
+            reasons.append(
+                {
+                    "kind": "unresolved_required_approvals",
+                    "required_approvals": task.required_approvals,
+                    "approval_state": task.approval_state,
+                }
+            )
+        return reasons
+
+    def _create_task_dependency(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        upstream_task_id: str,
+        downstream_task_id: str,
+        dependency_type: TaskDependencyType,
+        required_artifact_kind: str | None,
+        created_at: str,
+    ) -> TaskDependency:
+        if upstream_task_id == downstream_task_id:
+            raise ValueError("Task cannot depend on itself")
+        if self._dependency_path_exists(conn, downstream_task_id, upstream_task_id):
+            raise ValueError(
+                f"Task dependency cycle detected: {upstream_task_id} -> {downstream_task_id}"
+            )
+        dependency_id = f"task_dep_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO task_dependencies (
+              id, upstream_task_id, downstream_task_id, dependency_type,
+              required_artifact_kind, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dependency_id,
+                upstream_task_id,
+                downstream_task_id,
+                dependency_type.value,
+                required_artifact_kind,
+                created_at,
+            ),
+        )
+        return TaskDependency(
+            id=dependency_id,
+            upstream_task_id=upstream_task_id,
+            downstream_task_id=downstream_task_id,
+            dependency_type=dependency_type,
+            required_artifact_kind=required_artifact_kind,
+            created_at=parse_dt(created_at),
+        )
+
+    def _dependency_path_exists(
+        self,
+        conn: sqlite3.Connection,
+        start_task_id: str,
+        target_task_id: str,
+    ) -> bool:
+        seen: set[str] = set()
+        stack = [start_task_id]
+        while stack:
+            current = stack.pop()
+            if current == target_task_id:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            rows = conn.execute(
+                "SELECT downstream_task_id FROM task_dependencies WHERE upstream_task_id = ?",
+                (current,),
+            ).fetchall()
+            stack.extend(row["downstream_task_id"] for row in rows)
+        return False
+
+    def _require_task(self, conn: sqlite3.Connection, task_id: str) -> None:
+        row = conn.execute("SELECT id FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Task not found: {task_id}")
+
+    def _require_objective(self, conn: sqlite3.Connection, objective_id: str) -> None:
+        row = conn.execute("SELECT id FROM objectives WHERE id = ?", (objective_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Objective not found: {objective_id}")
 
     def list_task_transitions(self, task_id: str) -> list[TaskTransitionRecord]:
         with self.connect() as conn:
@@ -688,6 +912,18 @@ class SQLiteStore:
         )
 
     def _row_to_task(self, row: sqlite3.Row) -> TaskRecord:
+        depends_on = set(json.loads(row["depends_on_json"]))
+        with self.connect() as conn:
+            dependency_rows = conn.execute(
+                """
+                SELECT upstream_task_id
+                FROM task_dependencies
+                WHERE downstream_task_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (row["id"],),
+            ).fetchall()
+        depends_on.update(dependency["upstream_task_id"] for dependency in dependency_rows)
         return TaskRecord(
             id=row["id"],
             title=row["title"],
@@ -702,7 +938,7 @@ class SQLiteStore:
             agent_id=row["agent_id"],
             spec_source_kind=row["spec_source_kind"],
             spec_source_path=Path(row["spec_source_path"]) if row["spec_source_path"] else None,
-            depends_on=json.loads(row["depends_on_json"]),
+            depends_on=sorted(depends_on),
             idempotency_key=row["idempotency_key"] if "idempotency_key" in row.keys() else None,
             required_approvals=json.loads(row["required_approvals_json"])
             if "required_approvals_json" in row.keys() and row["required_approvals_json"]
@@ -710,6 +946,16 @@ class SQLiteStore:
             approval_state=row["approval_state"] if "approval_state" in row.keys() else None,
             run_id=row["run_id"],
             metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_task_dependency(self, row: sqlite3.Row) -> TaskDependency:
+        return TaskDependency(
+            id=row["id"],
+            upstream_task_id=row["upstream_task_id"],
+            downstream_task_id=row["downstream_task_id"],
+            dependency_type=TaskDependencyType(row["dependency_type"]),
+            required_artifact_kind=row["required_artifact_kind"],
+            created_at=parse_dt(row["created_at"]),
         )
 
     def _row_to_objective(self, row: sqlite3.Row) -> ObjectiveRecord:

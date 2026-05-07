@@ -349,8 +349,11 @@ Create and inspect tasks:
 
 ```bash
 harness tasks add --title "Inspect repository" --agent repo_inspector --workbench coding --project . --output json
+harness tasks add --title "Review queue plan" --objective obj_abc123def456 --depends-on task_abc123def456 --project . --output json
 harness tasks list --project . --output json
+harness tasks list --objective obj_abc123def456 --project . --output json
 harness tasks inspect task_abc123def456 --project . --output json
+harness tasks graph --objective obj_abc123def456 --project . --output json
 harness tasks status task_abc123def456 succeeded --project . --output json
 ```
 
@@ -358,15 +361,19 @@ Task commands use stable JSON wrappers:
 
 - `harness.task/v1` for add, inspect, and status updates.
 - `harness.tasks/v1` for list output.
+- `harness.task_graph/v1` for graph output.
 - `harness.task_run_next/v1` for manual next-task selection.
 
 Task records may store declarative built-in registry ids:
 
 - `workbench_id`, from `--workbench`.
 - `agent_id`, from `--agent`.
+- `objective_id`, from `--objective`.
+- `depends_on`, from repeated `--depends-on`.
+- `required_approvals`, from repeated `--requires-approval`.
 - `spec_source_kind: builtin` when registry ids are attached.
 
-These ids are metadata only in v0.3. They do not route work or imply backend execution.
+These ids are metadata only in v0.3. They do not route work or imply backend execution. Dependencies are persisted locally and can make a task `blocked`; required approvals are recorded locally and can make a task `waiting_approval`, but full policy resolution is deferred to a later control-plane slice.
 
 Select the next runnable task manually:
 

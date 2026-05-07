@@ -93,6 +93,7 @@ harness objectives add --title "Queue hardening" --workbench coding --project . 
 harness objectives list --project . --output json
 harness tasks add --title "Inspect repository" --agent repo_inspector --workbench coding --project . --output json
 harness tasks list --project . --output json
+harness tasks graph --project . --output json
 harness tasks run-next --project . --output json
 ```
 
@@ -100,6 +101,7 @@ Expected safety properties:
 
 - `run-next` selects one ready task and marks it `running`.
 - `run-next` does not create a run record or run artifact directory.
+- `tasks graph` is read-only and reports local objectives, tasks, dependencies, and blocked reasons.
 - Objective and task commands do not execute agents, preflight backends, run Docker, start daemons, or schedule work.
 
 ## Build Local Docker Test Image

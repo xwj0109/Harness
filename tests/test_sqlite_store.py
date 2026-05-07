@@ -239,6 +239,68 @@ def test_store_task_transitions_are_validated_and_recorded(tmp_path) -> None:
         raise AssertionError("invalid transition should raise")
 
 
+def test_store_tasks_support_objectives_dependencies_approvals_and_graph(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective(title="Objective", priority=3)
+    upstream = store.create_task(title="Upstream", objective_id=objective.id, priority=10)
+    downstream = store.create_task(
+        title="Downstream",
+        objective_id=objective.id,
+        depends_on=[upstream.id],
+        required_approvals=["hosted_provider"],
+        priority=5,
+    )
+
+    loaded = store.get_task(downstream.id)
+    assert loaded.objective_id == objective.id
+    assert loaded.status == TaskStatus.WAITING_APPROVAL
+    assert loaded.depends_on == [upstream.id]
+    assert loaded.required_approvals == ["hosted_provider"]
+    dependencies = store.list_task_dependencies(downstream.id)
+    assert len(dependencies) == 1
+    assert dependencies[0].upstream_task_id == upstream.id
+    assert dependencies[0].downstream_task_id == downstream.id
+
+    graph = store.build_task_graph(objective_id=objective.id)
+    assert [item["id"] for item in graph["objectives"]] == [objective.id]
+    assert {item["id"] for item in graph["tasks"]} == {upstream.id, downstream.id}
+    assert graph["dependencies"][0]["upstream_task_id"] == upstream.id
+    assert graph["blocked_reasons"][downstream.id] == [
+        {"kind": "unsatisfied_dependency", "task_id": upstream.id, "status": "ready"},
+        {
+            "kind": "unresolved_required_approvals",
+            "required_approvals": ["hosted_provider"],
+            "approval_state": "required",
+        },
+    ]
+
+
+def test_store_tasks_reject_unknown_references_and_dependency_cycles(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    first = store.create_task(title="First")
+    second = store.create_task(title="Second", depends_on=[first.id])
+
+    for create_kwargs, expected in [
+        ({"title": "Bad objective", "objective_id": "obj_missing"}, "Objective not found: obj_missing"),
+        ({"title": "Bad dependency", "depends_on": ["task_missing"]}, "Task not found: task_missing"),
+    ]:
+        try:
+            store.create_task(**create_kwargs)
+        except KeyError as exc:
+            assert str(exc).strip("'") == expected
+        else:
+            raise AssertionError(f"{expected} should raise")
+
+    try:
+        store.create_task_dependency(second.id, first.id)
+    except ValueError as exc:
+        assert "Task dependency cycle detected" in str(exc)
+    else:
+        raise AssertionError("dependency cycle should raise")
+
+
 def test_store_task_errors_are_stable_for_unknown_or_invalid_status(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -277,7 +339,7 @@ def test_store_select_next_task_uses_priority_and_dependencies(tmp_path) -> None
     assert selected is not None
     assert selected.id == dependency.id
     assert selected.status == TaskStatus.RUNNING
-    assert store.get_task(blocked_by_dependency.id).status == TaskStatus.READY
+    assert store.get_task(blocked_by_dependency.id).status == TaskStatus.BLOCKED
 
     store.update_task_status(dependency.id, TaskStatus.SUCCEEDED)
     selected_after_dependency = store.select_next_task()

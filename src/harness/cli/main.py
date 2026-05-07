@@ -258,6 +258,15 @@ def objectives_inspect(
 def tasks_add(
     title: Annotated[str, typer.Option("--title", help="Task title.")],
     description: Annotated[str, typer.Option("--description", help="Task description.")] = "",
+    objective: Annotated[str | None, typer.Option("--objective", help="Objective id to attach.")] = None,
+    depends_on: Annotated[
+        list[str] | None,
+        typer.Option("--depends-on", help="Task id this task depends on."),
+    ] = None,
+    requires_approval: Annotated[
+        list[str] | None,
+        typer.Option("--requires-approval", help="Approval key required before task selection."),
+    ] = None,
     workbench: Annotated[str | None, typer.Option("--workbench", help="Built-in workbench id.")] = None,
     agent: Annotated[str | None, typer.Option("--agent", help="Built-in agent id.")] = None,
     priority: Annotated[int, typer.Option("--priority", help="Higher priority tasks run first.")] = 0,
@@ -272,9 +281,12 @@ def tasks_add(
             title=title,
             description=description,
             priority=priority,
+            objective_id=objective,
             workbench_id=workbench,
             agent_id=agent,
             spec_source_kind="builtin" if (workbench or agent) else None,
+            depends_on=depends_on,
+            required_approvals=requires_approval,
             metadata={},
         )
     except (KeyError, ValueError) as exc:
@@ -289,12 +301,20 @@ def tasks_add(
 @tasks_app.command("list")
 def tasks_list(
     status: Annotated[TaskStatus | None, typer.Option("--status", help="Filter by task status.")] = None,
+    objective: Annotated[str | None, typer.Option("--objective", help="Filter by objective id.")] = None,
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    tasks = SQLiteStore(project_root).list_tasks(status.value if status is not None else None)
+    try:
+        tasks = SQLiteStore(project_root).list_tasks(
+            status.value if status is not None else None,
+            objective_id=objective,
+        )
+    except KeyError as exc:
+        _emit_task_error("harness.tasks/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
     if output == OutputFormat.JSON:
         _emit_json(
             {
@@ -309,6 +329,29 @@ def tasks_list(
         return
     for task in tasks:
         typer.echo(f"{task.id}\t{task.status.value}\t{task.priority}\t{task.title}")
+
+
+@tasks_app.command("graph")
+def tasks_graph(
+    objective: Annotated[str | None, typer.Option("--objective", help="Filter by objective id.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        graph = SQLiteStore(project_root).build_task_graph(objective_id=objective)
+    except KeyError as exc:
+        _emit_task_error("harness.task_graph/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {"schema_version": "harness.task_graph/v1", "ok": True, **graph}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(
+        f"Task graph: {len(graph['objectives'])} objectives, "
+        f"{len(graph['tasks'])} tasks, {len(graph['dependencies'])} dependencies"
+    )
 
 
 @tasks_app.command("inspect")
@@ -1045,8 +1088,14 @@ def _print_task(task) -> None:
     typer.echo(f"Description: {task.description}")
     typer.echo(f"Status: {task.status.value}")
     typer.echo(f"Priority: {task.priority}")
+    typer.echo(f"Objective: {task.objective_id or 'none'}")
     typer.echo(f"Workbench: {task.workbench_id or 'none'}")
     typer.echo(f"Agent: {task.agent_id or 'none'}")
+    typer.echo(f"Depends on: {', '.join(task.depends_on) if task.depends_on else 'none'}")
+    typer.echo(
+        "Required approvals: "
+        f"{', '.join(task.required_approvals) if task.required_approvals else 'none'}"
+    )
     typer.echo(f"Run: {task.run_id or 'none'}")
 
 
