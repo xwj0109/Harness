@@ -501,6 +501,19 @@ harness daemon execute-dry-run task_lease_abc123def456 --project . --output json
 
 `daemon inspect-lease` is read-only and returns `harness.daemon_lease/v1` with the lease, linked task, linked attempt, linked run/manifest when present, dry-run eligibility, and recovery recommendation. `daemon recover` can reconcile existing dry-run evidence, such as a completed dry-run run whose task or attempt remained non-terminal, but it must not create another run or retry ambiguous work automatically.
 
+The v0.5 read-only adapter is the first bounded real execution adapter, and it is also explicit:
+
+```bash
+harness tasks add --title "Read-only summary" --execution-adapter read_only_summary --task-type read_only_repo_summary --project . --output json
+harness daemon run-once --project . --output json
+harness daemon inspect-lease task_lease_abc123def456 --project . --output json
+harness daemon execute-read-only task_lease_abc123def456 --project . --output json
+```
+
+`daemon execute-read-only` requires an existing active lease id. It does not select work itself. It links the leased task attempt to one `read_only_repo_summary` run, uses the configured local-only and no-cost `local_openai_compatible` backend, executes only the existing read-only tools, records manifest/artifact/trace evidence through existing harness runtime APIs, marks the task and attempt terminal, and releases the lease. It returns `harness.daemon_execute_read_only/v1`.
+
+The read-only adapter can use only `list_files`, `read_file`, `git_status`, `git_diff`, and `final_answer`. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops. `daemon inspect-lease` reports read-only eligibility, and `daemon recover` may reconcile existing read-only linked-run evidence without creating a second run.
+
 Task statuses are:
 
 ```text

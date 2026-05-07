@@ -156,6 +156,15 @@ harness daemon inspect-lease "$LEASE_ID" --project . --output json
 harness daemon execute-dry-run "$LEASE_ID" --project . --output json
 ```
 
+Inspect the explicit v0.5 read-only adapter:
+
+```bash
+harness tasks add --title "Read-only summary" --execution-adapter read_only_summary --task-type read_only_repo_summary --project . --output json
+harness daemon run-once --project . --output json
+harness daemon inspect-lease "$LEASE_ID" --project . --output json
+harness daemon execute-read-only "$LEASE_ID" --project . --output json
+```
+
 Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon control-plane commands after `RUN_ID` setup:
 
 - These commands are local evidence inspection or baseline commands.
@@ -166,8 +175,10 @@ Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon cont
 - `daemon recover` may expire stale active leases and return tasks to `ready`, `blocked`, or `waiting_approval`, but it must not retry terminal tasks automatically.
 - v0.4 scheduler commands do not execute tasks, bind task attempts to runs, call backends, run Docker, create run artifacts, add hosted fallback, add paid fallback, or start unmanaged background work.
 - `daemon execute-dry-run` is explicit v0.4.5 contract evidence only: it may bind one active lease to one local `phase_1a_test` run and metadata-only artifacts, but it must not call backends, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted/paid fallback.
-- `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, and recovery recommendation without creating runs or artifacts.
-- `daemon recover` may reconcile existing dry-run evidence but must not create a second run for a linked attempt.
+- `daemon execute-read-only` is explicit v0.5 read-only adapter execution only: it may bind one active lease to one `read_only_repo_summary` run through the configured local-only and no-cost `local_openai_compatible` backend and existing read-only tools.
+- `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, read-only eligibility, and recovery recommendation without creating runs or artifacts.
+- `daemon recover` may reconcile existing dry-run or read-only evidence but must not create a second run for a linked attempt.
+- v0.5 does not authorize Codex execution, Docker-from-queue, shell execution, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops.
 - Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or artifact file contents.
 - `harness compare "$RUN_ID" "$RUN_ID"` and baseline comparison against the same run should report no drift.
 

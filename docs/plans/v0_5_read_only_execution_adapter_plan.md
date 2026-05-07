@@ -1,6 +1,6 @@
 # v0.5 Read-Only Execution Adapter Plan
 
-Status: active as the first bounded real execution adapter milestone.
+Status: complete for v0.5 Slice 1; release hygiene is the active checkpoint.
 
 ## Summary
 
@@ -35,6 +35,15 @@ Slice 1 is implemented as the first v0.5 checkpoint:
 - `daemon inspect-lease` reports read-only eligibility.
 - `daemon recover` reconciles read-only linked-run evidence without creating another run.
 - The read-only runner can execute inside an already-created run while preserving existing `harness run --task-type read_only_repo_summary` behavior.
+
+## Slice 1 Completion Note
+
+- `harness tasks add` accepts `--execution-adapter read_only_summary --task-type read_only_repo_summary` as sanitized task metadata.
+- `harness daemon execute-read-only <lease_id>` requires an existing active daemon lease and does not select work itself.
+- `TaskAttempt.run_id` is the authoritative lease-to-run join, with compatible `TaskRecord.run_id` and manifest `task_id` evidence.
+- `daemon inspect-lease` reports read-only eligibility, and `daemon recover` reconciles read-only linked-run evidence without creating a second run.
+- The adapter is gated to the configured local-only, no-cost `local_openai_compatible` backend and the existing read-only tools.
+- The adapter does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops.
 
 ## Safety Contract
 
