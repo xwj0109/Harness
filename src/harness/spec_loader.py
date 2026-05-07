@@ -75,6 +75,7 @@ def export_custom_spec_registry(path: Path) -> dict:
 
 def export_spec_registry(registry: SpecRegistry, *, source_kind: str, source_path: Path | None) -> dict:
     registry_sections = {
+        "agent_profiles": _dump_spec_mapping(registry.agent_profiles),
         "agents": _dump_spec_mapping(registry.agents),
         "memory_scopes": _dump_spec_mapping(registry.memory_scopes),
         "model_profiles": _dump_spec_mapping(registry.model_profiles),
@@ -118,6 +119,7 @@ def preview_agent_effective_policy(registry: SpecRegistry, agent_id: str) -> dic
         "parent": agent.parent,
         "parent_chain": [_dump_model(parent) for parent in parent_chain],
         "effective_agent": _sort_json(registry.resolve_agent_effective_spec(agent_id)),
+        "profiles": [_dump_model(profile) for profile in registry.list_agent_profiles(agent_id)],
         "model_profile": _dump_model(registry.model_profiles[agent.model_profile]),
         "tool_policy": _dump_model(registry.tool_policies[agent.tool_policy]),
         "memory_scope": _dump_model(registry.memory_scopes[agent.memory_scope]),
@@ -133,6 +135,7 @@ def preview_workbench_effective_policy(registry: SpecRegistry, workbench_id: str
             "agent": _dump_model(agent),
             "parent_chain": [parent.id for parent in registry.get_agent_parent_chain(agent_id)],
             "effective_agent": _sort_json(registry.resolve_agent_effective_spec(agent_id)),
+            "profiles": [_dump_model(profile) for profile in registry.list_agent_profiles(agent_id)],
             "model_profile": _dump_model(registry.model_profiles[agent.model_profile]),
             "tool_policy": _dump_model(registry.tool_policies[agent.tool_policy]),
             "memory_scope": _dump_model(registry.memory_scopes[agent.memory_scope]),

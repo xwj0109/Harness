@@ -191,9 +191,9 @@ Built-in inspection reads only the in-memory built-in registry. JSON output is s
 - `harness.agent_spec/v1`
 - `harness.workbench_spec/v1`
 
-## v0.6 Quant Workbench Declarations
+## v0.6 Agent Declarations
 
-The v0.6 Quant Workbench is declarative spec metadata. It makes quant roles inspectable, but it does not create tasks, schedule workflows, execute agents, run Docker, call backends, connect to brokers, place orders, or trade.
+The v0.6 Quant Workbench and agent profiles are declarative spec metadata. They make roles and customization points inspectable, but they do not create tasks, schedule workflows, execute agents, run Docker, call backends, connect to brokers, place orders, send messages, submit applications, or trade.
 
 Inspect the quant workbench and built-in quant agents:
 
@@ -210,13 +210,14 @@ harness specs agent low_level_optimizer --output json
 harness specs agent risk_reviewer --output json
 harness specs agent leakage_reviewer --output json
 harness specs agent statistical_validity_reviewer --output json
+harness specs preview agent commodities_researcher --output json
 ```
 
-The initial quant workflow templates are planning targets only: paper summary, strategy hypothesis, data checklist, backtest specification, risk review, leakage review, statistical-validity review, and local evidence comparison. A later decision-complete plan must authorize any executable quant workflow.
+Agent previews include inherited group context and attached profile metadata where present. Profiles are customization metadata only: knowledge domains, preferred outputs, review responsibilities, forbidden actions, tags, and simple metadata. They do not change permissions or authorize execution.
 
 The built-in `quant` workbench forbids live trading, broker actions, capital allocation, order placement, hosted fallback, and paid fallback. It also inherits the spec inspection safety boundary: no secret reads, no backend settings output, no environment inspection, and no `.harness/` state access.
 
-Built-in specs are packaged as repo-tracked YAML files under `src/harness/builtin_specs/` and loaded through the typed registry. The folder layout mirrors the roadmap workbench tree for maintainability, but it is not runtime auto-discovery and it does not add inheritance behavior. Custom operator bundles remain explicit-path only through `harness specs validate/export/diff/preview`.
+Built-in specs are packaged as repo-tracked YAML files under `src/harness/builtin_specs/` and loaded through the typed registry. The folder layout mirrors the roadmap workbench tree for maintainability, but it is not runtime auto-discovery. Custom operator bundles remain explicit-path only through `harness specs validate/export/diff/preview`.
 
 ## Read-Only Custom Spec Validation
 
@@ -341,7 +342,7 @@ harness specs preview agent repo_inspector --source path/to/specs.yaml --output 
 harness specs preview workbench coding --source path/to/specs.yaml --output json
 ```
 
-The JSON wrapper is `harness.spec_effective_preview/v1`. Agent previews include the agent declaration plus resolved model profile, tool policy, memory scope, and parent id. Workbench previews include the workbench declaration, default model profile, allowed agents with resolved references, forbidden actions, and workbench-local declarative policy maps.
+The JSON wrapper is `harness.spec_effective_preview/v1`. Agent previews include the agent declaration plus resolved model profile, tool policy, memory scope, parent chain, effective agent fields, and attached profiles. Workbench previews include the workbench declaration, default model profile, allowed agents with resolved references, forbidden actions, and workbench-local declarative policy maps.
 
 Effective preview is not runtime permission enforcement. It does not execute agents, check backend availability, route work, create tasks, or persist custom specs.
 

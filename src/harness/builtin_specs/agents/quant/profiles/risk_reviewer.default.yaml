@@ -1,0 +1,25 @@
+id: risk_reviewer.default
+agent_id: risk_reviewer
+description: Default risk review profile for quant strategy assumptions and operational limits.
+knowledge_domains:
+  - risk
+  - drawdown
+  - liquidity
+  - operational_limits
+preferred_outputs:
+  - risk_review.md
+review_responsibilities:
+  - Identify risk limits and fragile assumptions.
+  - Flag any broker, order, capital allocation, or live-trading implication.
+forbidden_actions:
+  - live_trading
+  - broker_action
+  - order_placement
+  - capital_allocation
+tags:
+  - starter
+  - quant
+  - review
+  - profile
+metadata:
+  customizable: true

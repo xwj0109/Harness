@@ -126,6 +126,21 @@ def test_builtin_quant_groups_and_parent_chains_are_resolved() -> None:
     assert resolved["outputs"] == ["research_brief.md", "data_requirements.md", "commodities_research_note.md"]
 
 
+def test_builtin_agent_profiles_load_and_attach_to_agents() -> None:
+    registry = builtin_spec_registry()
+
+    assert {"commodities_researcher.default", "risk_reviewer.default", "job_researcher.default"} <= set(
+        registry.agent_profiles
+    )
+    commodities_profiles = registry.list_agent_profiles("commodities_researcher")
+    assert [profile.id for profile in commodities_profiles] == ["commodities_researcher.default"]
+    profile = commodities_profiles[0]
+    assert profile.agent_id == "commodities_researcher"
+    assert "commodities" in profile.knowledge_domains
+    assert "commodities_research_note.md" in profile.preferred_outputs
+    assert "broker_action" in profile.forbidden_actions
+
+
 def test_builtin_registry_loads_from_packaged_hierarchical_yaml() -> None:
     registry = load_packaged_spec_registry()
 
@@ -172,6 +187,61 @@ memory_scope: quant
 
     with pytest.raises(ValueError, match="Packaged built-in specs are invalid"):
         load_packaged_spec_registry(root)
+
+
+def test_packaged_registry_rejects_duplicate_agent_profile_ids(tmp_path) -> None:
+    root = tmp_path / "builtin_specs"
+    shutil.copytree(BUILTIN_SPECS_DIR, root)
+    duplicate_dir = root / "agents" / "quant" / "profiles_extra" / "profiles"
+    duplicate_dir.mkdir(parents=True)
+    (duplicate_dir / "duplicate.yaml").write_text(
+        """
+id: commodities_researcher.default
+agent_id: commodities_researcher
+description: Duplicate profile.
+""".strip(),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Duplicate packaged built-in agent_profiles id"):
+        load_packaged_spec_registry(root)
+
+
+def test_registry_rejects_agent_profile_missing_agent_reference() -> None:
+    with pytest.raises(ValidationError, match="references missing agent"):
+        SpecRegistry(
+            agent_profiles={
+                "missing_agent.default": {
+                    "id": "missing_agent.default",
+                    "agent_id": "missing_agent",
+                    "description": "Missing agent profile.",
+                }
+            }
+        )
+
+
+def test_registry_rejects_agent_profile_forbidden_output_paths() -> None:
+    with pytest.raises(ValidationError, match="preferred_outputs cannot include forbidden path"):
+        SpecRegistry(
+            agents={
+                "repo_inspector": AgentSpec(
+                    id="repo_inspector",
+                    kind=AgentKind.SPECIALIST,
+                    role="Inspect repositories.",
+                    model_profile="local_reasoning",
+                    tool_policy="read_only",
+                    memory_scope="project",
+                )
+            },
+            agent_profiles={
+                "repo_inspector.default": {
+                    "id": "repo_inspector.default",
+                    "agent_id": "repo_inspector",
+                    "description": "Unsafe profile.",
+                    "preferred_outputs": [".env"],
+                }
+            },
+        )
 
 
 def test_registry_rejects_parent_cycles() -> None:

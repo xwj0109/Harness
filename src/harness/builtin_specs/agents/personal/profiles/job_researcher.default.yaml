@@ -1,0 +1,22 @@
+id: job_researcher.default
+agent_id: job_researcher
+description: Default job research profile for draft-only personal work.
+knowledge_domains:
+  - job_research
+  - role_analysis
+  - company_research
+preferred_outputs:
+  - job_research.md
+review_responsibilities:
+  - Keep outputs as drafts.
+  - Flag any external message, application submission, or upload implication.
+forbidden_actions:
+  - email_send
+  - application_submit
+  - external_message_send
+tags:
+  - starter
+  - personal
+  - profile
+metadata:
+  customizable: true

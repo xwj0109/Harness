@@ -26,6 +26,7 @@ harness specs workbench coding --output json
 harness specs workbench quant --output json
 harness specs agent quant_orchestrator --output json
 harness specs agent statistical_validity_reviewer --output json
+harness specs preview agent commodities_researcher --output json
 ```
 
 Create a temporary valid custom bundle outside `.harness/`:
@@ -91,7 +92,8 @@ v0.6 Quant Workbench expectations:
 - `harness specs workbench quant --output json` lists the built-in quant agent set.
 - Quant specs are declarations only; they do not create tasks, schedule workflows, execute agents, run Docker, call backends, connect to brokers, place orders, or trade.
 - The `quant` workbench forbids live trading, broker actions, capital allocation, order placement, hosted fallback, and paid fallback.
-- Built-in specs are packaged YAML loaded through the typed registry; there is no runtime folder auto-discovery outside the repo-packaged built-ins.
+- Agent profiles are declarations only; they expose customization metadata such as knowledge domains, preferred outputs, review responsibilities, and forbidden actions.
+- Built-in specs and profiles are packaged YAML loaded through the typed registry; there is no runtime folder auto-discovery outside the repo-packaged built-ins.
 
 ## Verify Manual v0.3 Task Queue
 

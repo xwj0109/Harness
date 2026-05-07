@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 from harness.specs import (
     AgentKind,
+    AgentProfileSpec,
     AgentSpec,
     MemoryScope,
     ModelProfile,
@@ -31,6 +32,7 @@ class SpecRegistry(BaseModel):
     tool_policies: dict[str, ToolPolicy] = Field(default_factory=dict)
     memory_scopes: dict[str, MemoryScope] = Field(default_factory=dict)
     agents: dict[str, AgentSpec] = Field(default_factory=dict)
+    agent_profiles: dict[str, AgentProfileSpec] = Field(default_factory=dict)
     workbenches: dict[str, WorkbenchSpec] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -38,6 +40,7 @@ class SpecRegistry(BaseModel):
         _validate_mapping_ids("model_profile", self.model_profiles)
         _validate_mapping_ids("memory_scope", self.memory_scopes)
         _validate_mapping_ids("agent", self.agents)
+        _validate_mapping_ids("agent_profile", self.agent_profiles)
         _validate_mapping_ids("workbench", self.workbenches)
         for policy_id in self.tool_policies:
             if not policy_id.strip():
@@ -70,6 +73,10 @@ class SpecRegistry(BaseModel):
             for agent_id in workbench.allowed_agents:
                 if agent_id not in self.agents:
                     raise ValueError(f"Workbench {workbench_id} references missing allowed agent: {agent_id}")
+        for profile_id, profile in self.agent_profiles.items():
+            if profile.agent_id not in self.agents:
+                raise ValueError(f"Agent profile {profile_id} references missing agent: {profile.agent_id}")
+            _validate_profile_forbidden_actions(profile_id=profile_id, profile=profile)
         _validate_agent_parent_cycles(self.agents)
         return self
 
@@ -114,6 +121,13 @@ class SpecRegistry(BaseModel):
                 "parents": [parent.id for parent in parent_chain],
             },
         }
+
+    def list_agent_profiles(self, agent_id: str | None = None) -> list[AgentProfileSpec]:
+        profiles = sorted(self.agent_profiles.values(), key=lambda profile: profile.id)
+        if agent_id is None:
+            return profiles
+        self.get_agent(agent_id)
+        return [profile for profile in profiles if profile.agent_id == agent_id]
 
 
 def _validate_mapping_ids(kind: str, mapping: dict[str, object]) -> None:
@@ -160,6 +174,12 @@ def _validate_child_policy_not_broader(
             )
 
 
+def _validate_profile_forbidden_actions(*, profile_id: str, profile: AgentProfileSpec) -> None:
+    for action in profile.forbidden_actions:
+        if not action.strip():
+            raise ValueError(f"Agent profile {profile_id} forbidden action must be non-empty.")
+
+
 def _permission_rank(permission: ToolPermission) -> int:
     return {
         ToolPermission.ALLOWED: 0,
@@ -187,11 +207,13 @@ def load_packaged_spec_registry(root: Path = BUILTIN_SPECS_DIR) -> SpecRegistry:
         "tool_policies": {},
         "memory_scopes": {},
         "agents": {},
+        "agent_profiles": {},
         "workbenches": {},
     }
     for section, (filename, _model) in BUILTIN_MAPPING_FILES.items():
         registry_data[section] = _load_mapping_file(spec_root / filename, section=section, root=spec_root)
     registry_data["agents"] = _load_spec_tree(spec_root / "agents", section="agents")
+    registry_data["agent_profiles"] = _load_profile_tree(spec_root / "agents")
     registry_data["workbenches"] = _load_spec_tree(spec_root / "workbenches", section="workbenches")
     try:
         return SpecRegistry.model_validate(registry_data)
@@ -214,6 +236,8 @@ def _load_spec_tree(root: Path, *, section: str) -> dict[str, Any]:
         raise ValueError(f"Packaged built-in spec directory is missing: {root}")
     collected: dict[str, Any] = {}
     for path in sorted(root.rglob("*.yaml")):
+        if "profiles" in path.parts:
+            continue
         _ensure_packaged_path(path, root)
         data = _load_yaml_mapping(path, root=root)
         if path.name == "group.yaml" and "id" not in data:
@@ -222,6 +246,20 @@ def _load_spec_tree(root: Path, *, section: str) -> dict[str, Any]:
             if spec_id in collected:
                 raise ValueError(f"Duplicate packaged built-in {section} id: {spec_id}")
             collected[spec_id] = spec_data
+    return collected
+
+
+def _load_profile_tree(root: Path) -> dict[str, Any]:
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"Packaged built-in spec directory is missing: {root}")
+    collected: dict[str, Any] = {}
+    for path in sorted(root.rglob("profiles/*.yaml")):
+        _ensure_packaged_path(path, root)
+        data = _load_yaml_mapping(path, root=root)
+        for profile_id, profile_data in _collect_id_mapping([data], section="agent_profiles", source=path).items():
+            if profile_id in collected:
+                raise ValueError(f"Duplicate packaged built-in agent_profiles id: {profile_id}")
+            collected[profile_id] = profile_data
     return collected
 
 

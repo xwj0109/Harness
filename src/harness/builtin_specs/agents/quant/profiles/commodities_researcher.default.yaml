@@ -1,0 +1,26 @@
+id: commodities_researcher.default
+agent_id: commodities_researcher
+description: Default commodities research profile for futures curve and market-structure notes.
+knowledge_domains:
+  - commodities
+  - futures
+  - energy
+  - metals
+  - seasonality
+preferred_outputs:
+  - commodities_research_note.md
+  - data_requirements.md
+review_responsibilities:
+  - Identify required local data inputs.
+  - Flag assumptions that require risk or leakage review.
+forbidden_actions:
+  - live_trading
+  - broker_action
+  - order_placement
+  - capital_allocation
+tags:
+  - starter
+  - quant
+  - profile
+metadata:
+  customizable: true

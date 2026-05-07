@@ -15,6 +15,7 @@ The v0.5 read-only execution adapter plan is tracked in [v0_5_read_only_executio
 The v0.5.1 read-only hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md).
 The v0.6 Quant Workbench plan is tracked in [v0_6_quant_workbench_plan.md](v0_6_quant_workbench_plan.md).
 The v0.6 Slice 2 agent-group inheritance plan is tracked in [v0_6_2_agent_group_inheritance_plan.md](v0_6_2_agent_group_inheritance_plan.md).
+The v0.6.3 Agent Structure MVP plan is tracked in [v0_6_3_agent_structure_mvp_plan.md](v0_6_3_agent_structure_mvp_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -58,6 +59,7 @@ The first v0.2 schema and registry foundations are in place:
 - v0.6 Quant Workbench declarative foundation is complete.
 - v0.6 packaged hierarchical built-in specs are complete.
 - v0.6 Slice 2 agent-group inheritance is complete.
+- v0.6.3 Agent Structure MVP is complete.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -94,7 +96,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is a separate decision plan for v0.6 Slice 3 declarative quant workflow templates. Workflow templates should remain non-executing metadata: they must not create tasks automatically, schedule work, run agents, call backends, run Docker, connect to brokers, place orders, or mutate active repo files.
+The immediate next target is v0.7 Personal Workbench declarative foundation. It should reuse the v0.6 agent group and profile structure for draft-only personal agents. Personal workbench declarations must not send messages, submit applications, upload files, schedule external work, call browser/email/calendar tools, or mutate active repo files.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

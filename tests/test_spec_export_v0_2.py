@@ -70,7 +70,14 @@ def test_cli_specs_export_builtin_json_is_stable_without_project_state(tmp_path,
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.spec_export/v1"
     assert payload["source"] == {"kind": "builtin", "path": None}
-    assert set(payload["registry"]) == {"model_profiles", "tool_policies", "memory_scopes", "agents", "workbenches"}
+    assert set(payload["registry"]) == {
+        "agent_profiles",
+        "model_profiles",
+        "tool_policies",
+        "memory_scopes",
+        "agents",
+        "workbenches",
+    }
     assert list(payload["registry"]["agents"]) == sorted(payload["registry"]["agents"])
     assert "repo_inspector" in payload["registry"]["agents"]
     assert not (tmp_path / ".harness").exists()

@@ -521,6 +521,7 @@ def specs_callback(ctx: typer.Context, output: OutputOption = OutputFormat.TEXT)
                 "tool_policies": _dump_spec_mapping(registry.tool_policies),
                 "memory_scopes": _dump_spec_mapping(registry.memory_scopes),
                 "agents": _dump_spec_mapping(registry.agents),
+                "agent_profiles": _dump_spec_mapping(registry.agent_profiles),
                 "workbenches": _dump_spec_mapping(registry.workbenches),
             }
         )

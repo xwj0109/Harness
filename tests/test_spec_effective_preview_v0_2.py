@@ -52,6 +52,8 @@ def test_cli_specs_preview_builtin_grouped_quant_agent_resolves_parent_chain(tmp
     assert preview["effective_agent"]["tool_policy"] == "read_only"
     assert preview["effective_agent"]["memory_scope"] == "quant"
     assert preview["effective_agent"]["tags"] == ["starter", "quant", "group", "research", "commodities"]
+    assert [profile["id"] for profile in preview["profiles"]] == ["commodities_researcher.default"]
+    assert "commodities" in preview["profiles"][0]["knowledge_domains"]
     assert not (tmp_path / ".harness").exists()
 
 
@@ -69,6 +71,7 @@ def test_cli_specs_preview_builtin_workbench_json_resolves_allowed_agents(tmp_pa
     assert list(preview["allowed_agents"]) == ["code_editor", "repo_inspector", "test_runner"]
     assert preview["allowed_agents"]["repo_inspector"]["tool_policy"]["network"] == "forbidden"
     assert preview["allowed_agents"]["repo_inspector"]["parent_chain"] == []
+    assert preview["allowed_agents"]["repo_inspector"]["profiles"] == []
     assert preview["forbidden_actions"] == ["hosted_fallback", "paid_api_fallback"]
     assert not (tmp_path / ".harness").exists()
 

@@ -153,6 +153,31 @@ class AgentSpec(BaseModel):
         return _non_empty(value, info.field_name)
 
 
+class AgentProfileSpec(BaseModel):
+    id: str
+    agent_id: str
+    description: str
+    knowledge_domains: list[str] = Field(default_factory=list)
+    preferred_outputs: list[str] = Field(default_factory=list)
+    review_responsibilities: list[str] = Field(default_factory=list)
+    forbidden_actions: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+
+    @field_validator("id", "agent_id", "description")
+    @classmethod
+    def required_non_empty(cls, value: str, info) -> str:
+        return _non_empty(value, info.field_name)
+
+    @field_validator("preferred_outputs")
+    @classmethod
+    def reject_forbidden_output_paths(cls, values: list[str]) -> list[str]:
+        for value in values:
+            if _is_hard_forbidden_path(value):
+                raise ValueError(f"AgentProfileSpec preferred_outputs cannot include forbidden path: {value}")
+        return values
+
+
 class WorkbenchSpec(BaseModel):
     id: str
     description: str

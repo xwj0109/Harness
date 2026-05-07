@@ -2060,6 +2060,9 @@ def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path)
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.spec_registry/v1"
     assert {"local_reasoning", "codex_supervised"} <= set(payload["model_profiles"])
+    assert {"commodities_researcher.default", "risk_reviewer.default", "job_researcher.default"} <= set(
+        payload["agent_profiles"]
+    )
     quant_agents = {
         "quant_orchestrator",
         "quant_researcher",
@@ -2166,6 +2169,9 @@ def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runti
     preview_payload = json.loads(preview_result.output)
     assert preview_payload["preview"]["parent"] == "quant_research"
     assert preview_payload["preview"]["effective_agent"]["parent_chain"] == ["quant_research"]
+    assert [profile["id"] for profile in preview_payload["preview"]["profiles"]] == [
+        "commodities_researcher.default"
+    ]
 
     serialized = workbench_result.output
     assert "settings" not in serialized
