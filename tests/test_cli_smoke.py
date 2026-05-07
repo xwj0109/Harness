@@ -5,7 +5,8 @@ from typer.testing import CliRunner
 
 from harness.approvals import ApprovalStore
 from harness.backends.codex_cli import CodexRunResult
-from harness.models import BackendStatus
+from harness.config import default_config
+from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
 
@@ -1450,6 +1451,15 @@ def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, mon
     assert payload["run"]["task_type"] == "read_only_repo_summary"
     assert payload["manifest"]["schema_version"] == "harness.manifest/v1.1"
     assert payload["manifest"]["task_id"] == payload["task"]["id"]
+    after = runner.invoke(
+        app,
+        ["daemon", "inspect-lease", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert after.exit_code == 0, after.output
+    after_payload = json.loads(after.output)
+    assert after_payload["read_only_eligibility"]["eligible"] is False
+    assert after_payload["run"]["id"] == payload["run"]["id"]
+    assert after_payload["manifest"]["run_id"] == payload["run"]["id"]
 
     assert duplicate.exit_code == 1
     duplicate_payload = json.loads(duplicate.output)
@@ -1458,11 +1468,182 @@ def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, mon
     assert duplicate_payload["errors"] == ["Read-only execution requires active lease: released"]
     assert len(SQLiteStore(tmp_path).list_runs()) == 1
 
-    serialized = task_result.output + tick.output + before.output + executed.output + duplicate.output
+    serialized = task_result.output + tick.output + before.output + executed.output + after.output + duplicate.output
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
     assert "http://localhost:11434" not in serialized
+
+
+def test_cli_daemon_execute_read_only_preflight_failure_leaves_lease_unchanged(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class UnavailableBackend:
+        def __init__(self, config):
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(
+                available=False,
+                reason="local backend unavailable for test",
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    monkeypatch.setattr("harness.daemon_adapters.LocalOpenAICompatibleBackend", UnavailableBackend)
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Read-only preflight",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_id = json.loads(task_result.output)["task"]["id"]
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    lease_id = json.loads(tick.output)["lease"]["id"]
+    attempt_id = json.loads(tick.output)["attempt"]["id"]
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert executed.exit_code == 1
+    payload = json.loads(executed.output)
+    assert payload["schema_version"] == "harness.daemon_execute_read_only/v1"
+    assert payload["errors"] == ["local backend unavailable for test"]
+    store = SQLiteStore(tmp_path)
+    assert store.list_runs() == []
+    assert store.get_task(task_id).status.value == "leased"
+    assert store.get_task_attempt(attempt_id).status.value == "leased"
+    assert store.get_task_attempt(attempt_id).run_id is None
+    assert store.get_task_lease(lease_id).status.value == "active"
+
+
+def test_cli_daemon_execute_read_only_runner_failure_marks_terminal_without_duplicate_run(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FailingBackend:
+        def __init__(self, config):
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+        def complete(self, messages):
+            raise RuntimeError("model loop failed in test")
+
+    monkeypatch.setattr("harness.daemon_adapters.LocalOpenAICompatibleBackend", FailingBackend)
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Read-only runner failure",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    task_id = json.loads(task_result.output)["task"]["id"]
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    lease_id = json.loads(tick.output)["lease"]["id"]
+    attempt_id = json.loads(tick.output)["attempt"]["id"]
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    duplicate = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert executed.exit_code == 1
+    payload = json.loads(executed.output)
+    assert payload["schema_version"] == "harness.daemon_execute_read_only/v1"
+    assert payload["errors"] == ["model loop failed in test"]
+    store = SQLiteStore(tmp_path)
+    runs = store.list_runs()
+    assert len(runs) == 1
+    assert runs[0].status == "failed"
+    assert store.get_task(task_id).status.value == "failed"
+    attempt = store.get_task_attempt(attempt_id)
+    assert attempt.status.value == "failed"
+    assert attempt.run_id == runs[0].id
+    assert attempt.failure_code == "read_only_execution_failed"
+    assert store.get_task_lease(lease_id).status.value == "released"
+    assert duplicate.exit_code == 1
+    assert len(store.list_runs()) == 1
+
+
+def test_cli_daemon_execute_read_only_rejects_unsafe_backend_descriptor(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    cfg = default_config()
+    cfg.backends["local_openai_compatible"].metadata.billing_mode = BillingMode.PAID_API
+    cfg.backends["local_openai_compatible"].metadata.execution_location = ExecutionLocation.HOSTED
+    cfg.backends["local_openai_compatible"].metadata.data_boundary = DataBoundary.HOSTED_PROVIDER
+    monkeypatch.setattr("harness.daemon_adapters.load_config", lambda _project_root: cfg)
+    monkeypatch.setattr(
+        "harness.daemon_adapters.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsafe backend must not instantiate")),
+    )
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Unsafe backend",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    lease_id = json.loads(tick.output)["lease"]["id"]
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert task_result.exit_code == 0
+    assert executed.exit_code == 1
+    payload = json.loads(executed.output)
+    assert payload["errors"] == ["Read-only execution requires local_no_api_cost backend"]
+    assert SQLiteStore(tmp_path).list_runs() == []
 
 
 def test_cli_daemon_inspect_lease_before_and_after_dry_run_is_read_only(tmp_path, monkeypatch) -> None:

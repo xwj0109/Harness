@@ -514,6 +514,13 @@ harness daemon execute-read-only task_lease_abc123def456 --project . --output js
 
 The read-only adapter can use only `list_files`, `read_file`, `git_status`, `git_diff`, and `final_answer`. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops. `daemon inspect-lease` reports read-only eligibility, and `daemon recover` may reconcile existing read-only linked-run evidence without creating a second run.
 
+Read-only execution troubleshooting:
+
+- Local backend unavailable before run creation: no run is created and the active lease remains inspectable.
+- Task not eligible: inspect the lease to review status, metadata, approvals, and linked attempt state.
+- Attempt already linked to a run: do not execute again; inspect the lease or run `daemon recover`.
+- Recovery required: `daemon recover` may reconcile completed or failed linked-run evidence, but it must not retry or create another run automatically.
+
 Task statuses are:
 
 ```text

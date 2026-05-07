@@ -562,6 +562,124 @@ def test_store_read_only_start_and_recovery_reconcile_completed_partial_state(tm
     assert len(store.list_runs()) == 1
 
 
+def test_store_read_only_recovery_reconciles_failed_partial_state(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Read-only",
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    run = store.start_read_only_lease_run(
+        leased.lease.id,
+        backend=backend,
+        owner="local_daemon:test:123",
+    )
+    store.update_run_status(run.id, "failed")
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert [item.id for item in recovery.recovered_tasks] == [task.id]
+    assert recovery.events[0].event_type == "recover_read_only"
+    assert store.get_task(task.id).status == TaskStatus.FAILED
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.failure_code == "read_only_failed"
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.RELEASED
+    assert len(store.list_runs()) == 1
+
+
+def test_store_read_only_recovery_fails_expired_active_nonterminal_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Read-only",
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    run = store.start_read_only_lease_run(
+        leased.lease.id,
+        backend=backend,
+        owner="local_daemon:test:123",
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, expires_at = ?, released_at = NULL WHERE id = ?",
+            (TaskLeaseStatus.ACTIVE.value, "2026-01-01T00:00:00+00:00", leased.lease.id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert [lease.id for lease in recovery.expired_leases] == [leased.lease.id]
+    assert [item.id for item in recovery.recovered_tasks] == [task.id]
+    assert recovery.events[0].event_type == "recover_read_only"
+    assert store.get_run(run.id).status == "running"
+    assert store.get_task(task.id).status == TaskStatus.FAILED
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.failure_code == "read_only_recovery_required"
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.EXPIRED
+    assert len(store.list_runs()) == 1
+
+
+def test_store_read_only_validation_rejects_existing_run_id_approvals_and_forbidden_metadata(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    linked = store.create_task(
+        title="Read-only",
+        priority=20,
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+    forbidden = store.create_task(
+        title="Forbidden",
+        priority=10,
+        metadata={
+            "execution_adapter": "read_only_summary",
+            "task_type": "read_only_repo_summary",
+            "requires_active_repo_write": True,
+            "requires_docker": True,
+        },
+    )
+    approval = store.create_task(
+        title="Approval",
+        priority=5,
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+
+    linked_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert linked_selection is not None
+    run = store.start_read_only_lease_run(
+        linked_selection["lease"].id,
+        backend=backend,
+        owner="local_daemon:test:123",
+    )
+    assert store.get_task(linked.id).run_id == run.id
+    with pytest.raises(ValueError, match="Task attempt already has run_id"):
+        store.validate_read_only_lease_for_execution(linked_selection["lease"].id)
+
+    forbidden_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert forbidden_selection is not None
+    with pytest.raises(ValueError, match="requires_active_repo_write, requires_docker"):
+        store.validate_read_only_lease_for_execution(forbidden_selection["lease"].id)
+
+    approval_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert approval_selection is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET required_approvals_json = ?, approval_state = ? WHERE id = ?",
+            ('["hosted_provider"]', "required", approval.id),
+        )
+    with pytest.raises(ValueError, match="unresolved required approvals"):
+        store.validate_read_only_lease_for_execution(approval_selection["lease"].id)
+
+
 def test_store_daemon_recovery_reconciles_completed_dry_run_partial_state(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

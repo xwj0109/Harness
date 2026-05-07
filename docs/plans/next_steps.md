@@ -12,6 +12,7 @@ The v0.3.5 stabilization plan is tracked in [v0_3_5_control_plane_stabilization_
 The v0.4 local daemon plan is tracked in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md).
 The v0.4.5 execution adapter decision gate is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md).
 The v0.5 read-only execution adapter plan is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md).
+The v0.5.1 read-only hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -83,7 +84,7 @@ The adapter is intentionally narrow. It uses only the configured local-only, no-
 
 ## Immediate Next Planning Target
 
-The immediate next target is either read-only adapter hardening or a separate decision plan for the next adapter. The default is to stop at the bounded read-only adapter until a new plan proves the next capability is small, local, typed, and testable.
+The immediate next target is v0.5.1 read-only adapter hardening. This checkpoint should strengthen failure handling, recovery coverage, inspection evidence, and operator troubleshooting for the existing `read_only_summary/read_only_repo_summary` adapter without adding another execution path.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, and active repo writes remain unauthorized.
 
