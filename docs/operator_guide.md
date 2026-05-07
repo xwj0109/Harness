@@ -488,6 +488,16 @@ harness daemon stop --project . --output json
 
 Daemon commands are scheduler-readiness control-plane operations only. They do not execute tasks, bind task attempts to runs, call Codex or local model backends, run Docker, create run artifacts, mutate active repo files, start unmanaged background work, add hosted fallback, add paid fallback, or expose backend settings and secrets.
 
+The v0.4.5 dry-run adapter is the only exception to the no-run-binding daemon rule, and it is explicit:
+
+```bash
+harness tasks add --title "Dry-run contract" --execution-adapter dry_run --task-type phase_1a_test --project . --output json
+harness daemon run-once --project . --output json
+harness daemon execute-dry-run task_lease_abc123def456 --project . --output json
+```
+
+`daemon execute-dry-run` requires an existing active lease id. It does not select work itself. It links the leased task attempt to a local `phase_1a_test` run, writes metadata-only run evidence through existing harness artifact APIs, marks the task and attempt succeeded, and releases the lease. It returns `harness.daemon_execute_dry_run/v1`. It does not call Codex, preflight a local model backend, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted or paid fallback.
+
 Task statuses are:
 
 ```text

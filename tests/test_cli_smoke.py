@@ -1263,6 +1263,126 @@ def test_cli_daemon_run_once_pauses_approval_required_tasks(tmp_path, monkeypatc
     assert "environment" not in serialized
 
 
+def test_cli_daemon_execute_dry_run_links_run_without_backends_or_docker(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dry run must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dry run must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("dry run must not touch Docker")),
+    )
+
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Dry run",
+            "--execution-adapter",
+            "dry_run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_payload = json.loads(task_result.output)
+    assert task_payload["task"]["metadata"] == {
+        "execution_adapter": "dry_run",
+        "task_type": "phase_1a_test",
+    }
+
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert tick.exit_code == 0, tick.output
+    tick_payload = json.loads(tick.output)
+    assert tick_payload["decision"] == "leased_task"
+    assert tick_payload["selected_task"]["status"] == "leased"
+    assert tick_payload["attempt"]["run_id"] is None
+    lease_id = tick_payload["lease"]["id"]
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-dry-run", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    duplicate = runner.invoke(
+        app,
+        ["daemon", "execute-dry-run", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert executed.exit_code == 0, executed.output
+    payload = json.loads(executed.output)
+    assert payload["schema_version"] == "harness.daemon_execute_dry_run/v1"
+    assert payload["ok"] is True
+    assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["task"]["status"] == "succeeded"
+    assert payload["attempt"]["status"] == "succeeded"
+    assert payload["attempt"]["run_id"] == payload["run"]["id"]
+    assert payload["lease"]["status"] == "released"
+    assert payload["run"]["status"] == "completed"
+    assert payload["run"]["task_type"] == "phase_1a_test"
+    assert payload["manifest"]["schema_version"] == "harness.manifest/v1.1"
+    assert payload["manifest"]["task_id"] == payload["task"]["id"]
+    assert payload["manifest"]["backend_descriptor"] is None
+    assert payload["manifest"]["backend_descriptor_sha256"] is None
+    assert {artifact["kind"] for artifact in payload["manifest"]["artifacts"]} >= {
+        "events",
+        "transcript",
+        "final_report",
+        "manifest",
+    }
+
+    assert duplicate.exit_code == 1
+    duplicate_payload = json.loads(duplicate.output)
+    assert duplicate_payload["schema_version"] == "harness.daemon_execute_dry_run/v1"
+    assert duplicate_payload["ok"] is False
+    assert duplicate_payload["errors"] == ["Dry-run execution requires active lease: released"]
+    assert len(SQLiteStore(tmp_path).list_runs()) == 1
+
+    serialized = task_result.output + tick.output + executed.output + duplicate.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
+def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Bad adapter",
+            "--execution-adapter",
+            "codex",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.task/v1"
+    assert payload["ok"] is False
+    assert payload["errors"] == ["Unsupported execution adapter: only dry_run is supported"]
+
+
 def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 

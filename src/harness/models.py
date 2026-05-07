@@ -222,6 +222,8 @@ class RunRecord(BaseModel):
     data_boundary: DataBoundary | None = None
     allow_network: bool | None = None
     approval_id: str | None = None
+    task_id: str | None = None
+    objective_id: str | None = None
 
 
 class TaskRecord(BaseModel):
@@ -445,6 +447,19 @@ class RunManifest(BaseModel):
     backend_descriptor_sha256: str | None = None
     sandbox_profile: dict[str, Any] | None = None
     validation_results: dict[str, Any] | None = None
+
+
+class DaemonDryRunResult(BaseModel):
+    schema_version: str = "harness.daemon_execute_dry_run/v1"
+    ok: bool = True
+    decision: str
+    project_root: Path
+    task: TaskRecord
+    attempt: TaskAttempt
+    lease: TaskLease
+    run: RunRecord
+    manifest: RunManifest
+    policy_sha256: str
 
 
 class RunBaselineRecord(BaseModel):

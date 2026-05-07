@@ -16,6 +16,7 @@ from harness.models import (
     BackendDescriptor,
     BackendKind,
     BackendMetadata,
+    DaemonDryRunResult,
     DaemonEvent,
     DaemonRecord,
     DaemonRecoveryResult,
@@ -64,6 +65,8 @@ TASK_STATUS_QUERY_ALIASES = {
 DEFAULT_TASK_LEASE_MINUTES = 30
 DEFAULT_TASK_LEASE_OWNER = "manual_cli"
 DEFAULT_DAEMON_STALE_AFTER_SECONDS = 120
+DRY_RUN_EXECUTION_ADAPTER = "dry_run"
+DRY_RUN_TASK_TYPE = "phase_1a_test"
 DAEMON_POLICY_FORBIDDEN_METADATA_KEYS = {
     "daemon_policy_forbidden",
     "requires_active_repo_write",
@@ -71,6 +74,14 @@ DAEMON_POLICY_FORBIDDEN_METADATA_KEYS = {
     "requires_docker",
     "requires_paid_provider",
     "requires_hosted_boundary",
+}
+DRY_RUN_FORBIDDEN_METADATA_KEYS = DAEMON_POLICY_FORBIDDEN_METADATA_KEYS | {
+    "requires_generic_shell",
+    "requires_mcp",
+    "requires_a2a",
+    "requires_browser",
+    "requires_email",
+    "requires_calendar",
 }
 
 ALLOWED_TASK_TRANSITIONS = {
@@ -154,6 +165,8 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.executescript(schema)
             self._ensure_column(conn, "runs", "approval_id", "TEXT")
+            self._ensure_column(conn, "runs", "task_id", "TEXT")
+            self._ensure_column(conn, "runs", "objective_id", "TEXT")
             self._ensure_column(conn, "artifacts", "schema_version", "TEXT")
             self._ensure_column(conn, "artifacts", "sha256", "TEXT")
             self._ensure_column(conn, "artifacts", "size_bytes", "INTEGER")
@@ -235,17 +248,23 @@ class SQLiteStore:
         status: str = "created",
         backend: BackendConfig | None = None,
         approval_id: str | None = None,
+        task_id: str | None = None,
+        objective_id: str | None = None,
     ) -> RunRecord:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         with self.connect() as conn:
+            if task_id is not None:
+                self._require_task(conn, task_id)
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
             conn.execute(
                 """
                 INSERT INTO runs (
                   id, goal, task_type, status, project_root, created_at, updated_at,
                   backend_name, backend_kind, billing_mode, execution_location,
-                  data_boundary, allow_network, approval_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  data_boundary, allow_network, approval_id, task_id, objective_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -262,6 +281,8 @@ class SQLiteStore:
                     backend.metadata.data_boundary.value if backend else None,
                     int(backend.metadata.allow_network) if backend else None,
                     approval_id,
+                    task_id,
+                    objective_id,
                 ),
             )
         self.initialize_run_artifacts(run_id)
@@ -294,6 +315,20 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Run not found: {run_id}")
         return self._row_to_run(row)
+
+    def get_task_attempt(self, attempt_id: str) -> TaskAttempt:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM task_attempts WHERE id = ?", (attempt_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Task attempt not found: {attempt_id}")
+        return self._row_to_task_attempt(row)
+
+    def get_task_lease(self, lease_id: str) -> TaskLease:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM task_leases WHERE id = ?", (lease_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Task lease not found: {lease_id}")
+        return self._row_to_task_lease(row)
 
     def update_run_status(self, run_id: str, status: str) -> None:
         with self.connect() as conn:
@@ -892,6 +927,189 @@ class SQLiteStore:
             lease=selection["lease"] if selection is not None else None,
             pause_reasons=pause_reasons,
         )
+
+    def execute_dry_run_lease(self, lease_id: str, owner: str = DEFAULT_TASK_LEASE_OWNER) -> DaemonDryRunResult:
+        lease = self.get_task_lease(lease_id)
+        if lease.status != TaskLeaseStatus.ACTIVE:
+            raise ValueError(f"Dry-run execution requires active lease: {lease.status.value}")
+        if lease.attempt_id is None:
+            raise ValueError(f"Dry-run execution requires linked task attempt: {lease.id}")
+        attempt = self.get_task_attempt(lease.attempt_id)
+        if attempt.run_id is not None:
+            raise ValueError(f"Task attempt already has run_id: {attempt.id}")
+        task = self.get_task(lease.task_id)
+        if task.status != TaskStatus.LEASED:
+            raise ValueError(f"Dry-run execution requires leased task status: {task.status.value}")
+        if task.required_approvals:
+            raise ValueError("Dry-run execution rejected: task has unresolved required approvals")
+        self._validate_dry_run_task_metadata(task)
+        task_policy = resolve_task_effective_policy(task)
+        policy_hash = effective_policy_sha256(task_policy)
+        goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
+        run = self.create_run(
+            goal=goal,
+            task_type=DRY_RUN_TASK_TYPE,
+            status="running",
+            backend=None,
+            task_id=task.id,
+            objective_id=task.objective_id,
+        )
+        started_at = now_iso()
+        with self.connect() as conn:
+            validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
+            result = conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?, run_id = ?, started_at = ?
+                WHERE id = ? AND run_id IS NULL
+                """,
+                (TaskStatus.RUNNING.value, run.id, started_at, attempt.id),
+            )
+            if result.rowcount == 0:
+                raise ValueError(f"Task attempt already has run_id: {attempt.id}")
+            conn.execute(
+                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ?",
+                (TaskStatus.RUNNING.value, run.id, started_at, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=TaskStatus.LEASED,
+                to_status=TaskStatus.RUNNING,
+                reason="dry_run_execution_started",
+                actor=owner,
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                created_at=started_at,
+            )
+        paths = self.initialize_run_artifacts(run.id)
+        append_jsonl(
+            paths["transcript"],
+            sanitize_for_logging(
+                {
+                    "event": "dry_run_no_tool_execution",
+                    "task_id": task.id,
+                    "attempt_id": attempt.id,
+                    "lease_id": lease.id,
+                    "run_id": run.id,
+                    "policy_sha256": policy_hash,
+                }
+            ),
+        )
+        paths["final_report"].write_text(
+            "\n".join(
+                [
+                    f"# Dry-run execution contract {run.id}",
+                    "",
+                    "This run was created by the daemon dry-run execution adapter.",
+                    "No backend, tool, Docker, shell, network, hosted provider, or paid provider was invoked.",
+                    "",
+                    f"- Task id: {task.id}",
+                    f"- Attempt id: {attempt.id}",
+                    f"- Lease id: {lease.id}",
+                    f"- Run id: {run.id}",
+                    f"- Policy sha256: {policy_hash}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        self.append_event(
+            run.id,
+            "info",
+            "dry_run_no_tool_execution",
+            "Dry-run execution contract completed without tool execution.",
+            {
+                "task_id": task.id,
+                "attempt_id": attempt.id,
+                "lease_id": lease.id,
+                "policy_sha256": policy_hash,
+            },
+        )
+        for kind in ("events", "transcript", "final_report", "manifest"):
+            self.register_artifact(
+                run.id,
+                kind=kind,
+                path=paths[kind],
+                producer="daemon_execute_dry_run",
+                redaction_state="redacted",
+                metadata={"dry_run": True},
+            )
+        finished_at = now_iso()
+        self.update_run_status(run.id, "completed")
+        with self.connect() as conn:
+            validate_task_transition(TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?, finished_at = ?
+                WHERE id = ?
+                """,
+                (TaskStatus.SUCCEEDED.value, finished_at, attempt.id),
+            )
+            conn.execute(
+                """
+                UPDATE task_leases
+                SET status = ?, released_at = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    TaskLeaseStatus.RELEASED.value,
+                    finished_at,
+                    json.dumps(
+                        sanitize_for_logging({"run_id": run.id, "decision": "dry_run_no_tool_execution"}),
+                        sort_keys=True,
+                    ),
+                    lease.id,
+                ),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (TaskStatus.SUCCEEDED.value, finished_at, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=TaskStatus.RUNNING,
+                to_status=TaskStatus.SUCCEEDED,
+                reason="dry_run_execution_succeeded",
+                actor=owner,
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                created_at=finished_at,
+            )
+        daemon = self.ensure_daemon(owner=lease.owner)
+        self.record_daemon_event(
+            daemon.id,
+            event_type="execute_dry_run",
+            message="Dry-run execution contract linked lease to run evidence.",
+            metadata={
+                "lease_id": lease.id,
+                "attempt_id": attempt.id,
+                "task_id": task.id,
+                "run_id": run.id,
+                "decision": "dry_run_no_tool_execution",
+                "policy_sha256": policy_hash,
+            },
+        )
+        self.write_run_manifest(run.id)
+        return DaemonDryRunResult(
+            decision="dry_run_no_tool_execution",
+            project_root=self.project_root,
+            task=self.get_task(task.id),
+            attempt=self.get_task_attempt(attempt.id),
+            lease=self.get_task_lease(lease.id),
+            run=self.get_run(run.id),
+            manifest=self.build_run_manifest(run.id),
+            policy_sha256=policy_hash,
+        )
+
+    def _validate_dry_run_task_metadata(self, task: TaskRecord) -> None:
+        if task.metadata.get("execution_adapter") != DRY_RUN_EXECUTION_ADAPTER:
+            raise ValueError("Dry-run execution requires execution_adapter=dry_run")
+        if task.metadata.get("task_type") != DRY_RUN_TASK_TYPE:
+            raise ValueError("Dry-run execution requires task_type=phase_1a_test")
+        forbidden = sorted(key for key in DRY_RUN_FORBIDDEN_METADATA_KEYS if bool(task.metadata.get(key)))
+        if forbidden:
+            raise ValueError(f"Dry-run execution rejected by task metadata: {', '.join(forbidden)}")
 
     def renew_daemon_leases(
         self,
@@ -1761,6 +1979,8 @@ class SQLiteStore:
             approval_id=run.approval_id,
             backend_descriptor=backend_descriptor,
             artifacts=artifacts,
+            task_id=run.task_id,
+            objective_id=run.objective_id,
             effective_policy=effective_policy,
             effective_policy_sha256=effective_policy_sha256(effective_policy),
             backend_descriptor_sha256=backend_descriptor_sha256(backend_descriptor),
@@ -1978,6 +2198,8 @@ class SQLiteStore:
             data_boundary=row["data_boundary"],
             allow_network=bool(row["allow_network"]) if row["allow_network"] is not None else None,
             approval_id=row["approval_id"] if "approval_id" in row.keys() else None,
+            task_id=row["task_id"] if "task_id" in row.keys() else None,
+            objective_id=row["objective_id"] if "objective_id" in row.keys() else None,
         )
 
     def _row_to_task(self, row: sqlite3.Row) -> TaskRecord:

@@ -68,7 +68,7 @@ The v0.4 scheduler-readiness checkpoint is complete. Daemon commands are local c
 
 ## Immediate Next Planning Target
 
-The next planning target is the v0.4.5 minimal execution adapter decision gate in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). The default remains no task execution unless a separate, decision-complete implementation plan explicitly authorizes a tiny adapter. Any future execution work must preserve the same safety boundary until explicitly changed: no backend calls, Docker, run artifact creation, unmanaged background work, hosted fallback, or paid fallback unless the approved adapter contract explicitly covers and tests that behavior.
+The next planning target is the post-Slice-1 v0.4.5 execution decision in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). Slice 1 now proves a dry-run lease-to-run contract only. The default remains no real task execution unless a separate, decision-complete implementation plan explicitly authorizes one tiny adapter. Any future execution work must preserve the same safety boundary until explicitly changed: no backend calls, Docker, unmanaged background work, hosted fallback, or paid fallback unless the approved adapter contract explicitly covers and tests that behavior.
 
 ## Later Work
 

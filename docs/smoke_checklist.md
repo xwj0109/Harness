@@ -147,6 +147,14 @@ harness daemon recover --project . --output json
 harness daemon stop --project . --output json
 ```
 
+Inspect the explicit v0.4.5 dry-run adapter without invoking providers or tools:
+
+```bash
+harness tasks add --title "Dry-run contract" --execution-adapter dry_run --task-type phase_1a_test --project . --output json
+harness daemon run-once --project . --output json
+harness daemon execute-dry-run "$LEASE_ID" --project . --output json
+```
+
 Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon control-plane commands after `RUN_ID` setup:
 
 - These commands are local evidence inspection or baseline commands.
@@ -156,6 +164,7 @@ Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon cont
 - `daemon status` must expose paused task reasons so operators can debug approval, dependency, active-lease, or daemon-policy gates without reading SQLite manually.
 - `daemon recover` may expire stale active leases and return tasks to `ready`, `blocked`, or `waiting_approval`, but it must not retry terminal tasks automatically.
 - v0.4 daemon commands do not execute tasks, bind task attempts to runs, call backends, run Docker, create run artifacts, add hosted fallback, add paid fallback, or start unmanaged background work.
+- `daemon execute-dry-run` is explicit v0.4.5 contract evidence only: it may bind one active lease to one local `phase_1a_test` run and metadata-only artifacts, but it must not call backends, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted/paid fallback.
 - Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or artifact file contents.
 - `harness compare "$RUN_ID" "$RUN_ID"` and baseline comparison against the same run should report no drift.
 

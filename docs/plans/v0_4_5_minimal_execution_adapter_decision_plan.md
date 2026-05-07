@@ -1,6 +1,6 @@
 # v0.4.5 Minimal Execution Adapter Decision Plan
 
-Status: planning gate only. This document does not authorize implementation until an explicit follow-on implementation slice is accepted.
+Status: Slice 1 dry-run lease-to-run execution contract implemented. Further real execution remains unauthorized until a separate follow-on implementation slice is accepted.
 
 ## Summary
 
@@ -281,6 +281,13 @@ Implementation should not start until this checklist is answered in a follow-on 
 
 ## Recommended Next Action
 
-Do not implement execution yet.
+Do not implement real backend or tool execution yet.
 
-The next step should be a short decision document or issue that chooses the first executable task type and answers the required decisions above. If those answers stay small and local, write a Slice 1 implementation plan for execution contract models only. If they expand into backend/tool execution complexity, defer execution to v0.5.
+Slice 1 proves the local dry-run lease-to-run contract only. The next step should be a short decision document or issue that chooses whether to remain at dry-run evidence or authorize one real bounded adapter. If those answers stay small and local, write a follow-on implementation plan for exactly one real adapter. If they expand into backend/tool execution complexity, defer execution to v0.5.
+
+## Slice 1 Completion Note
+
+- `harness tasks add` accepts `--execution-adapter dry_run --task-type phase_1a_test` as metadata only.
+- `harness daemon execute-dry-run <lease_id>` requires an existing active daemon lease and does not select work itself.
+- The dry-run adapter links `TaskAttempt.run_id`, sets compatible `TaskRecord.run_id`, creates a local `phase_1a_test` run, registers metadata-only artifacts, marks the task/attempt succeeded, and releases the lease.
+- The dry-run adapter does not call Codex, local model backends, Docker, shell tools, network, hosted providers, paid providers, or active repo write paths.

@@ -2,6 +2,8 @@ import json
 import sqlite3
 import hashlib
 
+import pytest
+
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import ObjectiveStatus, TaskLeaseStatus, TaskStatus
@@ -361,6 +363,115 @@ def test_store_daemon_recovery_requeues_to_waiting_approval_or_blocked(tmp_path)
     assert {task.id for task in recovery.recovered_tasks} == {approval_task.id, blocked_task.id}
     assert store.get_task(approval_task.id).status == TaskStatus.WAITING_APPROVAL
     assert store.get_task(blocked_task.id).status == TaskStatus.BLOCKED
+
+
+def test_store_daemon_execute_dry_run_links_lease_attempt_run_and_releases(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Dry run",
+        description="contract only",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    result = store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+
+    assert result.schema_version == "harness.daemon_execute_dry_run/v1"
+    assert result.decision == "dry_run_no_tool_execution"
+    assert result.task.id == task.id
+    assert result.task.status == TaskStatus.SUCCEEDED
+    assert result.attempt.run_id == result.run.id
+    assert result.attempt.status == TaskStatus.SUCCEEDED
+    assert result.attempt.started_at is not None
+    assert result.attempt.finished_at is not None
+    assert result.lease.status == TaskLeaseStatus.RELEASED
+    assert result.lease.metadata["run_id"] == result.run.id
+    assert result.run.status == "completed"
+    assert result.run.task_type == "phase_1a_test"
+    assert result.run.task_id == task.id
+    assert result.manifest.schema_version == "harness.manifest/v1.1"
+    assert result.manifest.task_id == task.id
+    assert result.manifest.objective_id is None
+    assert result.manifest.backend_descriptor is None
+    assert result.manifest.backend_descriptor_sha256 is None
+    assert {artifact.kind for artifact in store.list_artifacts(result.run.id)} >= {
+        "events",
+        "transcript",
+        "final_report",
+        "manifest",
+    }
+    assert store.list_task_transitions(task.id)[-2].reason == "dry_run_execution_started"
+    assert store.list_task_transitions(task.id)[-1].reason == "dry_run_execution_succeeded"
+    assert "execute_dry_run" in {event.event_type for event in store.list_daemon_events()}
+    report = tmp_path / ".harness" / "runs" / result.run.id / "final_report.md"
+    report_text = report.read_text(encoding="utf-8")
+    assert "No backend, tool, Docker, shell, network, hosted provider, or paid provider was invoked." in report_text
+    assert "api_key" not in report_text
+    assert "OPENAI_API_KEY" not in report_text
+
+
+def test_store_daemon_execute_dry_run_rejects_duplicate_and_ineligible_tasks(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+
+    with pytest.raises(ValueError, match="Dry-run execution requires active lease: released"):
+        store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+
+    missing_metadata = store.create_task(title="No adapter")
+    leased_missing = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased_missing.lease is not None
+    assert leased_missing.selected_task is not None
+    assert leased_missing.selected_task.id == missing_metadata.id
+    with pytest.raises(ValueError, match="Dry-run execution requires execution_adapter=dry_run"):
+        store.execute_dry_run_lease(leased_missing.lease.id, owner="local_daemon:test:123")
+
+
+def test_store_daemon_execute_dry_run_rejects_approvals_wrong_type_and_forbidden_metadata(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    wrong_type = store.create_task(
+        title="Wrong type",
+        priority=10,
+        metadata={"execution_adapter": "dry_run", "task_type": "read_only_repo_summary"},
+    )
+    forbidden = store.create_task(
+        title="Forbidden",
+        priority=5,
+        metadata={
+            "execution_adapter": "dry_run",
+            "task_type": "phase_1a_test",
+            "requires_external_network": True,
+        },
+    )
+    approval = store.create_task(
+        title="Approval",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+        required_approvals=["hosted_provider"],
+    )
+
+    wrong_type_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert wrong_type_selection is not None
+    with pytest.raises(ValueError, match="Dry-run execution requires task_type=phase_1a_test"):
+        store.execute_dry_run_lease(wrong_type_selection["lease"].id, owner="local_daemon:test:123")
+
+    forbidden_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert forbidden_selection is not None
+    assert forbidden_selection["task"].id == forbidden.id
+    with pytest.raises(ValueError, match="requires_external_network"):
+        store.execute_dry_run_lease(forbidden_selection["lease"].id, owner="local_daemon:test:123")
+
+    assert store.get_task(approval.id).status == TaskStatus.WAITING_APPROVAL
+    with pytest.raises(KeyError, match="Task lease not found: missing_lease"):
+        store.execute_dry_run_lease("missing_lease", owner="local_daemon:test:123")
 
 
 def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None:

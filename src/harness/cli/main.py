@@ -323,6 +323,14 @@ def tasks_add(
     ] = None,
     workbench: Annotated[str | None, typer.Option("--workbench", help="Built-in workbench id.")] = None,
     agent: Annotated[str | None, typer.Option("--agent", help="Built-in agent id.")] = None,
+    execution_adapter: Annotated[
+        str | None,
+        typer.Option("--execution-adapter", help="Execution adapter metadata. Only dry_run is supported."),
+    ] = None,
+    task_type: Annotated[
+        str | None,
+        typer.Option("--task-type", help="Execution task type metadata. Only phase_1a_test is supported."),
+    ] = None,
     priority: Annotated[int, typer.Option("--priority", help="Higher priority tasks run first.")] = 0,
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
@@ -331,6 +339,7 @@ def tasks_add(
     _require_initialized(project_root)
     try:
         _validate_task_spec_refs(workbench, agent)
+        metadata = _dry_run_task_metadata(execution_adapter, task_type)
         task = SQLiteStore(project_root).create_task(
             title=title,
             description=description,
@@ -341,7 +350,7 @@ def tasks_add(
             spec_source_kind="builtin" if (workbench or agent) else None,
             depends_on=depends_on,
             required_approvals=requires_approval,
-            metadata={},
+            metadata=metadata,
         )
     except (KeyError, ValueError) as exc:
         _emit_task_error("harness.task/v1", str(exc).strip("'"), output)
@@ -1066,6 +1075,29 @@ def daemon_recover(project: ProjectOption = Path("."), output: OutputOption = Ou
     typer.echo(f"Recovered tasks: {len(result.recovered_tasks)}")
 
 
+@daemon_app.command("execute-dry-run")
+def daemon_execute_dry_run(
+    lease_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    owner = _daemon_owner()
+    try:
+        result = SQLiteStore(project_root).execute_dry_run_lease(lease_id, owner=owner)
+    except (KeyError, ValueError) as exc:
+        _emit_daemon_error("harness.daemon_execute_dry_run/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Decision: {result.decision}")
+    typer.echo(f"Task: {result.task.id}")
+    typer.echo(f"Run: {result.run.id}")
+    typer.echo(f"Lease: {result.lease.id}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1558,6 +1590,16 @@ def _validate_task_spec_refs(workbench_id: str | None, agent_id: str | None) -> 
         registry.get_workbench(workbench_id)
     if agent_id is not None:
         registry.get_agent(agent_id)
+
+
+def _dry_run_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:
+    if execution_adapter is None and task_type is None:
+        return {}
+    if execution_adapter != "dry_run":
+        raise ValueError("Unsupported execution adapter: only dry_run is supported")
+    if task_type != "phase_1a_test":
+        raise ValueError("Unsupported dry-run task type: only phase_1a_test is supported")
+    return {"execution_adapter": "dry_run", "task_type": "phase_1a_test"}
 
 
 def _emit_objective_error(schema_version: str, message: str, output: OutputFormat) -> None:

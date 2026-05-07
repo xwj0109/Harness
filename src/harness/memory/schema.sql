@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS runs (
   execution_location TEXT,
   data_boundary TEXT,
   allow_network INTEGER,
-  approval_id TEXT
+  approval_id TEXT,
+  task_id TEXT,
+  objective_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
