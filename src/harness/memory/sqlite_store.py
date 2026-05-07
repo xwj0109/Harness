@@ -20,6 +20,8 @@ from harness.models import (
     ManifestArtifact,
     ObjectiveRecord,
     ObjectiveStatus,
+    RunBaselineRecord,
+    RunCompareResult,
     RunManifest,
     RunRecord,
     TaskAttempt,
@@ -1159,6 +1161,156 @@ class SQLiteStore:
             backend_descriptor_sha256=backend_descriptor_sha256(backend_descriptor),
         )
 
+    def build_run_evidence_snapshot(self, run_id: str) -> dict[str, Any]:
+        manifest = self.build_run_manifest(run_id).model_dump(mode="json")
+        return sanitize_for_logging(
+            {
+                "run_id": manifest["run_id"],
+                "run_status": {"status": manifest["status"]},
+                "effective_policy_sha256": manifest.get("effective_policy_sha256"),
+                "backend_descriptor_sha256": manifest.get("backend_descriptor_sha256"),
+                "sandbox_profile": manifest.get("sandbox_profile"),
+                "approvals": {
+                    "approval_id": manifest.get("approval_id"),
+                    "required_approvals": (
+                        manifest.get("effective_policy", {}).get("required_approvals", [])
+                        if manifest.get("effective_policy")
+                        else []
+                    ),
+                },
+                "task_objective_linkage": {
+                    "task_id": manifest.get("task_id"),
+                    "objective_id": manifest.get("objective_id"),
+                    "trace_id": manifest.get("trace_id"),
+                },
+                "artifacts": [
+                    {
+                        "id": artifact.get("id"),
+                        "kind": artifact.get("kind"),
+                        "sha256": artifact.get("sha256"),
+                        "size_bytes": artifact.get("size_bytes"),
+                        "producer": artifact.get("producer"),
+                        "redaction_state": artifact.get("redaction_state"),
+                        "evidence_status": artifact.get("evidence_status"),
+                        "metadata": artifact.get("metadata", {}),
+                    }
+                    for artifact in sorted(
+                        manifest.get("artifacts", []),
+                        key=lambda item: (item.get("kind") or "", item.get("id") or ""),
+                    )
+                ],
+                "test_result_evidence": {
+                    "validation_results": manifest.get("validation_results"),
+                    "test_artifacts": [
+                        {
+                            "id": artifact.get("id"),
+                            "kind": artifact.get("kind"),
+                            "sha256": artifact.get("sha256"),
+                            "size_bytes": artifact.get("size_bytes"),
+                            "evidence_status": artifact.get("evidence_status"),
+                        }
+                        for artifact in sorted(
+                            manifest.get("artifacts", []),
+                            key=lambda item: (item.get("kind") or "", item.get("id") or ""),
+                        )
+                        if "test" in (artifact.get("kind") or "")
+                        or "pytest" in (artifact.get("kind") or "")
+                    ],
+                },
+            }
+        )
+
+    def set_run_baseline(self, name: str, run_id: str) -> RunBaselineRecord:
+        if not name.strip():
+            raise ValueError("Baseline name is required")
+        snapshot = self.build_run_evidence_snapshot(run_id)
+        evidence_sha256 = self._stable_json_sha256(snapshot)
+        timestamp = now_iso()
+        snapshot_json = json.dumps(snapshot, sort_keys=True, default=str)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO run_baselines (name, run_id, created_at, evidence_sha256, snapshot_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                  run_id = excluded.run_id,
+                  created_at = excluded.created_at,
+                  evidence_sha256 = excluded.evidence_sha256,
+                  snapshot_json = excluded.snapshot_json
+                """,
+                (name, run_id, timestamp, evidence_sha256, snapshot_json),
+            )
+        return self.get_run_baseline(name)
+
+    def get_run_baseline(self, name: str) -> RunBaselineRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM run_baselines WHERE name = ?", (name,)).fetchone()
+        if row is None:
+            raise KeyError(f"Baseline not found: {name}")
+        return self._row_to_run_baseline(row)
+
+    def compare_runs(self, run_a: str, run_b: str) -> RunCompareResult:
+        return self._compare_snapshots(
+            run_a=run_a,
+            run_b=run_b,
+            snapshot_a=self.build_run_evidence_snapshot(run_a),
+            snapshot_b=self.build_run_evidence_snapshot(run_b),
+        )
+
+    def compare_run_to_baseline(self, run_id: str, baseline_name: str) -> dict[str, Any]:
+        baseline = self.get_run_baseline(baseline_name)
+        comparison = self._compare_snapshots(
+            run_a=baseline.run_id,
+            run_b=run_id,
+            snapshot_a=baseline.snapshot,
+            snapshot_b=self.build_run_evidence_snapshot(run_id),
+        )
+        return {
+            "schema_version": "harness.baseline_compare/v1",
+            "ok": True,
+            "baseline": baseline.model_dump(mode="json"),
+            "comparison": comparison.model_dump(mode="json"),
+        }
+
+    def _compare_snapshots(
+        self,
+        *,
+        run_a: str,
+        run_b: str,
+        snapshot_a: dict[str, Any],
+        snapshot_b: dict[str, Any],
+    ) -> RunCompareResult:
+        section_names = [
+            "run_status",
+            "effective_policy_sha256",
+            "backend_descriptor_sha256",
+            "sandbox_profile",
+            "approvals",
+            "task_objective_linkage",
+            "artifacts",
+            "test_result_evidence",
+        ]
+        sections = {
+            section: {
+                "matches": snapshot_a.get(section) == snapshot_b.get(section),
+                "run_a": snapshot_a.get(section),
+                "run_b": snapshot_b.get(section),
+            }
+            for section in section_names
+        }
+        changed_sections = [section for section, value in sections.items() if not value["matches"]]
+        return RunCompareResult(
+            run_a=run_a,
+            run_b=run_b,
+            matches=not changed_sections,
+            changed_sections=changed_sections,
+            sections=sections,
+        )
+
+    def _stable_json_sha256(self, value: Any) -> str:
+        payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _latest_backend_descriptor(self, run_id: str) -> BackendDescriptor | None:
         with self.connect() as conn:
             row = conn.execute(
@@ -1194,6 +1346,15 @@ class SQLiteStore:
             redaction_state=row["redaction_state"] or "unknown",
             evidence_status=row["evidence_status"] or "unknown",
             metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_run_baseline(self, row: sqlite3.Row) -> RunBaselineRecord:
+        return RunBaselineRecord(
+            name=row["name"],
+            run_id=row["run_id"],
+            created_at=parse_dt(row["created_at"]),
+            evidence_sha256=row["evidence_sha256"],
+            snapshot=json.loads(row["snapshot_json"]),
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:

@@ -367,6 +367,25 @@ The JSON wrappers are `harness.tool_capabilities/v1` for list output and `harnes
 
 Descriptors are control-plane metadata only. They do not grant permissions, execute tools, preflight backends, run Docker, create runs, create artifacts, mutate tasks, or start schedulers. Generic shell, MCP, A2A, browser, email, calendar, hosted fallback, paid fallback, and networked arbitrary execution are not exposed as tool descriptors in v0.3.5.
 
+## Compare and Baseline Evidence
+
+Compare two local run evidence snapshots:
+
+```bash
+harness compare run_abc123def456 run_def456abc123 --project . --output json
+```
+
+Save and compare against a named local baseline:
+
+```bash
+harness baseline set run_abc123def456 --name local-green --project . --output json
+harness baseline compare run_def456abc123 --baseline local-green --project . --output json
+```
+
+The JSON wrappers are `harness.compare/v1`, `harness.baseline/v1`, and `harness.baseline_compare/v1`. Compare output reports drift across run status, runtime policy hash, backend descriptor hash, sandbox profile, approval evidence, task/objective linkage, artifact checksum/status metadata, and test-result evidence when present.
+
+Baselines are local evidence snapshots stored through the harness runtime. They are not artifact-content copies and do not export file contents. Compare and baseline commands report evidence drift; they do not repair artifacts, execute tools, preflight backends, run Docker, create runs, create artifacts, mutate tasks, or start schedulers.
+
 ## v0.2 Specs Safety Boundary
 
 All `harness specs ...` commands are read-only inspection commands. They do not auto-discover spec files, read or write `.harness/`, read project config, read SQLite, inspect environment variables, read backend settings, read secrets, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.

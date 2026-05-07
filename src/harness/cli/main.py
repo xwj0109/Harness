@@ -63,6 +63,7 @@ specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previ
 policy_app = typer.Typer(help="Runtime effective policy evidence.")
 artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
 tools_app = typer.Typer(help="Harness tool capability descriptors.")
+baseline_app = typer.Typer(help="Local run evidence baselines.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
@@ -73,6 +74,7 @@ app.add_typer(specs_app, name="specs")
 app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(tools_app, name="tools")
+app.add_typer(baseline_app, name="baseline")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
@@ -176,6 +178,27 @@ def show(run_id: str, project: ProjectOption = Path("."), output: OutputOption =
     typer.echo(f"  events: {run_dir / 'events.jsonl'}")
     typer.echo(f"  transcript: {run_dir / 'transcript.jsonl'}")
     typer.echo(f"  final_report: {run_dir / 'final_report.md'}")
+
+
+@app.command()
+def compare(
+    run_a: str,
+    run_b: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        result = store.compare_runs(run_a, run_b)
+    except KeyError as exc:
+        _emit_compare_error("harness.compare/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    _print_compare_result(result.model_dump(mode="json"))
 
 
 @app.command()
@@ -857,6 +880,53 @@ def tools_inspect(
     typer.echo(f"Replay policy: {descriptor.replay_policy.value}")
 
 
+@baseline_app.command("set")
+def baseline_set(
+    run_id: str,
+    name: Annotated[str, typer.Option("--name", help="Baseline name.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        baseline = store.set_run_baseline(name, run_id)
+    except (KeyError, ValueError) as exc:
+        _emit_compare_error("harness.baseline/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = baseline.model_dump(mode="json")
+        payload.update({"ok": True})
+        _emit_json(payload)
+        return
+    typer.echo(f"Baseline: {baseline.name}")
+    typer.echo(f"Run: {baseline.run_id}")
+    typer.echo(f"Evidence: {baseline.evidence_sha256}")
+
+
+@baseline_app.command("compare")
+def baseline_compare(
+    run_id: str,
+    baseline: Annotated[str, typer.Option("--baseline", help="Baseline name.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        result = store.compare_run_to_baseline(run_id, baseline)
+    except KeyError as exc:
+        _emit_compare_error("harness.baseline_compare/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo(f"Baseline: {result['baseline']['name']}")
+    _print_compare_result(result["comparison"])
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1384,6 +1454,21 @@ def _emit_tool_error(message: str, output: OutputFormat) -> None:
         _emit_json({"schema_version": "harness.tool_capability/v1", "ok": False, "errors": [message]})
     else:
         typer.echo(f"Tool command failed: {message}")
+
+
+def _emit_compare_error(schema_version: str, message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Compare command failed: {message}")
+
+
+def _print_compare_result(result: dict) -> None:
+    typer.echo(f"Run A: {result['run_a']}")
+    typer.echo(f"Run B: {result['run_b']}")
+    typer.echo(f"Matches: {result['matches']}")
+    changed = result.get("changed_sections", [])
+    typer.echo(f"Changed sections: {', '.join(changed) if changed else 'none'}")
 
 
 def _emit_json(payload) -> None:

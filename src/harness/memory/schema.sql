@@ -143,6 +143,15 @@ CREATE TABLE IF NOT EXISTS task_transitions (
   FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
 
+CREATE TABLE IF NOT EXISTS run_baselines (
+  name TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  evidence_sha256 TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  FOREIGN KEY(run_id) REFERENCES runs(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created
   ON tasks(status, priority DESC, created_at ASC);
 
@@ -163,3 +172,6 @@ CREATE INDEX IF NOT EXISTS idx_task_leases_task_status
 
 CREATE INDEX IF NOT EXISTS idx_task_transitions_task_created
   ON task_transitions(task_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_run_baselines_run
+  ON run_baselines(run_id);

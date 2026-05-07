@@ -242,6 +242,150 @@ def test_cli_artifacts_unknown_refs_return_stable_json_errors(tmp_path) -> None:
     }
 
 
+def test_cli_compare_and_baseline_report_evidence_without_contents(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    first = store.create_run(goal="first", task_type="phase_1a_test")
+    second = store.create_run(goal="second", task_type="phase_1a_test")
+    artifact_path = tmp_path / ".harness" / "runs" / second.id / "pytest_stdout.txt"
+    artifact_path.write_text("initial output body", encoding="utf-8")
+    store.register_artifact(second.id, "pytest_stdout", artifact_path)
+    artifact_path.write_text("changed output body", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("compare must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("compare must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("compare must not touch Docker")),
+    )
+
+    compared = runner.invoke(
+        app,
+        ["compare", first.id, second.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    baseline = runner.invoke(
+        app,
+        ["baseline", "set", first.id, "--name", "local-green", "--project", str(tmp_path), "--output", "json"],
+    )
+    baseline_compared = runner.invoke(
+        app,
+        [
+            "baseline",
+            "compare",
+            second.id,
+            "--baseline",
+            "local-green",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    text = runner.invoke(app, ["compare", first.id, second.id, "--project", str(tmp_path)])
+
+    assert compared.exit_code == 0, compared.output
+    compare_payload = json.loads(compared.output)
+    assert compare_payload["schema_version"] == "harness.compare/v1"
+    assert compare_payload["ok"] is True
+    assert compare_payload["run_a"] == first.id
+    assert compare_payload["run_b"] == second.id
+    assert compare_payload["matches"] is False
+    assert "artifacts" in compare_payload["changed_sections"]
+    assert compare_payload["sections"]["artifacts"]["run_b"][0]["evidence_status"] == "mismatch"
+
+    assert baseline.exit_code == 0, baseline.output
+    baseline_payload = json.loads(baseline.output)
+    assert baseline_payload["schema_version"] == "harness.baseline/v1"
+    assert baseline_payload["ok"] is True
+    assert baseline_payload["name"] == "local-green"
+    assert baseline_payload["run_id"] == first.id
+    assert baseline_payload["evidence_sha256"]
+
+    assert baseline_compared.exit_code == 0, baseline_compared.output
+    baseline_compare_payload = json.loads(baseline_compared.output)
+    assert baseline_compare_payload["schema_version"] == "harness.baseline_compare/v1"
+    assert baseline_compare_payload["ok"] is True
+    assert baseline_compare_payload["baseline"]["name"] == "local-green"
+    assert baseline_compare_payload["comparison"]["schema_version"] == "harness.compare/v1"
+    assert baseline_compare_payload["comparison"]["run_b"] == second.id
+
+    assert text.exit_code == 0
+    assert "Changed sections:" in text.output
+    assert "artifacts" in text.output
+
+    serialized = json.dumps(compare_payload) + json.dumps(baseline_payload) + json.dumps(baseline_compare_payload)
+    assert "initial output body" not in serialized
+    assert "changed output body" not in serialized
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
+def test_cli_compare_and_baseline_unknown_refs_return_stable_json_errors(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    run = store.create_run(goal="run", task_type="phase_1a_test")
+
+    compared = runner.invoke(
+        app,
+        ["compare", run.id, "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+    baseline_set = runner.invoke(
+        app,
+        [
+            "baseline",
+            "set",
+            "run_missing",
+            "--name",
+            "missing",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    baseline_compared = runner.invoke(
+        app,
+        [
+            "baseline",
+            "compare",
+            run.id,
+            "--baseline",
+            "missing",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert compared.exit_code == 1
+    assert json.loads(compared.output) == {
+        "schema_version": "harness.compare/v1",
+        "ok": False,
+        "errors": ["Run not found: run_missing"],
+    }
+    assert baseline_set.exit_code == 1
+    assert json.loads(baseline_set.output) == {
+        "schema_version": "harness.baseline/v1",
+        "ok": False,
+        "errors": ["Run not found: run_missing"],
+    }
+    assert baseline_compared.exit_code == 1
+    assert json.loads(baseline_compared.output) == {
+        "schema_version": "harness.baseline_compare/v1",
+        "ok": False,
+        "errors": ["Baseline not found: missing"],
+    }
+
+
 def test_cli_tools_list_and_inspect_are_metadata_only(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         "harness.cli.main.CodexCliBackend",

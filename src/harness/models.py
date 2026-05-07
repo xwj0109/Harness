@@ -382,3 +382,22 @@ class RunManifest(BaseModel):
     backend_descriptor_sha256: str | None = None
     sandbox_profile: dict[str, Any] | None = None
     validation_results: dict[str, Any] | None = None
+
+
+class RunBaselineRecord(BaseModel):
+    schema_version: str = "harness.baseline/v1"
+    name: str
+    run_id: str
+    created_at: datetime
+    evidence_sha256: str
+    snapshot: dict[str, Any]
+
+
+class RunCompareResult(BaseModel):
+    schema_version: str = "harness.compare/v1"
+    ok: bool = True
+    run_a: str
+    run_b: str
+    matches: bool
+    changed_sections: list[str] = Field(default_factory=list)
+    sections: dict[str, dict[str, Any]] = Field(default_factory=dict)

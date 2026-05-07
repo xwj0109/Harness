@@ -52,7 +52,7 @@ Implementation queue:
 1. Add typed `PolicyLevel` and `EffectivePolicy`.
 2. Upgrade run manifests compatibly toward `harness.manifest/v1.1`.
 3. Add `policy explain` JSON output without backend preflight or secret inspection.
-4. Add artifact evidence, tool descriptors, compare/baseline, safety-smoke evals, and trace export in later v0.3.5 slices.
+4. Add compare/baseline, safety-smoke evals, and trace export in later v0.3.5 slices.
 5. Run full regression tests after each stabilization slice.
 
 ## Later Work

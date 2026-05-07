@@ -144,6 +144,7 @@ def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
         "task_attempts",
         "task_leases",
         "task_transitions",
+        "run_baselines",
     } <= tables
     assert {
         "objective_id",
@@ -228,6 +229,89 @@ def test_store_reads_legacy_artifact_rows_after_migration(tmp_path) -> None:
     assert artifact.size_bytes is None
     assert artifact.redaction_state == "unknown"
     assert artifact.evidence_status == "unknown"
+
+
+def test_store_run_baselines_round_trip_replace_and_compare(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    first = store.create_run(goal="baseline", task_type="phase_1a_test")
+    second = store.create_run(goal="compare", task_type="phase_1a_test")
+
+    baseline = store.set_run_baseline("local-green", first.id)
+
+    assert baseline.schema_version == "harness.baseline/v1"
+    assert baseline.name == "local-green"
+    assert baseline.run_id == first.id
+    assert baseline.evidence_sha256
+    assert baseline.snapshot["run_status"] == {"status": "created"}
+    assert store.get_run_baseline("local-green") == baseline
+
+    same = store.compare_runs(first.id, first.id)
+    assert same.schema_version == "harness.compare/v1"
+    assert same.matches is True
+    assert same.changed_sections == []
+    assert same.sections["artifacts"]["matches"] is True
+
+    store.update_run_status(second.id, "completed")
+    different = store.compare_runs(first.id, second.id)
+    assert different.matches is False
+    assert "run_status" in different.changed_sections
+    assert different.sections["run_status"]["run_a"] == {"status": "created"}
+    assert different.sections["run_status"]["run_b"] == {"status": "completed"}
+
+    replaced = store.set_run_baseline("local-green", second.id)
+    assert replaced.run_id == second.id
+    assert store.get_run_baseline("local-green").run_id == second.id
+
+
+def test_store_compare_reports_artifact_evidence_drift_without_contents(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    first = store.create_run(goal="first", task_type="phase_1a_test")
+    second = store.create_run(goal="second", task_type="phase_1a_test")
+    first_artifact = tmp_path / ".harness" / "runs" / first.id / "evidence.txt"
+    second_artifact = tmp_path / ".harness" / "runs" / second.id / "evidence.txt"
+    first_artifact.write_text("same", encoding="utf-8")
+    second_artifact.write_text("same", encoding="utf-8")
+    store.register_artifact(first.id, "pytest_stdout", first_artifact)
+    artifact = store.register_artifact(second.id, "pytest_stdout", second_artifact)
+
+    assert store.compare_runs(first.id, second.id).matches is False
+
+    second_artifact.write_text("changed secret-looking content", encoding="utf-8")
+    result = store.compare_runs(first.id, second.id)
+    serialized = json.dumps(result.model_dump(mode="json"))
+
+    assert "artifacts" in result.changed_sections
+    assert "test_result_evidence" in result.changed_sections
+    assert result.sections["artifacts"]["run_b"][0]["id"] == artifact.id
+    assert result.sections["artifacts"]["run_b"][0]["evidence_status"] == "mismatch"
+    assert "changed secret-looking content" not in serialized
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
+def test_store_baseline_errors_are_stable(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="run", task_type="phase_1a_test")
+
+    for action, expected in [
+        (lambda: store.get_run_baseline("missing"), "Baseline not found: missing"),
+        (lambda: store.set_run_baseline("", run.id), "Baseline name is required"),
+        (lambda: store.compare_runs(run.id, "run_missing"), "Run not found: run_missing"),
+        (
+            lambda: store.compare_run_to_baseline(run.id, "missing"),
+            "Baseline not found: missing",
+        ),
+    ]:
+        try:
+            action()
+        except (KeyError, ValueError) as exc:
+            assert str(exc).strip("'") == expected
+        else:
+            raise AssertionError(f"{expected} should raise")
 
 
 def test_store_creates_lists_filters_and_updates_tasks(tmp_path) -> None:
