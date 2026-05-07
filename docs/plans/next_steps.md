@@ -10,6 +10,7 @@ The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
 The v0.3.5 stabilization plan is tracked in [v0_3_5_control_plane_stabilization_plan.md](v0_3_5_control_plane_stabilization_plan.md).
 The v0.4 local daemon plan is tracked in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md).
+The v0.4.5 execution adapter decision gate is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -67,7 +68,7 @@ The v0.4 scheduler-readiness checkpoint is complete. Daemon commands are local c
 
 ## Immediate Next Planning Target
 
-The next planning target should be Slice 4: the minimal execution adapter decision gate. The default remains to stop v0.4 after scheduler readiness unless a separate, decision-complete plan explicitly authorizes a tiny execution adapter. Any future Slice 4 work must preserve the same safety boundary until explicitly changed: no task execution, backend calls, Docker, run artifact creation, unmanaged background work, hosted fallback, or paid fallback.
+The next planning target is the v0.4.5 minimal execution adapter decision gate in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). The default remains no task execution unless a separate, decision-complete implementation plan explicitly authorizes a tiny adapter. Any future execution work must preserve the same safety boundary until explicitly changed: no backend calls, Docker, run artifact creation, unmanaged background work, hosted fallback, or paid fallback unless the approved adapter contract explicitly covers and tests that behavior.
 
 ## Later Work
 
