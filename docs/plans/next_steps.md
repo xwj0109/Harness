@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -46,6 +46,8 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `0.3.5`.
 - v0.4 daemon control-plane persistence, scheduler tick, heartbeat/status/stop, lease renewal, expired lease recovery, approval/policy pause evidence, and daemon status pause reasons.
 - Version bump to `0.4.0`.
+- v0.4.5 dry-run lease-to-run contract, read-only lease inspection, dry-run recovery reconciliation, and dry-run smoke documentation.
+- Version bump to `0.4.5`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -66,9 +68,13 @@ v0.4 local daemon planning is captured in [v0_4_local_daemon_plan.md](v0_4_local
 
 The v0.4 scheduler-readiness checkpoint is complete. Daemon commands are local control-plane operations only: they may acquire/renew/recover leases and record daemon evidence, but they do not execute tasks, call backends, run Docker, create run artifacts, start unmanaged background work, add hosted fallback, or add paid fallback.
 
+## Completed v0.4.5 Dry-Run Adapter Milestone
+
+The v0.4.5 dry-run adapter milestone is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). Slice 1 proves a dry-run lease-to-run contract, and Slice 2 hardens dry-run lease inspection and recovery. The milestone is complete as dry-run evidence only: `daemon execute-dry-run` may create local `phase_1a_test` run evidence from an active lease, but it does not call backends, models, Docker, shell tools, network, hosted providers, paid providers, MCP/A2A, browser/email/calendar tools, or mutate active repo files.
+
 ## Immediate Next Planning Target
 
-The next planning target is the post-Slice-2 v0.4.5 execution decision in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). Slice 1 proves a dry-run lease-to-run contract, and Slice 2 hardens dry-run lease inspection and recovery. The default remains no real task execution unless a separate, decision-complete implementation plan explicitly authorizes one tiny adapter. Any future execution work must preserve the same safety boundary until explicitly changed: no backend calls, Docker, unmanaged background work, hosted fallback, or paid fallback unless the approved adapter contract explicitly covers and tests that behavior.
+The next planning target should be a separate decision: either plan exactly one real bounded adapter, likely `read_only_repo_summary`, or defer real execution to v0.5. The default remains no real task execution unless a separate, decision-complete implementation plan explicitly authorizes one tiny adapter. Any future execution work must preserve the same safety boundary until explicitly changed: no backend calls, Docker, unmanaged background work, hosted fallback, or paid fallback unless the approved adapter contract explicitly covers and tests that behavior.
 
 ## Later Work
 

@@ -164,7 +164,7 @@ Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon cont
 - `daemon run-once` must pause approval-required or daemon-policy-forbidden tasks and report `pause_reasons` instead of failing or executing them.
 - `daemon status` must expose paused task reasons so operators can debug approval, dependency, active-lease, or daemon-policy gates without reading SQLite manually.
 - `daemon recover` may expire stale active leases and return tasks to `ready`, `blocked`, or `waiting_approval`, but it must not retry terminal tasks automatically.
-- v0.4 daemon commands do not execute tasks, bind task attempts to runs, call backends, run Docker, create run artifacts, add hosted fallback, add paid fallback, or start unmanaged background work.
+- v0.4 scheduler commands do not execute tasks, bind task attempts to runs, call backends, run Docker, create run artifacts, add hosted fallback, add paid fallback, or start unmanaged background work.
 - `daemon execute-dry-run` is explicit v0.4.5 contract evidence only: it may bind one active lease to one local `phase_1a_test` run and metadata-only artifacts, but it must not call backends, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted/paid fallback.
 - `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, and recovery recommendation without creating runs or artifacts.
 - `daemon recover` may reconcile existing dry-run evidence but must not create a second run for a linked attempt.

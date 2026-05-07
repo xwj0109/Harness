@@ -1,6 +1,6 @@
 # v0.4.5 Minimal Execution Adapter Decision Plan
 
-Status: Slice 1 dry-run lease-to-run execution contract and Slice 2 dry-run recovery/inspection hardening are implemented. Further real execution remains unauthorized until a separate follow-on implementation slice is accepted.
+Status: complete as the v0.4.5 dry-run adapter milestone. Further real execution remains unauthorized until a separate follow-on implementation slice is accepted.
 
 ## Summary
 
@@ -298,3 +298,11 @@ Slice 1 proves the local dry-run lease-to-run contract only. The next step shoul
 - `harness daemon recover` reconciles existing dry-run evidence for completed or failed runs and handles expired active leases with non-terminal linked runs by failing closed for operator inspection.
 - Recovery does not create another run for an attempt that already has `run_id`.
 - Real backend/tool execution remains unauthorized.
+
+## v0.4.5 Release Completion Note
+
+- v0.4.5 is complete as a dry-run lease-to-run contract, inspection, and recovery milestone.
+- `daemon execute-dry-run` is the only daemon command that may bind a lease to a run, and it is limited to local `phase_1a_test` evidence without provider/tool execution.
+- `daemon inspect-lease` is read-only.
+- `daemon recover` may reconcile existing dry-run evidence but must not create second runs.
+- Real adapters such as `read_only_repo_summary`, `repo_planning`, `simple_code_edit`, and `codex_code_edit` remain unauthorized until a separate decision-complete plan is accepted.
