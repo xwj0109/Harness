@@ -1,6 +1,6 @@
 # v0.5.1 Read-Only Adapter Hardening Plan
 
-Status: active hardening checkpoint for the existing v0.5 read-only adapter.
+Status: complete as a hardening checkpoint for the existing v0.5 read-only adapter.
 
 ## Summary
 
@@ -53,3 +53,11 @@ Out of scope:
   - `git status --short`
   - `git diff --name-only`
   - Confirm no tracked edits touch `.harness/`, `.git/`, `.env*`, `*.pem`, `*.key`, `*.sqlite`, or `secrets/`.
+
+## Completion Note
+
+- Backend preflight failure before run creation is covered and leaves task, attempt, lease, and run state unchanged.
+- Runner failure after run creation is covered and marks run, task, and attempt failed while releasing the lease.
+- Duplicate execution, existing attempt/run linkage, unresolved approvals, forbidden metadata, and unsafe backend descriptors are covered.
+- Read-only recovery now has parity coverage for completed, failed, and expired non-terminal linked-run states.
+- Operator troubleshooting docs describe inspect/recover paths without authorizing new execution behavior.

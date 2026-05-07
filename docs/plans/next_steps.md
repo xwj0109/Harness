@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -52,6 +52,7 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `0.4.5`.
 - v0.5 Slice 1 read-only summary lease adapter for `read_only_summary/read_only_repo_summary`.
 - Version bump to `0.5.0`.
+- v0.5.1 read-only adapter hardening tests for failure, recovery, inspection, and unsafe metadata/backend gates.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -82,9 +83,13 @@ The v0.5 read-only adapter milestone is tracked in [v0_5_read_only_execution_ada
 
 The adapter is intentionally narrow. It uses only the configured local-only, no-cost `local_openai_compatible` backend and existing read-only tools. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, autonomous planning, generic task execution, or unmanaged daemon loops.
 
+## Completed v0.5.1 Read-Only Adapter Hardening
+
+The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md). It adds focused coverage for read-only adapter preflight failure, runner failure, duplicate execution, read-only recovery states, inspect-lease evidence, unresolved approvals, forbidden metadata, and unsafe backend descriptors. It does not add another execution path.
+
 ## Immediate Next Planning Target
 
-The immediate next target is v0.5.1 read-only adapter hardening. This checkpoint should strengthen failure handling, recovery coverage, inspection evidence, and operator troubleshooting for the existing `read_only_summary/read_only_repo_summary` adapter without adding another execution path.
+The immediate next target is a separate decision plan, not implementation. The default options are read-only adapter hardening follow-up only if a concrete gap remains, the next adapter decision plan, or v0.6 Quant Workbench planning aligned with the master roadmap.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, and active repo writes remain unauthorized.
 
