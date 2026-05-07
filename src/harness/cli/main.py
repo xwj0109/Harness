@@ -1044,6 +1044,24 @@ def daemon_stop(project: ProjectOption = Path("."), output: OutputOption = Outpu
     typer.echo(f"Stopped daemon records: {len(stopped)}")
 
 
+@daemon_app.command("recover")
+def daemon_recover(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    owner = _daemon_owner()
+    try:
+        result = SQLiteStore(project_root).recover_daemon_leases(owner=owner, pid=os.getpid())
+    except (KeyError, ValueError) as exc:
+        _emit_daemon_error("harness.daemon_recovery/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Daemon: {result.daemon_id}")
+    typer.echo(f"Expired leases: {len(result.expired_leases)}")
+    typer.echo(f"Recovered tasks: {len(result.recovered_tasks)}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,

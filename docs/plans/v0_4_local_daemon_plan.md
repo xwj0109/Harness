@@ -91,7 +91,7 @@ Acceptance criteria:
 
 ### Slice 2 — Lease Renewal and Recovery
 
-Status: next implementation target.
+Status: implemented.
 
 Purpose: make the daemon safe across restarts and interrupted work.
 
@@ -116,6 +116,8 @@ Acceptance criteria:
 - Recovery preserves task idempotency keys and transition evidence.
 
 ### Slice 3 — Approval and Policy Gating
+
+Status: next implementation target.
 
 Purpose: ensure the daemon pauses safely before any future execution path exists.
 

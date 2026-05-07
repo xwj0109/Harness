@@ -214,8 +214,11 @@ def test_store_daemon_run_once_leases_without_creating_runs_or_artifacts(tmp_pat
     assert result.attempt.run_id is None
     assert result.lease is not None
     assert result.lease.owner == "local_daemon:test:123"
-    assert second.selected_task is not None
-    assert second.selected_task.id == low.id
+    assert second.decision == "renewed_lease"
+    assert second.selected_task is None
+    assert second.lease is not None
+    assert second.lease.task_id == high.id
+    assert store.get_task(low.id).status == TaskStatus.READY
     assert store.list_runs() == []
     assert not any((tmp_path / ".harness" / "runs").iterdir())
     event_types = [event.event_type for event in store.list_daemon_events(result.daemon_id)]
@@ -236,6 +239,85 @@ def test_store_daemon_run_once_reports_no_eligible_task(tmp_path) -> None:
     assert result.attempt is None
     assert result.lease is None
     assert store.list_runs() == []
+
+
+def test_store_daemon_recovery_expires_leases_and_requeues_tasks(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(title="Recover me")
+    original_idempotency_key = task.idempotency_key
+    selection = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert selection.lease is not None
+    assert selection.attempt is not None
+    past = "2026-01-01T00:00:00+00:00"
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET expires_at = ? WHERE id = ?",
+            (past, selection.lease.id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+    second_recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    recovered = store.get_task(task.id)
+    attempts = store.list_task_attempts(task.id)
+    leases = store.list_task_leases(task.id)
+    assert recovery.schema_version == "harness.daemon_recovery/v1"
+    assert [lease.id for lease in recovery.expired_leases] == [selection.lease.id]
+    assert [item.id for item in recovery.recovered_tasks] == [task.id]
+    assert recovery.events[0].event_type == "recover_lease"
+    assert recovered.status == TaskStatus.READY
+    assert recovered.idempotency_key == original_idempotency_key
+    assert attempts[0].status == TaskStatus.FAILED
+    assert attempts[0].failure_code == "lease_expired"
+    assert attempts[0].run_id is None
+    assert leases[0].status == TaskLeaseStatus.EXPIRED
+    assert store.list_task_transitions(task.id)[-1].reason == "lease_expired"
+    assert second_recovery.expired_leases == []
+    assert second_recovery.recovered_tasks == []
+    assert store.list_runs() == []
+    assert not any((tmp_path / ".harness" / "runs").iterdir())
+
+
+def test_store_daemon_recovery_requeues_to_waiting_approval_or_blocked(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    dependency = store.create_task(title="Dependency")
+    approval_task = store.create_task(title="Approval", required_approvals=["hosted_provider"])
+    blocked_task = store.create_task(title="Blocked", depends_on=[dependency.id])
+
+    for task in [approval_task, blocked_task]:
+        with store.connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET status = ? WHERE id = ?",
+                (TaskStatus.LEASED.value, task.id),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_leases (
+                  id, task_id, attempt_id, owner, status, acquired_at, expires_at,
+                  heartbeat_at, released_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"lease_{task.id}",
+                    task.id,
+                    None,
+                    "local_daemon:test:123",
+                    TaskLeaseStatus.ACTIVE.value,
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                    None,
+                    None,
+                    "{}",
+                ),
+            )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert {task.id for task in recovery.recovered_tasks} == {approval_task.id, blocked_task.id}
+    assert store.get_task(approval_task.id).status == TaskStatus.WAITING_APPROVAL
+    assert store.get_task(blocked_task.id).status == TaskStatus.BLOCKED
 
 
 def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None:

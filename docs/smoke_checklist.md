@@ -143,6 +143,7 @@ Inspect the v0.4 daemon control plane without executing work:
 ```bash
 harness daemon status --project . --output json
 harness daemon run-once --project . --output json
+harness daemon recover --project . --output json
 harness daemon stop --project . --output json
 ```
 
@@ -150,7 +151,8 @@ Expected safety properties for the v0.3.5 evidence commands after `RUN_ID` setup
 
 - These commands are local evidence inspection or baseline commands.
 - They do not execute tools, preflight backends, run Docker, create extra runs or artifacts, start schedulers, or schedule background work.
-- `daemon run-once` may lease one eligible task and write daemon heartbeat/event evidence, but it must not execute the task or create a run.
+- `daemon run-once` may lease one eligible task or renew an active daemon-owned lease and write daemon heartbeat/event evidence, but it must not execute the task or create a run.
+- `daemon recover` may expire stale active leases and return tasks to `ready`, `blocked`, or `waiting_approval`, but it must not retry terminal tasks automatically.
 - Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or artifact file contents.
 - `harness compare "$RUN_ID" "$RUN_ID"` and baseline comparison against the same run should report no drift.
 

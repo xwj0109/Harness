@@ -351,6 +351,18 @@ class DaemonStatusResult(BaseModel):
     stale_after_seconds: int
 
 
+class DaemonRecoveryResult(BaseModel):
+    schema_version: str = "harness.daemon_recovery/v1"
+    ok: bool = True
+    daemon_id: str
+    owner: str
+    project_root: Path
+    renewed_leases: list[TaskLease] = Field(default_factory=list)
+    expired_leases: list[TaskLease] = Field(default_factory=list)
+    recovered_tasks: list[TaskRecord] = Field(default_factory=list)
+    events: list[DaemonEvent] = Field(default_factory=list)
+
+
 class PolicySource(BaseModel):
     kind: str
     id: str

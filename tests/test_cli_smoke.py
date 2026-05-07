@@ -1150,6 +1150,57 @@ def test_cli_daemon_run_once_status_and_stop_are_non_executing(tmp_path, monkeyp
     assert "environment" not in serialized
 
 
+def test_cli_daemon_recover_expires_lease_without_execution(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(title="Recover task", priority=10)
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon recover must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon recover must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon recover must not touch Docker")),
+    )
+
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    lease_id = json.loads(tick.output)["lease"]["id"]
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET expires_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00+00:00", lease_id),
+        )
+
+    recovered = runner.invoke(app, ["daemon", "recover", "--project", str(tmp_path), "--output", "json"])
+    recovered_again = runner.invoke(app, ["daemon", "recover", "--project", str(tmp_path), "--output", "json"])
+
+    assert recovered.exit_code == 0, recovered.output
+    payload = json.loads(recovered.output)
+    assert payload["schema_version"] == "harness.daemon_recovery/v1"
+    assert payload["ok"] is True
+    assert payload["expired_leases"][0]["id"] == lease_id
+    assert payload["expired_leases"][0]["status"] == "expired"
+    assert payload["recovered_tasks"][0]["id"] == task.id
+    assert payload["recovered_tasks"][0]["status"] == "ready"
+    assert payload["events"][0]["event_type"] == "recover_lease"
+    assert recovered_again.exit_code == 0
+    again_payload = json.loads(recovered_again.output)
+    assert again_payload["expired_leases"] == []
+    assert again_payload["recovered_tasks"] == []
+    assert store.list_runs() == []
+    assert not any((tmp_path / ".harness" / "runs").iterdir())
+
+    serialized = recovered.output + recovered_again.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
 def test_cli_daemon_run_once_returns_no_eligible_task(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 

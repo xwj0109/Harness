@@ -18,6 +18,7 @@ from harness.models import (
     BackendMetadata,
     DaemonEvent,
     DaemonRecord,
+    DaemonRecoveryResult,
     DaemonStatus,
     DaemonStatusResult,
     DaemonTickResult,
@@ -72,8 +73,17 @@ ALLOWED_TASK_TRANSITIONS = {
     },
     TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.SKIPPED},
     TaskStatus.WAITING_APPROVAL: {TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.SKIPPED},
-    TaskStatus.LEASED: {TaskStatus.RUNNING, TaskStatus.READY, TaskStatus.FAILED, TaskStatus.CANCELLED},
+    TaskStatus.LEASED: {
+        TaskStatus.RUNNING,
+        TaskStatus.READY,
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    },
     TaskStatus.RUNNING: {
+        TaskStatus.READY,
+        TaskStatus.BLOCKED,
         TaskStatus.SUCCEEDED,
         TaskStatus.FAILED,
         TaskStatus.WAITING_APPROVAL,
@@ -637,6 +647,29 @@ class SQLiteStore:
     def daemon_run_once(self, owner: str, pid: int | None = None) -> DaemonTickResult:
         daemon = self.ensure_daemon(owner=owner, pid=pid)
         tick_id = f"daemon_tick_{uuid.uuid4().hex[:12]}"
+        renewed_leases = self.renew_daemon_leases(owner=owner)
+        if renewed_leases:
+            self.record_daemon_event(
+                daemon.id,
+                event_type="tick",
+                message="Daemon scheduler tick renewed active lease.",
+                metadata={
+                    "tick_id": tick_id,
+                    "decision": "renewed_lease",
+                    "lease_ids": [lease.id for lease in renewed_leases],
+                },
+            )
+            return DaemonTickResult(
+                daemon_id=daemon.id,
+                owner=daemon.owner,
+                project_root=self.project_root,
+                tick_id=tick_id,
+                decision="renewed_lease",
+                selected_task=None,
+                attempt=None,
+                lease=renewed_leases[0],
+                pause_reasons=[],
+            )
         selection = self.select_next_task_for_lease(owner=owner)
         decision = "leased_task" if selection is not None else "no_eligible_task"
         metadata = {
@@ -663,6 +696,129 @@ class SQLiteStore:
             lease=selection["lease"] if selection is not None else None,
             pause_reasons=[],
         )
+
+    def renew_daemon_leases(
+        self,
+        owner: str,
+        lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+    ) -> list[TaskLease]:
+        timestamp = now_iso()
+        expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
+        renewed_ids: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM task_leases
+                WHERE owner = ? AND status = ? AND expires_at > ?
+                ORDER BY acquired_at ASC, id ASC
+                """,
+                (owner, TaskLeaseStatus.ACTIVE.value, timestamp),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE task_leases SET heartbeat_at = ?, expires_at = ? WHERE id = ?",
+                    (timestamp, expires_at, row["id"]),
+                )
+                renewed_ids.append(row["id"])
+        return [lease for lease in self.list_task_leases() if lease.id in set(renewed_ids)]
+
+    def recover_daemon_leases(self, owner: str, pid: int | None = None) -> DaemonRecoveryResult:
+        daemon = self.ensure_daemon(owner=owner, pid=pid)
+        timestamp = now_iso()
+        expired_ids: list[str] = []
+        recovered_task_ids: list[str] = []
+        event_ids: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM task_leases
+                WHERE status = ? AND expires_at <= ?
+                ORDER BY expires_at ASC, id ASC
+                """,
+                (TaskLeaseStatus.ACTIVE.value, timestamp),
+            ).fetchall()
+            for row in rows:
+                lease = self._row_to_task_lease(row)
+                task_row = conn.execute(
+                    "SELECT * FROM tasks WHERE id = ?", (lease.task_id,)
+                ).fetchone()
+                if task_row is None:
+                    continue
+                task = self._row_to_task(task_row)
+                if task.status not in {TaskStatus.LEASED, TaskStatus.RUNNING}:
+                    continue
+                next_status = self._task_requeue_status(task)
+                validate_task_transition(task.status, next_status)
+                conn.execute(
+                    """
+                    UPDATE task_leases
+                    SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?)
+                    WHERE id = ?
+                    """,
+                    (TaskLeaseStatus.EXPIRED.value, timestamp, timestamp, lease.id),
+                )
+                if lease.attempt_id is not None:
+                    conn.execute(
+                        """
+                        UPDATE task_attempts
+                        SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
+                        WHERE id = ? AND run_id IS NULL
+                        """,
+                        (
+                            TaskStatus.FAILED.value,
+                            timestamp,
+                            "lease_expired",
+                            "Daemon recovery expired an active lease before execution.",
+                            lease.attempt_id,
+                        ),
+                    )
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (next_status.value, timestamp, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=task.status,
+                    to_status=next_status,
+                    reason="lease_expired",
+                    actor=owner,
+                    metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id},
+                    created_at=timestamp,
+                )
+                event_ids.append(
+                    self._record_daemon_event(
+                        conn,
+                        daemon_id=daemon.id,
+                        event_type="recover_lease",
+                        message="Expired active lease and returned task to queue.",
+                        metadata={
+                            "lease_id": lease.id,
+                            "task_id": task.id,
+                            "attempt_id": lease.attempt_id,
+                            "next_status": next_status.value,
+                        },
+                        created_at=timestamp,
+                    )
+                )
+                expired_ids.append(lease.id)
+                recovered_task_ids.append(task.id)
+        return DaemonRecoveryResult(
+            daemon_id=daemon.id,
+            owner=daemon.owner,
+            project_root=self.project_root,
+            renewed_leases=[],
+            expired_leases=[lease for lease in self.list_task_leases() if lease.id in set(expired_ids)],
+            recovered_tasks=[self.get_task(task_id) for task_id in recovered_task_ids],
+            events=[self.get_daemon_event(event_id) for event_id in event_ids],
+        )
+
+    def _task_requeue_status(self, task: TaskRecord) -> TaskStatus:
+        if task.required_approvals:
+            return TaskStatus.WAITING_APPROVAL
+        if not self._task_dependencies_completed(task):
+            return TaskStatus.BLOCKED
+        return TaskStatus.READY
 
     def ensure_daemon(self, owner: str, pid: int | None = None) -> DaemonRecord:
         timestamp = now_iso()
