@@ -24,6 +24,7 @@ from harness.config import HARNESS_DIR, default_config, load_config, write_defau
 from harness.codex_runner import HostedBoundaryApprovalRequired, HostedSecretBlocked, CodexRepoPlanningRunner
 from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
+from harness.evals import run_safety_smoke
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import TaskStatus
@@ -51,6 +52,7 @@ from harness.spec_loader import (
 )
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tool_capabilities import get_tool_capability, list_tool_capabilities
+from harness.traces import export_run_trace, to_otel_json
 
 app = typer.Typer(help="Local-first agent harness.")
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
@@ -64,6 +66,8 @@ policy_app = typer.Typer(help="Runtime effective policy evidence.")
 artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
 tools_app = typer.Typer(help="Harness tool capability descriptors.")
 baseline_app = typer.Typer(help="Local run evidence baselines.")
+evals_app = typer.Typer(help="Local evidence-only eval suites.")
+traces_app = typer.Typer(help="Local run trace export.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
@@ -75,6 +79,8 @@ app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(tools_app, name="tools")
 app.add_typer(baseline_app, name="baseline")
+app.add_typer(evals_app, name="evals")
+app.add_typer(traces_app, name="traces")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
@@ -96,6 +102,7 @@ PolicySubjectKindOption = Annotated[
     typer.Option("--subject-kind", help="Policy subject kind: run, task, agent, workbench, or backend."),
 ]
 PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy subject id.")]
+TraceFormatOption = Annotated[str, typer.Option("--format", help="Trace format. Only otel-json is supported.")]
 
 GITIGNORE_SECTION = """# Harness local artifacts
 .harness/runs/
@@ -927,6 +934,56 @@ def baseline_compare(
     _print_compare_result(result["comparison"])
 
 
+@evals_app.command("run")
+def evals_run(
+    suite: Annotated[str, typer.Option("--suite", help="Eval suite id.")] = "safety-smoke",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    if suite != "safety-smoke":
+        _emit_eval_error(f"Unsupported eval suite: {suite}", output)
+        raise typer.Exit(code=1)
+    result = run_safety_smoke(project_root, load_config(project_root), SQLiteStore(project_root))
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+    else:
+        typer.echo(f"Suite: {result.suite}")
+        typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+        for check in result.checks:
+            typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@traces_app.command("export")
+def traces_export(
+    run_id: str,
+    format: TraceFormatOption = "otel-json",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    if format != "otel-json":
+        _emit_trace_error(f"Unsupported trace format: {format}", output)
+        raise typer.Exit(code=1)
+    try:
+        payload = to_otel_json(export_run_trace(project_root, SQLiteStore(project_root), run_id))
+    except KeyError as exc:
+        _emit_trace_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    span_count = sum(len(scope["spans"]) for resource in payload["resourceSpans"] for scope in resource["scopeSpans"])
+    typer.echo(f"Trace: {payload['trace_id']}")
+    typer.echo(f"Run: {payload['run_id']}")
+    typer.echo(f"Format: {payload['format']}")
+    typer.echo(f"Spans: {span_count}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1461,6 +1518,20 @@ def _emit_compare_error(schema_version: str, message: str, output: OutputFormat)
         _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
     else:
         typer.echo(f"Compare command failed: {message}")
+
+
+def _emit_eval_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.evals.safety_smoke/v1", "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Eval command failed: {message}")
+
+
+def _emit_trace_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.trace_export/v1", "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Trace command failed: {message}")
 
 
 def _print_compare_result(result: dict) -> None:

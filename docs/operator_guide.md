@@ -386,6 +386,24 @@ The JSON wrappers are `harness.compare/v1`, `harness.baseline/v1`, and `harness.
 
 Baselines are local evidence snapshots stored through the harness runtime. They are not artifact-content copies and do not export file contents. Compare and baseline commands report evidence drift; they do not repair artifacts, execute tools, preflight backends, run Docker, create runs, create artifacts, mutate tasks, or start schedulers.
 
+## Safety Evals and Trace Export
+
+Run the local safety-smoke evidence suite:
+
+```bash
+harness evals run --suite safety-smoke --project . --output json
+```
+
+Export a local run trace in OTEL-shaped JSON:
+
+```bash
+harness traces export run_abc123def456 --format otel-json --project . --output json
+```
+
+The JSON wrappers are `harness.evals.safety_smoke/v1` and `harness.trace_export/v1`. Safety-smoke checks runtime policy evidence, backend boundaries, sandbox network settings, artifact drift, and task queue non-execution using existing local persistence. Trace export links run, event, artifact, backend, approval, and policy metadata where present.
+
+These commands are evidence-only. They do not execute tools, preflight backends, run Docker, create runs, create artifacts, mutate tasks, inspect environment variables, or export artifact contents.
+
 ## v0.2 Specs Safety Boundary
 
 All `harness specs ...` commands are read-only inspection commands. They do not auto-discover spec files, read or write `.harness/`, read project config, read SQLite, inspect environment variables, read backend settings, read secrets, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.

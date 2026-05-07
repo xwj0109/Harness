@@ -386,6 +386,103 @@ def test_cli_compare_and_baseline_unknown_refs_return_stable_json_errors(tmp_pat
     }
 
 
+def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    run = store.create_run(goal="trace cli", task_type="phase_1a_test")
+    store.append_event(run.id, "info", "cli_trace_event", "Trace event.", {"payload": "safe"})
+
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("evals/traces must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("evals/traces must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("evals/traces must not touch Docker")),
+    )
+
+    evals = runner.invoke(
+        app,
+        ["evals", "run", "--suite", "safety-smoke", "--project", str(tmp_path), "--output", "json"],
+    )
+    trace = runner.invoke(
+        app,
+        ["traces", "export", run.id, "--format", "otel-json", "--project", str(tmp_path), "--output", "json"],
+    )
+    trace_text = runner.invoke(app, ["traces", "export", run.id, "--project", str(tmp_path)])
+
+    assert evals.exit_code == 0, evals.output
+    eval_payload = json.loads(evals.output)
+    assert eval_payload["schema_version"] == "harness.evals.safety_smoke/v1"
+    assert eval_payload["ok"] is True
+    assert {check["id"] for check in eval_payload["checks"]} >= {
+        "backend_boundaries",
+        "artifact_evidence",
+        "task_queue_non_execution",
+    }
+
+    assert trace.exit_code == 0, trace.output
+    trace_payload = json.loads(trace.output)
+    assert trace_payload["schema_version"] == "harness.trace_export/v1"
+    assert trace_payload["ok"] is True
+    assert trace_payload["format"] == "otel-json"
+    assert trace_payload["run_id"] == run.id
+    spans = trace_payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    assert {span["name"] for span in spans} >= {"harness.run", "harness.policy", "harness.event.cli_trace_event"}
+
+    assert trace_text.exit_code == 0
+    assert "Trace:" in trace_text.output
+    assert "Spans:" in trace_text.output
+
+    serialized = json.dumps(eval_payload) + json.dumps(trace_payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
+def test_cli_evals_and_traces_errors_are_stable_json(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    run = store.create_run(goal="run", task_type="phase_1a_test")
+
+    bad_suite = runner.invoke(
+        app,
+        ["evals", "run", "--suite", "unknown", "--project", str(tmp_path), "--output", "json"],
+    )
+    bad_format = runner.invoke(
+        app,
+        ["traces", "export", run.id, "--format", "zipkin", "--project", str(tmp_path), "--output", "json"],
+    )
+    missing_run = runner.invoke(
+        app,
+        ["traces", "export", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert bad_suite.exit_code == 1
+    assert json.loads(bad_suite.output) == {
+        "schema_version": "harness.evals.safety_smoke/v1",
+        "ok": False,
+        "errors": ["Unsupported eval suite: unknown"],
+    }
+    assert bad_format.exit_code == 1
+    assert json.loads(bad_format.output) == {
+        "schema_version": "harness.trace_export/v1",
+        "ok": False,
+        "errors": ["Unsupported trace format: zipkin"],
+    }
+    assert missing_run.exit_code == 1
+    assert json.loads(missing_run.output) == {
+        "schema_version": "harness.trace_export/v1",
+        "ok": False,
+        "errors": ["Run not found: run_missing"],
+    }
+
+
 def test_cli_tools_list_and_inspect_are_metadata_only(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(
         "harness.cli.main.CodexCliBackend",

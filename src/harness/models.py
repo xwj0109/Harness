@@ -401,3 +401,37 @@ class RunCompareResult(BaseModel):
     matches: bool
     changed_sections: list[str] = Field(default_factory=list)
     sections: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
+class SafetySmokeCheck(BaseModel):
+    id: str
+    status: str
+    message: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class SafetySmokeResult(BaseModel):
+    schema_version: str = "harness.evals.safety_smoke/v1"
+    ok: bool
+    suite: str = "safety-smoke"
+    checks: list[SafetySmokeCheck] = Field(default_factory=list)
+
+
+class TraceSpan(BaseModel):
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None = None
+    name: str
+    kind: str = "INTERNAL"
+    start_time: datetime
+    end_time: datetime
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class TraceExport(BaseModel):
+    schema_version: str = "harness.trace_export/v1"
+    ok: bool = True
+    format: str = "otel-json"
+    run_id: str
+    trace_id: str
+    spans: list[TraceSpan] = Field(default_factory=list)
