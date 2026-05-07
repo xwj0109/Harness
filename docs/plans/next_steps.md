@@ -4,9 +4,11 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. The current slice is v0.3 manual task queue hardening and release hygiene.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. The current slice is v0.3.5 control-plane stabilization.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
+The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
+The v0.3.5 stabilization plan is tracked in [v0_3_5_control_plane_stabilization_plan.md](v0_3_5_control_plane_stabilization_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -36,25 +38,26 @@ The first v0.2 schema and registry foundations are in place:
 - Full regression suite pass after documentation updates.
 - Version bump to `0.2.0`.
 - Final restricted-path worktree review.
-- Manual task queue persistence and CLI.
+- Manual v0.3 task queue persistence and CLI.
+- Durable objectives, task dependencies, transition evidence, cancel/retry, graph output, attempts, leases, and select-and-lease `run-next`.
 
-These components are declarative and read-only. They do not load user files, write `.harness/`, create tasks, execute agents, preflight backends, or schedule work.
+The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
-## Immediate v0.3 Slice
+## Immediate v0.3.5 Slice
 
-Harden and document the manual task queue:
+Stabilize the control-plane evidence that future daemon work will rely on:
 
 Implementation queue:
 
-1. Keep task records persistent and manually controlled.
-2. Preserve `run-next` as selection plus status transition only.
-3. Add no daemon, scheduler, autonomous background work, or backend execution.
-4. Run full regression tests after any queue changes.
-5. Prepare v0.3 release docs and version checklist after the queue is stable.
+1. Add typed `PolicyLevel` and `EffectivePolicy`.
+2. Upgrade run manifests compatibly toward `harness.manifest/v1.1`.
+3. Add `policy explain` JSON output without backend preflight or secret inspection.
+4. Add artifact evidence, tool descriptors, compare/baseline, safety-smoke evals, and trace export in later v0.3.5 slices.
+5. Run full regression tests after each stabilization slice.
 
-## Later v0.2+ Work
+## Later Work
 
-After v0.3 planning is stable, implement the manual queue in small read/write slices. Defer daemon scheduling, autonomous background behavior, broker actions, and external-message automation until a later milestone.
+After v0.3.5 exit criteria pass, plan v0.4 local daemon work as a scheduler over durable task state. Defer autonomous background behavior, broker actions, external-message automation, MCP/A2A adapters, hosted fallback, paid fallback, and generic shell access until a later milestone explicitly authorizes them.
 
 ## Working Defaults
 
