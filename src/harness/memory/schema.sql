@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS tasks (
   metadata_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_agents (
+  agent_id TEXT PRIMARY KEY,
+  workbench_id TEXT NOT NULL,
+  project_root TEXT NOT NULL,
+  imported_at TEXT NOT NULL,
+  source_path TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  agent_json TEXT NOT NULL,
+  profiles_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS objectives (
   id TEXT PRIMARY KEY,
   title TEXT NOT NULL,
@@ -181,6 +192,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created
 
 CREATE INDEX IF NOT EXISTS idx_tasks_objective_status
   ON tasks(objective_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_project_agents_workbench
+  ON project_agents(workbench_id, imported_at ASC);
 
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_downstream
   ON task_dependencies(downstream_task_id);

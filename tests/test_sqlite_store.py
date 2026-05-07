@@ -4,9 +4,53 @@ import hashlib
 
 import pytest
 
+from harness.agent_authoring import load_agent_bundle
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import ObjectiveStatus, TaskLeaseStatus, TaskStatus
+
+
+def _write_project_agent_bundle(path, *, agent_id: str = "custom_quant_researcher") -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "agent.yaml").write_text(
+        f"""
+schema_version: harness.agent_bundle/v1
+workbench_id: quant
+agent:
+  id: {agent_id}
+  kind: specialist
+  role: Custom quant research.
+  model_profile: local_reasoning
+  tool_policy: read_only
+  memory_scope: quant
+  parent: quant_research
+  outputs:
+    - custom_research_note.md
+  tags:
+    - custom
+""".lstrip(),
+        encoding="utf-8",
+    )
+    profiles_dir = path / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "default.yaml").write_text(
+        f"""
+id: {agent_id}.default
+agent_id: {agent_id}
+description: Default custom profile.
+knowledge_domains:
+  - commodities
+preferred_outputs:
+  - custom_research_note.md
+review_responsibilities: []
+forbidden_actions:
+  - live_trading
+tags:
+  - custom
+metadata: {{}}
+""".lstrip(),
+        encoding="utf-8",
+    )
 
 
 def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
@@ -29,6 +73,56 @@ def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
     assert paths["events"].read_text(encoding="utf-8")
     assert report.exists()
     assert "Run " in report.read_text(encoding="utf-8")
+
+
+def test_project_agent_import_persists_lists_and_inspects(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    bundle_path = tmp_path / "agents" / "custom_quant_researcher"
+    _write_project_agent_bundle(bundle_path)
+    loaded = load_agent_bundle(bundle_path)
+
+    imported = store.import_project_agent(loaded)
+    listed = store.list_project_agents()
+    inspected = store.get_project_agent("custom_quant_researcher")
+
+    assert imported.schema_version == "harness.project_agent/v1"
+    assert imported.agent_id == "custom_quant_researcher"
+    assert imported.workbench_id == "quant"
+    assert imported.source_path == bundle_path.resolve()
+    assert imported.content_sha256
+    assert imported.agent["id"] == "custom_quant_researcher"
+    assert imported.profiles[0]["id"] == "custom_quant_researcher.default"
+    assert [agent.agent_id for agent in listed] == ["custom_quant_researcher"]
+    assert inspected.content_sha256 == imported.content_sha256
+
+
+def test_project_agent_import_rejects_duplicate_and_unknown_inspect(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    bundle_path = tmp_path / "agents" / "custom_quant_researcher"
+    _write_project_agent_bundle(bundle_path)
+    loaded = load_agent_bundle(bundle_path)
+
+    store.import_project_agent(loaded)
+
+    with pytest.raises(ValueError, match="Project agent already imported: custom_quant_researcher"):
+        store.import_project_agent(loaded)
+    with pytest.raises(KeyError, match="Project agent not found: missing_agent"):
+        store.get_project_agent("missing_agent")
+
+
+def test_project_agent_table_initializes_on_existing_project(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    with store.connect() as conn:
+        conn.execute("DROP TABLE project_agents")
+
+    store.initialize()
+
+    with store.connect() as conn:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(project_agents)").fetchall()}
+    assert {"agent_id", "workbench_id", "source_path", "content_sha256", "agent_json", "profiles_json"} <= columns
 
 
 def test_store_writes_and_refreshes_run_manifest(tmp_path) -> None:

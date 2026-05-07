@@ -121,6 +121,23 @@ Expected v0.7 safety properties:
 - Authoring commands do not execute agents, preflight backends, run Docker, invoke shell tools, schedule work, call providers, connect to brokers, place orders, send messages, submit applications, or mutate active repo files.
 - Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or secret-like data.
 
+Verify v0.8 project-local agent import after initializing a project:
+
+```bash
+harness init --project .
+harness agents import /tmp/harness-agent-authoring-smoke --project . --output json
+harness agents list --project . --output json
+harness agents inspect smoke_agent --project . --output json
+harness tasks add --title "Use smoke agent" --agent smoke_agent --workbench quant --project . --output json
+```
+
+Expected v0.8 safety properties:
+
+- Import persists validated agent/profile metadata, source path, and content hash in initialized harness persistence.
+- Import does not modify packaged built-ins and rejects built-in id shadowing or duplicate project-local ids.
+- Imported task references record `spec_source_kind: project` but remain non-executing metadata.
+- Import/list/inspect do not execute agents, call backends, preflight providers, run Docker, invoke shell tools, create runs, create artifacts, start daemon work, or authorize new tools.
+
 ## Verify Manual v0.3 Task Queue
 
 The task queue requires initialized project state and writes only to `.harness/harness.sqlite`.

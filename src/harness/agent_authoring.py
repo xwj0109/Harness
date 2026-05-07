@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import hashlib
+import json
 import yaml
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
@@ -200,6 +202,17 @@ def load_agent_bundle(path: Path) -> LoadedAgentBundle:
 def merge_agent_bundle_with_builtins(loaded: LoadedAgentBundle) -> SpecRegistry:
     builtin = builtin_spec_registry()
     return _build_merged_registry(builtin, loaded.bundle, loaded.profiles)
+
+
+def agent_bundle_content_sha256(loaded: LoadedAgentBundle) -> str:
+    payload = {
+        "agent": _dump_model(loaded.bundle.agent),
+        "profiles": [_dump_model(profile) for profile in sorted(loaded.profiles, key=lambda item: item.id)],
+        "schema_version": loaded.bundle.schema_version,
+        "workbench_id": loaded.bundle.workbench_id,
+    }
+    encoded = json.dumps(_sort_json(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def resolve_agent_bundle_path(path: Path) -> Path:

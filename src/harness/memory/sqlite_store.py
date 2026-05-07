@@ -28,6 +28,7 @@ from harness.models import (
     ManifestArtifact,
     ObjectiveRecord,
     ObjectiveStatus,
+    ProjectAgentRecord,
     RunBaselineRecord,
     RunCompareResult,
     RunManifest,
@@ -43,6 +44,7 @@ from harness.models import (
     PolicyLevel,
     run_mode_for_task_type,
 )
+from harness.agent_authoring import LoadedAgentBundle, agent_bundle_content_sha256
 from harness.policy import (
     backend_descriptor_sha256,
     effective_policy_sha256,
@@ -389,6 +391,49 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Objective not found: {objective_id}")
         return self._row_to_objective(row)
+
+    def import_project_agent(self, loaded_bundle: LoadedAgentBundle) -> ProjectAgentRecord:
+        agent_id = loaded_bundle.bundle.agent.id
+        imported_at = now_iso()
+        agent_json = loaded_bundle.bundle.agent.model_dump(mode="json")
+        profiles_json = [profile.model_dump(mode="json") for profile in sorted(loaded_bundle.profiles, key=lambda item: item.id)]
+        with self.connect() as conn:
+            existing = conn.execute("SELECT agent_id FROM project_agents WHERE agent_id = ?", (agent_id,)).fetchone()
+            if existing is not None:
+                raise ValueError(f"Project agent already imported: {agent_id}")
+            conn.execute(
+                """
+                INSERT INTO project_agents (
+                  agent_id, workbench_id, project_root, imported_at, source_path,
+                  content_sha256, agent_json, profiles_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    loaded_bundle.bundle.workbench_id,
+                    str(self.project_root),
+                    imported_at,
+                    str(loaded_bundle.source_path),
+                    agent_bundle_content_sha256(loaded_bundle),
+                    json.dumps(sanitize_for_logging(agent_json), sort_keys=True, default=str),
+                    json.dumps(sanitize_for_logging(profiles_json), sort_keys=True, default=str),
+                ),
+            )
+        return self.get_project_agent(agent_id)
+
+    def list_project_agents(self) -> list[ProjectAgentRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM project_agents ORDER BY workbench_id ASC, imported_at ASC, agent_id ASC"
+            ).fetchall()
+        return [self._row_to_project_agent(row) for row in rows]
+
+    def get_project_agent(self, agent_id: str) -> ProjectAgentRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM project_agents WHERE agent_id = ?", (agent_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Project agent not found: {agent_id}")
+        return self._row_to_project_agent(row)
 
     def create_task(
         self,
@@ -2800,6 +2845,18 @@ class SQLiteStore:
             approval_state=row["approval_state"] if "approval_state" in row.keys() else None,
             run_id=row["run_id"],
             metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_project_agent(self, row: sqlite3.Row) -> ProjectAgentRecord:
+        return ProjectAgentRecord(
+            agent_id=row["agent_id"],
+            workbench_id=row["workbench_id"],
+            project_root=Path(row["project_root"]),
+            imported_at=parse_dt(row["imported_at"]),
+            source_path=Path(row["source_path"]),
+            content_sha256=row["content_sha256"],
+            agent=json.loads(row["agent_json"]),
+            profiles=json.loads(row["profiles_json"]),
         )
 
     def _row_to_task_dependency(self, row: sqlite3.Row) -> TaskDependency:

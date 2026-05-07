@@ -3099,3 +3099,152 @@ def test_cli_agents_do_not_preflight_backends_or_expose_secrets(tmp_path, monkey
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
     assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_agents_import_list_inspect_and_task_reference_project_agent(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    destination = tmp_path / "agents" / "project_agent"
+    scaffold = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "project_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    )
+    imported = runner.invoke(
+        app,
+        ["agents", "import", str(destination), "--project", str(tmp_path), "--output", "json"],
+    )
+    listed = runner.invoke(app, ["agents", "list", "--project", str(tmp_path), "--output", "json"])
+    inspected = runner.invoke(
+        app,
+        ["agents", "inspect", "project_agent", "--project", str(tmp_path), "--output", "json"],
+    )
+    task = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Use project agent",
+            "--agent",
+            "project_agent",
+            "--workbench",
+            "quant",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert scaffold.exit_code == 0, scaffold.output
+    assert imported.exit_code == 0, imported.output
+    imported_payload = json.loads(imported.output)
+    assert imported_payload["schema_version"] == "harness.project_agent/v1"
+    assert imported_payload["ok"] is True
+    assert imported_payload["agent_id"] == "project_agent"
+    assert imported_payload["agent"]["id"] == "project_agent"
+    assert imported_payload["profiles"][0]["id"] == "project_agent.default"
+    assert imported_payload["content_sha256"]
+    assert listed.exit_code == 0, listed.output
+    listed_payload = json.loads(listed.output)
+    assert listed_payload["schema_version"] == "harness.project_agents/v1"
+    assert [agent["agent_id"] for agent in listed_payload["agents"]] == ["project_agent"]
+    assert inspected.exit_code == 0, inspected.output
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["schema_version"] == "harness.project_agent/v1"
+    assert inspected_payload["agent_id"] == "project_agent"
+    assert task.exit_code == 0, task.output
+    task_payload = json.loads(task.output)
+    assert task_payload["task"]["agent_id"] == "project_agent"
+    assert task_payload["task"]["spec_source_kind"] == "project"
+    assert task_payload["task"]["spec_source_path"] == str(destination.resolve())
+
+
+def test_cli_agents_import_rejects_duplicates_unknowns_and_mismatched_task_workbench(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    destination = tmp_path / "agents" / "project_agent"
+    assert runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "project_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    ).exit_code == 0
+    assert runner.invoke(app, ["agents", "import", str(destination), "--project", str(tmp_path)]).exit_code == 0
+
+    duplicate = runner.invoke(
+        app,
+        ["agents", "import", str(destination), "--project", str(tmp_path), "--output", "json"],
+    )
+    missing = runner.invoke(
+        app,
+        ["agents", "inspect", "missing_agent", "--project", str(tmp_path), "--output", "json"],
+    )
+    mismatch = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Mismatch",
+            "--agent",
+            "project_agent",
+            "--workbench",
+            "coding",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert duplicate.exit_code == 1
+    duplicate_payload = json.loads(duplicate.output)
+    assert duplicate_payload["schema_version"] == "harness.project_agent/v1"
+    assert duplicate_payload["errors"] == ["Project agent already imported: project_agent"]
+    assert missing.exit_code == 1
+    missing_payload = json.loads(missing.output)
+    assert missing_payload["schema_version"] == "harness.project_agent/v1"
+    assert missing_payload["errors"] == ["Project agent not found: missing_agent"]
+    assert mismatch.exit_code == 1
+    mismatch_payload = json.loads(mismatch.output)
+    assert mismatch_payload["schema_version"] == "harness.task/v1"
+    assert mismatch_payload["errors"] == ["Project agent project_agent belongs to workbench quant, not coding"]

@@ -12,7 +12,14 @@ from typing import Annotated
 
 import typer
 
-from harness.agent_authoring import AgentBundleError, preview_agent_bundle, scaffold_agent_bundle, validate_agent_bundle
+from harness.agent_authoring import (
+    AgentBundleError,
+    load_agent_bundle,
+    merge_agent_bundle_with_builtins,
+    preview_agent_bundle,
+    scaffold_agent_bundle,
+    validate_agent_bundle,
+)
 from harness.approvals import ApprovalProfile, ApprovalStore
 from harness.backends.codex_cli import (
     AUTH_ERROR,
@@ -342,7 +349,7 @@ def tasks_add(
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     try:
-        _validate_task_spec_refs(workbench, agent)
+        spec_source_kind, spec_source_path = _validate_task_spec_refs(project_root, workbench, agent)
         metadata = _execution_task_metadata(execution_adapter, task_type)
         task = SQLiteStore(project_root).create_task(
             title=title,
@@ -351,7 +358,8 @@ def tasks_add(
             objective_id=objective,
             workbench_id=workbench,
             agent_id=agent,
-            spec_source_kind="builtin" if (workbench or agent) else None,
+            spec_source_kind=spec_source_kind,
+            spec_source_path=spec_source_path,
             depends_on=depends_on,
             required_approvals=requires_approval,
             metadata=metadata,
@@ -808,6 +816,77 @@ def agents_preview(bundle_path: Path, output: OutputOption = OutputFormat.TEXT) 
             typer.echo(f"  - {error}")
     if not result["ok"]:
         raise typer.Exit(code=1)
+
+
+@agents_app.command("import")
+def agents_import(
+    bundle_path: Path,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        loaded = load_agent_bundle(bundle_path)
+        merge_agent_bundle_with_builtins(loaded)
+        record = SQLiteStore(project_root).import_project_agent(loaded)
+    except (AgentBundleError, ValueError) as exc:
+        _emit_agent_authoring_error("harness.project_agent/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = record.model_dump(mode="json")
+        payload.update({"ok": True})
+        _emit_json(payload)
+        return
+    typer.echo(f"Imported agent {record.agent_id}")
+    typer.echo(f"Workbench: {record.workbench_id}")
+    typer.echo(f"Source: {record.source_path}")
+
+
+@agents_app.command("list")
+def agents_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    records = SQLiteStore(project_root).list_project_agents()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.project_agents/v1",
+                "ok": True,
+                "agents": [record.model_dump(mode="json") for record in records],
+            }
+        )
+        return
+    if not records:
+        typer.echo("No project agents imported.")
+        return
+    for record in records:
+        typer.echo(f"{record.agent_id}\t{record.workbench_id}\t{record.content_sha256}\t{record.source_path}")
+
+
+@agents_app.command("inspect")
+def agents_inspect(
+    agent_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        record = SQLiteStore(project_root).get_project_agent(agent_id)
+    except KeyError as exc:
+        _emit_agent_authoring_error("harness.project_agent/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = record.model_dump(mode="json")
+        payload.update({"ok": True})
+        _emit_json(payload)
+        return
+    typer.echo(f"Agent: {record.agent_id}")
+    typer.echo(f"Workbench: {record.workbench_id}")
+    typer.echo(f"Source: {record.source_path}")
+    typer.echo(f"Hash: {record.content_sha256}")
+    typer.echo(f"Profiles: {len(record.profiles)}")
 
 
 @policy_app.command("explain")
@@ -1718,12 +1797,29 @@ def _validate_objective_refs(workbench_id: str | None) -> None:
         registry.get_workbench(workbench_id)
 
 
-def _validate_task_spec_refs(workbench_id: str | None, agent_id: str | None) -> None:
+def _validate_task_spec_refs(project_root: Path, workbench_id: str | None, agent_id: str | None) -> tuple[str | None, Path | None]:
     registry = builtin_spec_registry()
+    source_kind = "builtin" if workbench_id is not None else None
+    source_path = None
     if workbench_id is not None:
         registry.get_workbench(workbench_id)
     if agent_id is not None:
-        registry.get_agent(agent_id)
+        try:
+            registry.get_agent(agent_id)
+            source_kind = "builtin"
+        except KeyError:
+            try:
+                project_agent = SQLiteStore(project_root).get_project_agent(agent_id)
+            except KeyError as exc:
+                raise KeyError(f"Agent not found: {agent_id}") from exc
+            if workbench_id is not None and project_agent.workbench_id != workbench_id:
+                raise ValueError(
+                    f"Project agent {agent_id} belongs to workbench {project_agent.workbench_id}, "
+                    f"not {workbench_id}"
+                )
+            source_kind = "project"
+            source_path = project_agent.source_path
+    return source_kind, source_path
 
 
 def _execution_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:

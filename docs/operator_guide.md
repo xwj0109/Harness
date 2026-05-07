@@ -263,6 +263,34 @@ Agent bundles use `schema_version: harness.agent_bundle/v1` in `agent.yaml`. The
 
 Built-ins remain immutable packaged YAML. Custom bundles are explicit-path only, are not auto-discovered, and are not persisted into `.harness/`, SQLite, or a runtime registry cache. Bundle paths, profile paths, and scaffold destinations must not include symlinks or hard-forbidden path targets. Profile files must be YAML. Importing custom agents into project state is a later milestone.
 
+## v0.8 Project-Local Agent Registry
+
+The v0.8 project-local registry imports a validated v0.7 agent bundle into initialized harness persistence. Imported agents remain declarative metadata. Importing an agent does not execute it, schedule work, call backends, create tasks automatically, create runs, create artifacts, start daemon work, or change immutable built-ins.
+
+Import, list, and inspect a custom agent:
+
+```bash
+harness init --project .
+harness agents import agents/my_agent --project . --output json
+harness agents list --project . --output json
+harness agents inspect my_agent --project . --output json
+```
+
+The JSON wrappers are:
+
+- `harness.project_agent/v1` for import and inspect.
+- `harness.project_agents/v1` for list.
+
+Imported agents include the parsed agent declaration, attached profiles, source path, import timestamp, and deterministic content hash. Built-in ids cannot be shadowed, and duplicate project-local agent ids are rejected. The import command uses the same explicit-path, no-symlink, no-forbidden-path validation as `harness agents validate`.
+
+Tasks may reference imported project-local agents:
+
+```bash
+harness tasks add --title "Use custom agent" --agent my_agent --workbench quant --project . --output json
+```
+
+The task record preserves `spec_source_kind: project` and the imported agent source path. This reference is still metadata only; it does not authorize execution or grant tools.
+
 ## Read-Only Custom Spec Validation
 
 Custom bundles must be explicit JSON or YAML files with a top-level schema version:

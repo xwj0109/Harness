@@ -248,6 +248,18 @@ class TaskRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class ProjectAgentRecord(BaseModel):
+    schema_version: str = "harness.project_agent/v1"
+    agent_id: str
+    workbench_id: str
+    project_root: Path
+    imported_at: datetime
+    source_path: Path
+    content_sha256: str
+    agent: dict[str, Any]
+    profiles: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class ObjectiveRecord(BaseModel):
     id: str
     title: str
