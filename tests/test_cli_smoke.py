@@ -2897,3 +2897,205 @@ def test_cli_simple_code_edit_approved_patch_is_applied(tmp_path, monkeypatch) -
     assert "Approved." in result.output
     assert "Changed files: app.py" in result.output
     assert "value = 2" in (tmp_path / "app.py").read_text(encoding="utf-8")
+
+
+def test_cli_agents_scaffold_validate_and_preview_custom_bundle(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    destination = tmp_path / "agents" / "my_agent"
+
+    scaffold = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "my_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--role",
+            "My custom read-only agent.",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert scaffold.exit_code == 0, scaffold.output
+    scaffold_payload = json.loads(scaffold.output)
+    assert scaffold_payload["schema_version"] == "harness.agent_scaffold/v1"
+    assert scaffold_payload["ok"] is True
+    assert scaffold_payload["agent_id"] == "my_agent"
+    assert (destination / "agent.yaml").exists()
+    assert (destination / "profiles" / "default.yaml").exists()
+
+    validation = runner.invoke(app, ["agents", "validate", str(destination), "--output", "json"])
+    preview = runner.invoke(app, ["agents", "preview", str(destination), "--output", "json"])
+
+    assert validation.exit_code == 0, validation.output
+    validation_payload = json.loads(validation.output)
+    assert validation_payload["schema_version"] == "harness.agent_bundle_validation/v1"
+    assert validation_payload["ok"] is True
+    assert validation_payload["agent_id"] == "my_agent"
+    assert [profile["id"] for profile in validation_payload["profiles"]] == ["my_agent.default"]
+
+    assert preview.exit_code == 0, preview.output
+    preview_payload = json.loads(preview.output)
+    assert preview_payload["schema_version"] == "harness.agent_bundle_preview/v1"
+    assert preview_payload["ok"] is True
+    assert preview_payload["agent"]["id"] == "my_agent"
+    assert [parent["id"] for parent in preview_payload["parent_chain"]] == ["quant_research"]
+    assert preview_payload["effective_agent"]["tool_policy"] == "read_only"
+    assert preview_payload["workbench"]["id"] == "quant"
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_agents_text_output_and_stable_json_errors(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    text_destination = tmp_path / "agents" / "text_agent"
+    text = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "text_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(text_destination),
+        ],
+    )
+    invalid = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "repo_inspector",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(tmp_path / "agents" / "shadow"),
+            "--output-format",
+            "json",
+        ],
+    )
+    missing = runner.invoke(app, ["agents", "validate", str(tmp_path / "missing"), "--output", "json"])
+    forbidden = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "bad_path_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(tmp_path / ".harness" / "agent"),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert text.exit_code == 0, text.output
+    assert "Agent bundle scaffolded" in text.output
+    assert invalid.exit_code == 1
+    invalid_payload = json.loads(invalid.output)
+    assert invalid_payload["schema_version"] == "harness.agent_scaffold/v1"
+    assert invalid_payload["ok"] is False
+    assert invalid_payload["errors"] == ["Custom agent id shadows built-in agent: repo_inspector"]
+    assert missing.exit_code == 1
+    missing_payload = json.loads(missing.output)
+    assert missing_payload["schema_version"] == "harness.agent_bundle_validation/v1"
+    assert missing_payload["ok"] is False
+    assert "does not exist" in missing_payload["errors"][0]
+    assert forbidden.exit_code == 1
+    forbidden_payload = json.loads(forbidden.output)
+    assert forbidden_payload["schema_version"] == "harness.agent_scaffold/v1"
+    assert forbidden_payload["ok"] is False
+    assert forbidden_payload["errors"] == ["Agent bundle path is forbidden by harness safety policy."]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_agents_do_not_preflight_backends_or_expose_secrets(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "harness.cli.main.load_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("agent authoring must not load config")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("agent authoring must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("agent authoring must not preflight local backend")
+        ),
+    )
+    destination = tmp_path / "agents" / "safe_agent"
+
+    scaffold = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "safe_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    )
+    preview = runner.invoke(app, ["agents", "preview", str(destination), "--output", "json"])
+
+    assert scaffold.exit_code == 0, scaffold.output
+    assert preview.exit_code == 0, preview.output
+    serialized = scaffold.output + preview.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert not (tmp_path / ".harness").exists()

@@ -95,6 +95,31 @@ v0.6 Quant Workbench expectations:
 - Agent profiles are declarations only; they expose customization metadata such as knowledge domains, preferred outputs, review responsibilities, and forbidden actions.
 - Built-in specs and profiles are packaged YAML loaded through the typed registry; there is no runtime folder auto-discovery outside the repo-packaged built-ins.
 
+Verify v0.7 explicit agent authoring:
+
+```bash
+rm -rf /tmp/harness-agent-authoring-smoke
+harness agents scaffold smoke_agent \
+  --workbench quant \
+  --kind specialist \
+  --parent quant_research \
+  --model-profile local_reasoning \
+  --tool-policy read_only \
+  --memory-scope quant \
+  --output /tmp/harness-agent-authoring-smoke \
+  --output-format json
+harness agents validate /tmp/harness-agent-authoring-smoke --output json
+harness agents preview /tmp/harness-agent-authoring-smoke --output json
+```
+
+Expected v0.7 safety properties:
+
+- Agent authoring commands read or write only the explicit operator path.
+- Built-in specs remain immutable and custom agent ids cannot shadow built-ins.
+- Custom bundles are not auto-discovered and are not persisted into `.harness/`, SQLite, tasks, objectives, runs, leases, artifacts, daemon events, or runtime registry state.
+- Authoring commands do not execute agents, preflight backends, run Docker, invoke shell tools, schedule work, call providers, connect to brokers, place orders, send messages, submit applications, or mutate active repo files.
+- Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or secret-like data.
+
 ## Verify Manual v0.3 Task Queue
 
 The task queue requires initialized project state and writes only to `.harness/harness.sqlite`.

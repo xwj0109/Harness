@@ -219,6 +219,50 @@ The built-in `quant` workbench forbids live trading, broker actions, capital all
 
 Built-in specs are packaged as repo-tracked YAML files under `src/harness/builtin_specs/` and loaded through the typed registry. The folder layout mirrors the roadmap workbench tree for maintainability, but it is not runtime auto-discovery. Custom operator bundles remain explicit-path only through `harness specs validate/export/diff/preview`.
 
+## v0.7 Agent Authoring
+
+The v0.7 authoring commands let operators scaffold, validate, and preview one custom declarative agent bundle from an explicit local path. Custom authoring is metadata only. It does not execute agents, create tasks, create objectives, create runs, start daemon work, call model backends, preflight providers, run Docker, invoke shell tools, mutate active repo files, or authorize new tools.
+
+Scaffold a custom bundle:
+
+```bash
+harness agents scaffold my_agent \
+  --workbench quant \
+  --kind specialist \
+  --parent quant_research \
+  --model-profile local_reasoning \
+  --tool-policy read_only \
+  --memory-scope quant \
+  --output agents/my_agent \
+  --output-format json
+```
+
+The scaffold command creates:
+
+```text
+agents/my_agent/
+  agent.yaml
+  profiles/
+    default.yaml
+```
+
+Validate and preview the explicit bundle:
+
+```bash
+harness agents validate agents/my_agent --output json
+harness agents preview agents/my_agent --output json
+```
+
+The JSON wrappers are:
+
+- `harness.agent_scaffold/v1`
+- `harness.agent_bundle_validation/v1`
+- `harness.agent_bundle_preview/v1`
+
+Agent bundles use `schema_version: harness.agent_bundle/v1` in `agent.yaml`. The authoring loader merges the custom agent and profiles with built-ins in memory only, validates the result through `SpecRegistry`, and rejects built-in id shadowing, missing references, parent cycles, forbidden paths, and policy broadening. Profiles are customization metadata only; they do not change permissions.
+
+Built-ins remain immutable packaged YAML. Custom bundles are explicit-path only, are not auto-discovered, and are not persisted into `.harness/`, SQLite, or a runtime registry cache. Importing custom agents into project state is a later milestone.
+
 ## Read-Only Custom Spec Validation
 
 Custom bundles must be explicit JSON or YAML files with a top-level schema version:

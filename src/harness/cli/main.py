@@ -12,6 +12,7 @@ from typing import Annotated
 
 import typer
 
+from harness.agent_authoring import AgentBundleError, preview_agent_bundle, scaffold_agent_bundle, validate_agent_bundle
 from harness.approvals import ApprovalProfile, ApprovalStore
 from harness.backends.codex_cli import (
     AUTH_ERROR,
@@ -74,6 +75,7 @@ traces_app = typer.Typer(help="Local run trace export.")
 daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
+agents_app = typer.Typer(help="Declarative custom agent authoring.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
@@ -88,6 +90,7 @@ app.add_typer(traces_app, name="traces")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
+app.add_typer(agents_app, name="agents")
 tests_app.add_typer(tests_image_app, name="image")
 specs_app.add_typer(specs_preview_app, name="preview")
 
@@ -726,6 +729,85 @@ def _specs_preview_error_source(source: str) -> dict:
     if source == "builtin":
         return {"kind": "builtin", "path": None}
     return {"kind": "custom", "path": str(Path(source).expanduser().resolve())}
+
+
+@agents_app.command("scaffold")
+def agents_scaffold(
+    agent_id: str,
+    workbench: Annotated[str, typer.Option("--workbench", help="Built-in workbench id.")],
+    kind: Annotated[str, typer.Option("--kind", help="Agent kind.")],
+    model_profile: Annotated[str, typer.Option("--model-profile", help="Built-in model profile id.")],
+    tool_policy: Annotated[str, typer.Option("--tool-policy", help="Built-in tool policy id.")],
+    memory_scope: Annotated[str, typer.Option("--memory-scope", help="Built-in memory scope id.")],
+    output_path: Annotated[Path, typer.Option("--output", help="Destination agent bundle directory.")],
+    parent: Annotated[str | None, typer.Option("--parent", help="Optional built-in group parent id.")] = None,
+    role: Annotated[str, typer.Option("--role", help="Agent role text.")] = "Custom declarative agent.",
+    output_format: Annotated[OutputFormat, typer.Option("--output-format", help="Output format.")] = OutputFormat.TEXT,
+) -> None:
+    try:
+        result = scaffold_agent_bundle(
+            agent_id=agent_id,
+            workbench_id=workbench,
+            kind=kind,
+            parent=parent,
+            model_profile=model_profile,
+            tool_policy=tool_policy,
+            memory_scope=memory_scope,
+            output_path=output_path,
+            role=role,
+        )
+    except AgentBundleError as exc:
+        _emit_agent_authoring_error(
+            "harness.agent_scaffold/v1",
+            str(exc).strip("'"),
+            output_format,
+            source_path=str(output_path.expanduser().resolve()),
+        )
+        raise typer.Exit(code=1) from exc
+    if output_format == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo(f"Agent bundle scaffolded: {result['source_path']}")
+    typer.echo(f"Agent: {result['agent_id']}")
+    typer.echo(f"Workbench: {result['workbench_id']}")
+
+
+@agents_app.command("validate")
+def agents_validate(bundle_path: Path, output: OutputOption = OutputFormat.TEXT) -> None:
+    result = validate_agent_bundle(bundle_path)
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+    elif result["ok"]:
+        typer.echo(f"Agent bundle valid: {result['source_path']}")
+        typer.echo(f"Agent: {result['agent_id']}")
+        typer.echo(f"Profiles: {len(result['profiles'])}")
+    else:
+        typer.echo(f"Agent bundle invalid: {result['source_path']}")
+        for error in result["errors"]:
+            typer.echo(f"  - {error}")
+    if not result["ok"]:
+        raise typer.Exit(code=1)
+
+
+@agents_app.command("preview")
+def agents_preview(bundle_path: Path, output: OutputOption = OutputFormat.TEXT) -> None:
+    result = preview_agent_bundle(bundle_path)
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+    elif result["ok"]:
+        typer.echo(f"Agent bundle preview: {result['source_path']}")
+        typer.echo(f"Agent: {result['agent']['id']}")
+        typer.echo(f"Workbench: {result['workbench']['id']}")
+        typer.echo(
+            "Parent chain: "
+            f"{', '.join(parent['id'] for parent in result['parent_chain']) if result['parent_chain'] else 'none'}"
+        )
+    else:
+        typer.echo(f"Agent bundle preview invalid: {result['source_path']}")
+        for error in result["errors"]:
+            typer.echo(f"  - {error}")
+    if not result["ok"]:
+        raise typer.Exit(code=1)
 
 
 @policy_app.command("explain")
@@ -1671,6 +1753,22 @@ def _emit_task_error(schema_version: str, message: str, output: OutputFormat) ->
         _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
     else:
         typer.echo(f"Task command failed: {message}")
+
+
+def _emit_agent_authoring_error(
+    schema_version: str,
+    message: str,
+    output: OutputFormat,
+    *,
+    source_path: str | None = None,
+) -> None:
+    if output == OutputFormat.JSON:
+        payload = {"schema_version": schema_version, "ok": False, "errors": [message]}
+        if source_path is not None:
+            payload["source_path"] = source_path
+        _emit_json(payload)
+    else:
+        typer.echo(f"Agent authoring command failed: {message}")
 
 
 def _emit_policy_error(message: str, output: OutputFormat) -> None:
