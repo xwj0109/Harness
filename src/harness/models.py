@@ -107,11 +107,15 @@ class BackendConfig(BaseModel):
     settings: dict[str, Any] = Field(default_factory=dict)
 
     def to_descriptor(self) -> BackendDescriptor:
+        constraints = []
+        if self.name == "paid_openai_compatible":
+            constraints = ["disabled_by_default", "no_automatic_fallback", "preflight_skipped"]
         return BackendDescriptor(
             name=self.name,
             kind=self.kind,
             metadata=self.metadata,
             capabilities=self.capabilities,
+            constraints=constraints,
         )
 
 

@@ -84,7 +84,12 @@ def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
     store = SQLiteStore(project_root)
     records = store.list_runs()
     if output == OutputFormat.JSON:
-        _emit_json({"runs": [record.model_dump(mode="json") for record in records]})
+        _emit_json(
+            {
+                "schema_version": "harness.runs/v1",
+                "runs": [record.model_dump(mode="json") for record in records],
+            }
+        )
         return
     if not records:
         typer.echo("No runs found.")
@@ -158,7 +163,10 @@ def backends_callback(
     cfg = load_config(project_root)
     if output == OutputFormat.JSON:
         _emit_json(
-            {"backends": [backend.to_descriptor().model_dump(mode="json") for backend in cfg.backends.values()]}
+            {
+                "schema_version": "harness.backends/v1",
+                "backends": [backend.to_descriptor().model_dump(mode="json") for backend in cfg.backends.values()],
+            }
         )
         return
     _print_backends(cfg)
@@ -202,7 +210,7 @@ def backends_preflight(project: ProjectOption = Path("."), output: OutputOption 
         for key, value in capabilities.model_dump().items():
             typer.echo(f"    {key}: {value}")
     if output == OutputFormat.JSON:
-        _emit_json({"backends": results})
+        _emit_json({"schema_version": "harness.backend_preflight/v1", "backends": results})
 
 
 @app.command()
@@ -358,7 +366,12 @@ def approvals_callback(
     store = ApprovalStore(project_root)
     approvals = store.list()
     if output == OutputFormat.JSON:
-        _emit_json({"approvals": [approval.model_dump(mode="json") for approval in approvals]})
+        _emit_json(
+            {
+                "schema_version": "harness.approvals/v1",
+                "approvals": [approval.model_dump(mode="json") for approval in approvals],
+            }
+        )
         return
     if not approvals:
         typer.echo("No approvals found.")
@@ -611,6 +624,7 @@ def _doctor_result(project_root: Path) -> dict:
         _doctor_sandbox_safety(checks, config)
 
     return {
+        "schema_version": "harness.doctor/v1",
         "project_root": str(project_root),
         "ok": all(check["status"] != "fail" for check in checks),
         "checks": checks,

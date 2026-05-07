@@ -123,6 +123,7 @@ def test_cli_runs_and_show_support_json_output(tmp_path) -> None:
     runs = runner.invoke(app, ["runs", "--project", str(tmp_path), "--output", "json"])
     assert runs.exit_code == 0
     runs_payload = json.loads(runs.output)
+    assert runs_payload["schema_version"] == "harness.runs/v1"
     assert runs_payload["runs"][0]["id"] == run_id
     assert runs_payload["runs"][0]["status"] == "completed"
     assert runs_payload["runs"][0]["task_type"] == "phase_1a_test"
@@ -255,6 +256,7 @@ def test_cli_doctor_supports_json_output_without_sensitive_backend_settings(tmp_
 
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.doctor/v1"
     assert payload["project_root"] == str(tmp_path.resolve())
     assert payload["ok"] is True
     checks = {check["id"]: check for check in payload["checks"]}
@@ -433,9 +435,12 @@ def test_cli_backends_support_json_output_without_settings(tmp_path) -> None:
     result = runner.invoke(app, ["backends", "--project", str(tmp_path), "--output", "json"])
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.backends/v1"
     names = {backend["name"] for backend in payload["backends"]}
+    paid = next(backend for backend in payload["backends"] if backend["name"] == "paid_openai_compatible")
 
     assert {"codex_cli", "local_openai_compatible", "paid_openai_compatible"} <= names
+    assert paid["constraints"] == ["disabled_by_default", "no_automatic_fallback", "preflight_skipped"]
     serialized = json.dumps(payload)
     assert "settings" not in serialized
     assert "base_url" not in serialized
@@ -474,6 +479,7 @@ def test_cli_backends_preflight_supports_json_output(tmp_path, monkeypatch) -> N
     result = runner.invoke(app, ["backends", "preflight", "--project", str(tmp_path), "--output", "json"])
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.backend_preflight/v1"
     by_name = {backend["name"]: backend for backend in payload["backends"]}
 
     assert by_name["codex_cli"]["available"] is True
@@ -540,6 +546,7 @@ def test_cli_approvals_support_json_output(tmp_path) -> None:
     result = runner.invoke(app, ["approvals", "--project", str(tmp_path), "--output", "json"])
     assert result.exit_code == 0
     payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.approvals/v1"
 
     assert payload["approvals"][0]["id"] == approval_id
     assert payload["approvals"][0]["backend"] == "codex_cli"

@@ -91,6 +91,7 @@ def test_golden_doctor_evidence_contract(tmp_path, monkeypatch) -> None:
     normalized = _normalize(payload, tmp_path)
     checks = {check["id"]: check for check in normalized["checks"]}
 
+    assert normalized["schema_version"] == "harness.doctor/v1"
     assert normalized["project_root"] == "<PROJECT_ROOT>"
     assert normalized["ok"] is True
     assert set(checks) == {
@@ -157,8 +158,16 @@ def test_golden_backend_and_approval_json_evidence_contract(tmp_path, monkeypatc
     preflight = _json_result(["backends", "preflight", "--project", str(tmp_path), "--output", "json"])
 
     backend_names = {backend["name"] for backend in backends["backends"]}
+    backend_by_name = {backend["name"]: backend for backend in backends["backends"]}
     preflight_by_name = {backend["name"]: backend for backend in preflight["backends"]}
+    assert backends["schema_version"] == "harness.backends/v1"
+    assert preflight["schema_version"] == "harness.backend_preflight/v1"
     assert backend_names == {"codex_cli", "local_openai_compatible", "paid_openai_compatible"}
+    assert backend_by_name["paid_openai_compatible"]["constraints"] == [
+        "disabled_by_default",
+        "no_automatic_fallback",
+        "preflight_skipped",
+    ]
     assert preflight_by_name["codex_cli"]["available"] is True
     assert preflight_by_name["local_openai_compatible"]["available"] is False
     assert preflight_by_name["paid_openai_compatible"]["available"] is False
@@ -188,6 +197,7 @@ def test_golden_backend_and_approval_json_evidence_contract(tmp_path, monkeypatc
     assert runner.invoke(app, ["approvals", "revoke", approval_id, "--project", str(tmp_path)]).exit_code == 0
 
     approvals = _normalize(_json_result(["approvals", "--project", str(tmp_path), "--output", "json"]), tmp_path)
+    assert approvals["schema_version"] == "harness.approvals/v1"
     assert approvals["approvals"] == [
         {
             "backend": "codex_cli",

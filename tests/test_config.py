@@ -37,7 +37,14 @@ def test_default_backends_produce_safe_descriptors() -> None:
         assert descriptor.metadata == backend.metadata
         assert descriptor.capabilities == backend.capabilities
         assert descriptor.operator_notes == []
-        assert descriptor.constraints == []
+        if backend.name == "paid_openai_compatible":
+            assert descriptor.constraints == [
+                "disabled_by_default",
+                "no_automatic_fallback",
+                "preflight_skipped",
+            ]
+        else:
+            assert descriptor.constraints == []
         assert "settings" not in dumped
 
 
@@ -59,6 +66,7 @@ def test_backend_descriptors_preserve_current_backend_semantics() -> None:
     assert paid.kind == BackendKind.NATIVE_MODEL
     assert paid.metadata.data_boundary == DataBoundary.HOSTED_PROVIDER
     assert paid.metadata.allow_network is True
+    assert paid.constraints == ["disabled_by_default", "no_automatic_fallback", "preflight_skipped"]
     assert cfg.backends["paid_openai_compatible"].settings["enabled"] is False
     assert "enabled" not in paid.model_dump(mode="json")
 
