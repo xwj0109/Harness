@@ -474,6 +474,120 @@ def test_store_daemon_execute_dry_run_rejects_approvals_wrong_type_and_forbidden
         store.execute_dry_run_lease("missing_lease", owner="local_daemon:test:123")
 
 
+def test_store_daemon_inspect_lease_reports_dry_run_linkage_without_mutation(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    before_runs = store.list_runs()
+
+    before = store.inspect_task_lease(leased.lease.id)
+    assert store.list_runs() == before_runs
+    executed = store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+    after = store.inspect_task_lease(leased.lease.id)
+
+    assert before.schema_version == "harness.daemon_lease/v1"
+    assert before.lease.id == leased.lease.id
+    assert before.task is not None
+    assert before.task.id == task.id
+    assert before.attempt is not None
+    assert before.attempt.run_id is None
+    assert before.run is None
+    assert before.manifest is None
+    assert before.dry_run_eligibility["eligible"] is True
+    assert before.recovery_recommendation["action"] == "none"
+    assert after.lease.status == TaskLeaseStatus.RELEASED
+    assert after.task is not None
+    assert after.task.status == TaskStatus.SUCCEEDED
+    assert after.attempt is not None
+    assert after.attempt.run_id == executed.run.id
+    assert after.run is not None
+    assert after.run.id == executed.run.id
+    assert after.manifest is not None
+    assert after.manifest.task_id == task.id
+    assert after.dry_run_eligibility["eligible"] is False
+    assert after.recovery_recommendation["action"] == "none"
+
+
+def test_store_daemon_recovery_reconciles_completed_dry_run_partial_state(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(title="Dry run", metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"})
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    executed = store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+    with store.connect() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (TaskStatus.RUNNING.value, executed.task.id))
+        conn.execute("UPDATE task_attempts SET status = ? WHERE id = ?", (TaskStatus.RUNNING.value, executed.attempt.id))
+        conn.execute(
+            "UPDATE task_leases SET status = ?, released_at = NULL WHERE id = ?",
+            (TaskLeaseStatus.ACTIVE.value, executed.lease.id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert len(store.list_runs()) == 1
+    assert [task.id for task in recovery.recovered_tasks] == [executed.task.id]
+    assert recovery.events[0].event_type == "recover_dry_run"
+    assert store.get_task(executed.task.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_attempt(executed.attempt.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_lease(executed.lease.id).status == TaskLeaseStatus.RELEASED
+
+
+def test_store_daemon_recovery_reconciles_failed_dry_run_partial_state(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(title="Dry run", metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"})
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    executed = store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+    with store.connect() as conn:
+        conn.execute("UPDATE runs SET status = ? WHERE id = ?", ("failed", executed.run.id))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (TaskStatus.RUNNING.value, executed.task.id))
+        conn.execute("UPDATE task_attempts SET status = ? WHERE id = ?", (TaskStatus.RUNNING.value, executed.attempt.id))
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert len(store.list_runs()) == 1
+    assert [task.id for task in recovery.recovered_tasks] == [executed.task.id]
+    assert store.get_task(executed.task.id).status == TaskStatus.FAILED
+    attempt = store.get_task_attempt(executed.attempt.id)
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.failure_code == "dry_run_failed"
+    assert store.get_task_lease(executed.lease.id).status == TaskLeaseStatus.RELEASED
+
+
+def test_store_daemon_recovery_fails_expired_active_dry_run_with_nonterminal_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(title="Dry run", metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"})
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    executed = store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+    with store.connect() as conn:
+        conn.execute("UPDATE runs SET status = ? WHERE id = ?", ("running", executed.run.id))
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (TaskStatus.RUNNING.value, executed.task.id))
+        conn.execute("UPDATE task_attempts SET status = ? WHERE id = ?", (TaskStatus.RUNNING.value, executed.attempt.id))
+        conn.execute(
+            "UPDATE task_leases SET status = ?, expires_at = ?, released_at = NULL WHERE id = ?",
+            (TaskLeaseStatus.ACTIVE.value, "2026-01-01T00:00:00+00:00", executed.lease.id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert len(store.list_runs()) == 1
+    assert [lease.id for lease in recovery.expired_leases] == [executed.lease.id]
+    assert store.get_task(executed.task.id).status == TaskStatus.FAILED
+    attempt = store.get_task_attempt(executed.attempt.id)
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.failure_code == "dry_run_recovery_required"
+    assert store.get_task_lease(executed.lease.id).status == TaskLeaseStatus.EXPIRED
+
+
 def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

@@ -18,6 +18,7 @@ from harness.models import (
     BackendMetadata,
     DaemonDryRunResult,
     DaemonEvent,
+    DaemonLeaseInspection,
     DaemonRecord,
     DaemonRecoveryResult,
     DaemonStatus,
@@ -936,7 +937,9 @@ class SQLiteStore:
             raise ValueError(f"Dry-run execution requires linked task attempt: {lease.id}")
         attempt = self.get_task_attempt(lease.attempt_id)
         if attempt.run_id is not None:
-            raise ValueError(f"Task attempt already has run_id: {attempt.id}")
+            raise ValueError(
+                f"Task attempt already has run_id: {attempt.id}; inspect the lease or run daemon recover"
+            )
         task = self.get_task(lease.task_id)
         if task.status != TaskStatus.LEASED:
             raise ValueError(f"Dry-run execution requires leased task status: {task.status.value}")
@@ -1111,6 +1114,98 @@ class SQLiteStore:
         if forbidden:
             raise ValueError(f"Dry-run execution rejected by task metadata: {', '.join(forbidden)}")
 
+    def inspect_task_lease(self, lease_id: str) -> DaemonLeaseInspection:
+        lease = self.get_task_lease(lease_id)
+        task: TaskRecord | None = None
+        attempt: TaskAttempt | None = None
+        run: RunRecord | None = None
+        manifest: RunManifest | None = None
+        try:
+            task = self.get_task(lease.task_id)
+        except KeyError:
+            task = None
+        if lease.attempt_id is not None:
+            try:
+                attempt = self.get_task_attempt(lease.attempt_id)
+            except KeyError:
+                attempt = None
+        if attempt is not None and attempt.run_id is not None:
+            try:
+                run = self.get_run(attempt.run_id)
+                manifest = self.build_run_manifest(run.id)
+            except KeyError:
+                run = None
+                manifest = None
+        return DaemonLeaseInspection(
+            project_root=self.project_root,
+            lease=lease,
+            task=task,
+            attempt=attempt,
+            run=run,
+            manifest=manifest,
+            dry_run_eligibility=self._dry_run_eligibility_for_inspection(lease, task, attempt),
+            recovery_recommendation=self._lease_recovery_recommendation(lease, task, attempt, run),
+        )
+
+    def _dry_run_eligibility_for_inspection(
+        self,
+        lease: TaskLease,
+        task: TaskRecord | None,
+        attempt: TaskAttempt | None,
+    ) -> dict[str, Any]:
+        if task is None:
+            return {"eligible": False, "reason": "Task not found."}
+        if attempt is None:
+            return {"eligible": False, "reason": "Task attempt not found."}
+        if lease.status != TaskLeaseStatus.ACTIVE:
+            return {"eligible": False, "reason": f"Lease is not active: {lease.status.value}."}
+        if attempt.run_id is not None:
+            return {"eligible": False, "reason": "Task attempt is already linked to a run."}
+        if task.status != TaskStatus.LEASED:
+            return {"eligible": False, "reason": f"Task status is not leased: {task.status.value}."}
+        if task.required_approvals:
+            return {
+                "eligible": False,
+                "reason": "Task has unresolved required approvals.",
+                "required_approvals": sorted(set(task.required_approvals)),
+            }
+        try:
+            self._validate_dry_run_task_metadata(task)
+        except ValueError as exc:
+            return {"eligible": False, "reason": str(exc)}
+        return {"eligible": True, "reason": "Dry-run execution is available."}
+
+    def _lease_recovery_recommendation(
+        self,
+        lease: TaskLease,
+        task: TaskRecord | None,
+        attempt: TaskAttempt | None,
+        run: RunRecord | None,
+    ) -> dict[str, Any]:
+        if task is None or attempt is None:
+            return {"action": "inspect", "reason": "Lease is missing linked task or attempt."}
+        if attempt.run_id is None:
+            if lease.status == TaskLeaseStatus.ACTIVE and lease.expires_at <= datetime.now(timezone.utc):
+                return {"action": "recover_expired_unexecuted_lease", "reason": "Active lease expired before run creation."}
+            return {"action": "none", "reason": "Lease has no linked run."}
+        if run is None:
+            return {"action": "inspect", "reason": "Attempt references a missing run."}
+        if run.status == "completed" and (
+            task.status != TaskStatus.SUCCEEDED
+            or attempt.status != TaskStatus.SUCCEEDED
+            or lease.status == TaskLeaseStatus.ACTIVE
+        ):
+            return {"action": "reconcile_succeeded", "reason": "Completed dry-run evidence is not fully reflected in task state."}
+        if run.status == "failed" and (
+            task.status != TaskStatus.FAILED
+            or attempt.status != TaskStatus.FAILED
+            or lease.status == TaskLeaseStatus.ACTIVE
+        ):
+            return {"action": "reconcile_failed", "reason": "Failed dry-run evidence is not fully reflected in task state."}
+        if lease.status == TaskLeaseStatus.ACTIVE and lease.expires_at <= datetime.now(timezone.utc):
+            return {"action": "fail_for_operator_inspection", "reason": "Expired active lease has non-terminal linked run."}
+        return {"action": "none", "reason": "No recovery action recommended."}
+
     def renew_daemon_leases(
         self,
         owner: str,
@@ -1143,6 +1238,15 @@ class SQLiteStore:
         recovered_task_ids: list[str] = []
         event_ids: list[str] = []
         with self.connect() as conn:
+            dry_run_recovery = self._recover_dry_run_contracts(
+                conn,
+                daemon_id=daemon.id,
+                owner=owner,
+                timestamp=timestamp,
+            )
+            expired_ids.extend(dry_run_recovery["expired_ids"])
+            recovered_task_ids.extend(dry_run_recovery["recovered_task_ids"])
+            event_ids.extend(dry_run_recovery["event_ids"])
             rows = conn.execute(
                 """
                 SELECT * FROM task_leases
@@ -1153,6 +1257,8 @@ class SQLiteStore:
             ).fetchall()
             for row in rows:
                 lease = self._row_to_task_lease(row)
+                if lease.id in set(expired_ids):
+                    continue
                 task_row = conn.execute(
                     "SELECT * FROM tasks WHERE id = ?", (lease.task_id,)
                 ).fetchone()
@@ -1226,6 +1332,264 @@ class SQLiteStore:
             recovered_tasks=[self.get_task(task_id) for task_id in recovered_task_ids],
             events=[self.get_daemon_event(event_id) for event_id in event_ids],
         )
+
+    def _recover_dry_run_contracts(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        owner: str,
+        timestamp: str,
+    ) -> dict[str, list[str]]:
+        expired_ids: list[str] = []
+        recovered_task_ids: list[str] = []
+        event_ids: list[str] = []
+        rows = conn.execute(
+            """
+            SELECT
+              task_leases.id AS lease_id,
+              task_leases.status AS lease_status,
+              task_leases.expires_at AS lease_expires_at,
+              task_leases.attempt_id AS lease_attempt_id,
+              task_attempts.run_id AS attempt_run_id,
+              runs.status AS run_status
+            FROM task_leases
+            JOIN task_attempts ON task_attempts.id = task_leases.attempt_id
+            JOIN runs ON runs.id = task_attempts.run_id
+            WHERE task_leases.status IN (?, ?)
+            ORDER BY task_leases.acquired_at ASC, task_leases.id ASC
+            """,
+            (TaskLeaseStatus.ACTIVE.value, TaskLeaseStatus.RELEASED.value),
+        ).fetchall()
+        for row in rows:
+            lease = self._row_to_task_lease(
+                conn.execute("SELECT * FROM task_leases WHERE id = ?", (row["lease_id"],)).fetchone()
+            )
+            task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+            if task_row is None:
+                continue
+            task = self._row_to_task(task_row)
+            if task.metadata.get("execution_adapter") != DRY_RUN_EXECUTION_ADAPTER:
+                continue
+            attempt = self._row_to_task_attempt(
+                conn.execute("SELECT * FROM task_attempts WHERE id = ?", (lease.attempt_id,)).fetchone()
+            )
+            run = self._row_to_run(conn.execute("SELECT * FROM runs WHERE id = ?", (attempt.run_id,)).fetchone())
+            if run.task_type != DRY_RUN_TASK_TYPE:
+                continue
+            if run.status == "completed":
+                changed = self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.SUCCEEDED,
+                    lease_status=TaskLeaseStatus.RELEASED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason="dry_run_recovery_succeeded",
+                    failure_code=None,
+                    failure_message=None,
+                )
+                if changed:
+                    recovered_task_ids.append(task.id)
+                    event_ids.append(
+                        self._record_daemon_event(
+                            conn,
+                            daemon_id=daemon_id,
+                            event_type="recover_dry_run",
+                            message="Reconciled completed dry-run evidence to succeeded task state.",
+                            metadata={
+                                "lease_id": lease.id,
+                                "attempt_id": attempt.id,
+                                "task_id": task.id,
+                                "run_id": run.id,
+                                "next_status": TaskStatus.SUCCEEDED.value,
+                            },
+                            created_at=timestamp,
+                        )
+                    )
+                continue
+            if run.status == "failed":
+                changed = self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.FAILED,
+                    lease_status=TaskLeaseStatus.RELEASED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason="dry_run_recovery_failed",
+                    failure_code="dry_run_failed",
+                    failure_message="Dry-run recovery reconciled failed run evidence.",
+                )
+                if changed:
+                    recovered_task_ids.append(task.id)
+                    event_ids.append(
+                        self._record_daemon_event(
+                            conn,
+                            daemon_id=daemon_id,
+                            event_type="recover_dry_run",
+                            message="Reconciled failed dry-run evidence to failed task state.",
+                            metadata={
+                                "lease_id": lease.id,
+                                "attempt_id": attempt.id,
+                                "task_id": task.id,
+                                "run_id": run.id,
+                                "next_status": TaskStatus.FAILED.value,
+                            },
+                            created_at=timestamp,
+                        )
+                    )
+                continue
+            if lease.status == TaskLeaseStatus.ACTIVE and lease.expires_at <= parse_dt(timestamp):
+                changed = self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.FAILED,
+                    lease_status=TaskLeaseStatus.EXPIRED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason="dry_run_recovery_required",
+                    failure_code="dry_run_recovery_required",
+                    failure_message="Dry-run recovery found expired lease with non-terminal linked run.",
+                )
+                if changed:
+                    expired_ids.append(lease.id)
+                    recovered_task_ids.append(task.id)
+                    event_ids.append(
+                        self._record_daemon_event(
+                            conn,
+                            daemon_id=daemon_id,
+                            event_type="recover_dry_run",
+                            message="Failed dry-run task for operator inspection after expired linked run.",
+                            metadata={
+                                "lease_id": lease.id,
+                                "attempt_id": attempt.id,
+                                "task_id": task.id,
+                                "run_id": run.id,
+                                "next_status": TaskStatus.FAILED.value,
+                                "failure_code": "dry_run_recovery_required",
+                            },
+                            created_at=timestamp,
+                        )
+                    )
+                continue
+            if lease.status == TaskLeaseStatus.ACTIVE and task.status == TaskStatus.RUNNING:
+                event_ids.append(
+                    self._record_daemon_event(
+                        conn,
+                        daemon_id=daemon_id,
+                        event_type="inspect_dry_run",
+                        message="Dry-run lease has non-terminal linked run; operator inspection recommended.",
+                        metadata={
+                            "lease_id": lease.id,
+                            "attempt_id": attempt.id,
+                            "task_id": task.id,
+                            "run_id": run.id,
+                            "run_status": run.status,
+                        },
+                        created_at=timestamp,
+                    )
+                )
+        return {
+            "expired_ids": expired_ids,
+            "recovered_task_ids": recovered_task_ids,
+            "event_ids": event_ids,
+        }
+
+    def _reconcile_dry_run_terminal_state(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task: TaskRecord,
+        attempt: TaskAttempt,
+        lease: TaskLease,
+        next_status: TaskStatus,
+        lease_status: TaskLeaseStatus,
+        timestamp: str,
+        actor: str,
+        reason: str,
+        failure_code: str | None,
+        failure_message: str | None,
+    ) -> bool:
+        changed = False
+        if task.status not in {next_status, TaskStatus.CANCELLED, TaskStatus.SKIPPED}:
+            current_status = task.status
+            if current_status == TaskStatus.LEASED:
+                validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (TaskStatus.RUNNING.value, timestamp, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=TaskStatus.LEASED,
+                    to_status=TaskStatus.RUNNING,
+                    reason=f"{reason}_running",
+                    actor=actor,
+                    metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": attempt.run_id},
+                    created_at=timestamp,
+                )
+                current_status = TaskStatus.RUNNING
+            validate_task_transition(current_status, next_status)
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (next_status.value, timestamp, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=current_status,
+                to_status=next_status,
+                reason=reason,
+                actor=actor,
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": attempt.run_id},
+                created_at=timestamp,
+            )
+            changed = True
+        if attempt.status != next_status:
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?,
+                    finished_at = COALESCE(finished_at, ?),
+                    failure_code = COALESCE(?, failure_code),
+                    failure_message = COALESCE(?, failure_message)
+                WHERE id = ?
+                """,
+                (next_status.value, timestamp, failure_code, failure_message, attempt.id),
+            )
+            changed = True
+        if lease.status != lease_status:
+            conn.execute(
+                """
+                UPDATE task_leases
+                SET status = ?, released_at = COALESCE(released_at, ?), metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    lease_status.value,
+                    timestamp,
+                    json.dumps(
+                        sanitize_for_logging(
+                            {
+                                **lease.metadata,
+                                "run_id": attempt.run_id,
+                                "recovery_reason": reason,
+                            }
+                        ),
+                        sort_keys=True,
+                    ),
+                    lease.id,
+                ),
+            )
+            changed = True
+        return changed
 
     def _task_requeue_status(self, task: TaskRecord) -> TaskStatus:
         if task.required_approvals:

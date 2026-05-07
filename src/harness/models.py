@@ -462,6 +462,19 @@ class DaemonDryRunResult(BaseModel):
     policy_sha256: str
 
 
+class DaemonLeaseInspection(BaseModel):
+    schema_version: str = "harness.daemon_lease/v1"
+    ok: bool = True
+    project_root: Path
+    lease: TaskLease
+    task: TaskRecord | None = None
+    attempt: TaskAttempt | None = None
+    run: RunRecord | None = None
+    manifest: RunManifest | None = None
+    dry_run_eligibility: dict[str, Any] = Field(default_factory=dict)
+    recovery_recommendation: dict[str, Any] = Field(default_factory=dict)
+
+
 class RunBaselineRecord(BaseModel):
     schema_version: str = "harness.baseline/v1"
     name: str

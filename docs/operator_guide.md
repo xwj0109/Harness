@@ -493,10 +493,13 @@ The v0.4.5 dry-run adapter is the only exception to the no-run-binding daemon ru
 ```bash
 harness tasks add --title "Dry-run contract" --execution-adapter dry_run --task-type phase_1a_test --project . --output json
 harness daemon run-once --project . --output json
+harness daemon inspect-lease task_lease_abc123def456 --project . --output json
 harness daemon execute-dry-run task_lease_abc123def456 --project . --output json
 ```
 
 `daemon execute-dry-run` requires an existing active lease id. It does not select work itself. It links the leased task attempt to a local `phase_1a_test` run, writes metadata-only run evidence through existing harness artifact APIs, marks the task and attempt succeeded, and releases the lease. It returns `harness.daemon_execute_dry_run/v1`. It does not call Codex, preflight a local model backend, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted or paid fallback.
+
+`daemon inspect-lease` is read-only and returns `harness.daemon_lease/v1` with the lease, linked task, linked attempt, linked run/manifest when present, dry-run eligibility, and recovery recommendation. `daemon recover` can reconcile existing dry-run evidence, such as a completed dry-run run whose task or attempt remained non-terminal, but it must not create another run or retry ambiguous work automatically.
 
 Task statuses are:
 

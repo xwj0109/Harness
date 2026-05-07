@@ -1,6 +1,6 @@
 # v0.4.5 Minimal Execution Adapter Decision Plan
 
-Status: Slice 1 dry-run lease-to-run execution contract implemented. Further real execution remains unauthorized until a separate follow-on implementation slice is accepted.
+Status: Slice 1 dry-run lease-to-run execution contract and Slice 2 dry-run recovery/inspection hardening are implemented. Further real execution remains unauthorized until a separate follow-on implementation slice is accepted.
 
 ## Summary
 
@@ -291,3 +291,10 @@ Slice 1 proves the local dry-run lease-to-run contract only. The next step shoul
 - `harness daemon execute-dry-run <lease_id>` requires an existing active daemon lease and does not select work itself.
 - The dry-run adapter links `TaskAttempt.run_id`, sets compatible `TaskRecord.run_id`, creates a local `phase_1a_test` run, registers metadata-only artifacts, marks the task/attempt succeeded, and releases the lease.
 - The dry-run adapter does not call Codex, local model backends, Docker, shell tools, network, hosted providers, paid providers, or active repo write paths.
+
+## Slice 2 Completion Note
+
+- `harness daemon inspect-lease <lease_id>` is read-only and reports lease, task, attempt, run/manifest linkage, dry-run eligibility, and recovery recommendation.
+- `harness daemon recover` reconciles existing dry-run evidence for completed or failed runs and handles expired active leases with non-terminal linked runs by failing closed for operator inspection.
+- Recovery does not create another run for an attempt that already has `run_id`.
+- Real backend/tool execution remains unauthorized.

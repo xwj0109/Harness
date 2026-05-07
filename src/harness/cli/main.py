@@ -1098,6 +1098,31 @@ def daemon_execute_dry_run(
     typer.echo(f"Lease: {result.lease.id}")
 
 
+@daemon_app.command("inspect-lease")
+def daemon_inspect_lease(
+    lease_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = SQLiteStore(project_root).inspect_task_lease(lease_id)
+    except (KeyError, ValueError) as exc:
+        _emit_daemon_error("harness.daemon_lease/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Lease: {result.lease.id}")
+    typer.echo(f"Status: {result.lease.status.value}")
+    typer.echo(f"Task: {result.task.id if result.task else 'missing'}")
+    typer.echo(f"Attempt: {result.attempt.id if result.attempt else 'missing'}")
+    typer.echo(f"Run: {result.run.id if result.run else 'none'}")
+    typer.echo(f"Dry-run eligible: {result.dry_run_eligibility.get('eligible')}")
+    typer.echo(f"Recovery action: {result.recovery_recommendation.get('action')}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,

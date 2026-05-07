@@ -1355,6 +1355,116 @@ def test_cli_daemon_execute_dry_run_links_run_without_backends_or_docker(tmp_pat
     assert "environment" not in serialized
 
 
+def test_cli_daemon_inspect_lease_before_and_after_dry_run_is_read_only(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("inspect must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("inspect must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("inspect must not touch Docker")),
+    )
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    lease_id = json.loads(tick.output)["lease"]["id"]
+
+    before = runner.invoke(app, ["daemon", "inspect-lease", lease_id, "--project", str(tmp_path), "--output", "json"])
+    assert before.exit_code == 0, before.output
+    before_payload = json.loads(before.output)
+    assert before_payload["schema_version"] == "harness.daemon_lease/v1"
+    assert before_payload["dry_run_eligibility"]["eligible"] is True
+    assert before_payload["run"] is None
+    assert len(store.list_runs()) == 0
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-dry-run", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert executed.exit_code == 0, executed.output
+    after = runner.invoke(app, ["daemon", "inspect-lease", lease_id, "--project", str(tmp_path), "--output", "json"])
+    assert after.exit_code == 0, after.output
+    after_payload = json.loads(after.output)
+    assert after_payload["schema_version"] == "harness.daemon_lease/v1"
+    assert after_payload["lease"]["status"] == "released"
+    assert after_payload["task"]["status"] == "succeeded"
+    assert after_payload["attempt"]["status"] == "succeeded"
+    assert after_payload["run"]["id"] == json.loads(executed.output)["run"]["id"]
+    assert after_payload["manifest"]["schema_version"] == "harness.manifest/v1.1"
+    assert after_payload["dry_run_eligibility"]["eligible"] is False
+
+    missing = runner.invoke(
+        app,
+        ["daemon", "inspect-lease", "missing_lease", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert missing.exit_code == 1
+    missing_payload = json.loads(missing.output)
+    assert missing_payload["schema_version"] == "harness.daemon_lease/v1"
+    assert missing_payload["ok"] is False
+    assert missing_payload["errors"] == ["Task lease not found: missing_lease"]
+
+    serialized = before.output + executed.output + after.output + missing.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
+def test_cli_daemon_recover_reports_dry_run_reconciliation_without_backends(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("recover must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("recover must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("recover must not touch Docker")),
+    )
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    executed = store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:123")
+    with store.connect() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE id = ?", ("running", executed.task.id))
+        conn.execute("UPDATE task_attempts SET status = ? WHERE id = ?", ("running", executed.attempt.id))
+        conn.execute(
+            "UPDATE task_leases SET status = ?, released_at = NULL WHERE id = ?",
+            ("active", executed.lease.id),
+        )
+
+    recovered = runner.invoke(app, ["daemon", "recover", "--project", str(tmp_path), "--output", "json"])
+
+    assert recovered.exit_code == 0, recovered.output
+    payload = json.loads(recovered.output)
+    assert payload["schema_version"] == "harness.daemon_recovery/v1"
+    assert payload["events"][0]["event_type"] == "recover_dry_run"
+    assert payload["recovered_tasks"][0]["status"] == "succeeded"
+    assert len(store.list_runs()) == 1
+    assert store.get_task(executed.task.id).status.value == "succeeded"
+
+    serialized = recovered.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
 def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 
