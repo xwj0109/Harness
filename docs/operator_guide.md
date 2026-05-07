@@ -388,7 +388,7 @@ harness tasks run-next --project . --output json
 Task statuses are:
 
 ```text
-queued
+created
 ready
 blocked
 waiting_approval

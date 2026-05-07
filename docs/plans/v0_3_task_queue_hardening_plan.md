@@ -64,17 +64,17 @@ These remain control-plane prerequisites or follow-on slices. The queue should r
 
 ## 3. Current Baseline
 
-The current repository already has a minimal manual queue:
+The current repository has a manual v0.3 queue:
 
-- `TaskRecord`.
-- `TaskStatus` values: `queued`, `blocked`, `running`, `completed`, `failed`, `canceled`.
-- `tasks` SQLite table.
-- `harness tasks add/list/inspect/status/run-next`.
+- Objective and task records with SQLite persistence.
+- Task dependencies, attempts, leases, transition evidence, and idempotency keys.
+- `harness objectives add/list/inspect`.
+- `harness tasks add/list/inspect/status/cancel/retry/graph/run-next`.
 - Built-in agent/workbench reference validation.
-- JSON output for task add/list/inspect/run-next.
+- JSON output for objective and task inspection flows.
 - Guard tests proving task commands do not preflight backends or expose settings.
 
-The current `run-next` behavior selects the highest-priority queued task whose inline `depends_on` tasks are completed, then immediately changes it to `running`. v0.3 must harden this into explicit ready/blocked/leased/attempt behavior before any future execution layer depends on it.
+The current `run-next` behavior selects and leases work only. It creates a task attempt and active lease, transitions the task to `leased`, and does not execute agents, call backends, run Docker, create runs, create run artifacts, or start background work.
 
 ## 4. Public CLI Contract
 
@@ -430,13 +430,13 @@ skipped
 `harness tasks run-next` must:
 
 1. Open one SQLite transaction.
-2. Find tasks with status `ready`.
+2. Find tasks with status `ready` or `blocked` with now-satisfied dependencies.
 3. Exclude tasks with active leases.
 4. Verify dependencies are satisfied.
 5. Select the highest priority task, then oldest `created_at`.
 6. Create a task attempt.
 7. Create an active lease.
-8. Transition task `ready -> leased`.
+8. Transition task `ready -> leased`, or `blocked -> ready -> leased` when dependencies were already satisfied.
 9. Return selected task, attempt, and lease in JSON.
 
 If no task is selectable, return:
@@ -445,7 +445,9 @@ If no task is selectable, return:
 {
   "schema_version": "harness.task_run_next/v1",
   "ok": true,
-  "selected_task": null
+  "selected_task": null,
+  "attempt": null,
+  "lease": null
 }
 ```
 
