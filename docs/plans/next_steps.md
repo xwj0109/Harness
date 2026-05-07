@@ -9,6 +9,7 @@ v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
 The v0.3.5 stabilization plan is tracked in [v0_3_5_control_plane_stabilization_plan.md](v0_3_5_control_plane_stabilization_plan.md).
+The v0.4 local daemon plan is tracked in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -58,7 +59,9 @@ The control-plane evidence that future daemon work will rely on is now implement
 
 ## Immediate Next Planning Target
 
-Plan v0.4 local daemon work as a scheduler over durable task state. The next plan should define daemon scope, lease renewal, recovery, approval pauses, and observability before implementation begins.
+v0.4 local daemon planning is now captured in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md). The next implementation target should be Slice 1 of that plan: daemon control-plane persistence, `daemon run-once/status/stop`, heartbeat/event evidence, and non-executing scheduler decisions.
+
+Slice 1 must not execute tasks, call backends, run Docker, create run artifacts, start unmanaged background work, or add hosted/paid fallback.
 
 ## Later Work
 
