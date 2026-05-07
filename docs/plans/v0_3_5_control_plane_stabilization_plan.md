@@ -8,6 +8,18 @@ This milestone must not add daemon behavior, background scheduling, autonomous e
 
 The first implementation target is **Slice 1: EffectivePolicy and manifest v1.1**. Later slices should build artifact immutability, typed tool descriptors, compare/baseline commands, safety-smoke evals, and trace export on top of that foundation.
 
+## Completion Status
+
+v0.3.5 is complete. The implemented and verified slices are:
+
+- [x] Slice 1: EffectivePolicy and manifest v1.1.
+- [x] Slice 2: Artifact evidence and immutability.
+- [x] Slice 3: Tool capability descriptors.
+- [x] Slice 4: Compare and baseline.
+- [x] Slice 5: Safety-smoke evals and trace export.
+
+The release-hygiene checkpoint bumps package metadata to `0.3.5`, updates operator smoke documentation, and preserves the boundary that v0.4 daemon scheduling must be planned separately before implementation.
+
 ## Key Changes
 
 ### Slice 1 — EffectivePolicy and manifest v1.1

@@ -105,6 +105,46 @@ Expected safety properties:
 - `tasks graph` is read-only and reports local objectives, tasks, dependencies, and blocked reasons.
 - Objective and task commands do not execute agents, preflight backends, run Docker, start daemons, or schedule work.
 
+## Verify v0.3.5 Control-Plane Evidence
+
+Create a local run if none exists:
+
+```bash
+harness dev create-run --goal "v0.3.5 evidence smoke" --task-type phase_1a_test --project .
+RUN_ID=$(harness runs --project . --output json | python -c 'import json,sys; print(json.load(sys.stdin)["runs"][0]["id"])')
+```
+
+Inspect runtime policy, artifacts, and tool descriptors:
+
+```bash
+harness policy explain --subject-kind run --subject-id "$RUN_ID" --project . --output json
+harness artifacts list "$RUN_ID" --project . --output json
+harness tools list --project . --output json
+harness tools inspect repo_read --project . --output json
+```
+
+Compare and baseline local run evidence:
+
+```bash
+harness compare "$RUN_ID" "$RUN_ID" --project . --output json
+harness baseline set "$RUN_ID" --name smoke-local --project . --output json
+harness baseline compare "$RUN_ID" --baseline smoke-local --project . --output json
+```
+
+Run local safety-smoke evals and export trace evidence:
+
+```bash
+harness evals run --suite safety-smoke --project . --output json
+harness traces export "$RUN_ID" --format otel-json --project . --output json
+```
+
+Expected safety properties for the v0.3.5 evidence commands after `RUN_ID` setup:
+
+- These commands are local evidence inspection or baseline commands.
+- They do not execute tools, preflight backends, run Docker, create extra runs or artifacts, mutate tasks, start schedulers, or schedule background work.
+- Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or artifact file contents.
+- `harness compare "$RUN_ID" "$RUN_ID"` and baseline comparison against the same run should report no drift.
+
 ## Build Local Docker Test Image
 
 ```bash

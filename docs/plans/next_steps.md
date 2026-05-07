@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. The current slice is v0.3.5 control-plane stabilization.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -40,20 +40,25 @@ The first v0.2 schema and registry foundations are in place:
 - Final restricted-path worktree review.
 - Manual v0.3 task queue persistence and CLI.
 - Durable objectives, task dependencies, transition evidence, cancel/retry, graph output, attempts, leases, and select-and-lease `run-next`.
+- Runtime EffectivePolicy, manifest v1.1 evidence, artifact checksums, tool capability descriptors, compare/baseline, safety-smoke evals, and trace export.
+- Version bump to `0.3.5`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
-## Immediate v0.3.5 Slice
+## Completed v0.3.5 Stabilization
 
-Stabilize the control-plane evidence that future daemon work will rely on:
+The control-plane evidence that future daemon work will rely on is now implemented and verified:
 
-Implementation queue:
+1. Runtime `EffectivePolicy` and `harness policy explain`.
+2. `harness.manifest/v1.1` run evidence.
+3. Artifact checksum/size evidence and drift inspection.
+4. Tool capability descriptors.
+5. Compare/baseline evidence.
+6. Safety-smoke evals and OTEL-shaped trace export.
 
-1. Add typed `PolicyLevel` and `EffectivePolicy`.
-2. Upgrade run manifests compatibly toward `harness.manifest/v1.1`.
-3. Add `policy explain` JSON output without backend preflight or secret inspection.
-4. Add safety-smoke evals and trace export as the final v0.3.5 stabilization slice.
-5. Run full regression tests after each stabilization slice.
+## Immediate Next Planning Target
+
+Plan v0.4 local daemon work as a scheduler over durable task state. The next plan should define daemon scope, lease renewal, recovery, approval pauses, and observability before implementation begins.
 
 ## Later Work
 
