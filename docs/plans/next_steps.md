@@ -57,6 +57,7 @@ The first v0.2 schema and registry foundations are in place:
 - v0.5.1 read-only adapter hardening tests for failure, recovery, inspection, and unsafe metadata/backend gates.
 - v0.6 Quant Workbench declarative foundation is complete.
 - v0.6 packaged hierarchical built-in specs are complete.
+- v0.6 Slice 2 agent-group inheritance is complete.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -93,7 +94,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is v0.6 Slice 2 agent-group semantics and permission inheritance, tracked in [v0_6_2_agent_group_inheritance_plan.md](v0_6_2_agent_group_inheritance_plan.md). This remains a declarative spec semantics checkpoint; execution adapters, task generation, scheduling, and quant workflow execution remain unauthorized.
+The immediate next target is a separate decision plan for v0.6 Slice 3 declarative quant workflow templates. Workflow templates should remain non-executing metadata: they must not create tasks automatically, schedule work, run agents, call backends, run Docker, connect to brokers, place orders, or mutate active repo files.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

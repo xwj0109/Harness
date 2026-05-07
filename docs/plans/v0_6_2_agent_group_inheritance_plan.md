@@ -6,7 +6,9 @@ Implement explicit agent-group semantics and permission inheritance for packaged
 
 This is still declarative control-plane work. It must not add execution adapters, scheduling, backend preflight, Docker-from-queue, shell access, broker actions, live trading, order placement, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, active repo writes, or automatic task generation.
 
-Status: implemented, pending release hygiene.
+Status: complete.
+
+Completion note: Slice 2 is implemented and verified. Packaged quant group specs, explicit parent links, effective-agent preview evidence, parent cycle rejection, non-group parent rejection, and monotonic parent/child policy validation are in place. This remains declarative spec semantics only and does not authorize execution or automatic task creation.
 
 ## Key Changes
 
