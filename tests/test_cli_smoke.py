@@ -242,6 +242,67 @@ def test_cli_artifacts_unknown_refs_return_stable_json_errors(tmp_path) -> None:
     }
 
 
+def test_cli_tools_list_and_inspect_are_metadata_only(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tools must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tools must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tools must not touch Docker")),
+    )
+
+    listed = runner.invoke(app, ["tools", "list", "--project", str(tmp_path), "--output", "json"])
+    inspected = runner.invoke(app, ["tools", "inspect", "repo_read", "--project", str(tmp_path), "--output", "json"])
+    text = runner.invoke(app, ["tools", "inspect", "docker_test", "--project", str(tmp_path)])
+
+    assert listed.exit_code == 0, listed.output
+    payload = json.loads(listed.output)
+    assert payload["schema_version"] == "harness.tool_capabilities/v1"
+    assert payload["ok"] is True
+    ids = [descriptor["id"] for descriptor in payload["tools"]]
+    assert ids == sorted(ids)
+    assert {"repo_read", "docker_test", "policy_explain"} <= set(ids)
+    assert {"generic_shell", "mcp", "a2a", "browser", "email", "calendar"}.isdisjoint(ids)
+
+    assert inspected.exit_code == 0, inspected.output
+    inspect_payload = json.loads(inspected.output)
+    assert inspect_payload["schema_version"] == "harness.tool_capability/v1"
+    assert inspect_payload["ok"] is True
+    assert inspect_payload["id"] == "repo_read"
+    assert inspect_payload["side_effect_level"] == "none"
+
+    assert text.exit_code == 0
+    assert "Tool: docker_test" in text.output
+    assert "Sandbox required: True" in text.output
+    assert "docker_execution" in text.output
+
+    serialized = json.dumps(payload) + json.dumps(inspect_payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_tools_unknown_id_returns_stable_json_error(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        ["tools", "inspect", "generic_shell", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.output) == {
+        "schema_version": "harness.tool_capability/v1",
+        "ok": False,
+        "errors": ["Tool capability not found: generic_shell"],
+    }
+
+
 def test_cli_runs_default_output_remains_text(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     created = runner.invoke(

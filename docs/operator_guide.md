@@ -354,6 +354,19 @@ unknown
 
 Artifact inspection recomputes checksum and size to report evidence drift, but it does not repair, rewrite, delete, or expose artifact file contents. A mismatch means the current local file no longer matches the checksum and size recorded when the artifact was registered.
 
+## Tool Capability Descriptors
+
+Inspect harness-native tool capability metadata:
+
+```bash
+harness tools list --project . --output json
+harness tools inspect repo_read --project . --output json
+```
+
+The JSON wrappers are `harness.tool_capabilities/v1` for list output and `harness.tool_capability/v1` for inspect output. Tool descriptors include input/output schema sketches, side-effect level, data boundary, approval requirements, sandbox requirement, replay policy, allowed run modes, and related policy keys.
+
+Descriptors are control-plane metadata only. They do not grant permissions, execute tools, preflight backends, run Docker, create runs, create artifacts, mutate tasks, or start schedulers. Generic shell, MCP, A2A, browser, email, calendar, hosted fallback, paid fallback, and networked arbitrary execution are not exposed as tool descriptors in v0.3.5.
+
 ## v0.2 Specs Safety Boundary
 
 All `harness specs ...` commands are read-only inspection commands. They do not auto-discover spec files, read or write `.harness/`, read project config, read SQLite, inspect environment variables, read backend settings, read secrets, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.

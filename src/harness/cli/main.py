@@ -50,6 +50,7 @@ from harness.spec_loader import (
     validate_spec_bundle,
 )
 from harness.test_runner import DockerTestRunner, RunTestsDecision
+from harness.tool_capabilities import get_tool_capability, list_tool_capabilities
 
 app = typer.Typer(help="Local-first agent harness.")
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
@@ -61,6 +62,7 @@ specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_
 specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previews.")
 policy_app = typer.Typer(help="Runtime effective policy evidence.")
 artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
+tools_app = typer.Typer(help="Harness tool capability descriptors.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
@@ -70,6 +72,7 @@ app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
 app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
+app.add_typer(tools_app, name="tools")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
@@ -805,6 +808,55 @@ def artifacts_inspect(
     typer.echo(f"Path: {artifact.path}")
 
 
+@tools_app.command("list")
+def tools_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    resolve_project_root(project)
+    descriptors = list_tool_capabilities()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.tool_capabilities/v1",
+                "ok": True,
+                "tools": [descriptor.model_dump(mode="json") for descriptor in descriptors],
+            }
+        )
+        return
+    for descriptor in descriptors:
+        typer.echo(
+            f"{descriptor.id}\t{descriptor.side_effect_level.value}\t"
+            f"approvals={','.join(descriptor.approval_required) if descriptor.approval_required else 'none'}\t"
+            f"sandbox={descriptor.sandbox_required}\t"
+            f"replay={descriptor.replay_policy.value}"
+        )
+
+
+@tools_app.command("inspect")
+def tools_inspect(
+    tool_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    resolve_project_root(project)
+    try:
+        descriptor = get_tool_capability(tool_id)
+    except KeyError as exc:
+        _emit_tool_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = descriptor.model_dump(mode="json")
+        payload.update({"ok": True})
+        _emit_json(payload)
+        return
+    typer.echo(f"Tool: {descriptor.id}")
+    typer.echo(f"Side effect: {descriptor.side_effect_level.value}")
+    typer.echo(
+        "Approvals: "
+        f"{', '.join(descriptor.approval_required) if descriptor.approval_required else 'none'}"
+    )
+    typer.echo(f"Sandbox required: {descriptor.sandbox_required}")
+    typer.echo(f"Replay policy: {descriptor.replay_policy.value}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1325,6 +1377,13 @@ def _emit_artifact_error(schema_version: str, message: str, output: OutputFormat
         _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
     else:
         typer.echo(f"Artifact command failed: {message}")
+
+
+def _emit_tool_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.tool_capability/v1", "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Tool command failed: {message}")
 
 
 def _emit_json(payload) -> None:

@@ -95,6 +95,21 @@ class PolicyLevel(str, Enum):
     ALLOWED = "allowed"
 
 
+class ToolSideEffectLevel(str, Enum):
+    NONE = "none"
+    ARTIFACT_WRITE = "artifact_write"
+    WORKSPACE_WRITE = "workspace_write"
+    ACTIVE_REPO_WRITE = "active_repo_write"
+    EXTERNAL = "external"
+
+
+class ToolReplayPolicy(str, Enum):
+    SAFE = "safe"
+    IDEMPOTENT_WITH_KEY = "idempotent_with_key"
+    REQUIRES_FRESH_APPROVAL = "requires_fresh_approval"
+    NOT_REPLAYABLE = "not_replayable"
+
+
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
     mapping = {
         "read_only_repo_summary": RunMode.READ_ONLY,
@@ -168,6 +183,22 @@ class BackendConfig(BaseModel):
             capabilities=self.capabilities,
             constraints=constraints,
         )
+
+
+class ToolCapabilityDescriptor(BaseModel):
+    schema_version: str = "harness.tool_capability/v1"
+    id: str
+    description: str
+    input_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    side_effect_level: ToolSideEffectLevel
+    data_boundary: DataBoundary
+    approval_required: list[str] = Field(default_factory=list)
+    sandbox_required: bool = False
+    idempotency: str = "none"
+    replay_policy: ToolReplayPolicy
+    allowed_run_modes: list[RunMode] = Field(default_factory=list)
+    policy_keys: list[str] = Field(default_factory=list)
 
 
 class RunRecord(BaseModel):
