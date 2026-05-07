@@ -3,7 +3,7 @@ import sqlite3
 
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import ObjectiveStatus, TaskStatus
+from harness.models import ObjectiveStatus, TaskLeaseStatus, TaskStatus
 
 
 def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
@@ -398,12 +398,104 @@ def test_store_select_next_task_uses_priority_and_dependencies(tmp_path) -> None
 
     assert selected is not None
     assert selected.id == dependency.id
-    assert selected.status == TaskStatus.RUNNING
+    assert selected.status == TaskStatus.LEASED
     assert store.get_task(blocked_by_dependency.id).status == TaskStatus.BLOCKED
 
+    store.update_task_status(dependency.id, TaskStatus.RUNNING)
     store.update_task_status(dependency.id, TaskStatus.SUCCEEDED)
     selected_after_dependency = store.select_next_task()
 
     assert selected_after_dependency is not None
     assert selected_after_dependency.id == blocked_by_dependency.id
+    assert selected_after_dependency.status == TaskStatus.LEASED
     assert store.get_task(runnable.id).status == TaskStatus.READY
+
+
+def test_store_select_next_task_for_lease_creates_attempt_and_active_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    low = store.create_task(title="Low", priority=0)
+    high = store.create_task(title="High", priority=10)
+
+    selection = store.select_next_task_for_lease()
+
+    assert selection is not None
+    assert selection["task"].id == high.id
+    assert selection["task"].status == TaskStatus.LEASED
+    assert selection["attempt"].task_id == high.id
+    assert selection["attempt"].attempt_number == 1
+    assert selection["attempt"].status == TaskStatus.LEASED
+    assert selection["lease"].task_id == high.id
+    assert selection["lease"].attempt_id == selection["attempt"].id
+    assert selection["lease"].owner == "manual_cli"
+    assert selection["lease"].status == TaskLeaseStatus.ACTIVE
+    assert store.get_task(low.id).status == TaskStatus.READY
+    assert store.list_task_attempts(high.id) == [selection["attempt"]]
+    assert store.list_task_leases(high.id) == [selection["lease"]]
+
+
+def test_store_select_next_task_for_lease_skips_active_leases_and_duplicate_calls(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    first = store.create_task(title="First", priority=10)
+    second = store.create_task(title="Second", priority=5)
+
+    first_selection = store.select_next_task_for_lease()
+    second_selection = store.select_next_task_for_lease()
+
+    assert first_selection is not None
+    assert second_selection is not None
+    assert first_selection["task"].id == first.id
+    assert second_selection["task"].id == second.id
+    assert second_selection["task"].id != first_selection["task"].id
+
+
+def test_store_select_next_task_for_lease_increments_attempt_numbers(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(title="Retryable")
+
+    first_selection = store.select_next_task_for_lease()
+    assert first_selection is not None
+
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, released_at = ? WHERE id = ?",
+            (
+                TaskLeaseStatus.RELEASED.value,
+                first_selection["lease"].acquired_at.isoformat(),
+                first_selection["lease"].id,
+            ),
+        )
+    store.update_task_status(task.id, TaskStatus.READY)
+
+    second_selection = store.select_next_task_for_lease()
+
+    assert second_selection is not None
+    assert second_selection["task"].id == task.id
+    assert second_selection["attempt"].attempt_number == 2
+
+
+def test_store_select_next_task_for_lease_handles_blocked_and_approval_tasks(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    dependency = store.create_task(title="Dependency", priority=10)
+    blocked = store.create_task(title="Blocked", priority=9, depends_on=[dependency.id])
+    waiting_approval = store.create_task(
+        title="Approval",
+        priority=100,
+        required_approvals=["hosted_provider"],
+    )
+
+    assert store.select_next_task_for_lease()["task"].id == dependency.id
+    assert store.select_next_task_for_lease() is None
+    assert store.get_task(blocked.id).status == TaskStatus.BLOCKED
+    assert store.get_task(waiting_approval.id).status == TaskStatus.WAITING_APPROVAL
+
+    store.update_task_status(dependency.id, TaskStatus.RUNNING)
+    store.update_task_status(dependency.id, TaskStatus.SUCCEEDED)
+    selected = store.select_next_task_for_lease()
+
+    assert selected is not None
+    assert selected["task"].id == blocked.id
+    assert selected["task"].status == TaskStatus.LEASED

@@ -383,7 +383,7 @@ Select the next runnable task manually:
 harness tasks run-next --project . --output json
 ```
 
-`run-next` selects the highest-priority, oldest ready task whose dependencies are complete, marks it `running`, and returns it. If no task is runnable, it returns `ok: true` with `selected_task: null`. It does not create a run record, create run artifacts, call a backend, execute tools, or mutate repository files outside the harness SQLite database.
+`run-next` selects the highest-priority, oldest ready task whose dependencies are complete, creates a local task attempt and active lease, marks it `leased`, and returns the task, attempt, and lease. If no task is runnable, it returns `ok: true` with `selected_task: null`, `attempt: null`, and `lease: null`. It does not create a run record, create run artifacts, call a backend, execute tools, or mutate repository files outside the harness SQLite database.
 
 Task statuses are:
 

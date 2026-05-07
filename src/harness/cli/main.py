@@ -423,20 +423,25 @@ def tasks_retry(task_id: str, project: ProjectOption = Path("."), output: Output
 def tasks_run_next(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    task = SQLiteStore(project_root).select_next_task()
+    selection = SQLiteStore(project_root).select_next_task_for_lease()
+    task = selection["task"] if selection is not None else None
+    attempt = selection["attempt"] if selection is not None else None
+    lease = selection["lease"] if selection is not None else None
     if output == OutputFormat.JSON:
         _emit_json(
             {
                 "schema_version": "harness.task_run_next/v1",
                 "ok": True,
                 "selected_task": task.model_dump(mode="json") if task is not None else None,
+                "attempt": attempt.model_dump(mode="json") if attempt is not None else None,
+                "lease": lease.model_dump(mode="json") if lease is not None else None,
             }
         )
         return
     if task is None:
-        typer.echo("No runnable queued task.")
+        typer.echo("No runnable ready task.")
     else:
-        typer.echo(f"Selected task {task.id}")
+        typer.echo(f"Leased task {task.id}")
 
 
 @specs_app.callback()

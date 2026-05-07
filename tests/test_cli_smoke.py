@@ -649,10 +649,37 @@ def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path
     assert payload["schema_version"] == "harness.task_run_next/v1"
     assert payload["ok"] is True
     assert payload["selected_task"]["id"] == high.id
-    assert payload["selected_task"]["status"] == "running"
+    assert payload["selected_task"]["status"] == "leased"
+    assert payload["attempt"]["task_id"] == high.id
+    assert payload["attempt"]["status"] == "leased"
+    assert payload["lease"]["task_id"] == high.id
+    assert payload["lease"]["attempt_id"] == payload["attempt"]["id"]
+    assert payload["lease"]["owner"] == "manual_cli"
+    assert payload["lease"]["status"] == "active"
     assert store.get_task(low.id).status.value == "ready"
     assert store.list_runs() == []
     assert not any((tmp_path / ".harness" / "runs").iterdir())
+
+    text_result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path)])
+    assert text_result.exit_code == 0
+    assert text_result.output.startswith(f"Leased task {low.id}")
+
+
+def test_cli_tasks_run_next_does_not_select_active_lease_twice(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    first = SQLiteStore(tmp_path).create_task(title="First", priority=10)
+    second = SQLiteStore(tmp_path).create_task(title="Second", priority=5)
+
+    first_result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path), "--output", "json"])
+    second_result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path), "--output", "json"])
+
+    assert first_result.exit_code == 0
+    assert second_result.exit_code == 0
+    first_payload = json.loads(first_result.output)
+    second_payload = json.loads(second_result.output)
+    assert first_payload["selected_task"]["id"] == first.id
+    assert second_payload["selected_task"]["id"] == second.id
+    assert second_payload["selected_task"]["id"] != first_payload["selected_task"]["id"]
 
 
 def test_cli_tasks_run_next_returns_null_without_runnable_task(tmp_path) -> None:
@@ -665,6 +692,8 @@ def test_cli_tasks_run_next_returns_null_without_runnable_task(tmp_path) -> None
     assert payload["schema_version"] == "harness.task_run_next/v1"
     assert payload["ok"] is True
     assert payload["selected_task"] is None
+    assert payload["attempt"] is None
+    assert payload["lease"] is None
 
 
 def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:

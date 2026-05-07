@@ -100,7 +100,7 @@ harness tasks cancel task_abc123def456 --project . --output json
 
 Expected safety properties:
 
-- `run-next` selects one ready task and marks it `running`.
+- `run-next` selects one ready task, creates a local attempt and lease, and marks it `leased`.
 - `run-next` does not create a run record or run artifact directory.
 - `tasks graph` is read-only and reports local objectives, tasks, dependencies, and blocked reasons.
 - Objective and task commands do not execute agents, preflight backends, run Docker, start daemons, or schedule work.

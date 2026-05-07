@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +21,11 @@ from harness.models import (
     ObjectiveStatus,
     RunManifest,
     RunRecord,
+    TaskAttempt,
     TaskDependency,
     TaskDependencyType,
+    TaskLease,
+    TaskLeaseStatus,
     TaskRecord,
     TaskStatus,
     TaskTransitionRecord,
@@ -41,6 +44,9 @@ TASK_STATUS_QUERY_ALIASES = {
     TaskStatus.SUCCEEDED: ("succeeded", "completed"),
     TaskStatus.CANCELLED: ("cancelled", "canceled"),
 }
+
+DEFAULT_TASK_LEASE_MINUTES = 30
+DEFAULT_TASK_LEASE_OWNER = "manual_cli"
 
 ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.CREATED: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.WAITING_APPROVAL},
@@ -468,6 +474,127 @@ class SQLiteStore:
         return self.update_task_status(task.id, TaskStatus.READY)
 
     def select_next_task(self) -> TaskRecord | None:
+        selection = self.select_next_task_for_lease()
+        return selection["task"] if selection is not None else None
+
+    def select_next_task_for_lease(
+        self,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+        lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+    ) -> dict[str, TaskAttempt | TaskLease | TaskRecord] | None:
+        timestamp = now_iso()
+        expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status IN (?, ?)
+                ORDER BY priority DESC, created_at ASC
+                """,
+                (TaskStatus.READY.value, TaskStatus.BLOCKED.value),
+            ).fetchall()
+            for row in rows:
+                task = self._row_to_task(row)
+                if self._task_has_active_lease(conn, task.id):
+                    continue
+                if task.required_approvals:
+                    continue
+                if not self._task_dependencies_completed(task):
+                    continue
+                current_status = task.status
+                if current_status == TaskStatus.BLOCKED:
+                    validate_task_transition(TaskStatus.BLOCKED, TaskStatus.READY)
+                    conn.execute(
+                        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                        (TaskStatus.READY.value, timestamp, task.id),
+                    )
+                    self._record_task_transition(
+                        conn,
+                        task_id=task.id,
+                        from_status=TaskStatus.BLOCKED,
+                        to_status=TaskStatus.READY,
+                        reason="dependencies_satisfied",
+                        actor="system",
+                        metadata={},
+                        created_at=timestamp,
+                    )
+                    current_status = TaskStatus.READY
+                validate_task_transition(current_status, TaskStatus.LEASED)
+                attempt_number = self._next_attempt_number(conn, task.id)
+                attempt_id = f"task_attempt_{uuid.uuid4().hex[:12]}"
+                lease_id = f"task_lease_{uuid.uuid4().hex[:12]}"
+                conn.execute(
+                    """
+                    INSERT INTO task_attempts (
+                      id, task_id, attempt_number, status, lease_id, run_id,
+                      created_at, started_at, finished_at, failure_code, failure_message,
+                      metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attempt_id,
+                        task.id,
+                        attempt_number,
+                        TaskStatus.LEASED.value,
+                        lease_id,
+                        None,
+                        timestamp,
+                        None,
+                        None,
+                        None,
+                        None,
+                        "{}",
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO task_leases (
+                      id, task_id, attempt_id, owner, status, acquired_at, expires_at,
+                      heartbeat_at, released_at, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        lease_id,
+                        task.id,
+                        attempt_id,
+                        owner,
+                        TaskLeaseStatus.ACTIVE.value,
+                        timestamp,
+                        expires_at,
+                        None,
+                        None,
+                        "{}",
+                    ),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (TaskStatus.LEASED.value, timestamp, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=current_status,
+                    to_status=TaskStatus.LEASED,
+                    reason="task_leased",
+                    actor=owner,
+                    metadata={"attempt_id": attempt_id, "lease_id": lease_id},
+                    created_at=timestamp,
+                )
+                return {
+                    "task": self._row_to_task(
+                        conn.execute("SELECT * FROM tasks WHERE id = ?", (task.id,)).fetchone()
+                    ),
+                    "attempt": self._row_to_task_attempt(
+                        conn.execute("SELECT * FROM task_attempts WHERE id = ?", (attempt_id,)).fetchone()
+                    ),
+                    "lease": self._row_to_task_lease(
+                        conn.execute("SELECT * FROM task_leases WHERE id = ?", (lease_id,)).fetchone()
+                    ),
+                }
+        return None
+
+    def select_next_task_legacy(self) -> TaskRecord | None:
         candidates = [
             task
             for task in self.list_tasks()
@@ -482,6 +609,56 @@ class SQLiteStore:
                 task = self.update_task_status(task.id, TaskStatus.READY)
             return self.update_task_status(task.id, TaskStatus.RUNNING)
         return None
+
+    def list_task_attempts(self, task_id: str | None = None) -> list[TaskAttempt]:
+        with self.connect() as conn:
+            if task_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM task_attempts ORDER BY created_at ASC, id ASC"
+                ).fetchall()
+            else:
+                self._require_task(conn, task_id)
+                rows = conn.execute(
+                    """
+                    SELECT * FROM task_attempts
+                    WHERE task_id = ?
+                    ORDER BY attempt_number ASC, created_at ASC, id ASC
+                    """,
+                    (task_id,),
+                ).fetchall()
+        return [self._row_to_task_attempt(row) for row in rows]
+
+    def list_task_leases(self, task_id: str | None = None) -> list[TaskLease]:
+        with self.connect() as conn:
+            if task_id is None:
+                rows = conn.execute(
+                    "SELECT * FROM task_leases ORDER BY acquired_at ASC, id ASC"
+                ).fetchall()
+            else:
+                self._require_task(conn, task_id)
+                rows = conn.execute(
+                    """
+                    SELECT * FROM task_leases
+                    WHERE task_id = ?
+                    ORDER BY acquired_at ASC, id ASC
+                    """,
+                    (task_id,),
+                ).fetchall()
+        return [self._row_to_task_lease(row) for row in rows]
+
+    def _task_has_active_lease(self, conn: sqlite3.Connection, task_id: str) -> bool:
+        row = conn.execute(
+            "SELECT id FROM task_leases WHERE task_id = ? AND status = ? LIMIT 1",
+            (task_id, TaskLeaseStatus.ACTIVE.value),
+        ).fetchone()
+        return row is not None
+
+    def _next_attempt_number(self, conn: sqlite3.Connection, task_id: str) -> int:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(attempt_number), 0) AS max_attempt FROM task_attempts WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row["max_attempt"]) + 1
 
     def _task_dependencies_completed(self, task: TaskRecord) -> bool:
         for dependency_id in task.depends_on:
@@ -977,6 +1154,36 @@ class SQLiteStore:
             dependency_type=TaskDependencyType(row["dependency_type"]),
             required_artifact_kind=row["required_artifact_kind"],
             created_at=parse_dt(row["created_at"]),
+        )
+
+    def _row_to_task_attempt(self, row: sqlite3.Row) -> TaskAttempt:
+        return TaskAttempt(
+            id=row["id"],
+            task_id=row["task_id"],
+            attempt_number=row["attempt_number"],
+            status=normalize_task_status(row["status"]),
+            lease_id=row["lease_id"],
+            run_id=row["run_id"],
+            created_at=parse_dt(row["created_at"]),
+            started_at=parse_dt(row["started_at"]) if row["started_at"] else None,
+            finished_at=parse_dt(row["finished_at"]) if row["finished_at"] else None,
+            failure_code=row["failure_code"],
+            failure_message=row["failure_message"],
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_task_lease(self, row: sqlite3.Row) -> TaskLease:
+        return TaskLease(
+            id=row["id"],
+            task_id=row["task_id"],
+            attempt_id=row["attempt_id"],
+            owner=row["owner"],
+            status=TaskLeaseStatus(row["status"]),
+            acquired_at=parse_dt(row["acquired_at"]),
+            expires_at=parse_dt(row["expires_at"]),
+            heartbeat_at=parse_dt(row["heartbeat_at"]) if row["heartbeat_at"] else None,
+            released_at=parse_dt(row["released_at"]) if row["released_at"] else None,
+            metadata=json.loads(row["metadata_json"]),
         )
 
     def _row_to_objective(self, row: sqlite3.Row) -> ObjectiveRecord:
