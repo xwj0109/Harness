@@ -123,7 +123,8 @@ class CodexCodeEditRunner:
                 "isolated_unified_diff": unified_diff_path,
                 "isolated_diff_stat": diff_stat_path,
             }.items():
-                self.store.register_artifact(run.id, kind=kind, path=path)
+                if path.exists():
+                    self.store.register_artifact(run.id, kind=kind, path=path)
             self.store.append_event(
                 run.id,
                 "info",
@@ -154,6 +155,8 @@ class CodexCodeEditRunner:
             diff_result = inspect_isolated_diff(workspace.path, workspace.baseline_manifest)
             unified_diff_path.write_text(str(sanitize_for_logging(diff_result.unified_diff)), encoding="utf-8")
             diff_stat_path.write_text(str(sanitize_for_logging(diff_result.diff_stat)), encoding="utf-8")
+            self.store.register_artifact(run.id, "isolated_unified_diff", unified_diff_path)
+            self.store.register_artifact(run.id, "isolated_diff_stat", diff_stat_path)
             self.store.append_event(
                 run.id,
                 "info",

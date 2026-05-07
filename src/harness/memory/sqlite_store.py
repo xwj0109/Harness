@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -121,11 +122,18 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.executescript(schema)
             self._ensure_column(conn, "runs", "approval_id", "TEXT")
+            self._ensure_column(conn, "artifacts", "schema_version", "TEXT")
+            self._ensure_column(conn, "artifacts", "sha256", "TEXT")
+            self._ensure_column(conn, "artifacts", "size_bytes", "INTEGER")
+            self._ensure_column(conn, "artifacts", "producer", "TEXT")
+            self._ensure_column(conn, "artifacts", "redaction_state", "TEXT")
+            self._ensure_column(conn, "artifacts", "evidence_status", "TEXT")
             self._ensure_column(conn, "tasks", "objective_id", "TEXT")
             self._ensure_column(conn, "tasks", "idempotency_key", "TEXT")
             self._ensure_column(conn, "tasks", "required_approvals_json", "TEXT")
             self._ensure_column(conn, "tasks", "approval_state", "TEXT")
             self._migrate_task_rows(conn)
+            self._migrate_artifact_rows(conn)
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -157,6 +165,29 @@ class SQLiteStore:
             WHERE updated_at IS NULL OR updated_at = ''
             """,
             (timestamp,),
+        )
+
+    def _migrate_artifact_rows(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET schema_version = 'harness.artifact/v1'
+            WHERE schema_version IS NULL OR schema_version = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET redaction_state = 'unknown'
+            WHERE redaction_state IS NULL OR redaction_state = ''
+            """
+        )
+        conn.execute(
+            """
+            UPDATE artifacts
+            SET evidence_status = 'unknown'
+            WHERE evidence_status IS NULL OR evidence_status = ''
+            """
         )
 
     def connect(self) -> sqlite3.Connection:
@@ -934,15 +965,24 @@ class SQLiteStore:
         kind: str,
         path: Path,
         metadata: dict[str, Any] | None = None,
+        producer: str | None = None,
+        redaction_state: str = "unknown",
     ) -> ArtifactRecord:
+        self.get_run(run_id)
+        if not path.exists():
+            raise FileNotFoundError(f"Artifact path not found: {path}")
         artifact_id = f"art_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         metadata = metadata or {}
+        sha256, size_bytes = self._artifact_file_evidence(path)
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO artifacts (id, run_id, kind, path, created_at, metadata_json)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO artifacts (
+                  id, run_id, kind, path, created_at, schema_version, sha256,
+                  size_bytes, producer, redaction_state, evidence_status, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact_id,
@@ -950,6 +990,12 @@ class SQLiteStore:
                     kind,
                     str(path),
                     timestamp,
+                    "harness.artifact/v1",
+                    sha256,
+                    size_bytes,
+                    producer,
+                    redaction_state,
+                    "verified",
                     json.dumps(metadata, sort_keys=True, default=str),
                 ),
             )
@@ -959,27 +1005,57 @@ class SQLiteStore:
             kind=kind,
             path=path,
             created_at=parse_dt(timestamp),
+            sha256=sha256,
+            size_bytes=size_bytes,
+            producer=producer,
+            redaction_state=redaction_state,
+            evidence_status="verified",
             metadata=metadata,
         )
         self.write_run_manifest(run_id)
         return record
 
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM artifacts WHERE id = ?", (artifact_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Artifact not found: {artifact_id}")
+        return self._row_to_artifact(row)
+
     def list_artifacts(self, run_id: str) -> list[ArtifactRecord]:
+        self.get_run(run_id)
         with self.connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at ASC", (run_id,)
             ).fetchall()
-        return [
-            ArtifactRecord(
-                id=row["id"],
-                run_id=row["run_id"],
-                kind=row["kind"],
-                path=Path(row["path"]),
-                created_at=parse_dt(row["created_at"]),
-                metadata=json.loads(row["metadata_json"]),
-            )
-            for row in rows
-        ]
+        return [self._row_to_artifact(row) for row in rows]
+
+    def verify_artifact(self, artifact_id: str) -> ArtifactRecord:
+        artifact = self.get_artifact(artifact_id)
+        status = self._artifact_evidence_status(artifact)
+        return artifact.model_copy(update={"evidence_status": status})
+
+    def verify_artifacts(self, run_id: str) -> list[ArtifactRecord]:
+        return [self.verify_artifact(artifact.id) for artifact in self.list_artifacts(run_id)]
+
+    def _artifact_file_evidence(self, path: Path) -> tuple[str, int]:
+        digest = hashlib.sha256()
+        size_bytes = 0
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                size_bytes += len(chunk)
+                digest.update(chunk)
+        return digest.hexdigest(), size_bytes
+
+    def _artifact_evidence_status(self, artifact: ArtifactRecord) -> str:
+        if not artifact.path.exists():
+            return "missing"
+        if artifact.sha256 is None or artifact.size_bytes is None:
+            return "unknown"
+        sha256, size_bytes = self._artifact_file_evidence(artifact.path)
+        if sha256 == artifact.sha256 and size_bytes == artifact.size_bytes:
+            return "verified"
+        return "mismatch"
 
     def persist_backend_snapshot(self, run_id: str, backend: BackendConfig) -> None:
         snapshot_id = f"backend_{uuid.uuid4().hex[:12]}"
@@ -1052,9 +1128,16 @@ class SQLiteStore:
         effective_policy = resolve_run_effective_policy(run, backend_descriptor)
         artifacts = [
             ManifestArtifact(
+                id=artifact.id,
+                run_id=artifact.run_id,
                 kind=artifact.kind,
                 path=artifact.path,
                 created_at=artifact.created_at,
+                sha256=artifact.sha256,
+                size_bytes=artifact.size_bytes,
+                producer=artifact.producer,
+                redaction_state=artifact.redaction_state,
+                evidence_status=self._artifact_evidence_status(artifact),
                 metadata=artifact.metadata,
             )
             for artifact in self.list_artifacts(run_id)
@@ -1095,6 +1178,22 @@ class SQLiteStore:
             kind=BackendKind(row["backend_kind"]),
             metadata=BackendMetadata.model_validate_json(row["metadata_json"]),
             capabilities=BackendCapabilities.model_validate_json(row["capabilities_json"]),
+        )
+
+    def _row_to_artifact(self, row: sqlite3.Row) -> ArtifactRecord:
+        return ArtifactRecord(
+            schema_version=row["schema_version"] or "harness.artifact/v1",
+            id=row["id"],
+            run_id=row["run_id"],
+            kind=row["kind"],
+            path=Path(row["path"]),
+            created_at=parse_dt(row["created_at"]),
+            sha256=row["sha256"],
+            size_bytes=row["size_bytes"],
+            producer=row["producer"],
+            redaction_state=row["redaction_state"] or "unknown",
+            evidence_status=row["evidence_status"] or "unknown",
+            metadata=json.loads(row["metadata_json"]),
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:

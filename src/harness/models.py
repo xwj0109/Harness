@@ -301,18 +301,32 @@ class EventRecord(BaseModel):
 
 
 class ArtifactRecord(BaseModel):
+    schema_version: str = "harness.artifact/v1"
     id: str
     run_id: str
     kind: str
     path: Path
     created_at: datetime
+    sha256: str | None = None
+    size_bytes: int | None = None
+    producer: str | None = None
+    redaction_state: str = "unknown"
+    evidence_status: str = "unknown"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class ManifestArtifact(BaseModel):
+    schema_version: str = "harness.artifact/v1"
+    id: str | None = None
+    run_id: str | None = None
     kind: str
     path: Path
     created_at: datetime
+    sha256: str | None = None
+    size_bytes: int | None = None
+    producer: str | None = None
+    redaction_state: str = "unknown"
+    evidence_status: str = "unknown"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

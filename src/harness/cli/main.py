@@ -60,6 +60,7 @@ tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
 specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_without_command=True)
 specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previews.")
 policy_app = typer.Typer(help="Runtime effective policy evidence.")
+artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
@@ -68,6 +69,7 @@ app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
 app.add_typer(policy_app, name="policy")
+app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
@@ -741,6 +743,68 @@ def _resolve_policy_explain(project_root: Path, subject_kind: str, subject_id: s
     }
 
 
+@artifacts_app.command("list")
+def artifacts_list(
+    run_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        artifacts = store.verify_artifacts(run_id)
+    except KeyError as exc:
+        _emit_artifact_error("harness.artifacts/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.artifacts/v1",
+                "ok": True,
+                "run_id": run_id,
+                "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+            }
+        )
+        return
+    if not artifacts:
+        typer.echo("No artifacts found.")
+        return
+    for artifact in artifacts:
+        typer.echo(
+            f"{artifact.id}\t{artifact.kind}\t{artifact.evidence_status}\t"
+            f"{artifact.sha256 or 'none'}\t{artifact.size_bytes if artifact.size_bytes is not None else 'unknown'}"
+        )
+
+
+@artifacts_app.command("inspect")
+def artifacts_inspect(
+    artifact_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        artifact = store.verify_artifact(artifact_id)
+    except KeyError as exc:
+        _emit_artifact_error("harness.artifact/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = artifact.model_dump(mode="json")
+        payload.update({"ok": True})
+        _emit_json(payload)
+        return
+    typer.echo(f"Artifact: {artifact.id}")
+    typer.echo(f"Run: {artifact.run_id}")
+    typer.echo(f"Kind: {artifact.kind}")
+    typer.echo(f"Status: {artifact.evidence_status}")
+    typer.echo(f"SHA256: {artifact.sha256 or 'none'}")
+    typer.echo(f"Size: {artifact.size_bytes if artifact.size_bytes is not None else 'unknown'}")
+    typer.echo(f"Path: {artifact.path}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1254,6 +1318,13 @@ def _emit_policy_error(message: str, output: OutputFormat) -> None:
         _emit_json({"schema_version": "harness.effective_policy/v1", "ok": False, "errors": [message]})
     else:
         typer.echo(f"Policy command failed: {message}")
+
+
+def _emit_artifact_error(schema_version: str, message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Artifact command failed: {message}")
 
 
 def _emit_json(payload) -> None:

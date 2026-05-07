@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import hashlib
 
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
@@ -19,6 +20,10 @@ def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
     assert len(store.list_runs()) == 1
     assert store.list_events(run.id)[0].id == event.id
     assert store.list_artifacts(run.id)[0].id == artifact.id
+    assert artifact.schema_version == "harness.artifact/v1"
+    assert artifact.sha256
+    assert artifact.size_bytes == paths["events"].stat().st_size
+    assert artifact.evidence_status == "verified"
     assert paths["events"].read_text(encoding="utf-8")
     assert report.exists()
     assert "Run " in report.read_text(encoding="utf-8")
@@ -53,11 +58,20 @@ def test_store_writes_and_refreshes_run_manifest(tmp_path) -> None:
     paths = store.initialize_run_artifacts(run.id)
     store.register_artifact(run.id, "events", paths["events"], {"required": True})
     with_artifact = json.loads(manifest_path.read_text(encoding="utf-8"))
+    artifact_entry = with_artifact["artifacts"][0]
     assert with_artifact["artifacts"] == [
         {
+            "schema_version": "harness.artifact/v1",
+            "id": artifact_entry["id"],
+            "run_id": run.id,
             "kind": "events",
             "path": str(paths["events"]),
-            "created_at": with_artifact["artifacts"][0]["created_at"],
+            "created_at": artifact_entry["created_at"],
+            "sha256": hashlib.sha256(b"").hexdigest(),
+            "size_bytes": 0,
+            "producer": None,
+            "redaction_state": "unknown",
+            "evidence_status": "verified",
             "metadata": {"required": True},
         }
     ]
@@ -117,6 +131,7 @@ def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
     with sqlite3.connect(tmp_path / ".harness" / "harness.sqlite") as conn:
         tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         task_columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        artifact_columns = {row[1] for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()}
 
     assert {
         "runs",
@@ -136,8 +151,83 @@ def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
         "required_approvals_json",
         "approval_state",
     } <= task_columns
+    assert {
+        "schema_version",
+        "sha256",
+        "size_bytes",
+        "producer",
+        "redaction_state",
+        "evidence_status",
+    } <= artifact_columns
     run = store.create_run(goal="test run", task_type="phase_1a_test")
     assert store.get_run(run.id).id == run.id
+
+
+def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="artifact run", task_type="phase_1a_test")
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "evidence.txt"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("initial", encoding="utf-8")
+
+    artifact = store.register_artifact(
+        run.id,
+        "evidence",
+        artifact_path,
+        producer="unit_test",
+        redaction_state="redacted",
+    )
+
+    assert artifact.sha256 == hashlib.sha256(b"initial").hexdigest()
+    assert artifact.size_bytes == len("initial")
+    assert artifact.producer == "unit_test"
+    assert artifact.redaction_state == "redacted"
+    assert store.verify_artifact(artifact.id).evidence_status == "verified"
+
+    artifact_path.write_text("changed", encoding="utf-8")
+    assert store.verify_artifact(artifact.id).evidence_status == "mismatch"
+
+    artifact_path.unlink()
+    assert store.verify_artifact(artifact.id).evidence_status == "missing"
+
+
+def test_store_rejects_missing_artifact_registration(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="artifact run", task_type="phase_1a_test")
+
+    try:
+        store.register_artifact(run.id, "missing", tmp_path / "missing.txt")
+    except FileNotFoundError as exc:
+        assert "Artifact path not found:" in str(exc)
+    else:
+        raise AssertionError("missing artifact should raise")
+
+
+def test_store_reads_legacy_artifact_rows_after_migration(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="legacy run", task_type="phase_1a_test")
+    legacy_path = tmp_path / ".harness" / "runs" / run.id / "legacy.txt"
+    legacy_path.write_text("legacy", encoding="utf-8")
+    with store.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO artifacts (id, run_id, kind, path, created_at, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("art_legacy", run.id, "legacy", str(legacy_path), "2026-01-01T00:00:00+00:00", "{}"),
+        )
+
+    store.initialize()
+    artifact = store.get_artifact("art_legacy")
+
+    assert artifact.schema_version == "harness.artifact/v1"
+    assert artifact.sha256 is None
+    assert artifact.size_bytes is None
+    assert artifact.redaction_state == "unknown"
+    assert artifact.evidence_status == "unknown"
 
 
 def test_store_creates_lists_filters_and_updates_tasks(tmp_path) -> None:

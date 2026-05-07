@@ -332,6 +332,28 @@ The JSON wrapper is `harness.effective_policy/v1`. Runtime policy evidence inclu
 
 Run manifests are written as `harness.manifest/v1.1` and include additive runtime policy evidence such as `effective_policy`, `effective_policy_sha256`, and backend descriptor hash when a backend descriptor exists. Manifest evidence does not include backend settings, API keys, environment variables, or secret-like metadata.
 
+## Artifact Evidence
+
+Inspect registered run artifact evidence without printing artifact contents:
+
+```bash
+harness artifacts list run_abc123def456 --project . --output json
+harness artifacts inspect art_abc123def456 --project . --output json
+```
+
+The JSON wrappers are `harness.artifacts/v1` for list output and `harness.artifact/v1` for inspect output. Artifact evidence includes local path, kind, producer metadata, redaction state, persisted `sha256`, persisted `size_bytes`, and current evidence status.
+
+Evidence status values are:
+
+```text
+verified
+mismatch
+missing
+unknown
+```
+
+Artifact inspection recomputes checksum and size to report evidence drift, but it does not repair, rewrite, delete, or expose artifact file contents. A mismatch means the current local file no longer matches the checksum and size recorded when the artifact was registered.
+
 ## v0.2 Specs Safety Boundary
 
 All `harness specs ...` commands are read-only inspection commands. They do not auto-discover spec files, read or write `.harness/`, read project config, read SQLite, inspect environment variables, read backend settings, read secrets, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.

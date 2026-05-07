@@ -32,6 +32,12 @@ CREATE TABLE IF NOT EXISTS artifacts (
   kind TEXT NOT NULL,
   path TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  schema_version TEXT,
+  sha256 TEXT,
+  size_bytes INTEGER,
+  producer TEXT,
+  redaction_state TEXT,
+  evidence_status TEXT,
   metadata_json TEXT NOT NULL,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );

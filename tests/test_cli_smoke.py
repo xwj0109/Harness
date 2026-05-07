@@ -97,6 +97,9 @@ def test_cli_dev_create_run_runs_show(tmp_path) -> None:
     assert manifest["run_mode"] == "dev"
     assert manifest["effective_policy"]["schema_version"] == "harness.effective_policy/v1"
     assert manifest["effective_policy_sha256"]
+    assert all(artifact["schema_version"] == "harness.artifact/v1" for artifact in manifest["artifacts"])
+    assert all(artifact["sha256"] for artifact in manifest["artifacts"])
+    assert all(artifact["evidence_status"] in {"verified", "mismatch"} for artifact in manifest["artifacts"])
     assert {artifact["kind"] for artifact in manifest["artifacts"]} >= {
         "events",
         "transcript",
@@ -144,6 +147,98 @@ def test_cli_runs_and_show_support_json_output(tmp_path) -> None:
         "transcript",
         "final_report",
         "manifest",
+    }
+
+
+def test_cli_artifacts_list_and_inspect_report_evidence_without_contents(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    created = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "artifact cli run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created.exit_code == 0
+    run_id = created.output.split("Created run ", 1)[1].splitlines()[0]
+
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("artifacts must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("artifacts must not preflight local backend")),
+    )
+
+    listed = runner.invoke(app, ["artifacts", "list", run_id, "--project", str(tmp_path), "--output", "json"])
+
+    assert listed.exit_code == 0, listed.output
+    payload = json.loads(listed.output)
+    assert payload["schema_version"] == "harness.artifacts/v1"
+    assert payload["ok"] is True
+    assert payload["run_id"] == run_id
+    assert payload["artifacts"]
+    artifact = payload["artifacts"][0]
+    assert artifact["schema_version"] == "harness.artifact/v1"
+    assert artifact["sha256"]
+    assert artifact["size_bytes"] >= 0
+    assert artifact["evidence_status"] == "verified"
+    assert "Created Phase 1A diagnostic run." not in json.dumps(payload)
+
+    inspected = runner.invoke(
+        app,
+        ["artifacts", "inspect", artifact["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+    assert inspected.exit_code == 0, inspected.output
+    inspect_payload = json.loads(inspected.output)
+    assert inspect_payload["schema_version"] == "harness.artifact/v1"
+    assert inspect_payload["ok"] is True
+    assert inspect_payload["id"] == artifact["id"]
+    assert inspect_payload["evidence_status"] == "verified"
+
+    text = runner.invoke(app, ["artifacts", "list", run_id, "--project", str(tmp_path)])
+    assert text.exit_code == 0
+    assert artifact["id"] in text.output
+    assert "verified" in text.output
+
+    serialized = json.dumps(inspect_payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
+def test_cli_artifacts_unknown_refs_return_stable_json_errors(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    listed = runner.invoke(
+        app,
+        ["artifacts", "list", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+    inspected = runner.invoke(
+        app,
+        ["artifacts", "inspect", "art_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert listed.exit_code == 1
+    list_payload = json.loads(listed.output)
+    assert list_payload == {
+        "schema_version": "harness.artifacts/v1",
+        "ok": False,
+        "errors": ["Run not found: run_missing"],
+    }
+    assert inspected.exit_code == 1
+    inspect_payload = json.loads(inspected.output)
+    assert inspect_payload == {
+        "schema_version": "harness.artifact/v1",
+        "ok": False,
+        "errors": ["Artifact not found: art_missing"],
     }
 
 
