@@ -145,6 +145,8 @@ def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
         "task_leases",
         "task_transitions",
         "run_baselines",
+        "daemon_records",
+        "daemon_events",
     } <= tables
     assert {
         "objective_id",
@@ -162,6 +164,78 @@ def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
     } <= artifact_columns
     run = store.create_run(goal="test run", task_type="phase_1a_test")
     assert store.get_run(run.id).id == run.id
+
+
+def test_store_daemon_records_events_status_and_stop(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    daemon = store.ensure_daemon("local_daemon:test:123", pid=123)
+    event = store.record_daemon_event(
+        daemon.id,
+        "tick",
+        "Daemon tick.",
+        {"secret": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz"},
+    )
+    status = store.daemon_status()
+
+    assert daemon.owner == "local_daemon:test:123"
+    assert daemon.status.value == "running"
+    assert daemon.pid == 123
+    assert status.schema_version == "harness.daemon_status/v1"
+    assert status.ok is True
+    assert status.active_daemons[0].id == daemon.id
+    assert store.get_daemon_event(event.id).metadata["secret"] == "[REDACTED_SECRET]"
+    assert store.list_daemon_events(daemon.id)[0].event_type == "tick"
+
+    stopped = store.stop_daemons(owner="local_daemon:test:123")
+
+    assert [item.id for item in stopped] == [daemon.id]
+    assert stopped[0].status.value == "stopped"
+    assert store.daemon_status().active_daemons == []
+
+
+def test_store_daemon_run_once_leases_without_creating_runs_or_artifacts(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    high = store.create_task(title="High", priority=10)
+    low = store.create_task(title="Low", priority=0)
+
+    result = store.daemon_run_once("local_daemon:test:123", pid=123)
+    second = store.daemon_run_once("local_daemon:test:123", pid=123)
+
+    assert result.schema_version == "harness.daemon_tick/v1"
+    assert result.ok is True
+    assert result.owner == "local_daemon:test:123"
+    assert result.decision == "leased_task"
+    assert result.selected_task is not None
+    assert result.selected_task.id == high.id
+    assert result.attempt is not None
+    assert result.attempt.run_id is None
+    assert result.lease is not None
+    assert result.lease.owner == "local_daemon:test:123"
+    assert second.selected_task is not None
+    assert second.selected_task.id == low.id
+    assert store.list_runs() == []
+    assert not any((tmp_path / ".harness" / "runs").iterdir())
+    event_types = [event.event_type for event in store.list_daemon_events(result.daemon_id)]
+    assert event_types.count("tick") == 2
+    assert event_types.count("heartbeat") == 1
+    assert event_types.count("start") == 1
+
+
+def test_store_daemon_run_once_reports_no_eligible_task(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(title="Approval", required_approvals=["hosted_provider"])
+
+    result = store.daemon_run_once("local_daemon:test:123", pid=123)
+
+    assert result.decision == "no_eligible_task"
+    assert result.selected_task is None
+    assert result.attempt is None
+    assert result.lease is None
+    assert store.list_runs() == []
 
 
 def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None:

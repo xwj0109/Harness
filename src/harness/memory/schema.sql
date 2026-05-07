@@ -152,6 +152,28 @@ CREATE TABLE IF NOT EXISTS run_baselines (
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
 
+CREATE TABLE IF NOT EXISTS daemon_records (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  status TEXT NOT NULL,
+  pid INTEGER,
+  project_root TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL,
+  stopped_at TEXT,
+  metadata_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daemon_events (
+  id TEXT PRIMARY KEY,
+  daemon_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  FOREIGN KEY(daemon_id) REFERENCES daemon_records(id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created
   ON tasks(status, priority DESC, created_at ASC);
 
@@ -175,3 +197,9 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task_created
 
 CREATE INDEX IF NOT EXISTS idx_run_baselines_run
   ON run_baselines(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_daemon_records_status_heartbeat
+  ON daemon_records(status, heartbeat_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_daemon_events_daemon_created
+  ON daemon_events(daemon_id, created_at DESC);

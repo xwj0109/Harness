@@ -62,6 +62,8 @@ Initial daemon defaults:
 
 ### Slice 1 — Daemon Control Plane, No Task Execution
 
+Status: implemented.
+
 Purpose: add daemon lifecycle and recovery primitives without executing task work.
 
 Key changes:
@@ -88,6 +90,8 @@ Acceptance criteria:
 - Full suite passes.
 
 ### Slice 2 — Lease Renewal and Recovery
+
+Status: next implementation target.
 
 Purpose: make the daemon safe across restarts and interrupted work.
 

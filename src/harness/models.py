@@ -89,6 +89,12 @@ class TaskLeaseStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class DaemonStatus(str, Enum):
+    RUNNING = "running"
+    STOPPED = "stopped"
+    STALE = "stale"
+
+
 class PolicyLevel(str, Enum):
     FORBIDDEN = "forbidden"
     APPROVAL_REQUIRED = "approval_required"
@@ -299,6 +305,50 @@ class TaskTransitionRecord(BaseModel):
     actor: str
     created_at: datetime
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DaemonRecord(BaseModel):
+    id: str
+    owner: str
+    status: DaemonStatus
+    pid: int | None = None
+    project_root: Path
+    started_at: datetime
+    heartbeat_at: datetime
+    stopped_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DaemonEvent(BaseModel):
+    id: str
+    daemon_id: str
+    event_type: str
+    message: str
+    created_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class DaemonTickResult(BaseModel):
+    schema_version: str = "harness.daemon_tick/v1"
+    ok: bool = True
+    daemon_id: str
+    owner: str
+    project_root: Path
+    tick_id: str
+    decision: str
+    selected_task: TaskRecord | None = None
+    attempt: TaskAttempt | None = None
+    lease: TaskLease | None = None
+    pause_reasons: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class DaemonStatusResult(BaseModel):
+    schema_version: str = "harness.daemon_status/v1"
+    ok: bool = True
+    project_root: Path
+    active_daemons: list[DaemonRecord] = Field(default_factory=list)
+    latest_events: list[DaemonEvent] = Field(default_factory=list)
+    stale_after_seconds: int
 
 
 class PolicySource(BaseModel):

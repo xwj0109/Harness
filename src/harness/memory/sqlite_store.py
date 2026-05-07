@@ -16,6 +16,11 @@ from harness.models import (
     BackendDescriptor,
     BackendKind,
     BackendMetadata,
+    DaemonEvent,
+    DaemonRecord,
+    DaemonStatus,
+    DaemonStatusResult,
+    DaemonTickResult,
     EventRecord,
     ManifestArtifact,
     ObjectiveRecord,
@@ -51,6 +56,7 @@ TASK_STATUS_QUERY_ALIASES = {
 
 DEFAULT_TASK_LEASE_MINUTES = 30
 DEFAULT_TASK_LEASE_OWNER = "manual_cli"
+DEFAULT_DAEMON_STALE_AFTER_SECONDS = 120
 
 ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.CREATED: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.WAITING_APPROVAL},
@@ -627,6 +633,252 @@ class SQLiteStore:
                     ),
                 }
         return None
+
+    def daemon_run_once(self, owner: str, pid: int | None = None) -> DaemonTickResult:
+        daemon = self.ensure_daemon(owner=owner, pid=pid)
+        tick_id = f"daemon_tick_{uuid.uuid4().hex[:12]}"
+        selection = self.select_next_task_for_lease(owner=owner)
+        decision = "leased_task" if selection is not None else "no_eligible_task"
+        metadata = {
+            "tick_id": tick_id,
+            "decision": decision,
+            "task_id": selection["task"].id if selection is not None else None,
+            "attempt_id": selection["attempt"].id if selection is not None else None,
+            "lease_id": selection["lease"].id if selection is not None else None,
+        }
+        self.record_daemon_event(
+            daemon.id,
+            event_type="tick",
+            message="Daemon scheduler tick completed.",
+            metadata=metadata,
+        )
+        return DaemonTickResult(
+            daemon_id=daemon.id,
+            owner=daemon.owner,
+            project_root=self.project_root,
+            tick_id=tick_id,
+            decision=decision,
+            selected_task=selection["task"] if selection is not None else None,
+            attempt=selection["attempt"] if selection is not None else None,
+            lease=selection["lease"] if selection is not None else None,
+            pause_reasons=[],
+        )
+
+    def ensure_daemon(self, owner: str, pid: int | None = None) -> DaemonRecord:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM daemon_records
+                WHERE owner = ? AND status = ?
+                ORDER BY heartbeat_at DESC
+                LIMIT 1
+                """,
+                (owner, DaemonStatus.RUNNING.value),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    "UPDATE daemon_records SET heartbeat_at = ?, pid = COALESCE(?, pid) WHERE id = ?",
+                    (timestamp, pid, row["id"]),
+                )
+                daemon_id = row["id"]
+                self._record_daemon_event(
+                    conn,
+                    daemon_id=daemon_id,
+                    event_type="heartbeat",
+                    message="Daemon heartbeat recorded.",
+                    metadata={},
+                    created_at=timestamp,
+                )
+                updated = conn.execute(
+                    "SELECT * FROM daemon_records WHERE id = ?", (daemon_id,)
+                ).fetchone()
+                return self._row_to_daemon(updated)
+            daemon_id = f"daemon_{uuid.uuid4().hex[:12]}"
+            conn.execute(
+                """
+                INSERT INTO daemon_records (
+                  id, owner, status, pid, project_root, started_at, heartbeat_at,
+                  stopped_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    daemon_id,
+                    owner,
+                    DaemonStatus.RUNNING.value,
+                    pid,
+                    str(self.project_root),
+                    timestamp,
+                    timestamp,
+                    None,
+                    "{}",
+                ),
+            )
+            self._record_daemon_event(
+                conn,
+                daemon_id=daemon_id,
+                event_type="start",
+                message="Daemon record started.",
+                metadata={},
+                created_at=timestamp,
+            )
+        return self.get_daemon(daemon_id)
+
+    def stop_daemons(self, owner: str | None = None) -> list[DaemonRecord]:
+        timestamp = now_iso()
+        stopped_ids: list[str] = []
+        with self.connect() as conn:
+            if owner is None:
+                rows = conn.execute(
+                    "SELECT * FROM daemon_records WHERE status = ? ORDER BY heartbeat_at DESC",
+                    (DaemonStatus.RUNNING.value,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM daemon_records
+                    WHERE status = ? AND owner = ?
+                    ORDER BY heartbeat_at DESC
+                    """,
+                    (DaemonStatus.RUNNING.value, owner),
+                ).fetchall()
+            for row in rows:
+                stopped_ids.append(row["id"])
+                conn.execute(
+                    "UPDATE daemon_records SET status = ?, stopped_at = ?, heartbeat_at = ? WHERE id = ?",
+                    (DaemonStatus.STOPPED.value, timestamp, timestamp, row["id"]),
+                )
+                self._record_daemon_event(
+                    conn,
+                    daemon_id=row["id"],
+                    event_type="stop",
+                    message="Daemon record stopped.",
+                    metadata={},
+                    created_at=timestamp,
+                )
+        return [self.get_daemon(daemon_id) for daemon_id in stopped_ids]
+
+    def daemon_status(
+        self,
+        *,
+        stale_after_seconds: int = DEFAULT_DAEMON_STALE_AFTER_SECONDS,
+    ) -> DaemonStatusResult:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
+        active_daemons = [
+            daemon.model_copy(update={"status": DaemonStatus.STALE})
+            if daemon.heartbeat_at < cutoff
+            else daemon
+            for daemon in self.list_daemons(include_stopped=False)
+        ]
+        return DaemonStatusResult(
+            project_root=self.project_root,
+            active_daemons=active_daemons,
+            latest_events=self.list_daemon_events(limit=20),
+            stale_after_seconds=stale_after_seconds,
+        )
+
+    def get_daemon(self, daemon_id: str) -> DaemonRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM daemon_records WHERE id = ?", (daemon_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Daemon not found: {daemon_id}")
+        return self._row_to_daemon(row)
+
+    def list_daemons(self, include_stopped: bool = False) -> list[DaemonRecord]:
+        with self.connect() as conn:
+            if include_stopped:
+                rows = conn.execute(
+                    "SELECT * FROM daemon_records ORDER BY heartbeat_at DESC, id ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM daemon_records
+                    WHERE status = ?
+                    ORDER BY heartbeat_at DESC, id ASC
+                    """,
+                    (DaemonStatus.RUNNING.value,),
+                ).fetchall()
+        return [self._row_to_daemon(row) for row in rows]
+
+    def record_daemon_event(
+        self,
+        daemon_id: str,
+        event_type: str,
+        message: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> DaemonEvent:
+        self.get_daemon(daemon_id)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            event_id = self._record_daemon_event(
+                conn,
+                daemon_id=daemon_id,
+                event_type=event_type,
+                message=message,
+                metadata=metadata or {},
+                created_at=timestamp,
+            )
+        return self.get_daemon_event(event_id)
+
+    def get_daemon_event(self, event_id: str) -> DaemonEvent:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM daemon_events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Daemon event not found: {event_id}")
+        return self._row_to_daemon_event(row)
+
+    def list_daemon_events(self, daemon_id: str | None = None, limit: int = 50) -> list[DaemonEvent]:
+        with self.connect() as conn:
+            if daemon_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM daemon_events
+                    ORDER BY created_at DESC, id ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            else:
+                self.get_daemon(daemon_id)
+                rows = conn.execute(
+                    """
+                    SELECT * FROM daemon_events
+                    WHERE daemon_id = ?
+                    ORDER BY created_at DESC, id ASC
+                    LIMIT ?
+                    """,
+                    (daemon_id, limit),
+                ).fetchall()
+        return [self._row_to_daemon_event(row) for row in rows]
+
+    def _record_daemon_event(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        event_type: str,
+        message: str,
+        metadata: dict[str, Any],
+        created_at: str,
+    ) -> str:
+        event_id = f"daemon_evt_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO daemon_events (
+              id, daemon_id, event_type, message, created_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                daemon_id,
+                event_type,
+                message,
+                created_at,
+                json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+            ),
+        )
+        return event_id
 
     def select_next_task_legacy(self) -> TaskRecord | None:
         candidates = [
@@ -1449,6 +1701,29 @@ class SQLiteStore:
             expires_at=parse_dt(row["expires_at"]),
             heartbeat_at=parse_dt(row["heartbeat_at"]) if row["heartbeat_at"] else None,
             released_at=parse_dt(row["released_at"]) if row["released_at"] else None,
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_daemon(self, row: sqlite3.Row) -> DaemonRecord:
+        return DaemonRecord(
+            id=row["id"],
+            owner=row["owner"],
+            status=DaemonStatus(row["status"]),
+            pid=row["pid"],
+            project_root=Path(row["project_root"]),
+            started_at=parse_dt(row["started_at"]),
+            heartbeat_at=parse_dt(row["heartbeat_at"]),
+            stopped_at=parse_dt(row["stopped_at"]) if row["stopped_at"] else None,
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_daemon_event(self, row: sqlite3.Row) -> DaemonEvent:
+        return DaemonEvent(
+            id=row["id"],
+            daemon_id=row["daemon_id"],
+            event_type=row["event_type"],
+            message=row["message"],
+            created_at=parse_dt(row["created_at"]),
             metadata=json.loads(row["metadata_json"]),
         )
 

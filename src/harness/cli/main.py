@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import socket
 import subprocess
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -68,6 +70,7 @@ tools_app = typer.Typer(help="Harness tool capability descriptors.")
 baseline_app = typer.Typer(help="Local run evidence baselines.")
 evals_app = typer.Typer(help="Local evidence-only eval suites.")
 traces_app = typer.Typer(help="Local run trace export.")
+daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
@@ -81,6 +84,7 @@ app.add_typer(tools_app, name="tools")
 app.add_typer(baseline_app, name="baseline")
 app.add_typer(evals_app, name="evals")
 app.add_typer(traces_app, name="traces")
+app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
@@ -984,6 +988,62 @@ def traces_export(
     typer.echo(f"Spans: {span_count}")
 
 
+@daemon_app.command("run-once")
+def daemon_run_once(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    owner = _daemon_owner()
+    try:
+        result = SQLiteStore(project_root).daemon_run_once(owner=owner, pid=os.getpid())
+    except (KeyError, ValueError) as exc:
+        _emit_daemon_error("harness.daemon_tick/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Daemon: {result.daemon_id}")
+    typer.echo(f"Decision: {result.decision}")
+    if result.selected_task is not None:
+        typer.echo(f"Leased task: {result.selected_task.id}")
+
+
+@daemon_app.command("status")
+def daemon_status(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    result = SQLiteStore(project_root).daemon_status()
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Project: {result.project_root}")
+    typer.echo(f"Active daemons: {len(result.active_daemons)}")
+    for daemon in result.active_daemons:
+        typer.echo(f"{daemon.id}\t{daemon.status.value}\t{daemon.owner}\t{daemon.heartbeat_at.isoformat()}")
+
+
+@daemon_app.command("stop")
+def daemon_stop(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    stopped = store.stop_daemons()
+    status = store.daemon_status()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.daemon_status/v1",
+                "ok": True,
+                "project_root": str(project_root),
+                "stopped_daemons": [daemon.model_dump(mode="json") for daemon in stopped],
+                "active_daemons": [daemon.model_dump(mode="json") for daemon in status.active_daemons],
+                "latest_events": [event.model_dump(mode="json") for event in status.latest_events],
+                "stale_after_seconds": status.stale_after_seconds,
+            }
+        )
+        return
+    typer.echo(f"Stopped daemon records: {len(stopped)}")
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1532,6 +1592,17 @@ def _emit_trace_error(message: str, output: OutputFormat) -> None:
         _emit_json({"schema_version": "harness.trace_export/v1", "ok": False, "errors": [message]})
     else:
         typer.echo(f"Trace command failed: {message}")
+
+
+def _emit_daemon_error(schema_version: str, message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Daemon command failed: {message}")
+
+
+def _daemon_owner() -> str:
+    return f"local_daemon:{socket.gethostname()}:{os.getpid()}"
 
 
 def _print_compare_result(result: dict) -> None:

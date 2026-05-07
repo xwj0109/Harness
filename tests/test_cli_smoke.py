@@ -1096,6 +1096,75 @@ def test_cli_tasks_run_next_returns_null_without_runnable_task(tmp_path) -> None
     assert payload["lease"] is None
 
 
+def test_cli_daemon_run_once_status_and_stop_are_non_executing(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(title="Daemon task", priority=10)
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon must not touch Docker")),
+    )
+
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    status = runner.invoke(app, ["daemon", "status", "--project", str(tmp_path), "--output", "json"])
+    stopped = runner.invoke(app, ["daemon", "stop", "--project", str(tmp_path), "--output", "json"])
+
+    assert tick.exit_code == 0, tick.output
+    tick_payload = json.loads(tick.output)
+    assert tick_payload["schema_version"] == "harness.daemon_tick/v1"
+    assert tick_payload["ok"] is True
+    assert tick_payload["decision"] == "leased_task"
+    assert tick_payload["selected_task"]["id"] == task.id
+    assert tick_payload["selected_task"]["status"] == "leased"
+    assert tick_payload["attempt"]["run_id"] is None
+    assert tick_payload["lease"]["owner"].startswith("local_daemon:")
+
+    assert status.exit_code == 0, status.output
+    status_payload = json.loads(status.output)
+    assert status_payload["schema_version"] == "harness.daemon_status/v1"
+    assert status_payload["ok"] is True
+    assert len(status_payload["active_daemons"]) == 1
+    assert {event["event_type"] for event in status_payload["latest_events"]} >= {"start", "tick"}
+
+    assert stopped.exit_code == 0, stopped.output
+    stopped_payload = json.loads(stopped.output)
+    assert stopped_payload["schema_version"] == "harness.daemon_status/v1"
+    assert stopped_payload["ok"] is True
+    assert stopped_payload["active_daemons"] == []
+    assert stopped_payload["stopped_daemons"][0]["status"] == "stopped"
+    assert store.list_runs() == []
+    assert not any((tmp_path / ".harness" / "runs").iterdir())
+
+    serialized = tick.output + status.output + stopped.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "environment" not in serialized
+
+
+def test_cli_daemon_run_once_returns_no_eligible_task(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.daemon_tick/v1"
+    assert payload["ok"] is True
+    assert payload["decision"] == "no_eligible_task"
+    assert payload["selected_task"] is None
+    assert payload["attempt"] is None
+    assert payload["lease"] is None
+
+
 def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 
