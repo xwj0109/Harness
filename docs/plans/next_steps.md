@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -43,6 +43,8 @@ The first v0.2 schema and registry foundations are in place:
 - Durable objectives, task dependencies, transition evidence, cancel/retry, graph output, attempts, leases, and select-and-lease `run-next`.
 - Runtime EffectivePolicy, manifest v1.1 evidence, artifact checksums, tool capability descriptors, compare/baseline, safety-smoke evals, and trace export.
 - Version bump to `0.3.5`.
+- v0.4 daemon control-plane persistence, scheduler tick, heartbeat/status/stop, lease renewal, expired lease recovery, approval/policy pause evidence, and daemon status pause reasons.
+- Version bump to `0.4.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -57,15 +59,19 @@ The control-plane evidence that future daemon work will rely on is now implement
 5. Compare/baseline evidence.
 6. Safety-smoke evals and OTEL-shaped trace export.
 
-## Immediate Next Planning Target
+## Completed v0.4 Scheduler Readiness
 
 v0.4 local daemon planning is captured in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md). Slice 1 is implemented: daemon control-plane persistence, `daemon run-once/status/stop`, heartbeat/event evidence, and non-executing scheduler decisions. Slice 2 is implemented: lease renewal, expired lease recovery, and `daemon recover`. Slice 3 is implemented: daemon eligibility now pauses approval-required and daemon-forbidden tasks with inspectable pause reasons.
+
+The v0.4 scheduler-readiness checkpoint is complete. Daemon commands are local control-plane operations only: they may acquire/renew/recover leases and record daemon evidence, but they do not execute tasks, call backends, run Docker, create run artifacts, start unmanaged background work, add hosted fallback, or add paid fallback.
+
+## Immediate Next Planning Target
 
 The next planning target should be Slice 4: the minimal execution adapter decision gate. The default remains to stop v0.4 after scheduler readiness unless a separate, decision-complete plan explicitly authorizes a tiny execution adapter. Any future Slice 4 work must preserve the same safety boundary until explicitly changed: no task execution, backend calls, Docker, run artifact creation, unmanaged background work, hosted fallback, or paid fallback.
 
 ## Later Work
 
-After v0.3.5 exit criteria pass, plan v0.4 local daemon work as a scheduler over durable task state. Defer autonomous background behavior, broker actions, external-message automation, MCP/A2A adapters, hosted fallback, paid fallback, and generic shell access until a later milestone explicitly authorizes them.
+After the v0.4 scheduler-readiness checkpoint, plan any execution adapter as a separate milestone with explicit policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts. Defer autonomous background behavior, broker actions, external-message automation, MCP/A2A adapters, hosted fallback, paid fallback, and generic shell access until a later milestone explicitly authorizes them.
 
 ## Working Defaults
 

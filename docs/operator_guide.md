@@ -473,6 +473,21 @@ harness tasks run-next --project . --output json
 
 `run-next` selects the highest-priority, oldest ready task whose dependencies are complete, creates a local task attempt and active lease, marks it `leased`, and returns the task, attempt, and lease. If no task is runnable, it returns `ok: true` with `selected_task: null`, `attempt: null`, and `lease: null`. It does not create a run record, create run artifacts, call a backend, execute tools, or mutate repository files outside the harness SQLite database.
 
+Inspect the v0.4 daemon scheduler control plane:
+
+```bash
+harness daemon run-once --project . --output json
+harness daemon status --project . --output json
+harness daemon recover --project . --output json
+harness daemon stop --project . --output json
+```
+
+`daemon run-once` performs a single local scheduler tick and exits. It may renew a daemon-owned active lease, lease one eligible task, or pause when only dependency-blocked, approval-required, active-leased, or daemon-policy-forbidden tasks are available. It returns `harness.daemon_tick/v1` with `decision`, selected task/attempt/lease fields when a lease is acquired, and `pause_reasons` when tasks are paused.
+
+`daemon status` returns `harness.daemon_status/v1` with active daemon records, recent daemon events, and `paused_tasks` so operators can debug queue state without reading SQLite manually. `daemon recover` returns `harness.daemon_recovery/v1` and can expire stale active leases, fail unexecuted lease attempts, and return tasks to `ready`, `blocked`, or `waiting_approval` according to dependencies and approvals.
+
+Daemon commands are scheduler-readiness control-plane operations only. They do not execute tasks, bind task attempts to runs, call Codex or local model backends, run Docker, create run artifacts, mutate active repo files, start unmanaged background work, add hosted fallback, add paid fallback, or expose backend settings and secrets.
+
 Task statuses are:
 
 ```text

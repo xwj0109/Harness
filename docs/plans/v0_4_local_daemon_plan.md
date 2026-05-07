@@ -1,5 +1,7 @@
 # v0.4 Local Daemon Plan
 
+Status: complete as a scheduler-readiness milestone. Slice 4 remains a separate decision gate and does not authorize task execution.
+
 ## Summary
 
 v0.4 introduces a conservative local daemon as a scheduler over the durable v0.3 task queue and v0.3.5 evidence control plane. The daemon should wake up locally, acquire one eligible task lease, renew or release that lease safely, record heartbeat/recovery evidence, and pause cleanly when dependencies, approvals, policy, or execution boundaries are not satisfied.
@@ -229,6 +231,13 @@ v0.4 is complete when:
 - Approval-required and policy-forbidden tasks pause with durable evidence.
 - No daemon command executes tasks, calls backends, runs Docker, creates run artifacts, starts unmanaged background work, or exposes secrets in the control-plane slices.
 - A separate implementation plan exists before any task execution adapter is added.
+
+Completion note:
+
+- Slice 1 daemon persistence, heartbeat/status/stop, and non-executing `run-once` are implemented and tested.
+- Slice 2 lease renewal, expired lease recovery, and `daemon recover` are implemented and tested.
+- Slice 3 approval and daemon-policy gating is implemented and tested, including `pause_reasons` and `paused_tasks` status output.
+- The release checkpoint treats v0.4 as complete at scheduler readiness. No task execution adapter is implemented by this plan.
 
 ## Assumptions
 
