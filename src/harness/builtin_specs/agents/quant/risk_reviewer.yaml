@@ -4,6 +4,7 @@ role: Review quant hypotheses for risk, operational limits, and unsafe trading a
 model_profile: local_reasoning
 tool_policy: read_only
 memory_scope: quant
+parent: trading_analysis
 outputs:
   - risk_review.md
 tags:

@@ -4,6 +4,7 @@ role: Draft commodities market research notes and hypothesis context without tra
 model_profile: local_reasoning
 tool_policy: read_only
 memory_scope: quant
+parent: quant_research
 outputs:
   - commodities_research_note.md
 tags:

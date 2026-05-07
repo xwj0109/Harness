@@ -8,9 +8,11 @@ from pydantic import BaseModel, Field, model_validator
 from pydantic import ValidationError
 
 from harness.specs import (
+    AgentKind,
     AgentSpec,
     MemoryScope,
     ModelProfile,
+    ToolPermission,
     ToolPolicy,
     WorkbenchSpec,
 )
@@ -49,6 +51,16 @@ class SpecRegistry(BaseModel):
                 raise ValueError(f"Agent {agent_id} references missing memory_scope: {agent.memory_scope}")
             if agent.parent is not None and agent.parent not in self.agents:
                 raise ValueError(f"Agent {agent_id} references missing parent: {agent.parent}")
+            if agent.parent is not None:
+                parent = self.agents[agent.parent]
+                if parent.kind != AgentKind.GROUP:
+                    raise ValueError(f"Agent {agent_id} parent is not a group: {agent.parent}")
+                _validate_child_policy_not_broader(
+                    agent_id=agent_id,
+                    parent_id=agent.parent,
+                    parent_policy=self.tool_policies[parent.tool_policy],
+                    child_policy=self.tool_policies[agent.tool_policy],
+                )
         for workbench_id, workbench in self.workbenches.items():
             if workbench.default_model_profile not in self.model_profiles:
                 raise ValueError(
@@ -58,6 +70,7 @@ class SpecRegistry(BaseModel):
             for agent_id in workbench.allowed_agents:
                 if agent_id not in self.agents:
                     raise ValueError(f"Workbench {workbench_id} references missing allowed agent: {agent_id}")
+        _validate_agent_parent_cycles(self.agents)
         return self
 
     def get_agent(self, agent_id: str) -> AgentSpec:
@@ -72,6 +85,36 @@ class SpecRegistry(BaseModel):
         except KeyError as exc:
             raise KeyError(f"Workbench not found: {workbench_id}") from exc
 
+    def get_agent_parent_chain(self, agent_id: str) -> list[AgentSpec]:
+        agent = self.get_agent(agent_id)
+        chain: list[AgentSpec] = []
+        while agent.parent is not None:
+            parent = self.get_agent(agent.parent)
+            chain.insert(0, parent)
+            agent = parent
+        return chain
+
+    def resolve_agent_effective_spec(self, agent_id: str) -> dict[str, Any]:
+        agent = self.get_agent(agent_id)
+        parent_chain = self.get_agent_parent_chain(agent_id)
+        lineage = [*parent_chain, agent]
+        tags = _merge_unique(item for spec in lineage for item in spec.tags)
+        outputs = _merge_unique(item for spec in lineage for item in spec.outputs)
+        return {
+            "id": agent.id,
+            "kind": agent.kind.value,
+            "parent_chain": [parent.id for parent in parent_chain],
+            "model_profile": agent.model_profile,
+            "tool_policy": agent.tool_policy,
+            "memory_scope": agent.memory_scope,
+            "tags": tags,
+            "outputs": outputs,
+            "resolved_from": {
+                "agent": agent.id,
+                "parents": [parent.id for parent in parent_chain],
+            },
+        }
+
 
 def _validate_mapping_ids(kind: str, mapping: dict[str, object]) -> None:
     for key, value in mapping.items():
@@ -80,6 +123,57 @@ def _validate_mapping_ids(kind: str, mapping: dict[str, object]) -> None:
         value_id = getattr(value, "id", None)
         if key != value_id:
             raise ValueError(f"{kind} mapping key must match contained id: {key} != {value_id}")
+
+
+def _validate_agent_parent_cycles(agents: dict[str, AgentSpec]) -> None:
+    for agent_id in agents:
+        seen: set[str] = set()
+        current = agents[agent_id]
+        while current.parent is not None:
+            if current.parent in seen or current.parent == agent_id:
+                raise ValueError(f"Agent parent cycle detected: {agent_id}")
+            seen.add(current.parent)
+            current = agents[current.parent]
+
+
+def _validate_child_policy_not_broader(
+    *,
+    agent_id: str,
+    parent_id: str,
+    parent_policy: ToolPolicy,
+    child_policy: ToolPolicy,
+) -> None:
+    for field_name in ("network", "active_repo_write", "hosted_boundary"):
+        parent_value = getattr(parent_policy, field_name)
+        child_value = getattr(child_policy, field_name)
+        if _permission_rank(child_value) < _permission_rank(parent_value):
+            raise ValueError(
+                f"Agent {agent_id} broadens parent {parent_id} {field_name}: "
+                f"{parent_value.value} -> {child_value.value}"
+            )
+    for tool_id, parent_value in parent_policy.tools.items():
+        child_value = child_policy.tools.get(tool_id, parent_value)
+        if _permission_rank(child_value) < _permission_rank(parent_value):
+            raise ValueError(
+                f"Agent {agent_id} broadens parent {parent_id} tool {tool_id}: "
+                f"{parent_value.value} -> {child_value.value}"
+            )
+
+
+def _permission_rank(permission: ToolPermission) -> int:
+    return {
+        ToolPermission.ALLOWED: 0,
+        ToolPermission.APPROVAL_REQUIRED: 1,
+        ToolPermission.FORBIDDEN: 2,
+    }[permission]
+
+
+def _merge_unique(values) -> list[str]:
+    merged: list[str] = []
+    for value in values:
+        if value not in merged:
+            merged.append(value)
+    return merged
 
 
 def builtin_spec_registry() -> SpecRegistry:

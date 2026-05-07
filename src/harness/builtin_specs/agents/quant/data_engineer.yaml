@@ -4,6 +4,7 @@ role: Draft local data requirement checklists and dataset validation plans.
 model_profile: local_reasoning
 tool_policy: read_only
 memory_scope: quant
+parent: quant_development
 outputs:
   - data_requirements.md
 tags:

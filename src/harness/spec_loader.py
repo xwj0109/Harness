@@ -112,9 +112,12 @@ def diff_builtin_to_custom_spec_registry(base_registry: SpecRegistry, path: Path
 
 def preview_agent_effective_policy(registry: SpecRegistry, agent_id: str) -> dict:
     agent = registry.get_agent(agent_id)
+    parent_chain = registry.get_agent_parent_chain(agent_id)
     return {
         "agent": _dump_model(agent),
         "parent": agent.parent,
+        "parent_chain": [_dump_model(parent) for parent in parent_chain],
+        "effective_agent": _sort_json(registry.resolve_agent_effective_spec(agent_id)),
         "model_profile": _dump_model(registry.model_profiles[agent.model_profile]),
         "tool_policy": _dump_model(registry.tool_policies[agent.tool_policy]),
         "memory_scope": _dump_model(registry.memory_scopes[agent.memory_scope]),
@@ -128,6 +131,8 @@ def preview_workbench_effective_policy(registry: SpecRegistry, workbench_id: str
         agent = registry.agents[agent_id]
         allowed_agents[agent_id] = {
             "agent": _dump_model(agent),
+            "parent_chain": [parent.id for parent in registry.get_agent_parent_chain(agent_id)],
+            "effective_agent": _sort_json(registry.resolve_agent_effective_spec(agent_id)),
             "model_profile": _dump_model(registry.model_profiles[agent.model_profile]),
             "tool_policy": _dump_model(registry.tool_policies[agent.tool_policy]),
             "memory_scope": _dump_model(registry.memory_scopes[agent.memory_scope]),

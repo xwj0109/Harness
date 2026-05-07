@@ -4,6 +4,7 @@ role: Draft optimization notes for local research code without mutating active r
 model_profile: local_reasoning
 tool_policy: read_only
 memory_scope: quant
+parent: quant_development
 outputs:
   - optimization_notes.md
 tags:

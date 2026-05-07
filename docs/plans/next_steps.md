@@ -14,6 +14,7 @@ The v0.4.5 execution adapter decision gate is tracked in [v0_4_5_minimal_executi
 The v0.5 read-only execution adapter plan is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md).
 The v0.5.1 read-only hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md).
 The v0.6 Quant Workbench plan is tracked in [v0_6_quant_workbench_plan.md](v0_6_quant_workbench_plan.md).
+The v0.6 Slice 2 agent-group inheritance plan is tracked in [v0_6_2_agent_group_inheritance_plan.md](v0_6_2_agent_group_inheritance_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -92,7 +93,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is a separate decision plan for v0.6 Slice 2 agent-group semantics and permission inheritance. The packaged folder hierarchy is currently organizational only; inheritance and group default resolution remain unauthorized until that plan is decision-complete.
+The immediate next target is v0.6 Slice 2 agent-group semantics and permission inheritance, tracked in [v0_6_2_agent_group_inheritance_plan.md](v0_6_2_agent_group_inheritance_plan.md). This remains a declarative spec semantics checkpoint; execution adapters, task generation, scheduling, and quant workflow execution remain unauthorized.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

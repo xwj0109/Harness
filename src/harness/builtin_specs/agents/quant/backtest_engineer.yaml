@@ -4,6 +4,7 @@ role: Draft backtest specifications and implementation plans without executing t
 model_profile: local_reasoning
 tool_policy: read_only
 memory_scope: quant
+parent: quant_development
 outputs:
   - backtest_spec.md
 tags:

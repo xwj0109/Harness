@@ -1,0 +1,13 @@
+id: trading_analysis
+kind: group
+role: Group defaults for trading-analysis review specialists without broker, order, or live-trading actions.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - trading_analysis_review.md
+tags:
+  - starter
+  - quant
+  - group
+  - trading_analysis

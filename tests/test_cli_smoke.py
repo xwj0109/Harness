@@ -2073,6 +2073,7 @@ def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path)
         "leakage_reviewer",
         "statistical_validity_reviewer",
     }
+    quant_groups = {"quant_research", "quant_development", "trading_analysis", "review"}
     assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | quant_agents) <= set(
         payload["agents"]
     )
@@ -2124,6 +2125,7 @@ def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runti
         "leakage_reviewer",
         "statistical_validity_reviewer",
     }
+    quant_groups = {"quant_research", "quant_development", "trading_analysis", "review"}
     workbench_result = runner.invoke(app, ["specs", "workbench", "quant", "--output", "json"])
 
     assert workbench_result.exit_code == 0
@@ -2141,7 +2143,7 @@ def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runti
         "hosted_fallback",
     } <= set(workbench["forbidden_actions"])
 
-    for agent_id in sorted(quant_agents):
+    for agent_id in sorted(quant_agents | quant_groups):
         agent_result = runner.invoke(app, ["specs", "agent", agent_id, "--output", "json"])
         assert agent_result.exit_code == 0
         agent_payload = json.loads(agent_result.output)
@@ -2151,6 +2153,19 @@ def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runti
         assert agent["model_profile"] == "local_reasoning"
         assert agent["tool_policy"] == "read_only"
         assert agent["memory_scope"] == "quant"
+
+    group_result = runner.invoke(app, ["specs", "agent", "quant_research", "--output", "json"])
+    assert group_result.exit_code == 0
+    group_payload = json.loads(group_result.output)
+    assert group_payload["agent"]["kind"] == "group"
+
+    preview_result = runner.invoke(
+        app, ["specs", "preview", "agent", "commodities_researcher", "--output", "json"]
+    )
+    assert preview_result.exit_code == 0
+    preview_payload = json.loads(preview_result.output)
+    assert preview_payload["preview"]["parent"] == "quant_research"
+    assert preview_payload["preview"]["effective_agent"]["parent_chain"] == ["quant_research"]
 
     serialized = workbench_result.output
     assert "settings" not in serialized

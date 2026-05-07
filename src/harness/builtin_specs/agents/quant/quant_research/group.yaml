@@ -1,0 +1,14 @@
+id: quant_research
+kind: group
+role: Group defaults for quant research specialists producing hypotheses and research notes.
+model_profile: local_reasoning
+tool_policy: read_only
+memory_scope: quant
+outputs:
+  - research_brief.md
+  - data_requirements.md
+tags:
+  - starter
+  - quant
+  - group
+  - research

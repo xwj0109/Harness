@@ -40,6 +40,8 @@ QUANT_FORBIDDEN_ACTIONS = {
     "hosted_fallback",
 }
 
+QUANT_GROUP_IDS = {"quant_research", "quant_development", "trading_analysis", "review"}
+
 
 def test_builtin_spec_registry_contains_starter_specs() -> None:
     registry = builtin_spec_registry()
@@ -101,6 +103,29 @@ def test_builtin_quant_workbench_contains_v0_6_agent_set_with_safety_boundaries(
         assert policy.hosted_boundary != ToolPermission.ALLOWED
 
 
+def test_builtin_quant_groups_and_parent_chains_are_resolved() -> None:
+    registry = builtin_spec_registry()
+
+    for group_id in QUANT_GROUP_IDS:
+        group = registry.get_agent(group_id)
+        assert group.kind == AgentKind.GROUP
+        assert group.tool_policy == "read_only"
+        assert group.memory_scope == "quant"
+
+    assert registry.get_agent("commodities_researcher").parent == "quant_research"
+    assert registry.get_agent("backtest_engineer").parent == "quant_development"
+    assert registry.get_agent("risk_reviewer").parent == "trading_analysis"
+    assert registry.get_agent("leakage_reviewer").parent == "review"
+
+    resolved = registry.resolve_agent_effective_spec("commodities_researcher")
+    assert resolved["parent_chain"] == ["quant_research"]
+    assert resolved["model_profile"] == "local_reasoning"
+    assert resolved["tool_policy"] == "read_only"
+    assert resolved["memory_scope"] == "quant"
+    assert resolved["tags"] == ["starter", "quant", "group", "research", "commodities"]
+    assert resolved["outputs"] == ["research_brief.md", "data_requirements.md", "commodities_research_note.md"]
+
+
 def test_builtin_registry_loads_from_packaged_hierarchical_yaml() -> None:
     registry = load_packaged_spec_registry()
 
@@ -147,6 +172,112 @@ memory_scope: quant
 
     with pytest.raises(ValueError, match="Packaged built-in specs are invalid"):
         load_packaged_spec_registry(root)
+
+
+def test_registry_rejects_parent_cycles() -> None:
+    with pytest.raises(ValidationError, match="Agent parent cycle detected"):
+        SpecRegistry(
+            model_profiles={
+                "local_reasoning": ModelProfile(
+                    id="local_reasoning",
+                    kind=ModelProfileKind.LOCAL,
+                    backend="local_openai_compatible",
+                )
+            },
+            tool_policies={"read_only": ToolPolicy(active_repo_write=ToolPermission.FORBIDDEN)},
+            memory_scopes={"project": MemoryScope(id="project")},
+            agents={
+                "group_a": AgentSpec(
+                    id="group_a",
+                    kind=AgentKind.GROUP,
+                    role="Group A.",
+                    model_profile="local_reasoning",
+                    tool_policy="read_only",
+                    memory_scope="project",
+                    parent="group_b",
+                ),
+                "group_b": AgentSpec(
+                    id="group_b",
+                    kind=AgentKind.GROUP,
+                    role="Group B.",
+                    model_profile="local_reasoning",
+                    tool_policy="read_only",
+                    memory_scope="project",
+                    parent="group_a",
+                ),
+            },
+        )
+
+
+def test_registry_rejects_non_group_parent() -> None:
+    with pytest.raises(ValidationError, match="parent is not a group"):
+        SpecRegistry(
+            model_profiles={
+                "local_reasoning": ModelProfile(
+                    id="local_reasoning",
+                    kind=ModelProfileKind.LOCAL,
+                    backend="local_openai_compatible",
+                )
+            },
+            tool_policies={"read_only": ToolPolicy(active_repo_write=ToolPermission.FORBIDDEN)},
+            memory_scopes={"project": MemoryScope(id="project")},
+            agents={
+                "parent_specialist": AgentSpec(
+                    id="parent_specialist",
+                    kind=AgentKind.SPECIALIST,
+                    role="Not a group.",
+                    model_profile="local_reasoning",
+                    tool_policy="read_only",
+                    memory_scope="project",
+                ),
+                "child": AgentSpec(
+                    id="child",
+                    kind=AgentKind.SPECIALIST,
+                    role="Child.",
+                    model_profile="local_reasoning",
+                    tool_policy="read_only",
+                    memory_scope="project",
+                    parent="parent_specialist",
+                ),
+            },
+        )
+
+
+def test_registry_rejects_child_policy_that_broadens_parent_policy() -> None:
+    with pytest.raises(ValidationError, match="broadens parent parent_group active_repo_write"):
+        SpecRegistry(
+            model_profiles={
+                "local_reasoning": ModelProfile(
+                    id="local_reasoning",
+                    kind=ModelProfileKind.LOCAL,
+                    backend="local_openai_compatible",
+                )
+            },
+            tool_policies={
+                "parent_policy": ToolPolicy(active_repo_write=ToolPermission.FORBIDDEN),
+                "child_policy": ToolPolicy(active_repo_write=ToolPermission.APPROVAL_REQUIRED),
+            },
+            memory_scopes={"project": MemoryScope(id="project")},
+            agents={
+                "parent_group": AgentSpec(
+                    id="parent_group",
+                    kind=AgentKind.GROUP,
+                    role="Parent group.",
+                    model_profile="local_reasoning",
+                    tool_policy="parent_policy",
+                    memory_scope="project",
+                ),
+                "child": AgentSpec(
+                    id="child",
+                    kind=AgentKind.SPECIALIST,
+                    role="Child.",
+                    model_profile="local_reasoning",
+                    tool_policy="child_policy",
+                    memory_scope="project",
+                    parent="parent_group",
+                ),
+            },
+        )
 
 
 def test_builtin_lookup_helpers_return_specs() -> None:

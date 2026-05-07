@@ -4,6 +4,7 @@ role: Draft equities research notes and signal context without trading actions.
 model_profile: local_reasoning
 tool_policy: read_only
 memory_scope: quant
+parent: quant_research
 outputs:
   - equities_research_note.md
 tags:
