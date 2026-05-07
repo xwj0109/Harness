@@ -8,7 +8,7 @@ This slice does not add a new execution adapter, autonomous workflow engine, bro
 
 ## Slice 1: Declarative Foundation
 
-Status: implemented, pending release hygiene.
+Status: complete.
 
 The first slice expands the built-in `quant` workbench using the existing v0.2 spec primitives:
 
@@ -52,7 +52,7 @@ Later slices must define separate decision-complete plans before any of these te
 
 ## Slice 1.5: Packaged Hierarchical Built-In Specs
 
-Status: active.
+Status: complete.
 
 Move built-in registry declarations from inline Python into packaged YAML files under `src/harness/builtin_specs/`.
 
