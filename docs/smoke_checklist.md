@@ -95,6 +95,7 @@ harness tasks add --title "Inspect repository" --agent repo_inspector --workbenc
 harness tasks list --project . --output json
 harness tasks graph --project . --output json
 harness tasks run-next --project . --output json
+harness tasks cancel task_abc123def456 --project . --output json
 ```
 
 Expected safety properties:

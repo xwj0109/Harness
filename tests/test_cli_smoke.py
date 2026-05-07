@@ -516,6 +516,126 @@ def test_cli_tasks_reject_invalid_objective_and_dependency_refs(tmp_path) -> Non
     assert cycle.exit_code == 0
 
 
+def test_cli_tasks_cancel_and_retry_support_json(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    cancel_candidate = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Cancel me", "--project", str(tmp_path), "--output", "json"],
+    )
+    retry_candidate = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Retry me", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert cancel_candidate.exit_code == 0
+    assert retry_candidate.exit_code == 0
+    cancel_task = json.loads(cancel_candidate.output)["task"]
+    retry_task = json.loads(retry_candidate.output)["task"]
+    retry_idempotency_key = retry_task["idempotency_key"]
+
+    cancelled = runner.invoke(
+        app,
+        ["tasks", "cancel", cancel_task["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+    assert cancelled.exit_code == 0
+    cancelled_payload = json.loads(cancelled.output)
+    assert cancelled_payload["schema_version"] == "harness.task/v1"
+    assert cancelled_payload["task"]["status"] == "cancelled"
+
+    assert (
+        runner.invoke(
+            app,
+            ["tasks", "status", retry_task["id"], "running", "--project", str(tmp_path), "--output", "json"],
+        ).exit_code
+        == 0
+    )
+    assert (
+        runner.invoke(
+            app,
+            ["tasks", "status", retry_task["id"], "failed", "--project", str(tmp_path), "--output", "json"],
+        ).exit_code
+        == 0
+    )
+    retried = runner.invoke(
+        app,
+        ["tasks", "retry", retry_task["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+    assert retried.exit_code == 0
+    retried_task = json.loads(retried.output)["task"]
+    assert retried_task["status"] == "ready"
+    assert retried_task["idempotency_key"] == retry_idempotency_key
+
+
+def test_cli_tasks_cancel_and_retry_reject_invalid_states(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task_result = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Terminal task", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert task_result.exit_code == 0
+    task_id = json.loads(task_result.output)["task"]["id"]
+
+    retry_ready = runner.invoke(
+        app,
+        ["tasks", "retry", task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert retry_ready.exit_code != 0
+    assert json.loads(retry_ready.output)["errors"] == ["Task retry requires failed status: ready"]
+
+    assert (
+        runner.invoke(
+            app,
+            ["tasks", "status", task_id, "succeeded", "--project", str(tmp_path), "--output", "json"],
+        ).exit_code
+        == 0
+    )
+    cancel_succeeded = runner.invoke(
+        app,
+        ["tasks", "cancel", task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert cancel_succeeded.exit_code != 0
+    assert json.loads(cancel_succeeded.output)["errors"] == [
+        "Invalid task transition: succeeded -> cancelled"
+    ]
+
+
+def test_cli_tasks_cancel_retry_require_initialized_project(tmp_path) -> None:
+    for command in ["cancel", "retry"]:
+        result = runner.invoke(
+            app,
+            ["tasks", command, "task_missing", "--project", str(tmp_path), "--output", "json"],
+        )
+        assert result.exit_code != 0
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_tasks_cancel_retry_do_not_preflight_backends_or_expose_settings(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tasks must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tasks must not preflight local backend")),
+    )
+    task_result = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Lifecycle task", "--project", str(tmp_path), "--output", "json"],
+    )
+    task_id = json.loads(task_result.output)["task"]["id"]
+
+    cancelled = runner.invoke(
+        app,
+        ["tasks", "cancel", task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert cancelled.exit_code == 0
+    serialized = json.dumps(json.loads(cancelled.output))
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
 def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)

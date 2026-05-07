@@ -355,6 +355,8 @@ harness tasks list --objective obj_abc123def456 --project . --output json
 harness tasks inspect task_abc123def456 --project . --output json
 harness tasks graph --objective obj_abc123def456 --project . --output json
 harness tasks status task_abc123def456 succeeded --project . --output json
+harness tasks cancel task_abc123def456 --project . --output json
+harness tasks retry task_abc123def456 --project . --output json
 ```
 
 Task commands use stable JSON wrappers:

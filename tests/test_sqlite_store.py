@@ -321,6 +321,66 @@ def test_store_task_errors_are_stable_for_unknown_or_invalid_status(tmp_path) ->
         raise AssertionError("invalid status should raise")
 
 
+def test_store_cancel_task_uses_transition_rules(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    ready = store.create_task(title="Ready")
+    failed = store.create_task(title="Failed")
+    store.update_task_status(failed.id, TaskStatus.FAILED)
+
+    cancelled = store.cancel_task(ready.id)
+    cancelled_failed = store.cancel_task(failed.id)
+
+    assert cancelled.status == TaskStatus.CANCELLED
+    assert cancelled_failed.status == TaskStatus.CANCELLED
+    assert store.list_task_transitions(ready.id)[-1].to_status == TaskStatus.CANCELLED
+
+    succeeded = store.create_task(title="Succeeded")
+    store.update_task_status(succeeded.id, TaskStatus.SUCCEEDED)
+    for task_id, expected in [
+        (succeeded.id, "Invalid task transition: succeeded -> cancelled"),
+        (cancelled.id, "Invalid task transition: cancelled -> cancelled"),
+    ]:
+        try:
+            store.cancel_task(task_id)
+        except ValueError as exc:
+            assert expected in str(exc)
+        else:
+            raise AssertionError(f"{expected} should raise")
+
+
+def test_store_retry_task_targets_ready_blocked_or_waiting_approval(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    dependency = store.create_task(title="Dependency")
+    ready_retry = store.create_task(title="Ready retry")
+    blocked_retry = store.create_task(title="Blocked retry", depends_on=[dependency.id])
+    approval_retry = store.create_task(title="Approval retry", required_approvals=["hosted_provider"])
+    ready_idempotency_key = ready_retry.idempotency_key
+
+    store.update_task_status(ready_retry.id, TaskStatus.RUNNING)
+    store.update_task_status(ready_retry.id, TaskStatus.FAILED)
+    store.update_task_status(blocked_retry.id, TaskStatus.CANCELLED)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id IN (?, ?)",
+            (TaskStatus.FAILED.value, blocked_retry.id, approval_retry.id),
+        )
+
+    assert store.retry_task(ready_retry.id).status == TaskStatus.READY
+    assert store.get_task(ready_retry.id).idempotency_key == ready_idempotency_key
+    assert store.retry_task(blocked_retry.id).status == TaskStatus.BLOCKED
+    assert store.retry_task(approval_retry.id).status == TaskStatus.WAITING_APPROVAL
+    assert store.list_task_transitions(ready_retry.id)[-1].to_status == TaskStatus.READY
+
+    try:
+        store.retry_task(dependency.id)
+    except ValueError as exc:
+        assert "Task retry requires failed status: ready" in str(exc)
+    else:
+        raise AssertionError("retry from non-failed should raise")
+
+
 def test_store_select_next_task_uses_priority_and_dependencies(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

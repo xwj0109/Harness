@@ -63,7 +63,12 @@ ALLOWED_TASK_TRANSITIONS = {
         TaskStatus.WAITING_APPROVAL,
         TaskStatus.CANCELLED,
     },
-    TaskStatus.FAILED: {TaskStatus.READY, TaskStatus.CANCELLED},
+    TaskStatus.FAILED: {
+        TaskStatus.READY,
+        TaskStatus.BLOCKED,
+        TaskStatus.WAITING_APPROVAL,
+        TaskStatus.CANCELLED,
+    },
     TaskStatus.SUCCEEDED: set(),
     TaskStatus.CANCELLED: set(),
     TaskStatus.SKIPPED: set(),
@@ -445,6 +450,22 @@ class SQLiteStore:
         if result.rowcount == 0:
             raise KeyError(f"Task not found: {task_id}")
         return self.get_task(task_id)
+
+    def cancel_task(self, task_id: str) -> TaskRecord:
+        task = self.get_task(task_id)
+        if task.status == TaskStatus.CANCELLED:
+            raise ValueError("Invalid task transition: cancelled -> cancelled")
+        return self.update_task_status(task.id, TaskStatus.CANCELLED)
+
+    def retry_task(self, task_id: str) -> TaskRecord:
+        task = self.get_task(task_id)
+        if task.status != TaskStatus.FAILED:
+            raise ValueError(f"Task retry requires failed status: {task.status.value}")
+        if task.required_approvals:
+            return self.update_task_status(task.id, TaskStatus.WAITING_APPROVAL)
+        if not self._task_dependencies_completed(task):
+            return self.update_task_status(task.id, TaskStatus.BLOCKED)
+        return self.update_task_status(task.id, TaskStatus.READY)
 
     def select_next_task(self) -> TaskRecord | None:
         candidates = [

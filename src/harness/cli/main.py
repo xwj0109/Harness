@@ -389,6 +389,36 @@ def tasks_status(
     typer.echo(f"Task {task.id}: {task.status.value}")
 
 
+@tasks_app.command("cancel")
+def tasks_cancel(task_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        task = SQLiteStore(project_root).cancel_task(task_id)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.task/v1", "ok": True, "task": task.model_dump(mode="json")})
+        return
+    typer.echo(f"Task {task.id}: {task.status.value}")
+
+
+@tasks_app.command("retry")
+def tasks_retry(task_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        task = SQLiteStore(project_root).retry_task(task_id)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.task/v1", "ok": True, "task": task.model_dump(mode="json")})
+        return
+    typer.echo(f"Task {task.id}: {task.status.value}")
+
+
 @tasks_app.command("run-next")
 def tasks_run_next(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
