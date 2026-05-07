@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter work is in release hygiene.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -83,7 +83,7 @@ The adapter is intentionally narrow. It uses only the configured local-only, no-
 
 ## Immediate Next Planning Target
 
-The immediate next target after v0.5 release hygiene is either read-only adapter hardening or a separate decision plan for the next adapter. The default is to stop at the bounded read-only adapter until a new plan proves the next capability is small, local, typed, and testable.
+The immediate next target is either read-only adapter hardening or a separate decision plan for the next adapter. The default is to stop at the bounded read-only adapter until a new plan proves the next capability is small, local, typed, and testable.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, and active repo writes remain unauthorized.
 

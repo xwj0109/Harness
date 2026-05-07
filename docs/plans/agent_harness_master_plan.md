@@ -14,7 +14,7 @@ The central rule is that agents may propose, plan, delegate, critique, edit in i
 
 ## 2. Current State
 
-The current repository has moved beyond the original v0.1 snapshot. v0.1 hardening is complete, v0.2 declarative specs are in progress, and the project is entering v0.3 manual task-queue work.
+The current repository has moved beyond the original v0.1 snapshot. v0.1 hardening, v0.2 declarative specs, v0.3 manual task-queue hardening, v0.3.5 control-plane stabilization, v0.4 daemon scheduler readiness, v0.4.5 dry-run adapter evidence, and v0.5 read-only execution adapter work are complete.
 
 The important conclusion from the edited plan and research report is that the project should not rush from a simple queue into daemon autonomy. v0.3 must become the durable control-plane substrate for future daemon execution, workbenches, bounded sessions, and long-running supervised workflows.
 
@@ -40,11 +40,16 @@ Implemented capabilities include:
 - Broad regression tests covering config, security paths, approvals, protocols, backends, isolation, patching, Docker sandboxing, and CLI smoke behavior.
 - Run modes, backend descriptors, run manifests, stable JSON inspection output, `harness doctor`, and golden v0.1 evidence tests.
 - Declarative v0.2-style registry/spec primitives for workbenches, agents, model profiles, tool policies, and memory scopes.
-- A manual persistent task queue with task creation, listing, inspection, status movement, and safe `run-next` selection that does not execute agents or create background work.
+- A manual persistent task queue with task creation, listing, inspection, status movement, and safe `run-next` selection that leases work without executing agents or creating background work.
+- Durable objectives, task dependencies, attempts, leases, transition evidence, task graph output, cancel/retry commands, and idempotency keys.
+- Runtime EffectivePolicy evidence, manifest v1.1, artifact checksum/size evidence, tool capability descriptors, compare/baseline, safety-smoke evals, and trace export.
+- Local daemon scheduler-readiness commands with heartbeat/status/stop, lease renewal, expired lease recovery, approval/policy pause evidence, and daemon status pause reasons.
+- A dry-run lease-to-run adapter proving task attempt/run/manifest/artifact linkage without provider or tool execution.
+- A bounded read-only lease adapter that executes `read_only_repo_summary` only through the local-only `local_openai_compatible` backend and existing read-only tools.
 
 This should not be treated as a throwaway prototype. It is the security and evidence substrate for the later autonomous system.
 
-Near-term planning implication: preserve the existing safety kernel, retrofit the remaining policy/evidence gaps, and harden task state before building the daemon.
+Near-term planning implication: preserve the existing safety kernel, keep real execution adapters narrow and explicit, and do not proceed to domain workbenches or broader autonomy until each new execution path has policy, evidence, recovery, and approval contracts.
 
 ## 3. Strategic Positioning
 
@@ -360,7 +365,43 @@ Initial daemon constraints:
 - Acquire and renew leases.
 - Recover safely after process kill, backend timeout, Docker timeout, SQLite lock contention, expired approval, expired lease, or artifact-write crash.
 
-### v0.5 — Quant Workbench
+### v0.4.5 — Dry-Run Execution Adapter Evidence
+
+Status: complete.
+
+Add a narrow bridge between daemon-held leases and run evidence without executing real work.
+
+Rules:
+
+- `daemon execute-dry-run` requires an existing active lease and never selects work itself.
+- It binds one task attempt to one local `phase_1a_test` run.
+- It writes manifest/artifact/trace evidence through existing harness runtime APIs.
+- It marks task and attempt terminal and releases the lease.
+- It does not call Codex, local model backends, Docker, shell tools, network, hosted providers, paid providers, MCP/A2A, browser/email/calendar tools, or active repo write paths.
+- `daemon inspect-lease` and `daemon recover` provide read-only inspection and safe reconciliation without creating duplicate runs.
+
+### v0.5 — Read-Only Execution Adapter
+
+Status: complete.
+
+Authorize exactly one bounded real execution adapter before domain workbenches:
+
+- Adapter metadata: `execution_adapter=read_only_summary`.
+- Task type: `read_only_repo_summary`.
+- Command: `harness daemon execute-read-only <lease_id>`.
+- Input: an existing active daemon lease with linked task attempt.
+- Backend: only configured `local_openai_compatible` when local-only, local-machine, no-cost, and `allow_network=false`.
+- Tools: only `list_files`, `read_file`, `git_status`, `git_diff`, and `final_answer`.
+- Join: `TaskAttempt.run_id` is authoritative, with compatible task/run manifest linkage.
+- Recovery: `daemon recover` reconciles terminal linked runs and does not create a second run.
+
+Rules:
+
+- `daemon run-once` remains lease-only and non-executing.
+- `execute-read-only` does not select work itself.
+- No Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, unmanaged daemon loops, or additional adapters are authorized by this milestone.
+
+### v0.6 — Quant Workbench
 
 Introduce quant finance agents and structured workflows.
 
@@ -390,7 +431,7 @@ Initial quant tasks:
 
 Hard boundary: no live trading, broker integration, capital allocation, or order placement.
 
-### v0.6 — Personal Workbench
+### v0.7 — Personal Workbench
 
 Introduce personal productivity and job-application agents.
 
@@ -407,7 +448,7 @@ Initial agents:
 
 Hard boundary: drafts only. No automatic sending, submitting, uploading, or messaging.
 
-### v0.7 — Multi-Agent Workflows
+### v0.8 — Multi-Agent Workflows
 
 Introduce plans, task dependencies, review gates, and orchestrator-managed workflows.
 
@@ -428,7 +469,7 @@ objective: research futures curve carry signal
   -> human approval required for promotion/apply-back
 ```
 
-### v0.8 — Bounded Sessions
+### v0.9 — Bounded Sessions
 
 Introduce bounded multi-agent debate and parallel review sessions. Internally prefer `BoundedSession` over `swarm` terminology because the important property is enforced limits and artifact output.
 
@@ -445,7 +486,7 @@ Bounded sessions must have:
 - Termination condition.
 - Artifact requirements.
 
-### v0.9 — Tool Adapter Layer
+### v0.10 — Tool Adapter Layer
 
 Add external protocol adapters only after native policy, task, and tool contracts are stable.
 

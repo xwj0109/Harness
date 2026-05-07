@@ -1,6 +1,6 @@
 # v0.5 Read-Only Execution Adapter Plan
 
-Status: complete for v0.5 Slice 1; release hygiene is the active checkpoint.
+Status: complete as the v0.5 read-only execution adapter milestone.
 
 ## Summary
 
@@ -76,15 +76,20 @@ Slice 1 verification:
 - `git diff --check`.
 - Forbidden target check for `.harness/`, `.git/`, `.env*`, `*.pem`, `*.key`, `*.sqlite`, and `secrets/`.
 
-## Next Decisions
+## Release Completion Note
 
-The next v0.5 work should be release hygiene for the read-only adapter checkpoint before authorizing any additional adapter.
+- v0.5 is complete as the first bounded real execution adapter checkpoint.
+- Package metadata is versioned as `0.5.0`.
+- Operator docs and smoke checks cover the read-only adapter flow and safety boundary.
+- The milestone remains a bridge to later workbenches, not a general execution framework.
+
+## Next Decisions
 
 Potential follow-on work must be planned separately:
 
 - Read-only adapter hardening and additional recovery tests.
-- Operator documentation and smoke checklist updates.
 - A decision plan for the next adapter, if any.
+- A later quant-workbench plan aligned with the master roadmap.
 
 The following remain unauthorized until a separate decision-complete plan is accepted:
 
