@@ -233,12 +233,55 @@ def test_store_daemon_run_once_reports_no_eligible_task(tmp_path) -> None:
     store.create_task(title="Approval", required_approvals=["hosted_provider"])
 
     result = store.daemon_run_once("local_daemon:test:123", pid=123)
+    status = store.daemon_status()
 
-    assert result.decision == "no_eligible_task"
+    assert result.decision == "paused"
     assert result.selected_task is None
     assert result.attempt is None
     assert result.lease is None
+    assert result.pause_reasons[0]["decision"] == "waiting_approval"
+    assert result.pause_reasons[0]["required_approvals"] == ["hosted_provider"]
+    assert status.paused_tasks[0]["decision"] == "waiting_approval"
     assert store.list_runs() == []
+
+
+def test_store_daemon_policy_forbidden_task_is_paused_not_leased(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    forbidden = store.create_task(
+        title="Forbidden active repo write",
+        priority=10,
+        metadata={"requires_active_repo_write": True},
+    )
+    eligible = store.create_task(title="Eligible", priority=0)
+
+    result = store.daemon_run_once("local_daemon:test:123", pid=123)
+    paused = store.daemon_status().paused_tasks
+
+    assert result.decision == "leased_task"
+    assert result.selected_task is not None
+    assert result.selected_task.id == eligible.id
+    assert result.pause_reasons[0]["task_id"] == forbidden.id
+    assert result.pause_reasons[0]["decision"] == "policy_forbidden"
+    assert result.pause_reasons[0]["forbidden_policy_keys"] == ["active_repo_write"]
+    assert paused[0]["task_id"] == forbidden.id
+    assert store.get_task(forbidden.id).status == TaskStatus.READY
+    assert store.list_runs() == []
+
+
+def test_store_manual_run_next_is_not_blocked_by_daemon_policy_metadata(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Manual active repo write task",
+        metadata={"requires_active_repo_write": True},
+    )
+
+    selection = store.select_next_task_for_lease()
+
+    assert selection is not None
+    assert selection["task"].id == task.id
+    assert selection["task"].status == TaskStatus.LEASED
 
 
 def test_store_daemon_recovery_expires_leases_and_requeues_tasks(tmp_path) -> None:

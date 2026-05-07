@@ -348,6 +348,7 @@ class DaemonStatusResult(BaseModel):
     project_root: Path
     active_daemons: list[DaemonRecord] = Field(default_factory=list)
     latest_events: list[DaemonEvent] = Field(default_factory=list)
+    paused_tasks: list[dict[str, Any]] = Field(default_factory=list)
     stale_after_seconds: int
 
 

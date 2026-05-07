@@ -59,9 +59,9 @@ The control-plane evidence that future daemon work will rely on is now implement
 
 ## Immediate Next Planning Target
 
-v0.4 local daemon planning is captured in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md). Slice 1 is implemented: daemon control-plane persistence, `daemon run-once/status/stop`, heartbeat/event evidence, and non-executing scheduler decisions. Slice 2 is implemented: lease renewal, expired lease recovery, and `daemon recover`.
+v0.4 local daemon planning is captured in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md). Slice 1 is implemented: daemon control-plane persistence, `daemon run-once/status/stop`, heartbeat/event evidence, and non-executing scheduler decisions. Slice 2 is implemented: lease renewal, expired lease recovery, and `daemon recover`. Slice 3 is implemented: daemon eligibility now pauses approval-required and daemon-forbidden tasks with inspectable pause reasons.
 
-The next implementation target should be Slice 3: approval and policy gating. Slice 3 must preserve the same safety boundary: no task execution, backend calls, Docker, run artifact creation, unmanaged background work, hosted fallback, or paid fallback.
+The next planning target should be Slice 4: the minimal execution adapter decision gate. The default remains to stop v0.4 after scheduler readiness unless a separate, decision-complete plan explicitly authorizes a tiny execution adapter. Any future Slice 4 work must preserve the same safety boundary until explicitly changed: no task execution, backend calls, Docker, run artifact creation, unmanaged background work, hosted fallback, or paid fallback.
 
 ## Later Work
 

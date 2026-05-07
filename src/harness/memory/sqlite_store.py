@@ -38,9 +38,15 @@ from harness.models import (
     TaskRecord,
     TaskStatus,
     TaskTransitionRecord,
+    PolicyLevel,
     run_mode_for_task_type,
 )
-from harness.policy import backend_descriptor_sha256, effective_policy_sha256, resolve_run_effective_policy
+from harness.policy import (
+    backend_descriptor_sha256,
+    effective_policy_sha256,
+    resolve_run_effective_policy,
+    resolve_task_effective_policy,
+)
 from harness.security import sanitize_for_logging
 
 LEGACY_TASK_STATUS_VALUES = {
@@ -58,6 +64,14 @@ TASK_STATUS_QUERY_ALIASES = {
 DEFAULT_TASK_LEASE_MINUTES = 30
 DEFAULT_TASK_LEASE_OWNER = "manual_cli"
 DEFAULT_DAEMON_STALE_AFTER_SECONDS = 120
+DAEMON_POLICY_FORBIDDEN_METADATA_KEYS = {
+    "daemon_policy_forbidden",
+    "requires_active_repo_write",
+    "requires_external_network",
+    "requires_docker",
+    "requires_paid_provider",
+    "requires_hosted_boundary",
+}
 
 ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.CREATED: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.WAITING_APPROVAL},
@@ -552,97 +566,278 @@ class SQLiteStore:
                     continue
                 if not self._task_dependencies_completed(task):
                     continue
-                current_status = task.status
-                if current_status == TaskStatus.BLOCKED:
-                    validate_task_transition(TaskStatus.BLOCKED, TaskStatus.READY)
-                    conn.execute(
-                        "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                        (TaskStatus.READY.value, timestamp, task.id),
-                    )
-                    self._record_task_transition(
-                        conn,
-                        task_id=task.id,
-                        from_status=TaskStatus.BLOCKED,
-                        to_status=TaskStatus.READY,
-                        reason="dependencies_satisfied",
-                        actor="system",
-                        metadata={},
-                        created_at=timestamp,
-                    )
-                    current_status = TaskStatus.READY
-                validate_task_transition(current_status, TaskStatus.LEASED)
-                attempt_number = self._next_attempt_number(conn, task.id)
-                attempt_id = f"task_attempt_{uuid.uuid4().hex[:12]}"
-                lease_id = f"task_lease_{uuid.uuid4().hex[:12]}"
-                conn.execute(
-                    """
-                    INSERT INTO task_attempts (
-                      id, task_id, attempt_number, status, lease_id, run_id,
-                      created_at, started_at, finished_at, failure_code, failure_message,
-                      metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        attempt_id,
-                        task.id,
-                        attempt_number,
-                        TaskStatus.LEASED.value,
-                        lease_id,
-                        None,
-                        timestamp,
-                        None,
-                        None,
-                        None,
-                        None,
-                        "{}",
-                    ),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO task_leases (
-                      id, task_id, attempt_id, owner, status, acquired_at, expires_at,
-                      heartbeat_at, released_at, metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        lease_id,
-                        task.id,
-                        attempt_id,
-                        owner,
-                        TaskLeaseStatus.ACTIVE.value,
-                        timestamp,
-                        expires_at,
-                        None,
-                        None,
-                        "{}",
-                    ),
-                )
-                conn.execute(
-                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                    (TaskStatus.LEASED.value, timestamp, task.id),
-                )
-                self._record_task_transition(
+                return self._lease_task_in_conn(
                     conn,
-                    task_id=task.id,
-                    from_status=current_status,
-                    to_status=TaskStatus.LEASED,
-                    reason="task_leased",
-                    actor=owner,
-                    metadata={"attempt_id": attempt_id, "lease_id": lease_id},
-                    created_at=timestamp,
+                    task=task,
+                    owner=owner,
+                    timestamp=timestamp,
+                    expires_at=expires_at,
                 )
-                return {
-                    "task": self._row_to_task(
-                        conn.execute("SELECT * FROM tasks WHERE id = ?", (task.id,)).fetchone()
-                    ),
-                    "attempt": self._row_to_task_attempt(
-                        conn.execute("SELECT * FROM task_attempts WHERE id = ?", (attempt_id,)).fetchone()
-                    ),
-                    "lease": self._row_to_task_lease(
-                        conn.execute("SELECT * FROM task_leases WHERE id = ?", (lease_id,)).fetchone()
-                    ),
-                }
         return None
+
+    def select_next_daemon_task_for_lease(
+        self,
+        owner: str,
+        lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+    ) -> tuple[dict[str, TaskAttempt | TaskLease | TaskRecord] | None, list[dict[str, Any]]]:
+        timestamp = now_iso()
+        expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
+        pause_reasons: list[dict[str, Any]] = []
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status IN (?, ?, ?)
+                ORDER BY priority DESC, created_at ASC
+                """,
+                (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value),
+            ).fetchall()
+            for row in rows:
+                task = self._row_to_task(row)
+                eligibility = self.daemon_task_eligibility(task, conn=conn)
+                if eligibility["decision"] == "eligible":
+                    return (
+                        self._lease_task_in_conn(
+                            conn,
+                            task=task,
+                            owner=owner,
+                            timestamp=timestamp,
+                            expires_at=expires_at,
+                        ),
+                        pause_reasons,
+                    )
+                if eligibility["decision"] in {
+                    "blocked_dependency",
+                    "waiting_approval",
+                    "policy_forbidden",
+                    "active_lease",
+                }:
+                    pause_reasons.append(eligibility)
+        return None, pause_reasons
+
+    def daemon_task_eligibility(
+        self,
+        task: TaskRecord,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        policy = resolve_task_effective_policy(task)
+        policy_hash = effective_policy_sha256(policy)
+        base = {
+            "task_id": task.id,
+            "status": task.status.value,
+            "required_approvals": sorted(set(task.required_approvals)),
+            "effective_policy_sha256": policy_hash,
+        }
+        if task.status in {
+            TaskStatus.LEASED,
+            TaskStatus.RUNNING,
+            TaskStatus.SUCCEEDED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED,
+        }:
+            return {
+                **base,
+                "decision": "skipped_status",
+                "reason": f"Task status is not daemon-selectable: {task.status.value}",
+            }
+        if conn is not None and self._task_has_active_lease(conn, task.id):
+            return {
+                **base,
+                "decision": "active_lease",
+                "reason": "Task already has an active lease.",
+            }
+        if task.required_approvals:
+            return {
+                **base,
+                "decision": "waiting_approval",
+                "reason": "Task has unresolved required approvals.",
+            }
+        forbidden_keys = self._daemon_policy_forbidden_keys(task, policy)
+        if forbidden_keys:
+            return {
+                **base,
+                "decision": "policy_forbidden",
+                "reason": "Task metadata requests daemon-forbidden capability.",
+                "forbidden_policy_keys": forbidden_keys,
+            }
+        if not self._task_dependencies_completed(task):
+            return {
+                **base,
+                "decision": "blocked_dependency",
+                "reason": "Task dependencies are not satisfied.",
+                "blocked_dependency_ids": self._task_blocked_dependency_ids(task),
+            }
+        return {
+            **base,
+            "decision": "eligible",
+            "reason": "Task is ready for daemon lease acquisition.",
+        }
+
+    def daemon_paused_tasks(self) -> list[dict[str, Any]]:
+        rows: list[sqlite3.Row]
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status IN (?, ?, ?)
+                ORDER BY priority DESC, created_at ASC
+                """,
+                (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value),
+            ).fetchall()
+            paused = [
+                self.daemon_task_eligibility(self._row_to_task(row), conn=conn)
+                for row in rows
+            ]
+        return [
+            item
+            for item in paused
+            if item["decision"] in {
+                "blocked_dependency",
+                "waiting_approval",
+                "policy_forbidden",
+                "active_lease",
+            }
+        ]
+
+    def _daemon_policy_forbidden_keys(
+        self,
+        task: TaskRecord,
+        policy: Any,
+    ) -> list[str]:
+        requested = [
+            key
+            for key in sorted(DAEMON_POLICY_FORBIDDEN_METADATA_KEYS)
+            if bool(task.metadata.get(key))
+        ]
+        metadata_to_policy_key = {
+            "daemon_policy_forbidden": "task_queue_execution",
+            "requires_active_repo_write": "active_repo_write",
+            "requires_external_network": "external_network",
+            "requires_docker": "docker_execution",
+            "requires_paid_provider": "paid_provider",
+            "requires_hosted_boundary": "hosted_boundary",
+        }
+        forbidden: list[str] = []
+        for metadata_key in requested:
+            policy_key = metadata_to_policy_key[metadata_key]
+            if policy.levels.get(policy_key) in {PolicyLevel.FORBIDDEN, PolicyLevel.APPROVAL_REQUIRED}:
+                forbidden.append(policy_key)
+        return sorted(set(forbidden))
+
+    def _task_blocked_dependency_ids(self, task: TaskRecord) -> list[str]:
+        blocked: list[str] = []
+        for dependency_id in task.depends_on:
+            try:
+                dependency = self.get_task(dependency_id)
+            except KeyError:
+                blocked.append(dependency_id)
+                continue
+            if dependency.status != TaskStatus.SUCCEEDED:
+                blocked.append(dependency_id)
+        return sorted(set(blocked))
+
+    def _lease_task_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task: TaskRecord,
+        owner: str,
+        timestamp: str,
+        expires_at: str,
+    ) -> dict[str, TaskAttempt | TaskLease | TaskRecord]:
+        current_status = task.status
+        if current_status == TaskStatus.BLOCKED:
+            validate_task_transition(TaskStatus.BLOCKED, TaskStatus.READY)
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (TaskStatus.READY.value, timestamp, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=TaskStatus.BLOCKED,
+                to_status=TaskStatus.READY,
+                reason="dependencies_satisfied",
+                actor="system",
+                metadata={},
+                created_at=timestamp,
+            )
+            current_status = TaskStatus.READY
+        validate_task_transition(current_status, TaskStatus.LEASED)
+        attempt_number = self._next_attempt_number(conn, task.id)
+        attempt_id = f"task_attempt_{uuid.uuid4().hex[:12]}"
+        lease_id = f"task_lease_{uuid.uuid4().hex[:12]}"
+        conn.execute(
+            """
+            INSERT INTO task_attempts (
+              id, task_id, attempt_number, status, lease_id, run_id,
+              created_at, started_at, finished_at, failure_code, failure_message,
+              metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                attempt_id,
+                task.id,
+                attempt_number,
+                TaskStatus.LEASED.value,
+                lease_id,
+                None,
+                timestamp,
+                None,
+                None,
+                None,
+                None,
+                "{}",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO task_leases (
+              id, task_id, attempt_id, owner, status, acquired_at, expires_at,
+              heartbeat_at, released_at, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                lease_id,
+                task.id,
+                attempt_id,
+                owner,
+                TaskLeaseStatus.ACTIVE.value,
+                timestamp,
+                expires_at,
+                None,
+                None,
+                "{}",
+            ),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+            (TaskStatus.LEASED.value, timestamp, task.id),
+        )
+        self._record_task_transition(
+            conn,
+            task_id=task.id,
+            from_status=current_status,
+            to_status=TaskStatus.LEASED,
+            reason="task_leased",
+            actor=owner,
+            metadata={"attempt_id": attempt_id, "lease_id": lease_id},
+            created_at=timestamp,
+        )
+        return {
+            "task": self._row_to_task(
+                conn.execute("SELECT * FROM tasks WHERE id = ?", (task.id,)).fetchone()
+            ),
+            "attempt": self._row_to_task_attempt(
+                conn.execute("SELECT * FROM task_attempts WHERE id = ?", (attempt_id,)).fetchone()
+            ),
+            "lease": self._row_to_task_lease(
+                conn.execute("SELECT * FROM task_leases WHERE id = ?", (lease_id,)).fetchone()
+            ),
+        }
 
     def daemon_run_once(self, owner: str, pid: int | None = None) -> DaemonTickResult:
         daemon = self.ensure_daemon(owner=owner, pid=pid)
@@ -670,14 +865,15 @@ class SQLiteStore:
                 lease=renewed_leases[0],
                 pause_reasons=[],
             )
-        selection = self.select_next_task_for_lease(owner=owner)
-        decision = "leased_task" if selection is not None else "no_eligible_task"
+        selection, pause_reasons = self.select_next_daemon_task_for_lease(owner=owner)
+        decision = "leased_task" if selection is not None else "paused" if pause_reasons else "no_eligible_task"
         metadata = {
             "tick_id": tick_id,
             "decision": decision,
             "task_id": selection["task"].id if selection is not None else None,
             "attempt_id": selection["attempt"].id if selection is not None else None,
             "lease_id": selection["lease"].id if selection is not None else None,
+            "pause_reasons": pause_reasons,
         }
         self.record_daemon_event(
             daemon.id,
@@ -694,7 +890,7 @@ class SQLiteStore:
             selected_task=selection["task"] if selection is not None else None,
             attempt=selection["attempt"] if selection is not None else None,
             lease=selection["lease"] if selection is not None else None,
-            pause_reasons=[],
+            pause_reasons=pause_reasons,
         )
 
     def renew_daemon_leases(
@@ -930,6 +1126,7 @@ class SQLiteStore:
             project_root=self.project_root,
             active_daemons=active_daemons,
             latest_events=self.list_daemon_events(limit=20),
+            paused_tasks=self.daemon_paused_tasks(),
             stale_after_seconds=stale_after_seconds,
         )
 

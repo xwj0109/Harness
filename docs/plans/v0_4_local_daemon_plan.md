@@ -117,7 +117,7 @@ Acceptance criteria:
 
 ### Slice 3 — Approval and Policy Gating
 
-Status: next implementation target.
+Status: implemented.
 
 Purpose: ensure the daemon pauses safely before any future execution path exists.
 
@@ -140,6 +140,12 @@ Acceptance criteria:
 - Policy-forbidden work is not leased for execution.
 - Queue commands remain non-executing.
 - Daemon status exposes enough state to debug without manual SQLite reads.
+
+Implementation note:
+
+- `daemon run-once` uses daemon-specific eligibility, records pause reasons in tick events, and keeps manual queue leasing behavior separate.
+- `daemon status --output json` includes `paused_tasks` with dependency, approval, active-lease, or daemon-policy reasons.
+- Policy evidence is referenced through runtime EffectivePolicy hashes, but this slice does not authorize task execution or backend/tool calls.
 
 ### Slice 4 — Minimal Execution Adapter Planning Gate
 

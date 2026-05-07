@@ -1005,6 +1005,8 @@ def daemon_run_once(project: ProjectOption = Path("."), output: OutputOption = O
     typer.echo(f"Decision: {result.decision}")
     if result.selected_task is not None:
         typer.echo(f"Leased task: {result.selected_task.id}")
+    for reason in result.pause_reasons:
+        typer.echo(f"Paused task: {reason['task_id']}\t{reason['decision']}")
 
 
 @daemon_app.command("status")
@@ -1017,6 +1019,7 @@ def daemon_status(project: ProjectOption = Path("."), output: OutputOption = Out
         return
     typer.echo(f"Project: {result.project_root}")
     typer.echo(f"Active daemons: {len(result.active_daemons)}")
+    typer.echo(f"Paused tasks: {len(result.paused_tasks)}")
     for daemon in result.active_daemons:
         typer.echo(f"{daemon.id}\t{daemon.status.value}\t{daemon.owner}\t{daemon.heartbeat_at.isoformat()}")
 
@@ -1037,6 +1040,7 @@ def daemon_stop(project: ProjectOption = Path("."), output: OutputOption = Outpu
                 "stopped_daemons": [daemon.model_dump(mode="json") for daemon in stopped],
                 "active_daemons": [daemon.model_dump(mode="json") for daemon in status.active_daemons],
                 "latest_events": [event.model_dump(mode="json") for event in status.latest_events],
+                "paused_tasks": status.paused_tasks,
                 "stale_after_seconds": status.stale_after_seconds,
             }
         )
