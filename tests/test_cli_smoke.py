@@ -92,9 +92,11 @@ def test_cli_dev_create_run_runs_show(tmp_path) -> None:
     assert transcript_path.exists()
     assert report_path.exists()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["schema_version"] == "harness.manifest/v1"
+    assert manifest["schema_version"] == "harness.manifest/v1.1"
     assert manifest["run_id"] == run_id
     assert manifest["run_mode"] == "dev"
+    assert manifest["effective_policy"]["schema_version"] == "harness.effective_policy/v1"
+    assert manifest["effective_policy_sha256"]
     assert {artifact["kind"] for artifact in manifest["artifacts"]} >= {
         "events",
         "transcript",
@@ -133,9 +135,10 @@ def test_cli_runs_and_show_support_json_output(tmp_path) -> None:
     show = runner.invoke(app, ["show", run_id, "--project", str(tmp_path), "--output", "json"])
     assert show.exit_code == 0
     show_payload = json.loads(show.output)
-    assert show_payload["schema_version"] == "harness.manifest/v1"
+    assert show_payload["schema_version"] == "harness.manifest/v1.1"
     assert show_payload["run_id"] == run_id
     assert show_payload["run_mode"] == "dev"
+    assert show_payload["effective_policy_sha256"]
     assert {artifact["kind"] for artifact in show_payload["artifacts"]} >= {
         "events",
         "transcript",
@@ -871,6 +874,95 @@ def test_cli_doctor_supports_json_output_without_sensitive_backend_settings(tmp_
     assert "base_url" not in serialized
     assert "api_key" not in serialized
     assert "api_key_env" not in serialized
+
+
+def test_cli_policy_explain_supports_runtime_subjects_without_preflight_or_settings(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    run = store.create_run(goal="policy run", task_type="phase_1a_test")
+    task = store.create_task(
+        title="Policy task",
+        required_approvals=["hosted_provider"],
+        agent_id="repo_inspector",
+        workbench_id="coding",
+    )
+
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("policy explain must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("policy explain must not preflight local backend")),
+    )
+
+    for kind, subject_id in [
+        ("run", run.id),
+        ("task", task.id),
+        ("agent", "repo_inspector"),
+        ("workbench", "coding"),
+        ("backend", "local_openai_compatible"),
+    ]:
+        result = runner.invoke(
+            app,
+            [
+                "policy",
+                "explain",
+                "--subject-kind",
+                kind,
+                "--subject-id",
+                subject_id,
+                "--project",
+                str(tmp_path),
+                "--output",
+                "json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.effective_policy/v1"
+        assert payload["ok"] is True
+        assert payload["subject_kind"] == kind
+        assert payload["subject_id"] == subject_id
+        assert payload["policy_sha256"]
+        serialized = json.dumps(payload)
+        assert "api_key" not in serialized
+        assert "OPENAI_API_KEY" not in serialized
+        assert "base_url" not in serialized
+
+
+def test_cli_policy_explain_unknown_subject_returns_stable_json_error(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    expected_errors = {
+        "run": "Run not found: run_missing",
+        "task": "Task not found: task_missing",
+        "agent": "Agent not found: agent_missing",
+        "workbench": "Workbench not found: workbench_missing",
+        "backend": "Backend not found: backend_missing",
+    }
+    for kind, expected_error in expected_errors.items():
+        result = runner.invoke(
+            app,
+            [
+                "policy",
+                "explain",
+                "--subject-kind",
+                kind,
+                "--subject-id",
+                f"{kind}_missing",
+                "--project",
+                str(tmp_path),
+                "--output",
+                "json",
+            ],
+        )
+
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.effective_policy/v1"
+        assert payload["ok"] is False
+        assert payload["errors"] == [expected_error]
 
 
 def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path) -> None:

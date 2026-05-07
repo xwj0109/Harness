@@ -301,7 +301,7 @@ The JSON wrapper is `harness.spec_diff/v1`. Each registry section reports determ
 
 Diff is structural and declarative. It does not explain semantic impact or activate custom specs.
 
-## Effective Policy Preview
+## Spec Effective Policy Preview
 
 Preview resolved policy relationships for one agent or one workbench:
 
@@ -315,6 +315,22 @@ harness specs preview workbench coding --source path/to/specs.yaml --output json
 The JSON wrapper is `harness.spec_effective_preview/v1`. Agent previews include the agent declaration plus resolved model profile, tool policy, memory scope, and parent id. Workbench previews include the workbench declaration, default model profile, allowed agents with resolved references, forbidden actions, and workbench-local declarative policy maps.
 
 Effective preview is not runtime permission enforcement. It does not execute agents, check backend availability, route work, create tasks, or persist custom specs.
+
+## Runtime Effective Policy Evidence
+
+Explain runtime policy evidence for persisted harness subjects:
+
+```bash
+harness policy explain --subject-kind run --subject-id run_abc123def456 --project . --output json
+harness policy explain --subject-kind task --subject-id task_abc123def456 --project . --output json
+harness policy explain --subject-kind agent --subject-id repo_inspector --project . --output json
+harness policy explain --subject-kind workbench --subject-id coding --project . --output json
+harness policy explain --subject-kind backend --subject-id codex_cli --project . --output json
+```
+
+The JSON wrapper is `harness.effective_policy/v1`. Runtime policy evidence includes policy levels, sources, required approvals, forbidden reasons, a deterministic policy hash, and subject identity. It is an evidence and explanation surface only; it does not grant permissions, execute agents, preflight backends, run Docker, create runs, create artifacts, mutate tasks, or start schedulers.
+
+Run manifests are written as `harness.manifest/v1.1` and include additive runtime policy evidence such as `effective_policy`, `effective_policy_sha256`, and backend descriptor hash when a backend descriptor exists. Manifest evidence does not include backend settings, API keys, environment variables, or secret-like metadata.
 
 ## v0.2 Specs Safety Boundary
 
@@ -375,7 +391,7 @@ Task records may store declarative built-in registry ids:
 - `required_approvals`, from repeated `--requires-approval`.
 - `spec_source_kind: builtin` when registry ids are attached.
 
-These ids are metadata only in v0.3. They do not route work or imply backend execution. Dependencies are persisted locally and can make a task `blocked`; required approvals are recorded locally and can make a task `waiting_approval`, but full policy resolution is deferred to a later control-plane slice.
+These ids are metadata only in v0.3. They do not route work or imply backend execution. Dependencies are persisted locally and can make a task `blocked`; required approvals are recorded locally and can make a task `waiting_approval`. v0.3.5 runtime policy explanation can summarize this metadata, but it remains non-executing evidence rather than authorization for autonomous work.
 
 Select the next runnable task manually:
 

@@ -89,6 +89,12 @@ class TaskLeaseStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class PolicyLevel(str, Enum):
+    FORBIDDEN = "forbidden"
+    APPROVAL_REQUIRED = "approval_required"
+    ALLOWED = "allowed"
+
+
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
     mapping = {
         "read_only_repo_summary": RunMode.READ_ONLY,
@@ -264,6 +270,26 @@ class TaskTransitionRecord(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class PolicySource(BaseModel):
+    kind: str
+    id: str
+    description: str = ""
+    levels: dict[str, PolicyLevel] = Field(default_factory=dict)
+    required_approvals: list[str] = Field(default_factory=list)
+
+
+class EffectivePolicy(BaseModel):
+    schema_version: str = "harness.effective_policy/v1"
+    subject_kind: str
+    subject_id: str
+    resolved_at: datetime
+    levels: dict[str, PolicyLevel]
+    sources: list[PolicySource] = Field(default_factory=list)
+    required_approvals: list[str] = Field(default_factory=list)
+    forbidden_reasons: list[str] = Field(default_factory=list)
+    monotonicity_checked: bool = True
+
+
 class EventRecord(BaseModel):
     id: str
     run_id: str
@@ -291,7 +317,7 @@ class ManifestArtifact(BaseModel):
 
 
 class RunManifest(BaseModel):
-    schema_version: str = "harness.manifest/v1"
+    schema_version: str = "harness.manifest/v1.1"
     run_id: str
     goal: str | None = None
     task_type: str | None = None
@@ -303,3 +329,11 @@ class RunManifest(BaseModel):
     approval_id: str | None = None
     backend_descriptor: BackendDescriptor | None = None
     artifacts: list[ManifestArtifact] = Field(default_factory=list)
+    trace_id: str | None = None
+    task_id: str | None = None
+    objective_id: str | None = None
+    effective_policy: EffectivePolicy | None = None
+    effective_policy_sha256: str | None = None
+    backend_descriptor_sha256: str | None = None
+    sandbox_profile: dict[str, Any] | None = None
+    validation_results: dict[str, Any] | None = None

@@ -31,7 +31,7 @@ def test_store_writes_and_refreshes_run_manifest(tmp_path) -> None:
     manifest_path = tmp_path / ".harness" / "runs" / run.id / "manifest.json"
 
     initial = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert initial["schema_version"] == "harness.manifest/v1"
+    assert initial["schema_version"] == "harness.manifest/v1.1"
     assert initial["run_id"] == run.id
     assert initial["goal"] == "test run"
     assert initial["task_type"] == "phase_1a_test"
@@ -40,6 +40,14 @@ def test_store_writes_and_refreshes_run_manifest(tmp_path) -> None:
     assert initial["project_root"] == str(tmp_path.resolve())
     assert initial["approval_id"] is None
     assert initial["backend_descriptor"] is None
+    assert initial["backend_descriptor_sha256"] is None
+    assert initial["effective_policy"]["schema_version"] == "harness.effective_policy/v1"
+    assert initial["effective_policy"]["subject_kind"] == "run"
+    assert initial["effective_policy"]["subject_id"] == run.id
+    assert initial["effective_policy_sha256"]
+    assert initial["task_id"] is None
+    assert initial["objective_id"] is None
+    assert initial["trace_id"] is None
     assert initial["artifacts"] == []
 
     paths = store.initialize_run_artifacts(run.id)
@@ -81,6 +89,8 @@ def test_store_manifest_includes_backend_descriptor_without_settings(tmp_path) -
     assert descriptor["kind"] == "native_model"
     assert descriptor["metadata"]["data_boundary"] == "local_only"
     assert descriptor["capabilities"]["json_mode"] is True
+    assert manifest["backend_descriptor_sha256"]
+    assert manifest["effective_policy_sha256"]
     assert "settings" not in descriptor
     assert "base_url" not in json.dumps(descriptor)
 

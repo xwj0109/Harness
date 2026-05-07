@@ -31,6 +31,7 @@ from harness.models import (
     TaskTransitionRecord,
     run_mode_for_task_type,
 )
+from harness.policy import backend_descriptor_sha256, effective_policy_sha256, resolve_run_effective_policy
 from harness.security import sanitize_for_logging
 
 LEGACY_TASK_STATUS_VALUES = {
@@ -1047,6 +1048,8 @@ class SQLiteStore:
 
     def build_run_manifest(self, run_id: str) -> RunManifest:
         run = self.get_run(run_id)
+        backend_descriptor = self._latest_backend_descriptor(run_id)
+        effective_policy = resolve_run_effective_policy(run, backend_descriptor)
         artifacts = [
             ManifestArtifact(
                 kind=artifact.kind,
@@ -1066,8 +1069,11 @@ class SQLiteStore:
             created_at=run.created_at,
             updated_at=run.updated_at,
             approval_id=run.approval_id,
-            backend_descriptor=self._latest_backend_descriptor(run_id),
+            backend_descriptor=backend_descriptor,
             artifacts=artifacts,
+            effective_policy=effective_policy,
+            effective_policy_sha256=effective_policy_sha256(effective_policy),
+            backend_descriptor_sha256=backend_descriptor_sha256(backend_descriptor),
         )
 
     def _latest_backend_descriptor(self, run_id: str) -> BackendDescriptor | None:

@@ -137,11 +137,14 @@ def test_golden_manifest_and_show_evidence_contract(tmp_path) -> None:
     normalized_shown = _normalize(shown, tmp_path)
 
     assert normalized_shown == normalized_manifest
-    assert normalized_manifest["schema_version"] == "harness.manifest/v1"
+    assert normalized_manifest["schema_version"] == "harness.manifest/v1.1"
     assert normalized_manifest["run_id"] == "<RUN_ID>"
     assert normalized_manifest["run_mode"] == "dev"
     assert normalized_manifest["status"] == "completed"
     assert normalized_manifest["backend_descriptor"] is None
+    assert normalized_manifest["effective_policy"]["schema_version"] == "harness.effective_policy/v1"
+    assert normalized_manifest["effective_policy"]["subject_kind"] == "run"
+    assert normalized_manifest["effective_policy_sha256"]
     assert {artifact["kind"] for artifact in normalized_manifest["artifacts"]} == {
         "events",
         "transcript",

@@ -28,6 +28,14 @@ from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import TaskStatus
 from harness.paths import resolve_project_root
+from harness.policy import (
+    backend_descriptor_sha256,
+    effective_policy_sha256,
+    resolve_agent_effective_policy,
+    resolve_backend_effective_policy,
+    resolve_task_effective_policy,
+    resolve_workbench_effective_policy,
+)
 from harness.registry import builtin_spec_registry
 from harness.runner import ReadOnlyRepoSummaryRunner
 from harness.sandbox import CommandValidationError, DockerImageManager
@@ -51,6 +59,7 @@ tests_app = typer.Typer(help="Docker-sandboxed test execution.")
 tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
 specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_without_command=True)
 specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previews.")
+policy_app = typer.Typer(help="Runtime effective policy evidence.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
@@ -58,6 +67,7 @@ app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
+app.add_typer(policy_app, name="policy")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
@@ -74,6 +84,11 @@ class OutputFormat(str, Enum):
 
 OutputOption = Annotated[OutputFormat, typer.Option("--output", help="Output format.")]
 SpecSourceOption = Annotated[str, typer.Option("--source", help="Spec source: builtin or explicit bundle path.")]
+PolicySubjectKindOption = Annotated[
+    str,
+    typer.Option("--subject-kind", help="Policy subject kind: run, task, agent, workbench, or backend."),
+]
+PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy subject id.")]
 
 GITIGNORE_SECTION = """# Harness local artifacts
 .harness/runs/
@@ -663,6 +678,69 @@ def _specs_preview_error_source(source: str) -> dict:
     return {"kind": "custom", "path": str(Path(source).expanduser().resolve())}
 
 
+@policy_app.command("explain")
+def policy_explain(
+    subject_kind: PolicySubjectKindOption,
+    subject_id: PolicySubjectIdOption,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        policy, extra = _resolve_policy_explain(project_root, subject_kind, subject_id)
+    except (KeyError, ValueError) as exc:
+        _emit_policy_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    policy_hash = effective_policy_sha256(policy)
+    if output == OutputFormat.JSON:
+        payload = policy.model_dump(mode="json")
+        payload.update({"ok": True, "policy_sha256": policy_hash, **extra})
+        _emit_json(payload)
+        return
+    typer.echo(f"Subject: {policy.subject_kind}/{policy.subject_id}")
+    typer.echo(f"Policy: {policy_hash}")
+    typer.echo("Levels:")
+    for key, level in policy.levels.items():
+        typer.echo(f"  {key}: {level.value}")
+    typer.echo(
+        "Required approvals: "
+        f"{', '.join(policy.required_approvals) if policy.required_approvals else 'none'}"
+    )
+    typer.echo(
+        "Forbidden reasons: "
+        f"{'; '.join(policy.forbidden_reasons) if policy.forbidden_reasons else 'none'}"
+    )
+
+
+def _resolve_policy_explain(project_root: Path, subject_kind: str, subject_id: str):
+    normalized_kind = subject_kind.strip().lower()
+    if normalized_kind not in {"run", "task", "agent", "workbench", "backend"}:
+        raise ValueError(f"Unsupported policy subject kind: {subject_kind}")
+    store = SQLiteStore(project_root)
+    if normalized_kind == "run":
+        manifest = store.build_run_manifest(subject_id)
+        if manifest.effective_policy is None:
+            raise KeyError(f"Effective policy not found for run: {subject_id}")
+        return manifest.effective_policy, {"backend_descriptor_sha256": manifest.backend_descriptor_sha256}
+    if normalized_kind == "task":
+        return resolve_task_effective_policy(store.get_task(subject_id)), {}
+    registry = builtin_spec_registry()
+    if normalized_kind == "agent":
+        return resolve_agent_effective_policy(registry, subject_id), {}
+    if normalized_kind == "workbench":
+        return resolve_workbench_effective_policy(registry, subject_id), {}
+    cfg = load_config(project_root)
+    try:
+        backend = cfg.backends[subject_id]
+    except KeyError as exc:
+        raise KeyError(f"Backend not found: {subject_id}") from exc
+    descriptor = backend.to_descriptor()
+    return resolve_backend_effective_policy(descriptor), {
+        "backend_descriptor_sha256": backend_descriptor_sha256(descriptor)
+    }
+
+
 @backends_app.callback()
 def backends_callback(
     ctx: typer.Context,
@@ -1169,6 +1247,13 @@ def _emit_task_error(schema_version: str, message: str, output: OutputFormat) ->
         _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
     else:
         typer.echo(f"Task command failed: {message}")
+
+
+def _emit_policy_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.effective_policy/v1", "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Policy command failed: {message}")
 
 
 def _emit_json(payload) -> None:
