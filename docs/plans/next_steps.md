@@ -4,13 +4,14 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter work has started.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
 The v0.3.5 stabilization plan is tracked in [v0_3_5_control_plane_stabilization_plan.md](v0_3_5_control_plane_stabilization_plan.md).
 The v0.4 local daemon plan is tracked in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md).
 The v0.4.5 execution adapter decision gate is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md).
+The v0.5 read-only execution adapter plan is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -48,6 +49,7 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `0.4.0`.
 - v0.4.5 dry-run lease-to-run contract, read-only lease inspection, dry-run recovery reconciliation, and dry-run smoke documentation.
 - Version bump to `0.4.5`.
+- v0.5 Slice 1 read-only summary lease adapter for `read_only_summary/read_only_repo_summary`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -72,13 +74,21 @@ The v0.4 scheduler-readiness checkpoint is complete. Daemon commands are local c
 
 The v0.4.5 dry-run adapter milestone is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). Slice 1 proves a dry-run lease-to-run contract, and Slice 2 hardens dry-run lease inspection and recovery. The milestone is complete as dry-run evidence only: `daemon execute-dry-run` may create local `phase_1a_test` run evidence from an active lease, but it does not call backends, models, Docker, shell tools, network, hosted providers, paid providers, MCP/A2A, browser/email/calendar tools, or mutate active repo files.
 
+## Active v0.5 Read-Only Adapter Milestone
+
+The v0.5 read-only adapter milestone is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md). Slice 1 is implemented: `daemon execute-read-only` can bind an existing active daemon lease to the existing `read_only_repo_summary` runner when the task metadata is exactly `execution_adapter=read_only_summary` and `task_type=read_only_repo_summary`.
+
+The adapter is intentionally narrow. It uses only the configured local-only, no-cost `local_openai_compatible` backend and existing read-only tools. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, autonomous planning, generic task execution, or unmanaged daemon loops.
+
 ## Immediate Next Planning Target
 
-The next planning target should be a separate decision: either plan exactly one real bounded adapter, likely `read_only_repo_summary`, or defer real execution to v0.5. The default remains no real task execution unless a separate, decision-complete implementation plan explicitly authorizes one tiny adapter. Any future execution work must preserve the same safety boundary until explicitly changed: no backend calls, Docker, unmanaged background work, hosted fallback, or paid fallback unless the approved adapter contract explicitly covers and tests that behavior.
+The immediate next target is v0.5 release hygiene for the read-only adapter checkpoint: update operator-facing docs and smoke checks, verify the safety boundary, and decide whether to stop at this bounded adapter or write a separate plan for the next adapter.
+
+Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, and active repo writes remain unauthorized.
 
 ## Later Work
 
-After the v0.4 scheduler-readiness checkpoint, plan any execution adapter as a separate milestone with explicit policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts. Defer autonomous background behavior, broker actions, external-message automation, MCP/A2A adapters, hosted fallback, paid fallback, and generic shell access until a later milestone explicitly authorizes them.
+After the v0.5 read-only adapter checkpoint, plan any additional execution adapter as a separate milestone with explicit policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts. Defer autonomous background behavior, broker actions, external-message automation, MCP/A2A adapters, hosted fallback, paid fallback, and generic shell access until a later milestone explicitly authorizes them.
 
 ## Working Defaults
 
