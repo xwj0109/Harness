@@ -41,11 +41,14 @@ class ReadOnlyRepoSummaryRunner:
         if not backend_status.available:
             raise LocalEndpointUnavailable(backend_status.reason or "Local backend unavailable.")
         run = self.store.create_run(goal=goal, task_type=task_type, status="running", backend=self.backend.config)
-        paths = self.store.initialize_run_artifacts(run.id)
+        return self.run_existing(run.id, goal=goal, task_type=task_type)
+
+    def run_existing(self, run_id: str, goal: str, task_type: str) -> dict[str, Any]:
+        paths = self.store.initialize_run_artifacts(run_id)
         for kind, path in paths.items():
-            self.store.register_artifact(run.id, kind=kind, path=path)
+            self.store.register_artifact(run_id, kind=kind, path=path)
         self.store.append_event(
-            run.id,
+            run_id,
             "info",
             "run_started",
             "Started read-only repo summary run.",
@@ -69,7 +72,7 @@ class ReadOnlyRepoSummaryRunner:
             except CommandValidationError as exc:
                 invalid_count += 1
                 self.store.append_event(
-                    run.id,
+                    run_id,
                     "warning",
                     "invalid_model_command",
                     "Rejected invalid model command.",
@@ -92,7 +95,7 @@ class ReadOnlyRepoSummaryRunner:
             if command.command == "final_answer":
                 final_summary = str(sanitize_for_logging(command.final_text))
                 self.store.append_event(
-                    run.id,
+                    run_id,
                     "info",
                     "final_answer",
                     "Model returned final answer.",
@@ -110,7 +113,7 @@ class ReadOnlyRepoSummaryRunner:
                 "data": result.data,
             }
             tool_results.append(tool_payload)
-            self.store.append_event(run.id, "info", "tool_executed", "Executed read-only tool.", tool_payload)
+            self.store.append_event(run_id, "info", "tool_executed", "Executed read-only tool.", tool_payload)
             append_jsonl(transcript_path, sanitize_for_logging({"role": "tool", **tool_payload}))
             messages.append(
                 {
@@ -121,7 +124,7 @@ class ReadOnlyRepoSummaryRunner:
         if not final_summary:
             final_summary = "Run ended without a final model summary."
         self._write_phase_1b_report(
-            run_id=run.id,
+            run_id=run_id,
             goal=goal,
             task_type=task_type,
             tools_executed=tools_executed,
@@ -130,15 +133,15 @@ class ReadOnlyRepoSummaryRunner:
             artifact_paths=paths,
         )
         self.store.append_event(
-            run.id,
+            run_id,
             "info",
             "run_completed",
             "Completed read-only repo summary run.",
             {"invalid_model_command_count": invalid_count, "tools_executed": tools_executed},
         )
-        self.store.update_run_status(run.id, "failed" if stopped_for_invalid_output else "completed")
+        self.store.update_run_status(run_id, "failed" if stopped_for_invalid_output else "completed")
         return {
-            "run_id": run.id,
+            "run_id": run_id,
             "final_summary": final_summary,
             "invalid_model_command_count": invalid_count,
             "tools_executed": tools_executed,
@@ -206,7 +209,6 @@ class ReadOnlyRepoSummaryRunner:
             f"- Execution location: {metadata.execution_location.value}",
             f"- Data boundary: {metadata.data_boundary.value}",
             f"- Allow network: {metadata.allow_network}",
-            f"- Local endpoint: {self.backend.base_url}",
             f"- Capabilities: {capabilities.model_dump(mode='json')}",
             f"- Tools executed: {tools_executed}",
             f"- Invalid/blocked model commands: {invalid_count}",

@@ -37,7 +37,10 @@ def test_runner_executes_read_only_tools_through_command_protocol(tmp_path) -> N
     assert result["final_summary"] == "Repo has a README."
     assert result["tools_executed"] == ["list_files", "read_file"]
     report = tmp_path / ".harness" / "runs" / result["run_id"] / "final_report.md"
-    assert "local_openai_compatible" in report.read_text(encoding="utf-8")
+    report_text = report.read_text(encoding="utf-8")
+    assert "local_openai_compatible" in report_text
+    assert "base_url" not in report_text
+    assert "http://localhost:11434" not in report_text
 
 
 def test_runner_retries_invalid_model_output(tmp_path) -> None:

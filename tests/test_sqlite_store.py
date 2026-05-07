@@ -513,6 +513,55 @@ def test_store_daemon_inspect_lease_reports_dry_run_linkage_without_mutation(tmp
     assert after.recovery_recommendation["action"] == "none"
 
 
+def test_store_read_only_lease_validation_and_inspection(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Read-only",
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    lease, attempt, validated_task = store.validate_read_only_lease_for_execution(leased.lease.id)
+    inspection = store.inspect_task_lease(leased.lease.id)
+
+    assert lease.id == leased.lease.id
+    assert attempt.run_id is None
+    assert validated_task.id == task.id
+    assert inspection.read_only_eligibility["eligible"] is True
+    assert inspection.dry_run_eligibility["eligible"] is False
+    assert store.list_runs() == []
+
+
+def test_store_read_only_start_and_recovery_reconcile_completed_partial_state(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Read-only",
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    run = store.start_read_only_lease_run(
+        leased.lease.id,
+        backend=backend,
+        owner="local_daemon:test:123",
+    )
+    store.update_run_status(run.id, "completed")
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert [item.id for item in recovery.recovered_tasks] == [task.id]
+    assert recovery.events[0].event_type == "recover_read_only"
+    assert store.get_task(task.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_attempt(leased.attempt.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.RELEASED
+    assert len(store.list_runs()) == 1
+
+
 def test_store_daemon_recovery_reconciles_completed_dry_run_partial_state(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

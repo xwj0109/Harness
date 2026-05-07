@@ -1355,6 +1355,116 @@ def test_cli_daemon_execute_dry_run_links_run_without_backends_or_docker(tmp_pat
     assert "environment" not in serialized
 
 
+def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+
+    class FakeBackend:
+        def __init__(self, config):
+            self.config = config
+            self.name = config.name
+            self.responses = [
+                '{"command":"list_files","arguments":{"path":"."}}',
+                '{"command":"final_answer","arguments":{"answer":"Read-only lease summary."}}',
+            ]
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+        def complete(self, messages):
+            return self.responses.pop(0)
+
+    monkeypatch.setattr("harness.daemon_adapters.LocalOpenAICompatibleBackend", FakeBackend)
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only adapter must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only adapter must not touch Docker")),
+    )
+
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Summarize repo",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task_payload = json.loads(task_result.output)
+    assert task_payload["task"]["metadata"] == {
+        "execution_adapter": "read_only_summary",
+        "task_type": "read_only_repo_summary",
+    }
+
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert tick.exit_code == 0, tick.output
+    tick_payload = json.loads(tick.output)
+    assert tick_payload["decision"] == "leased_task"
+    assert tick_payload["attempt"]["run_id"] is None
+    lease_id = tick_payload["lease"]["id"]
+
+    before = runner.invoke(
+        app,
+        ["daemon", "inspect-lease", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert before.exit_code == 0, before.output
+    before_payload = json.loads(before.output)
+    assert before_payload["read_only_eligibility"]["eligible"] is True
+    assert before_payload["run"] is None
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+    duplicate = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert executed.exit_code == 0, executed.output
+    payload = json.loads(executed.output)
+    assert payload["schema_version"] == "harness.daemon_execute_read_only/v1"
+    assert payload["ok"] is True
+    assert payload["decision"] == "read_only_summary_completed"
+    assert payload["task"]["status"] == "succeeded"
+    assert payload["attempt"]["status"] == "succeeded"
+    assert payload["attempt"]["run_id"] == payload["run"]["id"]
+    assert payload["lease"]["status"] == "released"
+    assert payload["run"]["status"] == "completed"
+    assert payload["run"]["task_type"] == "read_only_repo_summary"
+    assert payload["manifest"]["schema_version"] == "harness.manifest/v1.1"
+    assert payload["manifest"]["task_id"] == payload["task"]["id"]
+
+    assert duplicate.exit_code == 1
+    duplicate_payload = json.loads(duplicate.output)
+    assert duplicate_payload["schema_version"] == "harness.daemon_execute_read_only/v1"
+    assert duplicate_payload["ok"] is False
+    assert duplicate_payload["errors"] == ["Read-only execution requires active lease: released"]
+    assert len(SQLiteStore(tmp_path).list_runs()) == 1
+
+    serialized = task_result.output + tick.output + before.output + executed.output + duplicate.output
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "http://localhost:11434" not in serialized
+
+
 def test_cli_daemon_inspect_lease_before_and_after_dry_run_is_read_only(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     monkeypatch.setattr(
@@ -1490,7 +1600,10 @@ def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) 
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.task/v1"
     assert payload["ok"] is False
-    assert payload["errors"] == ["Unsupported execution adapter: only dry_run is supported"]
+    assert payload["errors"] == [
+        "Unsupported execution metadata: supported pairs are "
+        "dry_run/phase_1a_test and read_only_summary/read_only_repo_summary"
+    ]
 
 
 def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:

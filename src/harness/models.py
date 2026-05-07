@@ -462,6 +462,20 @@ class DaemonDryRunResult(BaseModel):
     policy_sha256: str
 
 
+class DaemonReadOnlyResult(BaseModel):
+    schema_version: str = "harness.daemon_execute_read_only/v1"
+    ok: bool = True
+    decision: str
+    project_root: Path
+    task: TaskRecord
+    attempt: TaskAttempt
+    lease: TaskLease
+    run: RunRecord
+    manifest: RunManifest
+    policy_sha256: str
+    errors: list[str] = Field(default_factory=list)
+
+
 class DaemonLeaseInspection(BaseModel):
     schema_version: str = "harness.daemon_lease/v1"
     ok: bool = True
@@ -472,6 +486,7 @@ class DaemonLeaseInspection(BaseModel):
     run: RunRecord | None = None
     manifest: RunManifest | None = None
     dry_run_eligibility: dict[str, Any] = Field(default_factory=dict)
+    read_only_eligibility: dict[str, Any] = Field(default_factory=dict)
     recovery_recommendation: dict[str, Any] = Field(default_factory=dict)
 
 

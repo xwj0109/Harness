@@ -25,6 +25,7 @@ from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAIC
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
 from harness.codex_runner import HostedBoundaryApprovalRequired, HostedSecretBlocked, CodexRepoPlanningRunner
 from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
+from harness.daemon_adapters import execute_read_only_summary_lease
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.evals import run_safety_smoke
 from harness.isolation import ActiveRepoDirtyError
@@ -325,11 +326,11 @@ def tasks_add(
     agent: Annotated[str | None, typer.Option("--agent", help="Built-in agent id.")] = None,
     execution_adapter: Annotated[
         str | None,
-        typer.Option("--execution-adapter", help="Execution adapter metadata. Only dry_run is supported."),
+        typer.Option("--execution-adapter", help="Execution adapter metadata."),
     ] = None,
     task_type: Annotated[
         str | None,
-        typer.Option("--task-type", help="Execution task type metadata. Only phase_1a_test is supported."),
+        typer.Option("--task-type", help="Execution task type metadata."),
     ] = None,
     priority: Annotated[int, typer.Option("--priority", help="Higher priority tasks run first.")] = 0,
     project: ProjectOption = Path("."),
@@ -339,7 +340,7 @@ def tasks_add(
     _require_initialized(project_root)
     try:
         _validate_task_spec_refs(workbench, agent)
-        metadata = _dry_run_task_metadata(execution_adapter, task_type)
+        metadata = _execution_task_metadata(execution_adapter, task_type)
         task = SQLiteStore(project_root).create_task(
             title=title,
             description=description,
@@ -1098,6 +1099,30 @@ def daemon_execute_dry_run(
     typer.echo(f"Lease: {result.lease.id}")
 
 
+@daemon_app.command("execute-read-only")
+def daemon_execute_read_only(
+    lease_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    owner = _daemon_owner()
+    try:
+        result = execute_read_only_summary_lease(project_root, lease_id, owner=owner)
+    except (KeyError, ValueError, LocalEndpointUnavailable) as exc:
+        _emit_daemon_error("harness.daemon_execute_read_only/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Decision: {result.decision}")
+    typer.echo(f"Task: {result.task.id}")
+    typer.echo(f"Attempt: {result.attempt.id}")
+    typer.echo(f"Run: {result.run.id}")
+    typer.echo(f"Lease: {result.lease.id}")
+
+
 @daemon_app.command("inspect-lease")
 def daemon_inspect_lease(
     lease_id: str,
@@ -1120,6 +1145,7 @@ def daemon_inspect_lease(
     typer.echo(f"Attempt: {result.attempt.id if result.attempt else 'missing'}")
     typer.echo(f"Run: {result.run.id if result.run else 'none'}")
     typer.echo(f"Dry-run eligible: {result.dry_run_eligibility.get('eligible')}")
+    typer.echo(f"Read-only eligible: {result.read_only_eligibility.get('eligible')}")
     typer.echo(f"Recovery action: {result.recovery_recommendation.get('action')}")
 
 
@@ -1617,14 +1643,19 @@ def _validate_task_spec_refs(workbench_id: str | None, agent_id: str | None) -> 
         registry.get_agent(agent_id)
 
 
-def _dry_run_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:
+def _execution_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:
     if execution_adapter is None and task_type is None:
         return {}
-    if execution_adapter != "dry_run":
-        raise ValueError("Unsupported execution adapter: only dry_run is supported")
-    if task_type != "phase_1a_test":
-        raise ValueError("Unsupported dry-run task type: only phase_1a_test is supported")
-    return {"execution_adapter": "dry_run", "task_type": "phase_1a_test"}
+    supported = {
+        ("dry_run", "phase_1a_test"),
+        ("read_only_summary", "read_only_repo_summary"),
+    }
+    if (execution_adapter, task_type) not in supported:
+        raise ValueError(
+            "Unsupported execution metadata: supported pairs are "
+            "dry_run/phase_1a_test and read_only_summary/read_only_repo_summary"
+        )
+    return {"execution_adapter": execution_adapter or "", "task_type": task_type or ""}
 
 
 def _emit_objective_error(schema_version: str, message: str, output: OutputFormat) -> None:
