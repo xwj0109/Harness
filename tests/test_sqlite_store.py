@@ -1,7 +1,9 @@
 import json
+import sqlite3
 
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
+from harness.models import TaskStatus
 
 
 def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
@@ -96,3 +98,79 @@ def test_store_redacts_secret_like_event_payloads(tmp_path) -> None:
     assert "sk-abcdefghijklmnopqrstuvwxyz" not in events_jsonl
     assert "sk-abcdefghijklmnopqrstuvwxyz" not in str(events[0].payload)
     assert "[REDACTED_SECRET]" in events_jsonl
+
+
+def test_store_initializes_tasks_table_without_breaking_runs(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    with sqlite3.connect(tmp_path / ".harness" / "harness.sqlite") as conn:
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+
+    assert {"runs", "events", "artifacts", "backend_snapshots", "tasks"} <= tables
+    run = store.create_run(goal="test run", task_type="phase_1a_test")
+    assert store.get_run(run.id).id == run.id
+
+
+def test_store_creates_lists_filters_and_updates_tasks(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    low = store.create_task(title="Low priority", priority=0, agent_id="repo_inspector")
+    high = store.create_task(title="High priority", description="Important", priority=5, workbench_id="coding")
+
+    assert store.get_task(high.id).description == "Important"
+    assert [task.id for task in store.list_tasks()] == [high.id, low.id]
+    assert [task.id for task in store.list_tasks(status="queued")] == [high.id, low.id]
+
+    completed = store.update_task_status(low.id, TaskStatus.COMPLETED)
+    assert completed.status == TaskStatus.COMPLETED
+    assert [task.id for task in store.list_tasks(status="queued")] == [high.id]
+
+
+def test_store_task_errors_are_stable_for_unknown_or_invalid_status(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(title="Task")
+
+    try:
+        store.get_task("task_missing")
+    except KeyError as exc:
+        assert str(exc).strip("'") == "Task not found: task_missing"
+    else:
+        raise AssertionError("missing task should raise")
+
+    try:
+        store.update_task_status(task.id, "invalid")
+    except ValueError as exc:
+        assert "invalid" in str(exc)
+    else:
+        raise AssertionError("invalid status should raise")
+
+
+def test_store_select_next_task_uses_priority_and_dependencies(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    dependency = store.create_task(title="Dependency", priority=10)
+    blocked_by_dependency = store.create_task(
+        title="Blocked by dependency",
+        priority=100,
+        depends_on=[dependency.id],
+    )
+    runnable = store.create_task(title="Runnable", priority=1)
+    canceled = store.create_task(title="Canceled", priority=200)
+    store.update_task_status(canceled.id, TaskStatus.CANCELED)
+
+    selected = store.select_next_task()
+
+    assert selected is not None
+    assert selected.id == dependency.id
+    assert selected.status == TaskStatus.RUNNING
+    assert store.get_task(blocked_by_dependency.id).status == TaskStatus.QUEUED
+
+    store.update_task_status(dependency.id, TaskStatus.COMPLETED)
+    selected_after_dependency = store.select_next_task()
+
+    assert selected_after_dependency is not None
+    assert selected_after_dependency.id == blocked_by_dependency.id
+    assert store.get_task(runnable.id).status == TaskStatus.QUEUED

@@ -7,6 +7,7 @@ from harness.approvals import ApprovalStore
 from harness.backends.codex_cli import CodexRunResult
 from harness.models import BackendStatus
 from harness.cli.main import app
+from harness.memory.sqlite_store import SQLiteStore
 
 
 runner = CliRunner()
@@ -163,6 +164,169 @@ def test_cli_runs_default_output_remains_text(tmp_path) -> None:
     assert runs.exit_code == 0
     assert not runs.output.lstrip().startswith("{")
     assert "\tcompleted\t" in runs.output
+
+
+def test_cli_tasks_require_initialized_project(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Uninitialized task", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code != 0
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_tasks_add_list_inspect_and_status_support_json(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    created = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Inspect repo",
+            "--description",
+            "Read repository state.",
+            "--agent",
+            "repo_inspector",
+            "--workbench",
+            "coding",
+            "--priority",
+            "7",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert created.exit_code == 0
+    created_payload = json.loads(created.output)
+    assert created_payload["schema_version"] == "harness.task/v1"
+    assert created_payload["ok"] is True
+    task = created_payload["task"]
+    assert task["id"].startswith("task_")
+    assert task["status"] == "queued"
+    assert task["title"] == "Inspect repo"
+    assert task["agent_id"] == "repo_inspector"
+    assert task["workbench_id"] == "coding"
+    assert task["spec_source_kind"] == "builtin"
+
+    listed = runner.invoke(app, ["tasks", "list", "--project", str(tmp_path), "--output", "json"])
+    assert listed.exit_code == 0
+    listed_payload = json.loads(listed.output)
+    assert listed_payload["schema_version"] == "harness.tasks/v1"
+    assert [item["id"] for item in listed_payload["tasks"]] == [task["id"]]
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", task["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+    assert inspected.exit_code == 0
+    assert json.loads(inspected.output)["task"]["id"] == task["id"]
+
+    updated = runner.invoke(
+        app,
+        ["tasks", "status", task["id"], "completed", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert updated.exit_code == 0
+    assert json.loads(updated.output)["task"]["status"] == "completed"
+
+
+def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    low = store.create_task(title="Low", priority=0)
+    high = store.create_task(title="High", priority=10)
+
+    result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.task_run_next/v1"
+    assert payload["ok"] is True
+    assert payload["selected_task"]["id"] == high.id
+    assert payload["selected_task"]["status"] == "running"
+    assert store.get_task(low.id).status.value == "queued"
+    assert store.list_runs() == []
+    assert not any((tmp_path / ".harness" / "runs").iterdir())
+
+
+def test_cli_tasks_run_next_returns_null_without_runnable_task(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.task_run_next/v1"
+    assert payload["ok"] is True
+    assert payload["selected_task"] is None
+
+
+def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    invalid_agent = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Bad agent",
+            "--agent",
+            "missing_agent",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    invalid_workbench = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Bad workbench",
+            "--workbench",
+            "missing_workbench",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert invalid_agent.exit_code != 0
+    assert json.loads(invalid_agent.output)["errors"] == ["Agent not found: missing_agent"]
+    assert invalid_workbench.exit_code != 0
+    assert json.loads(invalid_workbench.output)["errors"] == ["Workbench not found: missing_workbench"]
+
+
+def test_cli_tasks_do_not_preflight_backends_or_expose_settings(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tasks must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("tasks must not preflight local backend")),
+    )
+
+    result = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Safe task", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    serialized = json.dumps(payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
 
 
 def test_cli_doctor_reports_initialized_project_without_mutation(tmp_path, monkeypatch) -> None:
@@ -352,6 +516,184 @@ def test_cli_specs_missing_ids_fail_without_creating_harness_dir(tmp_path) -> No
     assert "Agent not found: missing_agent" in missing_agent.output
     assert missing_workbench.exit_code != 0
     assert "Workbench not found: missing_workbench" in missing_workbench.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_specs_validate_valid_bundle_supports_text_and_json(tmp_path, monkeypatch) -> None:
+    bundle_path = tmp_path / "specs.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "harness.spec_bundle/v1",
+                "model_profiles": {
+                    "local_reasoning": {
+                        "id": "local_reasoning",
+                        "kind": "local",
+                        "backend": "local_openai_compatible",
+                    }
+                },
+                "tool_policies": {
+                    "read_only": {
+                        "tools": {"repo_read": "allowed"},
+                        "network": "forbidden",
+                        "active_repo_write": "forbidden",
+                        "hosted_boundary": "approval_required",
+                    }
+                },
+                "memory_scopes": {"project": {"id": "project"}},
+                "agents": {
+                    "repo_inspector": {
+                        "id": "repo_inspector",
+                        "kind": "specialist",
+                        "role": "Inspect repository evidence.",
+                        "model_profile": "local_reasoning",
+                        "tool_policy": "read_only",
+                        "memory_scope": "project",
+                    }
+                },
+                "workbenches": {
+                    "coding": {
+                        "id": "coding",
+                        "description": "Coding workbench.",
+                        "allowed_agents": ["repo_inspector"],
+                        "default_model_profile": "local_reasoning",
+                        "forbidden_actions": ["paid_api_fallback", "hosted_fallback"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.load_config",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spec validation must not load config")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spec validation must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("spec validation must not preflight local backend")),
+    )
+
+    text = runner.invoke(app, ["specs", "validate", str(bundle_path)])
+    json_result = runner.invoke(app, ["specs", "validate", str(bundle_path), "--output", "json"])
+
+    assert text.exit_code == 0
+    assert f"Spec bundle valid: {bundle_path.resolve()}" in text.output
+    assert not text.output.lstrip().startswith("{")
+
+    assert json_result.exit_code == 0
+    payload = json.loads(json_result.output)
+    assert payload["schema_version"] == "harness.spec_validation/v1"
+    assert payload["ok"] is True
+    assert payload["path"] == str(bundle_path.resolve())
+    assert payload["errors"] == []
+    assert payload["registry"]["agents"]["repo_inspector"]["kind"] == "specialist"
+    serialized = json.dumps(payload)
+    assert "settings" not in serialized
+    assert "base_url" not in serialized
+    assert "api_key" not in serialized
+    assert "api_key_env" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_specs_validate_invalid_bundle_supports_text_and_json(tmp_path) -> None:
+    bundle_path = tmp_path / "specs.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "harness.spec_bundle/v1",
+                "model_profiles": {
+                    "local_reasoning": {
+                        "id": "local_reasoning",
+                        "kind": "local",
+                        "backend": "local_openai_compatible",
+                    }
+                },
+                "workbenches": {
+                    "coding": {
+                        "id": "coding",
+                        "description": "Coding workbench.",
+                        "allowed_agents": ["missing_agent"],
+                        "default_model_profile": "local_reasoning",
+                        "forbidden_actions": ["paid_api_fallback", "hosted_fallback"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    text = runner.invoke(app, ["specs", "validate", str(bundle_path)])
+    json_result = runner.invoke(app, ["specs", "validate", str(bundle_path), "--output", "json"])
+
+    assert text.exit_code != 0
+    assert f"Spec bundle invalid: {bundle_path.resolve()}" in text.output
+    assert "missing allowed agent" in text.output
+
+    assert json_result.exit_code != 0
+    payload = json.loads(json_result.output)
+    assert payload["schema_version"] == "harness.spec_validation/v1"
+    assert payload["ok"] is False
+    assert "missing allowed agent" in payload["errors"][0]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_specs_validate_missing_schema_version_supports_json_error(tmp_path) -> None:
+    bundle_path = tmp_path / "specs.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "model_profiles": {
+                    "local_reasoning": {
+                        "id": "local_reasoning",
+                        "kind": "local",
+                        "backend": "local_openai_compatible",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["specs", "validate", str(bundle_path), "--output", "json"])
+
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.spec_validation/v1"
+    assert payload["ok"] is False
+    assert payload["errors"] == ["Spec bundle missing schema_version."]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_specs_validate_unsupported_schema_version_supports_json_error(tmp_path) -> None:
+    bundle_path = tmp_path / "specs.json"
+    bundle_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "harness.spec_bundle/v0",
+                "model_profiles": {
+                    "local_reasoning": {
+                        "id": "local_reasoning",
+                        "kind": "local",
+                        "backend": "local_openai_compatible",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["specs", "validate", str(bundle_path), "--output", "json"])
+
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.spec_validation/v1"
+    assert payload["ok"] is False
+    assert payload["errors"] == ["Unsupported spec bundle schema_version: harness.spec_bundle/v0"]
     assert not (tmp_path / ".harness").exists()
 
 

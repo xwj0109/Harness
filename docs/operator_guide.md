@@ -170,9 +170,9 @@ Artifacts for each run include:
 - `transcript.jsonl`
 - `final_report.md`
 
-## Read-Only Built-In Spec Inspection
+## Read-Only v0.2 Spec Inspection
 
-The v0.2 spec inspection commands expose built-in declarative model profiles, tool policies, memory scopes, agents, and workbenches. They inspect the in-memory built-in registry only.
+The v0.2 spec commands expose declarative model profiles, tool policies, memory scopes, agents, and workbenches. They are operator inspection surfaces only. They do not register, persist, activate, execute, schedule, route, or preflight agents.
 
 ```bash
 harness specs
@@ -183,7 +183,198 @@ harness specs workbench coding
 harness specs workbench coding --output json
 ```
 
-These commands do not load custom spec files, read or write `.harness/`, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.
+Built-in inspection reads only the in-memory built-in registry. JSON output is schema-versioned:
+
+- `harness.spec_registry/v1`
+- `harness.agent_spec/v1`
+- `harness.workbench_spec/v1`
+
+## Read-Only Custom Spec Validation
+
+Custom bundles must be explicit JSON or YAML files with a top-level schema version:
+
+```yaml
+schema_version: harness.spec_bundle/v1
+```
+
+Validate a custom bundle:
+
+```bash
+harness specs validate path/to/specs.json
+harness specs validate path/to/specs.json --output json
+harness specs validate path/to/specs.yaml --output json
+```
+
+The `validate` command reads only the explicit file path provided by the operator and validates it against the declarative spec registry schema. It supports `.json`, `.yaml`, and `.yml` only.
+
+Validation failures are returned as stable JSON when `--output json` is used:
+
+```json
+{
+  "schema_version": "harness.spec_validation/v1",
+  "ok": false,
+  "path": "/absolute/path/to/specs.json",
+  "errors": [
+    "Spec bundle missing schema_version."
+  ]
+}
+```
+
+Unsupported schema versions are also rejected safely:
+
+```json
+{
+  "schema_version": "harness.spec_validation/v1",
+  "ok": false,
+  "path": "/absolute/path/to/specs.json",
+  "errors": [
+    "Unsupported spec bundle schema_version: harness.spec_bundle/v0"
+  ]
+}
+```
+
+Custom bundle paths are guarded before file contents are read. Paths under or matching `.harness/`, `.git/`, `.env*`, `*.pem`, `*.key`, `*.sqlite`, and `secrets/` are rejected.
+
+## Normalized Spec Export
+
+Export the built-in registry or an explicit custom bundle in a stable JSON shape:
+
+```bash
+harness specs export --source builtin --output json
+harness specs export --source path/to/specs.yaml --output json
+```
+
+The JSON wrapper is `harness.spec_export/v1`:
+
+```json
+{
+  "schema_version": "harness.spec_export/v1",
+  "source": {
+    "kind": "builtin",
+    "path": null
+  },
+  "registry": {
+    "agents": {},
+    "memory_scopes": {},
+    "model_profiles": {},
+    "tool_policies": {},
+    "workbenches": {}
+  }
+}
+```
+
+For custom bundles, `source.kind` is `custom` and `source.path` is the absolute explicit path.
+
+## Registry Diff
+
+Compare the built-in registry with an explicit custom bundle:
+
+```bash
+harness specs diff --source path/to/specs.yaml --output json
+```
+
+The JSON wrapper is `harness.spec_diff/v1`. Each registry section reports deterministic `added`, `removed`, `changed`, and `unchanged` id lists:
+
+```json
+{
+  "schema_version": "harness.spec_diff/v1",
+  "source": {
+    "base": {
+      "kind": "builtin",
+      "path": null
+    },
+    "compare": {
+      "kind": "custom",
+      "path": "/absolute/path/to/specs.yaml"
+    }
+  },
+  "diff": {
+    "agents": {
+      "added": [],
+      "removed": [],
+      "changed": [],
+      "unchanged": []
+    }
+  }
+}
+```
+
+Diff is structural and declarative. It does not explain semantic impact or activate custom specs.
+
+## Effective Policy Preview
+
+Preview resolved policy relationships for one agent or one workbench:
+
+```bash
+harness specs preview agent repo_inspector --output json
+harness specs preview workbench coding --output json
+harness specs preview agent repo_inspector --source path/to/specs.yaml --output json
+harness specs preview workbench coding --source path/to/specs.yaml --output json
+```
+
+The JSON wrapper is `harness.spec_effective_preview/v1`. Agent previews include the agent declaration plus resolved model profile, tool policy, memory scope, and parent id. Workbench previews include the workbench declaration, default model profile, allowed agents with resolved references, forbidden actions, and workbench-local declarative policy maps.
+
+Effective preview is not runtime permission enforcement. It does not execute agents, check backend availability, route work, create tasks, or persist custom specs.
+
+## v0.2 Specs Safety Boundary
+
+All `harness specs ...` commands are read-only inspection commands. They do not auto-discover spec files, read or write `.harness/`, read project config, read SQLite, inspect environment variables, read backend settings, read secrets, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.
+
+## Manual Task Queue
+
+The v0.3 task queue stores operator-created task records in the initialized project database at `.harness/harness.sqlite`. It is a manual queue only: tasks can be created, listed, inspected, moved through statuses, and selected with `run-next`, but no task command executes agents, calls a backend, runs Docker, starts a scheduler, or creates background work.
+
+Initialize the project before using the queue:
+
+```bash
+harness init --project .
+```
+
+Create and inspect tasks:
+
+```bash
+harness tasks add --title "Inspect repository" --agent repo_inspector --workbench coding --project . --output json
+harness tasks list --project . --output json
+harness tasks inspect task_abc123def456 --project . --output json
+harness tasks status task_abc123def456 completed --project . --output json
+```
+
+Task commands use stable JSON wrappers:
+
+- `harness.task/v1` for add, inspect, and status updates.
+- `harness.tasks/v1` for list output.
+- `harness.task_run_next/v1` for manual next-task selection.
+
+Task records may store declarative built-in registry ids:
+
+- `workbench_id`, from `--workbench`.
+- `agent_id`, from `--agent`.
+- `spec_source_kind: builtin` when registry ids are attached.
+
+These ids are metadata only in v0.3. They do not route work or imply backend execution.
+
+Select the next runnable task manually:
+
+```bash
+harness tasks run-next --project . --output json
+```
+
+`run-next` selects the highest-priority, oldest queued task whose dependencies are complete, marks it `running`, and returns it. If no task is runnable, it returns `ok: true` with `selected_task: null`. It does not create a run record, create run artifacts, call a backend, execute tools, or mutate repository files outside the harness SQLite database.
+
+Task statuses are:
+
+```text
+queued
+blocked
+running
+completed
+failed
+canceled
+```
+
+## v0.3 Task Queue Safety Boundary
+
+Task queue commands require initialized local project state and may read or write `.harness/harness.sqlite`. They do not read environment variables, backend settings, secrets, `.env*`, `*.pem`, `*.key`, `*.sqlite` outside the harness database, or `secrets/`. They do not add hosted fallback, paid fallback, OpenAI API usage, browser/email/calendar automation, broker actions, trading actions, external message sends, application submission, daemon behavior, scheduling, or autonomous background work.
 
 ## Model-Visible Docker `run_tests` For `simple_code_edit`
 

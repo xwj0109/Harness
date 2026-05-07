@@ -46,3 +46,21 @@ CREATE TABLE IF NOT EXISTS backend_snapshots (
   created_at TEXT NOT NULL,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
+
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  description TEXT NOT NULL,
+  status TEXT NOT NULL,
+  project_root TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  workbench_id TEXT,
+  agent_id TEXT,
+  spec_source_kind TEXT,
+  spec_source_path TEXT,
+  depends_on_json TEXT NOT NULL,
+  run_id TEXT,
+  metadata_json TEXT NOT NULL
+);

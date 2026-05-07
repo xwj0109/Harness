@@ -5,9 +5,11 @@ from harness.registry import SpecRegistry, builtin_spec_registry
 from harness.specs import (
     AgentKind,
     AgentSpec,
+    HARD_FORBIDDEN_PATHS,
     MemoryScope,
     ModelProfile,
     ModelProfileKind,
+    REQUIRED_WORKBENCH_FORBIDDEN_ACTIONS,
     ToolPermission,
     ToolPolicy,
     WorkbenchSpec,
@@ -42,18 +44,19 @@ def test_builtin_workbench_references_resolve() -> None:
         assert workbench.default_model_profile in registry.model_profiles
         for agent_id in workbench.allowed_agents:
             assert agent_id in registry.agents
+        assert REQUIRED_WORKBENCH_FORBIDDEN_ACTIONS[workbench.id] <= set(workbench.forbidden_actions)
 
 
 def test_builtin_registry_preserves_safety_defaults() -> None:
     registry = builtin_spec_registry()
 
     for policy in registry.tool_policies.values():
-        assert policy.network in {ToolPermission.FORBIDDEN, ToolPermission.APPROVAL_REQUIRED}
+        assert policy.network == ToolPermission.FORBIDDEN
+        assert policy.hosted_boundary != ToolPermission.ALLOWED
         assert policy.active_repo_write != ToolPermission.ALLOWED
+    assert registry.tool_policies["read_only"].active_repo_write == ToolPermission.FORBIDDEN
     for scope in registry.memory_scopes.values():
-        assert {".harness/", ".git/", ".env*", "*.pem", "*.key", "*.sqlite", "secrets/"} <= set(
-            scope.forbidden_paths
-        )
+        assert HARD_FORBIDDEN_PATHS <= set(scope.forbidden_paths)
 
 
 def test_builtin_lookup_helpers_return_specs() -> None:
@@ -106,6 +109,7 @@ def test_registry_rejects_workbench_missing_allowed_agent() -> None:
                     description="Coding workbench.",
                     allowed_agents=["missing_agent"],
                     default_model_profile="local_reasoning",
+                    forbidden_actions=["paid_api_fallback", "hosted_fallback"],
                 )
             },
         )
@@ -135,3 +139,57 @@ def test_registry_rejects_agent_missing_parent() -> None:
                 )
             },
         )
+
+
+def test_registry_rejects_model_profile_mapping_key_mismatch() -> None:
+    with pytest.raises(ValidationError, match="model_profile mapping key must match contained id"):
+        SpecRegistry(
+            model_profiles={
+                "local": ModelProfile(
+                    id="local_reasoning",
+                    kind=ModelProfileKind.LOCAL,
+                    backend="local_openai_compatible",
+                )
+            }
+        )
+
+
+def test_registry_rejects_memory_scope_mapping_key_mismatch() -> None:
+    with pytest.raises(ValidationError, match="memory_scope mapping key must match contained id"):
+        SpecRegistry(memory_scopes={"project_scope": MemoryScope(id="project")})
+
+
+def test_registry_rejects_agent_mapping_key_mismatch() -> None:
+    with pytest.raises(ValidationError, match="agent mapping key must match contained id"):
+        SpecRegistry(
+            agents={
+                "inspector": AgentSpec(
+                    id="repo_inspector",
+                    kind=AgentKind.SPECIALIST,
+                    role="Inspect repositories.",
+                    model_profile="local_reasoning",
+                    tool_policy="read_only",
+                    memory_scope="project",
+                )
+            }
+        )
+
+
+def test_registry_rejects_workbench_mapping_key_mismatch() -> None:
+    with pytest.raises(ValidationError, match="workbench mapping key must match contained id"):
+        SpecRegistry(
+            workbenches={
+                "code": WorkbenchSpec(
+                    id="coding",
+                    description="Coding workbench.",
+                    allowed_agents=[],
+                    default_model_profile="local_reasoning",
+                    forbidden_actions=["paid_api_fallback", "hosted_fallback"],
+                )
+            }
+        )
+
+
+def test_registry_rejects_empty_tool_policy_mapping_key() -> None:
+    with pytest.raises(ValidationError, match="Tool policy id must be non-empty"):
+        SpecRegistry(tool_policies={"": ToolPolicy()})

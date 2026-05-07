@@ -26,10 +26,21 @@ from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecis
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
+from harness.models import TaskStatus
 from harness.paths import resolve_project_root
 from harness.registry import builtin_spec_registry
 from harness.runner import ReadOnlyRepoSummaryRunner
 from harness.sandbox import CommandValidationError, DockerImageManager
+from harness.spec_loader import (
+    SpecBundleError,
+    diff_builtin_to_custom_spec_registry,
+    effective_policy_preview,
+    export_builtin_spec_registry,
+    export_custom_spec_registry,
+    load_spec_registry,
+    resolve_spec_bundle_path,
+    validate_spec_bundle,
+)
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 
 app = typer.Typer(help="Local-first agent harness.")
@@ -39,14 +50,19 @@ approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invo
 tests_app = typer.Typer(help="Docker-sandboxed test execution.")
 tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
 specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_without_command=True)
+specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previews.")
+tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
+app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
+specs_app.add_typer(specs_preview_app, name="preview")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
+TaskStatusArg = Annotated[TaskStatus, typer.Argument(help="Task status.")]
 
 
 class OutputFormat(str, Enum):
@@ -55,6 +71,7 @@ class OutputFormat(str, Enum):
 
 
 OutputOption = Annotated[OutputFormat, typer.Option("--output", help="Output format.")]
+SpecSourceOption = Annotated[str, typer.Option("--source", help="Spec source: builtin or explicit bundle path.")]
 
 GITIGNORE_SECTION = """# Harness local artifacts
 .harness/runs/
@@ -154,6 +171,118 @@ def doctor(project: ProjectOption = Path("."), output: OutputOption = OutputForm
         raise typer.Exit(code=1)
 
 
+@tasks_app.command("add")
+def tasks_add(
+    title: Annotated[str, typer.Option("--title", help="Task title.")],
+    description: Annotated[str, typer.Option("--description", help="Task description.")] = "",
+    workbench: Annotated[str | None, typer.Option("--workbench", help="Built-in workbench id.")] = None,
+    agent: Annotated[str | None, typer.Option("--agent", help="Built-in agent id.")] = None,
+    priority: Annotated[int, typer.Option("--priority", help="Higher priority tasks run first.")] = 0,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        _validate_task_spec_refs(workbench, agent)
+        task = SQLiteStore(project_root).create_task(
+            title=title,
+            description=description,
+            priority=priority,
+            workbench_id=workbench,
+            agent_id=agent,
+            spec_source_kind="builtin" if (workbench or agent) else None,
+            metadata={},
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.task/v1", "ok": True, "task": task.model_dump(mode="json")})
+        return
+    typer.echo(f"Created task {task.id}")
+
+
+@tasks_app.command("list")
+def tasks_list(
+    status: Annotated[TaskStatus | None, typer.Option("--status", help="Filter by task status.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    tasks = SQLiteStore(project_root).list_tasks(status.value if status is not None else None)
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.tasks/v1",
+                "ok": True,
+                "tasks": [task.model_dump(mode="json") for task in tasks],
+            }
+        )
+        return
+    if not tasks:
+        typer.echo("No tasks found.")
+        return
+    for task in tasks:
+        typer.echo(f"{task.id}\t{task.status.value}\t{task.priority}\t{task.title}")
+
+
+@tasks_app.command("inspect")
+def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        task = SQLiteStore(project_root).get_task(task_id)
+    except KeyError as exc:
+        _emit_task_error("harness.task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.task/v1", "ok": True, "task": task.model_dump(mode="json")})
+        return
+    _print_task(task)
+
+
+@tasks_app.command("status")
+def tasks_status(
+    task_id: str,
+    status: TaskStatusArg,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        task = SQLiteStore(project_root).update_task_status(task_id, status)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.task/v1", "ok": True, "task": task.model_dump(mode="json")})
+        return
+    typer.echo(f"Task {task.id}: {task.status.value}")
+
+
+@tasks_app.command("run-next")
+def tasks_run_next(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    task = SQLiteStore(project_root).select_next_task()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.task_run_next/v1",
+                "ok": True,
+                "selected_task": task.model_dump(mode="json") if task is not None else None,
+            }
+        )
+        return
+    if task is None:
+        typer.echo("No runnable queued task.")
+    else:
+        typer.echo(f"Selected task {task.id}")
+
+
 @specs_app.callback()
 def specs_callback(ctx: typer.Context, output: OutputOption = OutputFormat.TEXT) -> None:
     if ctx.invoked_subcommand is not None:
@@ -208,6 +337,169 @@ def specs_workbench(workbench_id: str, output: OutputOption = OutputFormat.TEXT)
         )
         return
     _print_workbench_spec(workbench)
+
+
+@specs_app.command("validate")
+def specs_validate(path: Path, output: OutputOption = OutputFormat.TEXT) -> None:
+    result = validate_spec_bundle(path)
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+    else:
+        if result["ok"]:
+            typer.echo(f"Spec bundle valid: {result['path']}")
+        else:
+            typer.echo(f"Spec bundle invalid: {result['path']}")
+            for error in result["errors"]:
+                typer.echo(f"  - {error}")
+    if not result["ok"]:
+        raise typer.Exit(code=1)
+
+
+@specs_app.command("export")
+def specs_export(
+    source: Annotated[str, typer.Option("--source", help="Spec source: builtin or explicit bundle path.")],
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    try:
+        if source == "builtin":
+            result = export_builtin_spec_registry(builtin_spec_registry())
+        else:
+            result = export_custom_spec_registry(Path(source))
+    except SpecBundleError as exc:
+        if output == OutputFormat.JSON:
+            _emit_json(
+                {
+                    "schema_version": "harness.spec_export/v1",
+                    "ok": False,
+                    "source": {"kind": "custom", "path": str(Path(source).expanduser().resolve())},
+                    "errors": [str(exc)],
+                }
+            )
+        else:
+            typer.echo(f"Spec export invalid: {Path(source).expanduser().resolve()}")
+            typer.echo(f"  - {exc}")
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo(f"Spec export: {result['source']['kind']}")
+    if result["source"]["path"] is not None:
+        typer.echo(f"Path: {result['source']['path']}")
+    typer.echo(
+        "Sections: "
+        + ", ".join(
+            f"{section}={len(values)}"
+            for section, values in result["registry"].items()
+        )
+    )
+
+
+@specs_app.command("diff")
+def specs_diff(
+    source: Annotated[
+        str,
+        typer.Option("--source", help="Explicit custom bundle path to compare with built-in specs."),
+    ],
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    try:
+        result = diff_builtin_to_custom_spec_registry(builtin_spec_registry(), Path(source))
+    except SpecBundleError as exc:
+        if output == OutputFormat.JSON:
+            _emit_json(
+                {
+                    "schema_version": "harness.spec_diff/v1",
+                    "ok": False,
+                    "source": {
+                        "base": {"kind": "builtin", "path": None},
+                        "compare": {"kind": "custom", "path": str(Path(source).expanduser().resolve())},
+                    },
+                    "errors": [str(exc)],
+                }
+            )
+        else:
+            typer.echo(f"Spec diff invalid: {Path(source).expanduser().resolve()}")
+            typer.echo(f"  - {exc}")
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo("Spec diff: builtin -> custom")
+    typer.echo(f"Path: {result['source']['compare']['path']}")
+    for section, section_diff in result["diff"].items():
+        typer.echo(
+            f"{section}: "
+            f"added={len(section_diff['added'])}, "
+            f"removed={len(section_diff['removed'])}, "
+            f"changed={len(section_diff['changed'])}, "
+            f"unchanged={len(section_diff['unchanged'])}"
+        )
+
+
+@specs_preview_app.command("agent")
+def specs_preview_agent(
+    agent_id: str,
+    source: SpecSourceOption = "builtin",
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_effective_preview(target_kind="agent", target_id=agent_id, source=source, output=output)
+
+
+@specs_preview_app.command("workbench")
+def specs_preview_workbench(
+    workbench_id: str,
+    source: SpecSourceOption = "builtin",
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_effective_preview(target_kind="workbench", target_id=workbench_id, source=source, output=output)
+
+
+def _emit_effective_preview(*, target_kind: str, target_id: str, source: str, output: OutputFormat) -> None:
+    try:
+        registry, source_info = _load_specs_preview_source(source)
+        result = effective_policy_preview(
+            registry,
+            target_kind=target_kind,
+            target_id=target_id,
+            source_kind=source_info["kind"],
+            source_path=Path(source_info["path"]) if source_info["path"] is not None else None,
+        )
+    except (KeyError, SpecBundleError) as exc:
+        source_info = _specs_preview_error_source(source)
+        if output == OutputFormat.JSON:
+            _emit_json(
+                {
+                    "schema_version": "harness.spec_effective_preview/v1",
+                    "ok": False,
+                    "source": source_info,
+                    "target": {"kind": target_kind, "id": target_id},
+                    "errors": [str(exc).strip("'")],
+                }
+            )
+        else:
+            typer.echo(f"Spec preview invalid: {target_kind} {target_id}")
+            typer.echo(f"  - {str(exc).strip("'")}")
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo(f"Spec preview: {target_kind} {target_id}")
+    typer.echo(f"Source: {result['source']['kind']}")
+    if result["source"]["path"] is not None:
+        typer.echo(f"Path: {result['source']['path']}")
+
+
+def _load_specs_preview_source(source: str):
+    if source == "builtin":
+        return builtin_spec_registry(), {"kind": "builtin", "path": None}
+    spec_path = resolve_spec_bundle_path(Path(source))
+    return load_spec_registry(spec_path), {"kind": "custom", "path": str(spec_path)}
+
+
+def _specs_preview_error_source(source: str) -> dict:
+    if source == "builtin":
+        return {"kind": "builtin", "path": None}
+    return {"kind": "custom", "path": str(Path(source).expanduser().resolve())}
 
 
 @backends_app.callback()
@@ -662,6 +954,32 @@ def _print_workbench_spec(workbench) -> None:
         f"{', '.join(f'{key}={value.value}' for key, value in workbench.approval_policy.items()) if workbench.approval_policy else 'none'}"
     )
     typer.echo(f"Forbidden actions: {', '.join(workbench.forbidden_actions) if workbench.forbidden_actions else 'none'}")
+
+
+def _print_task(task) -> None:
+    typer.echo(f"Task: {task.id}")
+    typer.echo(f"Title: {task.title}")
+    typer.echo(f"Description: {task.description}")
+    typer.echo(f"Status: {task.status.value}")
+    typer.echo(f"Priority: {task.priority}")
+    typer.echo(f"Workbench: {task.workbench_id or 'none'}")
+    typer.echo(f"Agent: {task.agent_id or 'none'}")
+    typer.echo(f"Run: {task.run_id or 'none'}")
+
+
+def _validate_task_spec_refs(workbench_id: str | None, agent_id: str | None) -> None:
+    registry = builtin_spec_registry()
+    if workbench_id is not None:
+        registry.get_workbench(workbench_id)
+    if agent_id is not None:
+        registry.get_agent(agent_id)
+
+
+def _emit_task_error(schema_version: str, message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Task command failed: {message}")
 
 
 def _emit_json(payload) -> None:

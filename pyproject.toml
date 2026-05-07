@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-harness"
-version = "0.1.0"
-description = "Local-first agent harness Phase 1A foundation"
+version = "0.2.0"
+description = "Local-first agent harness with declarative spec inspection"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

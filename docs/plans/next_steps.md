@@ -4,7 +4,9 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-The project has entered v0.2 schema and registry work. The current slice is read-only spec inspection for the built-in registry.
+v0.2.0 release hygiene is complete. The current slice is v0.3 manual task queue hardening and release hygiene.
+
+The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -20,27 +22,39 @@ The first v0.2 schema and registry foundations are in place:
 - Built-in profiles: `local_reasoning`, `codex_supervised`.
 - Built-in agents: `repo_inspector`, `code_editor`, `test_runner`, `quant_researcher`, `job_researcher`.
 - Built-in workbenches: `coding`, `quant`, `personal`.
+- Read-only custom bundle validation with required `schema_version: harness.spec_bundle/v1`.
+- Centralized explicit-path custom bundle guard.
+- Registry mapping key and contained id consistency checks.
+- Memory-scope hard-forbidden path invariants.
+- Model-profile backend compatibility invariants.
+- Tool-policy safety invariants.
+- Workbench forbidden-action invariants.
+- Normalized spec export for built-in and custom registries.
+- Registry diff for built-in versus custom registries.
+- Effective policy preview for built-in and custom registries.
+- Operator documentation and smoke checklist updates.
+- Full regression suite pass after documentation updates.
+- Version bump to `0.2.0`.
+- Final restricted-path worktree review.
+- Manual task queue persistence and CLI.
 
 These components are declarative and read-only. They do not load user files, write `.harness/`, create tasks, execute agents, preflight backends, or schedule work.
 
-## Immediate v0.2 Slice
+## Immediate v0.3 Slice
 
-Add operator-facing inspection commands for the built-in registry:
+Harden and document the manual task queue:
 
-```bash
-harness specs
-harness specs --output json
-harness specs agent <agent_id>
-harness specs agent <agent_id> --output json
-harness specs workbench <workbench_id>
-harness specs workbench <workbench_id> --output json
-```
+Implementation queue:
 
-The commands should preserve the same safety boundary: inspect built-in specs only, do not load custom files, do not read or write `.harness/`, and do not execute or preflight anything.
+1. Keep task records persistent and manually controlled.
+2. Preserve `run-next` as selection plus status transition only.
+3. Add no daemon, scheduler, autonomous background work, or backend execution.
+4. Run full regression tests after any queue changes.
+5. Prepare v0.3 release docs and version checklist after the queue is stable.
 
 ## Later v0.2+ Work
 
-After read-only built-in spec inspection is stable, the next target should be a read-only custom spec-file validator/loader with no execution or persistence. Defer runtime routing, effective permission inheritance, task queues, schedulers, daemons, and autonomous behavior until the schema and validation surfaces are stable.
+After v0.3 planning is stable, implement the manual queue in small read/write slices. Defer daemon scheduling, autonomous background behavior, broker actions, and external-message automation until a later milestone.
 
 ## Working Defaults
 

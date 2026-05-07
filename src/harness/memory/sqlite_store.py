@@ -19,6 +19,8 @@ from harness.models import (
     ManifestArtifact,
     RunManifest,
     RunRecord,
+    TaskRecord,
+    TaskStatus,
     run_mode_for_task_type,
 )
 from harness.security import sanitize_for_logging
@@ -136,6 +138,107 @@ class SQLiteStore:
                 (status, now_iso(), run_id),
             )
         self.write_run_manifest(run_id)
+
+    def create_task(
+        self,
+        title: str,
+        description: str = "",
+        priority: int = 0,
+        workbench_id: str | None = None,
+        agent_id: str | None = None,
+        spec_source_kind: str | None = None,
+        spec_source_path: Path | None = None,
+        depends_on: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> TaskRecord:
+        task_id = f"task_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        depends_on = depends_on or []
+        metadata = metadata or {}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                  id, title, description, status, project_root, created_at, updated_at,
+                  priority, workbench_id, agent_id, spec_source_kind, spec_source_path,
+                  depends_on_json, run_id, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    title,
+                    description,
+                    TaskStatus.QUEUED.value,
+                    str(self.project_root),
+                    timestamp,
+                    timestamp,
+                    priority,
+                    workbench_id,
+                    agent_id,
+                    spec_source_kind,
+                    str(spec_source_path) if spec_source_path is not None else None,
+                    json.dumps(depends_on, sort_keys=True),
+                    None,
+                    json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+                ),
+            )
+        return self.get_task(task_id)
+
+    def list_tasks(self, status: str | None = None) -> list[TaskRecord]:
+        with self.connect() as conn:
+            if status is None:
+                rows = conn.execute(
+                    "SELECT * FROM tasks ORDER BY priority DESC, created_at ASC"
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM tasks WHERE status = ? ORDER BY priority DESC, created_at ASC",
+                    (TaskStatus(status).value,),
+                ).fetchall()
+        return [self._row_to_task(row) for row in rows]
+
+    def get_task(self, task_id: str) -> TaskRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Task not found: {task_id}")
+        return self._row_to_task(row)
+
+    def update_task_status(
+        self,
+        task_id: str,
+        status: str | TaskStatus,
+        *,
+        run_id: str | None = None,
+    ) -> TaskRecord:
+        next_status = TaskStatus(status)
+        if run_id is not None:
+            self.get_run(run_id)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            result = conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ?, run_id = COALESCE(?, run_id) WHERE id = ?",
+                (next_status.value, timestamp, run_id, task_id),
+            )
+        if result.rowcount == 0:
+            raise KeyError(f"Task not found: {task_id}")
+        return self.get_task(task_id)
+
+    def select_next_task(self) -> TaskRecord | None:
+        for task in self.list_tasks(status=TaskStatus.QUEUED.value):
+            if self._task_dependencies_completed(task):
+                return self.update_task_status(task.id, TaskStatus.RUNNING)
+        return None
+
+    def _task_dependencies_completed(self, task: TaskRecord) -> bool:
+        for dependency_id in task.depends_on:
+            try:
+                dependency = self.get_task(dependency_id)
+            except KeyError:
+                return False
+            if dependency.status != TaskStatus.COMPLETED:
+                return False
+        return True
 
     def append_event(
         self,
@@ -367,4 +470,23 @@ class SQLiteStore:
             data_boundary=row["data_boundary"],
             allow_network=bool(row["allow_network"]) if row["allow_network"] is not None else None,
             approval_id=row["approval_id"] if "approval_id" in row.keys() else None,
+        )
+
+    def _row_to_task(self, row: sqlite3.Row) -> TaskRecord:
+        return TaskRecord(
+            id=row["id"],
+            title=row["title"],
+            description=row["description"],
+            status=TaskStatus(row["status"]),
+            project_root=Path(row["project_root"]),
+            created_at=parse_dt(row["created_at"]),
+            updated_at=parse_dt(row["updated_at"]),
+            priority=row["priority"],
+            workbench_id=row["workbench_id"],
+            agent_id=row["agent_id"],
+            spec_source_kind=row["spec_source_kind"],
+            spec_source_path=Path(row["spec_source_path"]) if row["spec_source_path"] else None,
+            depends_on=json.loads(row["depends_on_json"]),
+            run_id=row["run_id"],
+            metadata=json.loads(row["metadata_json"]),
         )

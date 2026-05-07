@@ -15,6 +15,91 @@ git log --oneline --decorate -5
 pytest -q
 ```
 
+## Verify Read-Only v0.2 Specs Commands
+
+Built-in inspection:
+
+```bash
+harness specs --output json
+harness specs agent repo_inspector --output json
+harness specs workbench coding --output json
+```
+
+Create a temporary valid custom bundle outside `.harness/`:
+
+```bash
+cat > /tmp/harness-v0-2-specs.yaml <<'EOF'
+schema_version: harness.spec_bundle/v1
+model_profiles:
+  local_reasoning:
+    id: local_reasoning
+    kind: local
+    backend: local_openai_compatible
+tool_policies:
+  read_only:
+    tools:
+      repo_read: allowed
+    network: forbidden
+    active_repo_write: forbidden
+    hosted_boundary: approval_required
+memory_scopes:
+  project:
+    id: project
+agents:
+  repo_inspector:
+    id: repo_inspector
+    kind: specialist
+    role: Inspect repository evidence.
+    model_profile: local_reasoning
+    tool_policy: read_only
+    memory_scope: project
+workbenches:
+  coding:
+    id: coding
+    description: Coding workbench.
+    allowed_agents:
+      - repo_inspector
+    default_model_profile: local_reasoning
+    forbidden_actions:
+      - paid_api_fallback
+      - hosted_fallback
+EOF
+```
+
+Validate, export, diff, and preview the explicit bundle:
+
+```bash
+harness specs validate /tmp/harness-v0-2-specs.yaml --output json
+harness specs export --source /tmp/harness-v0-2-specs.yaml --output json
+harness specs diff --source /tmp/harness-v0-2-specs.yaml --output json
+harness specs preview agent repo_inspector --source /tmp/harness-v0-2-specs.yaml --output json
+harness specs preview workbench coding --source /tmp/harness-v0-2-specs.yaml --output json
+```
+
+Expected safety properties:
+
+- Specs commands do not execute agents or preflight backends.
+- Specs commands do not read or write `.harness/`.
+- Custom bundles are explicit-path only and are not persisted.
+- JSON output uses stable `schema_version` wrappers.
+
+## Verify Manual v0.3 Task Queue
+
+The task queue requires initialized project state and writes only to `.harness/harness.sqlite`.
+
+```bash
+harness init --project .
+harness tasks add --title "Inspect repository" --agent repo_inspector --workbench coding --project . --output json
+harness tasks list --project . --output json
+harness tasks run-next --project . --output json
+```
+
+Expected safety properties:
+
+- `run-next` selects and marks one task `running`.
+- `run-next` does not create a run record or run artifact directory.
+- Task commands do not execute agents, preflight backends, run Docker, start daemons, or schedule work.
+
 ## Build Local Docker Test Image
 
 ```bash

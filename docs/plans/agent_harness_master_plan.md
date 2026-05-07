@@ -2,6 +2,8 @@
 
 Imported from `/Users/oscarxue/Downloads/agent_harness_master_plan.md` as the repo-local planning reference. This roadmap snapshot preserves strategic direction and safety boundaries, but it is not blanket implementation approval for every listed item.
 
+This version incorporates the useful parts of the edited plan at `/Users/oscarxue/Documents/plan_edit.md` and the research report at `/Users/oscarxue/Downloads/deep-research-report(1).md`: explicit control-plane/execution-plane separation, durable task state, typed tool contracts, idempotency, traceability, sandbox tiers, eval gates, and the rule that external interoperability protocols remain adapters rather than the harness control plane.
+
 ## 1. Product Definition
 
 `agent-harness` is a local-first supervised agent runtime for controlled work on local projects. It records runs, artifacts, approvals, backend metadata, data-boundary decisions, isolated edits, test results, and safety events.
@@ -12,7 +14,9 @@ The central rule is that agents may propose, plan, delegate, critique, edit in i
 
 ## 2. Current State
 
-The current repository is best described as a v0.1 safety kernel. It already provides the core local control plane and safety boundaries needed for future autonomous workflows.
+The current repository has moved beyond the original v0.1 snapshot. v0.1 hardening is complete, v0.2 declarative specs are in progress, and the project is entering v0.3 manual task-queue work.
+
+The important conclusion from the edited plan and research report is that the project should not rush from a simple queue into daemon autonomy. v0.3 must become the durable control-plane substrate for future daemon execution, workbenches, bounded sessions, and long-running supervised workflows.
 
 Implemented capabilities include:
 
@@ -34,8 +38,13 @@ Implemented capabilities include:
 - Secret-path blocking.
 - Secret-scanner primitives.
 - Broad regression tests covering config, security paths, approvals, protocols, backends, isolation, patching, Docker sandboxing, and CLI smoke behavior.
+- Run modes, backend descriptors, run manifests, stable JSON inspection output, `harness doctor`, and golden v0.1 evidence tests.
+- Declarative v0.2-style registry/spec primitives for workbenches, agents, model profiles, tool policies, and memory scopes.
+- A manual persistent task queue with task creation, listing, inspection, status movement, and safe `run-next` selection that does not execute agents or create background work.
 
 This should not be treated as a throwaway prototype. It is the security and evidence substrate for the later autonomous system.
+
+Near-term planning implication: preserve the existing safety kernel, retrofit the remaining policy/evidence gaps, and harden task state before building the daemon.
 
 ## 3. Strategic Positioning
 
@@ -69,6 +78,8 @@ It is not yet:
 - A live trading system.
 - A system that should auto-send job applications or emails.
 - A system that should auto-place trades or broker orders.
+- A framework-driven swarm where agents negotiate permissions among themselves.
+- A system whose internal safety model is delegated to MCP, A2A, AGENTS.md, or any other external protocol.
 
 ## 4. Core Design Principles
 
@@ -88,22 +99,50 @@ It is not yet:
 
 8. **Autonomy is bounded.** A 24/7 daemon may run safe tasks automatically, but sensitive actions must pause at approval gates.
 
+9. **Control plane owns authority.** Policy, approvals, manifests, task state, artifact registration, and apply-back boundaries belong to the harness core. Execution runners, model routers, external agent backends, and protocol adapters operate under that authority.
+
+10. **Durability before autonomy.** Long-running workflows require explicit task attempts, leases, state transitions, checkpoints, idempotency keys, and replay policy before daemon execution is allowed.
+
+11. **Typed tools, not ambient power.** Every tool must have a typed capability descriptor that declares schemas, side effects, boundaries, allowed run modes, approval requirements, sandbox requirements, and replay/idempotency behavior.
+
+12. **Interop is adapter-only.** AGENTS.md may provide read-only repo context. MCP may later expose tools through the typed tool gateway. A2A may later model remote agents as external backends. None of these may grant permissions, bypass approvals, or become the internal control plane.
+
 ## 5. Target Architecture
 
 ```text
-agent-harness core
+agent-harness control plane
+  policy engine
+  approval service
   runs
   events
   artifacts
+  artifact registry
+  task/objective registry
+  manifest writer
   approvals
   backend descriptors
   model profiles
   tool policies
+  tool capability registry
   memory scopes
+  sandbox profile registry
+  JSON/JSONL API
+  observability exporter
+  compare/baseline engine
+
+agent-harness execution plane
+  manual scheduler
+  daemon scheduler
+  orchestrator runner
+  specialist agent runner
+  model router
+  typed tool gateway
   isolation manager
   Docker sandbox
+  sandbox runner
+  test runner
   secret scanner
-  JSON/JSONL protocol
+  patch/diff engine
 
 workbench layer
   quant workbench
@@ -125,27 +164,37 @@ orchestration layer
   plans
   tasks
   dependencies
+  task attempts
+  task leases
+  checkpoints
   delegation records
   review gates
   approval gates
-  swarm sessions
+  bounded sessions
 
 daemon layer
   local scheduler
   task queue runner
+  leases
   resource limits
   heartbeat events
   approval blocking
+  crash recovery
+  resumability
   artifact generation
 ```
+
+The control plane owns policy and evidence. The execution plane performs bounded actions under control-plane authority.
 
 ## 6. Version Roadmap
 
 ### v0.1 — Safety Kernel
 
-Current state. The focus is local project state, persistence, approvals, Codex supervision, isolated editing, patch apply-back, Docker tests, and safety primitives.
+Status: complete baseline; keep hardening as compatibility-preserving retrofits.
 
-Remaining v0.1 work:
+The focus is local project state, persistence, approvals, Codex supervision, isolated editing, patch apply-back, Docker tests, and safety primitives.
+
+Completed v0.1 hardening includes:
 
 - Add `RunMode` enum.
 - Add `BackendDescriptor` contract.
@@ -155,19 +204,31 @@ Remaining v0.1 work:
 - Add `harness doctor`.
 - Add golden end-to-end tests.
 
+Required v0.1-compatible retrofits before v0.3 hardens:
+
+- Add `EffectivePolicy` snapshots for runs, tasks, tools, agents, and backends.
+- Make artifact records immutable by contract with `schema_version`, `sha256`, `size_bytes`, `producer`, redaction state, and derived-artifact lineage.
+- Upgrade manifests to include `task_id`, `objective_id`, `trace_id`, effective-policy hash, backend descriptor hash, sandbox profile, artifact checksums, and validation results.
+- Add an observability spine with local JSONL events as source of truth and OpenTelemetry-compatible IDs/fields for later export.
+- Ensure redaction creates derived artifacts or blocks unsafe registration; it must not silently mutate evidence such as patch artifacts.
+
 ### v0.2 — Agent Specs and Model Profiles
 
-Introduce generic agent definitions and model routing without autonomy.
+Status: in progress. Introduce generic agent definitions and model routing without autonomy.
 
 Add:
 
-- `AgentSpec`.
+- `AgentNode`, replacing loose `AgentSpec` as the hierarchical agent model.
 - `WorkbenchSpec`.
 - `ModelProfile`.
 - `ToolPolicy`.
+- `ToolCapabilityDescriptor`.
 - `MemoryScope`.
 - Agent registry.
 - Built-in starter agents.
+- `harness agents explain <agent_id> --json`.
+- `harness workbenches explain <workbench_id> --json`.
+- AGENTS.md ingestion as read-only repo context.
 
 Starter agents:
 
@@ -177,22 +238,106 @@ Starter agents:
 - `quant_researcher`.
 - `job_researcher`.
 
+Rules:
+
+- Agent/workbench specs are declarative and do not execute work.
+- Effective-agent resolution must show inherited tools, model profile, memory scope, output contracts, and effective policy.
+- Model profiles must declare boundary, budget, fallback behavior, approval requirements, isolation requirements, timeout, and supported capabilities.
+- `fallback: none` means hard fail.
+- Fallback across local/hosted, offline/networked, free/paid, or read/write boundaries requires policy permission and approval.
+- AGENTS.md can provide instructions and context only. It cannot grant tools, authorize network, authorize Codex, authorize Docker, authorize active repo mutation, or override policy.
+- Memory scopes stay metadata-only until artifact-backed memory and redaction policy are stable.
+
 ### v0.3 — Task Queue and Manual Scheduler
 
-Add persistent tasks, dependencies, and manual task execution before a daemon.
+Status: current focus.
+
+Add persistent objectives, tasks, dependencies, task attempts, leases, deterministic state transitions, expected outputs, run linkage, and manual scheduling before a daemon.
+
+The task queue is not just a to-do list. It is the future daemon substrate.
 
 Commands:
 
 ```bash
+harness objectives add tasks/objective.md --workbench coding
+harness objectives list
+harness objectives inspect <objective_id>
 harness tasks add tasks/idea.md --agent quant_researcher
 harness tasks list
 harness tasks inspect <task_id>
 harness tasks run-next
+harness tasks run <task_id>
+harness tasks cancel <task_id>
+harness tasks retry <task_id>
+harness tasks graph <objective_id> --json
 ```
+
+Required task states:
+
+```text
+created
+ready
+blocked
+waiting_approval
+leased
+running
+succeeded
+failed
+cancelled
+skipped
+```
+
+Required v0.3 behavior:
+
+- A task cannot run until dependencies are satisfied.
+- Dependency cycles are rejected.
+- `run-next` selects only ready tasks whose policy allows execution or whose approvals already exist.
+- `run-next` creates a lease before execution work is added.
+- Every task attempt links to a run when execution exists.
+- Every task has an `idempotency_key`.
+- Required output contracts must be registered as artifacts before a task can succeed.
+- Invalid state transitions emit `task_transition_denied`.
+- Approval-required tasks pause instead of failing silently.
+- Duplicate task execution is prevented by leases and idempotency.
+
+Failure modes to test:
+
+- Dependency cycle.
+- Missing required artifact.
+- Task selected without policy resolution.
+- Task selected without required approval.
+- Duplicate `run-next`.
+- Retry after partial output.
+- Agent not registered.
+- Model profile unavailable.
+- Backend descriptor missing.
+- Task references forbidden tool.
+- Task asks for active repo write in plan mode.
+
+### v0.3.5 — Control-Plane Stabilization
+
+Add this milestone before v0.4. The daemon should not be built on a weak manual scheduler.
+
+Add:
+
+- `harness compare <run_a> <run_b>`.
+- `harness baseline set <run_id> --name local-green`.
+- `harness baseline compare <run_id> --baseline local-green`.
+- `harness evals run --suite safety-smoke`.
+- `harness traces export <run_id> --format otel-json`.
+- Policy regression suite.
+- Sandbox regression suite.
+- Task replay tests.
+
+Exit criteria:
+
+- Baseline compare detects changed policy, backend boundary, sandbox profile, artifact checksums, and test result.
+- Safety-smoke evals block release on safety regression.
+- Trace export links run, task, agent, backend, tool, sandbox, approval, and artifact spans.
 
 ### v0.4 — Local Daemon
 
-Add conservative local 24/7 operation.
+Add conservative local 24/7 operation. Implement the daemon as a scheduler over durable task state, not as an agent loop.
 
 Commands:
 
@@ -212,6 +357,8 @@ Initial daemon constraints:
 - Codex only through approval and isolation.
 - Pause on approval gates.
 - Write heartbeat events.
+- Acquire and renew leases.
+- Recover safely after process kill, backend timeout, Docker timeout, SQLite lock contention, expired approval, expired lease, or artifact-write crash.
 
 ### v0.5 — Quant Workbench
 
@@ -264,6 +411,8 @@ Hard boundary: drafts only. No automatic sending, submitting, uploading, or mess
 
 Introduce plans, task dependencies, review gates, and orchestrator-managed workflows.
 
+Multi-agent means artifact-producing task graph, not free-form group chat. Only add multi-agent workflows after v0.3/v0.4 durability is stable.
+
 Example quant workflow:
 
 ```text
@@ -279,11 +428,11 @@ objective: research futures curve carry signal
   -> human approval required for promotion/apply-back
 ```
 
-### v0.8 — Bounded Swarm Sessions
+### v0.8 — Bounded Sessions
 
-Introduce bounded multi-agent debate and parallel review sessions.
+Introduce bounded multi-agent debate and parallel review sessions. Internally prefer `BoundedSession` over `swarm` terminology because the important property is enforced limits and artifact output.
 
-Swarm sessions must have:
+Bounded sessions must have:
 
 - Moderator/orchestrator.
 - Fixed participants.
@@ -293,6 +442,35 @@ Swarm sessions must have:
 - Explicit output contracts.
 - Persisted artifacts.
 - No hidden recursive delegation.
+- Termination condition.
+- Artifact requirements.
+
+### v0.9 — Tool Adapter Layer
+
+Add external protocol adapters only after native policy, task, and tool contracts are stable.
+
+Adapter boundaries:
+
+- Native harness tools.
+- AGENTS.md read-only context adapter.
+- MCP read-only adapter.
+- MCP sandboxed adapter.
+- A2A remote-agent adapter.
+
+MCP rules:
+
+- MCP servers run sandboxed.
+- MCP tools receive least privilege.
+- MCP cannot grant harness permissions.
+- MCP descriptors are translated into `ToolCapabilityDescriptor`.
+- Networked MCP requires approval.
+
+A2A rules:
+
+- A2A is only for independently deployed remote agents.
+- A2A agents are treated as external backends.
+- A2A cannot receive repo data without data-boundary approval.
+- A2A outputs are artifacts requiring validation.
 
 ### v1.0 — Autonomous Supervised Agent Team
 
@@ -307,7 +485,7 @@ The system should support:
 - Objective/task queue.
 - Orchestrator agents.
 - Review agents.
-- Bounded swarm sessions.
+- Bounded sessions.
 - Approval gates.
 - Local artifact memory.
 - Safe Codex escalation where approved.
@@ -552,16 +730,16 @@ limits:
   require_human_final_approval: true
 ```
 
-## 11. Swarm Design
+## 11. Bounded Session Design
 
-Swarm behavior should be bounded, artifact-driven, and moderated by an orchestrator.
+Bounded session behavior should be artifact-driven and moderated by an orchestrator.
 
-A swarm session is not an infinite group chat. It is a controlled multi-agent work session with a fixed purpose.
+A bounded session is not an infinite group chat. It is a controlled multi-agent work session with a fixed purpose.
 
 Example:
 
 ```yaml
-id: quant_signal_review_swarm
+id: quant_signal_review_session
 workbench: quant
 
 participants:
@@ -588,7 +766,7 @@ approval_policy:
   broker_action: forbidden
 ```
 
-Swarm output must collapse into artifacts:
+Bounded session output must collapse into artifacts:
 
 - `consensus_summary.md`.
 - `disagreements.json`.
@@ -597,7 +775,7 @@ Swarm output must collapse into artifacts:
 
 ## 12. Core Models to Add
 
-### 12.1 Run and backend models
+### 12.1 Run, policy, artifact, and backend models
 
 ```python
 class RunMode(str, Enum):
@@ -623,6 +801,55 @@ class BackendDescriptor(BaseModel):
     requires_approval: list[str]
 ```
 
+```python
+class PolicyLevel(str, Enum):
+    FORBIDDEN = "forbidden"
+    APPROVAL_REQUIRED = "approval_required"
+    ALLOWED = "allowed"
+```
+
+```python
+class BoundaryKind(str, Enum):
+    LOCAL_ONLY = "local_only"
+    HOSTED_PROVIDER = "hosted_provider"
+    NETWORKED = "networked"
+    ACTIVE_REPO = "active_repo"
+    FILESYSTEM = "filesystem"
+    PERSONAL_DATA = "personal_data"
+    FINANCIAL_ACTION = "financial_action"
+    EXTERNAL_MESSAGE = "external_message"
+```
+
+```python
+class EffectivePolicy(BaseModel):
+    schema_version: str = "harness.effective_policy/v1"
+    subject_id: str
+    subject_kind: Literal["run", "task", "agent", "tool", "backend"]
+    resolved_at: datetime
+    levels: dict[str, PolicyLevel]
+    sources: list[PolicySource]
+    required_approvals: list[str]
+    forbidden_reasons: list[str] = []
+    monotonicity_checked: bool
+```
+
+```python
+class ArtifactRecord(BaseModel):
+    schema_version: str = "harness.artifact/v1"
+    artifact_id: str
+    run_id: str
+    task_id: str | None = None
+    kind: ArtifactKind
+    path: str
+    size_bytes: int
+    sha256: str
+    producer: str
+    created_at: datetime
+    content_type: str | None = None
+    redaction_state: Literal["raw", "redacted_copy", "blocked_secret"]
+    parent_artifact_ids: list[str] = []
+```
+
 ### 12.2 Workbench and agent models
 
 ```python
@@ -638,18 +865,58 @@ class WorkbenchSpec(BaseModel):
 
 ```python
 class AgentNode(BaseModel):
+    schema_version: str = "harness.agent_node/v1"
     id: str
     parent_id: str | None = None
     workbench_id: str
     kind: Literal["group", "agent", "specialist", "orchestrator", "reviewer"]
     role: str
+    instructions_ref: str | None = None
     model_profile: str | None = None
     memory_scope: str | None = None
-    tools: list[str] | None = None
-    permissions: dict[str, str] | None = None
-    approval_policy: dict[str, str] | None = None
-    output_contracts: list[str] | None = None
+    allowed_tools: list[str] | None = None
+    permissions: dict[str, PolicyLevel] | None = None
+    approval_policy: dict[str, PolicyLevel] | None = None
+    output_contracts: list[str] = []
+    limits: AgentLimits = AgentLimits()
     tags: list[str] = []
+```
+
+```python
+class ModelProfile(BaseModel):
+    schema_version: str = "harness.model_profile/v1"
+    id: str
+    backend_id: str
+    model: str
+    boundary: BoundaryKind
+    requires_approval: list[str] = []
+    requires_isolation: bool = False
+    network_allowed: bool = False
+    fallback: str | None = None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None = None
+    max_cost_usd: Decimal | None = None
+    timeout_seconds: int
+    supports_tools: bool
+    supports_json_output: bool
+    supports_streaming: bool
+    local_only: bool
+```
+
+```python
+class ToolCapabilityDescriptor(BaseModel):
+    schema_version: str = "harness.tool/v1"
+    id: str
+    description: str
+    input_schema_ref: str
+    output_schema_ref: str
+    side_effect_level: Literal["none", "artifact_write", "workspace_write", "active_repo_write", "external"]
+    boundaries: list[BoundaryKind]
+    allowed_modes: list[RunMode]
+    approval_required: list[str] = []
+    idempotency: Literal["pure", "idempotent", "non_idempotent"]
+    replay_policy: Literal["replay_from_record", "rerun_allowed", "rerun_forbidden"]
+    sandbox_required: bool
 ```
 
 ### 12.3 Objective, plan, and task models
@@ -676,16 +943,65 @@ class PlanSpec(BaseModel):
 ```
 
 ```python
+class TaskStatus(str, Enum):
+    CREATED = "created"
+    READY = "ready"
+    BLOCKED = "blocked"
+    WAITING_APPROVAL = "waiting_approval"
+    LEASED = "leased"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+```
+
+```python
 class TaskSpec(BaseModel):
+    schema_version: str = "harness.task/v1"
     id: str
     objective_id: str | None = None
     workbench_id: str
     agent_id: str
+    title: str
     instruction: str
     inputs: list[str] = []
     expected_outputs: list[str] = []
     mode: RunMode
-    status: str = "created"
+    status: TaskStatus
+    priority: int = 0
+    idempotency_key: str
+    max_attempts: int = 1
+    timeout_seconds: int | None = None
+    required_approvals: list[str] = []
+    created_at: datetime
+    updated_at: datetime
+```
+
+```python
+class TaskAttempt(BaseModel):
+    schema_version: str = "harness.task_attempt/v1"
+    id: str
+    task_id: str
+    run_id: str | None = None
+    attempt_number: int
+    status: TaskStatus
+    lease_id: str | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    failure_code: str | None = None
+    failure_message: str | None = None
+```
+
+```python
+class TaskLease(BaseModel):
+    schema_version: str = "harness.task_lease/v1"
+    lease_id: str
+    task_id: str
+    owner: str
+    acquired_at: datetime
+    expires_at: datetime
+    heartbeat_at: datetime | None = None
 ```
 
 ```python
@@ -798,14 +1114,17 @@ Rules:
 
 ## 15. Reproducibility Manifest
 
-Every run should write `manifest.json`.
+Every run should write `manifest.json`. The current `harness.manifest/v1` contract should be upgraded compatibly toward `harness.manifest/v1.1` before daemon work.
 
 Example:
 
 ```json
 {
-  "schema_version": "harness.manifest/v1",
+  "schema_version": "harness.manifest/v1.1",
   "run_id": "run_...",
+  "task_id": "task_...",
+  "objective_id": "obj_...",
+  "trace_id": "trace_...",
   "harness_version": "0.3.0",
   "repo": {
     "vcs": "git",
@@ -816,9 +1135,17 @@ Example:
   "task": {
     "type": "codex_code_edit",
     "mode": "edit-isolated",
-    "task_hash": "..."
+    "task_hash": "...",
+    "idempotency_key": "...",
+    "attempt": 1
+  },
+  "agent": {
+    "agent_id": "...",
+    "workbench_id": "...",
+    "effective_policy_sha256": "..."
   },
   "backend": {
+    "descriptor_sha256": "...",
     "name": "codex_cli",
     "kind": "external_agent",
     "data_boundary": "hosted_provider",
@@ -837,6 +1164,7 @@ Example:
   },
   "docker": {
     "used": true,
+    "profile": "strict",
     "image": "agent-harness-test:local",
     "image_digest": "...",
     "network": "none"
@@ -847,7 +1175,13 @@ Example:
       "path": "diff.patch",
       "sha256": "..."
     }
-  ]
+  ],
+  "checks": {
+    "path_policy": "passed",
+    "secret_scan": "passed",
+    "tests": "passed",
+    "policy_validation": "passed"
+  }
 }
 ```
 
@@ -985,88 +1319,104 @@ Acceptance criteria:
 
 ## 20. Immediate PR Sequence
 
-### PR 1 — RunMode and policy matrix
+The edited plan is worth adopting, but as a reordered implementation sequence rather than a wholesale rewrite. Since v0.1 hardening exists and v0.3 has started, the next PRs should retrofit missing control-plane contracts while continuing task-queue work.
 
-- Add `RunMode` enum.
-- Map task routes to allowed modes.
-- Map tools to allowed modes.
-- Add tests for forbidden combinations.
+### PR A — Effective Policy and Manifest Retrofit
 
-### PR 2 — Backend descriptors
+- Add `PolicyLevel`.
+- Add `EffectivePolicy`.
+- Add deterministic policy resolution tests.
+- Upgrade manifest toward `v1.1`.
+- Add `trace_id`, `task_id`, and `objective_id` fields where available.
+- Add `policy explain` JSON output.
 
-- Add `BackendDescriptor` model.
-- Make Codex and local-compatible backends emit descriptors.
-- Record descriptor snapshots on runs/manifests.
-- Add `harness backends preflight --json`.
+### PR B — Artifact and JSON Contract Retrofit
 
-### PR 3 — Artifact contract and manifest
+- Add or upgrade `ArtifactRecord`.
+- Add artifact `sha256`, `size_bytes`, `producer`, `schema_version`, and redaction state.
+- Enforce immutable registered artifacts.
+- Add JSON/JSONL output for runs, events, artifacts, approvals, policy, and doctor flows.
+- Add snapshot tests.
 
-- Add `ArtifactKind` enum.
-- Add artifact `sha256`, `size`, `producer`, `schema_version`.
-- Write `manifest.json` for every run.
-- Add manifest tests.
+### PR C — Agent, Workbench, and Model Resolution
 
-### PR 4 — JSON/JSONL CLI
+- Stabilize `AgentNode`.
+- Stabilize `WorkbenchSpec`.
+- Stabilize `ModelProfile`.
+- Add effective-agent resolution.
+- Add `agents explain` and `workbenches explain`.
+- Add fallback-boundary tests.
+- Add read-only AGENTS.md ingestion.
 
-- Add `--json` to runs, show, artifacts, approvals, backends.
-- Add `events --jsonl`.
-- Add snapshot tests for JSON output.
+### PR D — Tool Capability Gateway
 
-### PR 5 — Security docs and redaction
+- Add `ToolCapabilityDescriptor`.
+- Wrap initial tools: `repo_read`, `artifact_read`, `artifact_write`, `isolated_edit`, `diff_inspect`, `secret_scan`, `docker_test`, `policy_explain`, and `approval_request`.
+- Add side-effect level, idempotency, replay policy, allowed modes, and sandbox requirements.
+- Add tool-policy tests.
 
-- Add `SECURITY.md`.
-- Add threat model docs.
-- Add display/artifact redaction layer.
-- Add redaction tests.
+### PR E — Task Schema and State Machine
 
-### PR 6 — Docker sandbox profiles
+- Add or upgrade `ObjectiveSpec`.
+- Add or upgrade `TaskSpec`.
+- Add `TaskAttempt`.
+- Add `TaskDependency`.
+- Add `TaskLease`.
+- Add deterministic task transition validation.
+- Add SQLite migrations.
 
-- Add sandbox profile model.
-- Add strict/default/networked profiles.
-- Record profile in test result and manifest.
-- Require approval for networked mode.
+### PR F — Task CLI Completion
 
-### PR 7 — AgentSpec and WorkbenchSpec
+- Add `objectives add/list/inspect`.
+- Add `tasks add/list/inspect`.
+- Add `tasks graph --json`.
+- Add `tasks cancel`.
+- Add `tasks retry`.
+- Preserve the invariant that task inspection commands do not execute agents, preflight backends, run Docker, or start background work.
 
-- Add `WorkbenchSpec`.
-- Add hierarchical `AgentNode`.
-- Add inheritance and effective-agent resolution.
-- Add starter workbenches and agents.
+### PR G — Manual Scheduler Hardening
 
-### PR 8 — Model profiles
+- Harden `run-next`.
+- Add dependency satisfaction checks.
+- Add lease acquisition.
+- Add policy gate.
+- Add approval gate.
+- Add task attempt creation.
+- Bind task attempts to runs once execution is introduced.
 
-- Add `ModelProfile`.
-- Add local model profile support.
-- Add Codex supervised profile.
-- Add route policy.
+### PR H — Task Artifacts and Output Contracts
 
-### PR 9 — Task queue
+- Add expected-output validation.
+- Register task artifacts.
+- Fail tasks when required artifacts are missing.
+- Record output-contract status in manifest/report evidence.
 
-- Add `ObjectiveSpec` and `TaskSpec`.
-- Add task records to SQLite.
-- Add `tasks add/list/inspect/run-next`.
+### PR I — Failure and Replay Tests
 
-### PR 10 — Compare and baseline
+- Add duplicate `run-next` test.
+- Add blocked dependency test.
+- Add approval-required pause test.
+- Add crash-after-artifact test.
+- Add retry idempotency test.
+- Add missing required artifact test.
+- Add invalid transition test.
 
-- Add compare command.
-- Add local baseline pointer table.
-- Add baseline compare.
-- Add JSON output.
+### PR J — Compare, Baseline, Evals, and Traces
 
-### PR 11 — Golden E2E suite
+- Add compare.
+- Add baseline set/compare.
+- Add safety-smoke eval suite.
+- Add local OTEL-compatible trace export.
+- Add regression gates for policy, manifest, artifacts, sandbox, and apply-back.
 
-- Add fixture repos.
-- Add fake Codex subprocess/backend.
-- Add golden flow assertions.
-- Run in CI.
+### PR K — Minimal Local Daemon
 
-### PR 12 — Local daemon
-
-- Add daemon process.
-- Add heartbeat events.
-- Add stop/status commands.
-- Enforce approval gates.
-- Start with single-task execution.
+- Add daemon process after v0.3.5 exit criteria pass.
+- Add heartbeat.
+- Add task lease renewal.
+- Add approval blocking.
+- Add crash recovery.
+- Start with one task at a time.
 
 ## 21. Local Testing Plan on Current Hardware
 
@@ -1087,7 +1437,7 @@ Avoid using the current machine for:
 
 - Heavy quant backtesting.
 - Large local models.
-- Long-running multi-agent swarms.
+- Long-running multi-agent bounded sessions.
 - Large parallel Docker workloads.
 
 Recommended local testing layers:
@@ -1125,11 +1475,12 @@ harness run \
 
 Use Codex only for isolated edit runs. Keep tasks small, deterministic, and reviewed.
 
-## 22. Non-Goals Until After v0.7
+## 22. Non-Goals Until Native Control-Plane Contracts Are Stable
 
 Do not add these yet:
 
-- MCP.
+- MCP as an internal architecture.
+- A2A.
 - Plugin marketplace.
 - Browser control.
 - Email/calendar integration.
@@ -1145,19 +1496,27 @@ Do not add these yet:
 - Live trading or broker actions.
 - Automatic job application sending.
 
+Read-only AGENTS.md ingestion is allowed earlier because it is repo context, not a permission source. MCP may be considered later only as a tool-adapter boundary after `ToolCapabilityDescriptor`, sandbox policy, approval gates, and task evidence are stable.
+
 ## 23. Near-Term Definition of Done
 
 The next milestone is complete when a new user can:
 
 1. Install `agent-harness`.
 2. Initialize a local repo.
-3. Run an inspect task.
-4. Run a supervised Codex isolated edit.
-5. Inspect the diff.
-6. Approve or deny apply-back.
-7. Run Docker tests.
-8. Inspect a complete manifest/report.
-9. See every approval, backend boundary, artifact checksum, and safety decision recorded locally.
+3. Inspect effective policy.
+4. Run an inspect task.
+5. Create an objective.
+6. Create tasks with dependencies.
+7. Select safe work with `run-next`.
+8. Pause cleanly on approval-required work.
+9. Run a supervised Codex isolated edit.
+10. Inspect the diff.
+11. Approve or deny apply-back.
+12. Run Docker tests with a sandbox profile.
+13. Inspect a complete manifest/report/events/artifacts set.
+14. Compare a run to a baseline.
+15. See every approval, backend boundary, artifact checksum, task transition, and safety decision recorded locally.
 
 ## 24. Long-Term Definition of Done
 
@@ -1169,10 +1528,12 @@ The long-term system is complete when a dedicated local device can run a supervi
 - Operate separate quant, coding, personal, writing, and research workbenches.
 - Use hierarchical specialized agents.
 - Delegate work through an orchestrator.
-- Conduct bounded swarm sessions.
+- Conduct bounded sessions.
 - Produce durable artifacts and reports.
 - Pause at approval gates.
 - Keep memory separated by domain.
 - Never silently send external messages, submit applications, mutate active repos, or take financial actions.
 
 The system should become autonomous in planning and artifact production, not autonomous in sensitive real-world action.
+
+Autonomy is allowed to grow in planning, artifact production, review, and safe local execution. It must not grow into irreversible real-world action without a separate future plan and explicit approval model.

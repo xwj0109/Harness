@@ -44,6 +44,15 @@ class RunMode(str, Enum):
     DEV = "dev"
 
 
+class TaskStatus(str, Enum):
+    QUEUED = "queued"
+    BLOCKED = "blocked"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELED = "canceled"
+
+
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
     mapping = {
         "read_only_repo_summary": RunMode.READ_ONLY,
@@ -134,6 +143,24 @@ class RunRecord(BaseModel):
     data_boundary: DataBoundary | None = None
     allow_network: bool | None = None
     approval_id: str | None = None
+
+
+class TaskRecord(BaseModel):
+    id: str
+    title: str
+    description: str = ""
+    status: TaskStatus
+    project_root: Path
+    created_at: datetime
+    updated_at: datetime
+    priority: int = 0
+    workbench_id: str | None = None
+    agent_id: str | None = None
+    spec_source_kind: str | None = None
+    spec_source_path: Path | None = None
+    depends_on: list[str] = Field(default_factory=list)
+    run_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventRecord(BaseModel):

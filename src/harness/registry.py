@@ -23,6 +23,13 @@ class SpecRegistry(BaseModel):
 
     @model_validator(mode="after")
     def validate_references(self) -> SpecRegistry:
+        _validate_mapping_ids("model_profile", self.model_profiles)
+        _validate_mapping_ids("memory_scope", self.memory_scopes)
+        _validate_mapping_ids("agent", self.agents)
+        _validate_mapping_ids("workbench", self.workbenches)
+        for policy_id in self.tool_policies:
+            if not policy_id.strip():
+                raise ValueError("Tool policy id must be non-empty.")
         for agent_id, agent in self.agents.items():
             if agent.model_profile not in self.model_profiles:
                 raise ValueError(f"Agent {agent_id} references missing model_profile: {agent.model_profile}")
@@ -54,6 +61,15 @@ class SpecRegistry(BaseModel):
             return self.workbenches[workbench_id]
         except KeyError as exc:
             raise KeyError(f"Workbench not found: {workbench_id}") from exc
+
+
+def _validate_mapping_ids(kind: str, mapping: dict[str, object]) -> None:
+    for key, value in mapping.items():
+        if not key.strip():
+            raise ValueError(f"{kind} mapping key must be non-empty.")
+        value_id = getattr(value, "id", None)
+        if key != value_id:
+            raise ValueError(f"{kind} mapping key must match contained id: {key} != {value_id}")
 
 
 def builtin_spec_registry() -> SpecRegistry:
