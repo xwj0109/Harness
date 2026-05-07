@@ -17,6 +17,8 @@ from harness.models import (
     BackendMetadata,
     EventRecord,
     ManifestArtifact,
+    ObjectiveRecord,
+    ObjectiveStatus,
     RunManifest,
     RunRecord,
     TaskRecord,
@@ -223,6 +225,54 @@ class SQLiteStore:
                 (status, now_iso(), run_id),
             )
         self.write_run_manifest(run_id)
+
+    def create_objective(
+        self,
+        title: str,
+        description: str = "",
+        priority: int = 0,
+        workbench_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> ObjectiveRecord:
+        objective_id = f"obj_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        metadata = metadata or {}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO objectives (
+                  id, title, description, status, project_root, created_at, updated_at,
+                  priority, workbench_id, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    objective_id,
+                    title,
+                    description,
+                    ObjectiveStatus.ACTIVE.value,
+                    str(self.project_root),
+                    timestamp,
+                    timestamp,
+                    priority,
+                    workbench_id,
+                    json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+                ),
+            )
+        return self.get_objective(objective_id)
+
+    def list_objectives(self) -> list[ObjectiveRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM objectives ORDER BY priority DESC, created_at ASC"
+            ).fetchall()
+        return [self._row_to_objective(row) for row in rows]
+
+    def get_objective(self, objective_id: str) -> ObjectiveRecord:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM objectives WHERE id = ?", (objective_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Objective not found: {objective_id}")
+        return self._row_to_objective(row)
 
     def create_task(
         self,
@@ -659,6 +709,20 @@ class SQLiteStore:
             else [],
             approval_state=row["approval_state"] if "approval_state" in row.keys() else None,
             run_id=row["run_id"],
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_objective(self, row: sqlite3.Row) -> ObjectiveRecord:
+        return ObjectiveRecord(
+            id=row["id"],
+            title=row["title"],
+            description=row["description"],
+            status=ObjectiveStatus(row["status"]),
+            project_root=Path(row["project_root"]),
+            created_at=parse_dt(row["created_at"]),
+            updated_at=parse_dt(row["updated_at"]),
+            priority=row["priority"],
+            workbench_id=row["workbench_id"],
             metadata=json.loads(row["metadata_json"]),
         )
 

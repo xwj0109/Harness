@@ -176,6 +176,129 @@ def test_cli_tasks_require_initialized_project(tmp_path) -> None:
     assert not (tmp_path / ".harness").exists()
 
 
+def test_cli_objectives_require_initialized_project(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        ["objectives", "add", "--title", "Uninitialized objective", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code != 0
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_objectives_add_list_and_inspect_support_json_and_text(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    text_created = runner.invoke(
+        app,
+        ["objectives", "add", "--title", "Text objective", "--project", str(tmp_path)],
+    )
+    assert text_created.exit_code == 0
+    assert "Created objective obj_" in text_created.output
+
+    created = runner.invoke(
+        app,
+        [
+            "objectives",
+            "add",
+            "--title",
+            "Queue hardening",
+            "--description",
+            "Build objective persistence.",
+            "--workbench",
+            "coding",
+            "--priority",
+            "7",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert created.exit_code == 0
+    created_payload = json.loads(created.output)
+    assert created_payload["schema_version"] == "harness.objective/v1"
+    assert created_payload["ok"] is True
+    objective = created_payload["objective"]
+    assert objective["id"].startswith("obj_")
+    assert objective["status"] == "active"
+    assert objective["title"] == "Queue hardening"
+    assert objective["description"] == "Build objective persistence."
+    assert objective["workbench_id"] == "coding"
+
+    listed = runner.invoke(app, ["objectives", "list", "--project", str(tmp_path), "--output", "json"])
+    assert listed.exit_code == 0
+    listed_payload = json.loads(listed.output)
+    assert listed_payload["schema_version"] == "harness.objectives/v1"
+    assert [item["id"] for item in listed_payload["objectives"]][0] == objective["id"]
+
+    text_listed = runner.invoke(app, ["objectives", "list", "--project", str(tmp_path)])
+    assert text_listed.exit_code == 0
+    assert f"{objective['id']}\tactive\t7\tQueue hardening" in text_listed.output
+
+    inspected = runner.invoke(
+        app,
+        ["objectives", "inspect", objective["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+    assert inspected.exit_code == 0
+    assert json.loads(inspected.output)["objective"]["id"] == objective["id"]
+
+    text_inspected = runner.invoke(app, ["objectives", "inspect", objective["id"], "--project", str(tmp_path)])
+    assert text_inspected.exit_code == 0
+    assert f"Objective: {objective['id']}" in text_inspected.output
+    assert "Workbench: coding" in text_inspected.output
+
+
+def test_cli_objectives_reject_invalid_builtin_registry_refs(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    invalid_workbench = runner.invoke(
+        app,
+        [
+            "objectives",
+            "add",
+            "--title",
+            "Bad workbench",
+            "--workbench",
+            "missing_workbench",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert invalid_workbench.exit_code != 0
+    payload = json.loads(invalid_workbench.output)
+    assert payload["schema_version"] == "harness.objective/v1"
+    assert payload["ok"] is False
+    assert payload["errors"] == ["Workbench not found: missing_workbench"]
+
+
+def test_cli_objectives_do_not_preflight_backends_or_expose_settings(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("objectives must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("objectives must not preflight local backend")),
+    )
+
+    result = runner.invoke(
+        app,
+        ["objectives", "add", "--title", "Safe objective", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 0
+    serialized = json.dumps(json.loads(result.output))
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
 def test_cli_tasks_add_list_inspect_and_status_support_json(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 

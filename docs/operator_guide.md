@@ -320,15 +320,30 @@ Effective preview is not runtime permission enforcement. It does not execute age
 
 All `harness specs ...` commands are read-only inspection commands. They do not auto-discover spec files, read or write `.harness/`, read project config, read SQLite, inspect environment variables, read backend settings, read secrets, create tasks, execute agents, preflight backends, run Docker, start schedulers, or change project state.
 
-## Manual Task Queue
+## Manual Objectives and Task Queue
 
-The v0.3 task queue stores operator-created task records in the initialized project database at `.harness/harness.sqlite`. It is a manual queue only: tasks can be created, listed, inspected, moved through statuses, and selected with `run-next`, but no task command executes agents, calls a backend, runs Docker, starts a scheduler, or creates background work.
+The v0.3 queue stores operator-created objective and task records in the initialized project database at `.harness/harness.sqlite`. It is a manual queue only: objectives can group work, tasks can be created, listed, inspected, moved through statuses, and selected with `run-next`, but no objective or task command executes agents, calls a backend, runs Docker, starts a scheduler, or creates background work.
 
 Initialize the project before using the queue:
 
 ```bash
 harness init --project .
 ```
+
+Create and inspect objectives:
+
+```bash
+harness objectives add --title "Queue hardening" --workbench coding --project . --output json
+harness objectives list --project . --output json
+harness objectives inspect obj_abc123def456 --project . --output json
+```
+
+Objective commands use stable JSON wrappers:
+
+- `harness.objective/v1` for add and inspect output.
+- `harness.objectives/v1` for list output.
+
+Objectives are metadata only in v0.3. They do not create tasks automatically and do not imply planning, routing, backend execution, scheduling, or autonomy.
 
 Create and inspect tasks:
 

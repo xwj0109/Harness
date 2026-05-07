@@ -3,7 +3,7 @@ import sqlite3
 
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import TaskStatus
+from harness.models import ObjectiveStatus, TaskStatus
 
 
 def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
@@ -149,6 +149,37 @@ def test_store_creates_lists_filters_and_updates_tasks(tmp_path) -> None:
     assert succeeded.status == TaskStatus.SUCCEEDED
     assert [task.id for task in store.list_tasks(status="ready")] == [high.id]
     assert [task.id for task in store.list_tasks(status="queued")] == [high.id]
+
+
+def test_store_creates_lists_and_gets_objectives(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    low = store.create_objective(title="Low priority", priority=0, workbench_id="coding")
+    high = store.create_objective(
+        title="High priority",
+        description="Important",
+        priority=5,
+        workbench_id="quant",
+        metadata={"secret": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz"},
+    )
+
+    loaded = store.get_objective(high.id)
+    assert loaded.id == high.id
+    assert loaded.title == "High priority"
+    assert loaded.description == "Important"
+    assert loaded.status == ObjectiveStatus.ACTIVE
+    assert loaded.workbench_id == "quant"
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in json.dumps(loaded.metadata)
+    assert "[REDACTED_SECRET]" in json.dumps(loaded.metadata)
+    assert [objective.id for objective in store.list_objectives()] == [high.id, low.id]
+
+    try:
+        store.get_objective("obj_missing")
+    except KeyError as exc:
+        assert str(exc).strip("'") == "Objective not found: obj_missing"
+    else:
+        raise AssertionError("missing objective should raise")
 
 
 def test_store_normalizes_legacy_task_statuses(tmp_path) -> None:

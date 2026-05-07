@@ -51,12 +51,14 @@ tests_app = typer.Typer(help="Docker-sandboxed test execution.")
 tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
 specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_without_command=True)
 specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previews.")
+objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
+app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 tests_app.add_typer(tests_image_app, name="image")
 specs_app.add_typer(specs_preview_app, name="preview")
@@ -169,6 +171,87 @@ def doctor(project: ProjectOption = Path("."), output: OutputOption = OutputForm
             typer.echo(f"{check['status']}\t{check['id']}\t{check['message']}")
     if not result["ok"]:
         raise typer.Exit(code=1)
+
+
+@objectives_app.command("add")
+def objectives_add(
+    title: Annotated[str, typer.Option("--title", help="Objective title.")],
+    description: Annotated[str, typer.Option("--description", help="Objective description.")] = "",
+    workbench: Annotated[str | None, typer.Option("--workbench", help="Built-in workbench id.")] = None,
+    priority: Annotated[int, typer.Option("--priority", help="Higher priority objectives list first.")] = 0,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        _validate_objective_refs(workbench)
+        objective = SQLiteStore(project_root).create_objective(
+            title=title,
+            description=description,
+            priority=priority,
+            workbench_id=workbench,
+            metadata={},
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.objective/v1",
+                "ok": True,
+                "objective": objective.model_dump(mode="json"),
+            }
+        )
+        return
+    typer.echo(f"Created objective {objective.id}")
+
+
+@objectives_app.command("list")
+def objectives_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    objectives = SQLiteStore(project_root).list_objectives()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.objectives/v1",
+                "ok": True,
+                "objectives": [objective.model_dump(mode="json") for objective in objectives],
+            }
+        )
+        return
+    if not objectives:
+        typer.echo("No objectives found.")
+        return
+    for objective in objectives:
+        typer.echo(f"{objective.id}\t{objective.status.value}\t{objective.priority}\t{objective.title}")
+
+
+@objectives_app.command("inspect")
+def objectives_inspect(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        objective = SQLiteStore(project_root).get_objective(objective_id)
+    except KeyError as exc:
+        _emit_objective_error("harness.objective/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.objective/v1",
+                "ok": True,
+                "objective": objective.model_dump(mode="json"),
+            }
+        )
+        return
+    _print_objective(objective)
 
 
 @tasks_app.command("add")
@@ -967,12 +1050,34 @@ def _print_task(task) -> None:
     typer.echo(f"Run: {task.run_id or 'none'}")
 
 
+def _print_objective(objective) -> None:
+    typer.echo(f"Objective: {objective.id}")
+    typer.echo(f"Title: {objective.title}")
+    typer.echo(f"Description: {objective.description}")
+    typer.echo(f"Status: {objective.status.value}")
+    typer.echo(f"Priority: {objective.priority}")
+    typer.echo(f"Workbench: {objective.workbench_id or 'none'}")
+
+
+def _validate_objective_refs(workbench_id: str | None) -> None:
+    registry = builtin_spec_registry()
+    if workbench_id is not None:
+        registry.get_workbench(workbench_id)
+
+
 def _validate_task_spec_refs(workbench_id: str | None, agent_id: str | None) -> None:
     registry = builtin_spec_registry()
     if workbench_id is not None:
         registry.get_workbench(workbench_id)
     if agent_id is not None:
         registry.get_agent(agent_id)
+
+
+def _emit_objective_error(schema_version: str, message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Objective command failed: {message}")
 
 
 def _emit_task_error(schema_version: str, message: str, output: OutputFormat) -> None:
