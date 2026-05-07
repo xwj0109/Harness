@@ -115,6 +115,7 @@ harness agents preview /tmp/harness-agent-authoring-smoke --output json
 Expected v0.7 safety properties:
 
 - Agent authoring commands read or write only the explicit operator path.
+- Agent authoring commands reject symlinked paths, unsupported profile files, and hard-forbidden path targets.
 - Built-in specs remain immutable and custom agent ids cannot shadow built-ins.
 - Custom bundles are not auto-discovered and are not persisted into `.harness/`, SQLite, tasks, objectives, runs, leases, artifacts, daemon events, or runtime registry state.
 - Authoring commands do not execute agents, preflight backends, run Docker, invoke shell tools, schedule work, call providers, connect to brokers, place orders, send messages, submit applications, or mutate active repo files.

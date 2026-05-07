@@ -261,7 +261,7 @@ The JSON wrappers are:
 
 Agent bundles use `schema_version: harness.agent_bundle/v1` in `agent.yaml`. The authoring loader merges the custom agent and profiles with built-ins in memory only, validates the result through `SpecRegistry`, and rejects built-in id shadowing, missing references, parent cycles, forbidden paths, and policy broadening. Profiles are customization metadata only; they do not change permissions.
 
-Built-ins remain immutable packaged YAML. Custom bundles are explicit-path only, are not auto-discovered, and are not persisted into `.harness/`, SQLite, or a runtime registry cache. Importing custom agents into project state is a later milestone.
+Built-ins remain immutable packaged YAML. Custom bundles are explicit-path only, are not auto-discovered, and are not persisted into `.harness/`, SQLite, or a runtime registry cache. Bundle paths, profile paths, and scaffold destinations must not include symlinks or hard-forbidden path targets. Profile files must be YAML. Importing custom agents into project state is a later milestone.
 
 ## Read-Only Custom Spec Validation
 

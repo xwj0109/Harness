@@ -226,6 +226,79 @@ def test_agent_bundle_rejects_forbidden_paths_and_existing_non_empty_scaffold_de
         )
 
 
+def test_agent_bundle_rejects_symlink_paths(tmp_path) -> None:
+    bundle_path = tmp_path / "agents" / "custom_quant_researcher"
+    _write_valid_bundle(bundle_path)
+    symlink_path = tmp_path / "agent_link"
+    symlink_path.symlink_to(bundle_path, target_is_directory=True)
+    output_target = tmp_path / "output_target"
+    output_target.mkdir()
+    output_symlink = tmp_path / "output_link"
+    output_symlink.symlink_to(output_target, target_is_directory=True)
+
+    result = validate_agent_bundle(symlink_path)
+
+    assert result["ok"] is False
+    assert result["errors"] == ["Agent bundle path cannot include symlinks."]
+    with pytest.raises(AgentBundleError, match="cannot include symlinks"):
+        scaffold_agent_bundle(
+            agent_id="my_agent",
+            workbench_id="quant",
+            kind="specialist",
+            parent="quant_research",
+            model_profile="local_reasoning",
+            tool_policy="read_only",
+            memory_scope="quant",
+            output_path=output_symlink / "my_agent",
+        )
+
+
+def test_agent_bundle_rejects_unsupported_profile_files_and_profile_directories(tmp_path) -> None:
+    unsupported = tmp_path / "agents" / "unsupported"
+    _write_valid_bundle(unsupported)
+    (unsupported / "profiles" / "notes.txt").write_text("not a profile", encoding="utf-8")
+    directory_entry = tmp_path / "agents" / "directory_entry"
+    _write_valid_bundle(directory_entry)
+    (directory_entry / "profiles" / "nested.yaml").mkdir()
+
+    unsupported_result = validate_agent_bundle(unsupported)
+    directory_result = validate_agent_bundle(directory_entry)
+
+    assert unsupported_result["ok"] is False
+    assert unsupported_result["errors"] == ["Unsupported agent profile extension: .txt"]
+    assert directory_result["ok"] is False
+    assert "Agent profile entry is not a file" in directory_result["errors"][0]
+
+
+def test_agent_scaffold_rejects_existing_file_destination_and_invalid_kind(tmp_path) -> None:
+    existing_file = tmp_path / "agents" / "file_agent"
+    existing_file.parent.mkdir()
+    existing_file.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(AgentBundleError, match="destination is not a directory"):
+        scaffold_agent_bundle(
+            agent_id="my_agent",
+            workbench_id="quant",
+            kind="specialist",
+            parent="quant_research",
+            model_profile="local_reasoning",
+            tool_policy="read_only",
+            memory_scope="quant",
+            output_path=existing_file,
+        )
+    with pytest.raises(AgentBundleError, match="Input should be"):
+        scaffold_agent_bundle(
+            agent_id="my_agent",
+            workbench_id="quant",
+            kind="unsupported",
+            parent="quant_research",
+            model_profile="local_reasoning",
+            tool_policy="read_only",
+            memory_scope="quant",
+            output_path=tmp_path / "agents" / "invalid_kind",
+        )
+
+
 def test_agent_bundle_preview_output_contains_no_secret_like_terms(tmp_path) -> None:
     bundle_path = tmp_path / "agents" / "custom_quant_researcher"
     _write_valid_bundle(bundle_path)

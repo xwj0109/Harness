@@ -18,6 +18,7 @@ AGENT_BUNDLE_PREVIEW_SCHEMA_VERSION = "harness.agent_bundle_preview/v1"
 
 FORBIDDEN_AGENT_PATH_PARTS = {".harness", ".git", "secrets"}
 FORBIDDEN_AGENT_SUFFIXES = {".pem", ".key", ".sqlite"}
+SUPPORTED_PROFILE_SUFFIXES = {".yaml", ".yml"}
 
 
 class AgentBundleError(ValueError):
@@ -55,6 +56,8 @@ def scaffold_agent_bundle(
     role: str = "Custom declarative agent.",
 ) -> dict:
     destination = _resolve_output_path(output_path)
+    if destination.exists() and not destination.is_dir():
+        raise AgentBundleError(f"Agent bundle destination is not a directory: {destination}")
     if destination.exists() and any(destination.iterdir()):
         raise AgentBundleError(f"Agent bundle destination is not empty: {destination}")
     registry = builtin_spec_registry()
@@ -89,11 +92,16 @@ def scaffold_agent_bundle(
         "tags": [],
         "metadata": {},
     }
-    merged = _build_merged_registry(
-        registry,
-        AgentBundle(schema_version=AGENT_BUNDLE_SCHEMA_VERSION, workbench_id=workbench_id, agent=AgentSpec.model_validate(agent_data)),
-        [AgentProfileSpec.model_validate(profile_data)],
-    )
+    try:
+        bundle = AgentBundle(
+            schema_version=AGENT_BUNDLE_SCHEMA_VERSION,
+            workbench_id=workbench_id,
+            agent=AgentSpec.model_validate(agent_data),
+        )
+        profiles = [AgentProfileSpec.model_validate(profile_data)]
+    except ValidationError as exc:
+        raise AgentBundleError(str(exc)) from exc
+    merged = _build_merged_registry(registry, bundle, profiles)
     destination.mkdir(parents=True, exist_ok=True)
     profiles_dir = destination / "profiles"
     profiles_dir.mkdir(exist_ok=True)
@@ -122,7 +130,7 @@ def scaffold_agent_bundle(
 def validate_agent_bundle(path: Path) -> dict:
     source_path = path.expanduser().resolve()
     try:
-        loaded = load_agent_bundle(source_path)
+        loaded = load_agent_bundle(path)
         registry = merge_agent_bundle_with_builtins(loaded)
     except AgentBundleError as exc:
         return _validation_error(source_path, str(exc))
@@ -142,7 +150,7 @@ def validate_agent_bundle(path: Path) -> dict:
 def preview_agent_bundle(path: Path) -> dict:
     source_path = path.expanduser().resolve()
     try:
-        loaded = load_agent_bundle(source_path)
+        loaded = load_agent_bundle(path)
         registry = merge_agent_bundle_with_builtins(loaded)
         preview = preview_agent_effective_policy(registry, loaded.bundle.agent.id)
         workbench = registry.get_workbench(loaded.bundle.workbench_id)
@@ -195,7 +203,9 @@ def merge_agent_bundle_with_builtins(loaded: LoadedAgentBundle) -> SpecRegistry:
 
 
 def resolve_agent_bundle_path(path: Path) -> Path:
-    bundle_path = path.expanduser().resolve()
+    expanded = path.expanduser()
+    _reject_symlink_components(expanded)
+    bundle_path = expanded.resolve()
     _validate_agent_path(bundle_path)
     if not bundle_path.exists():
         raise AgentBundleError(f"Agent bundle does not exist: {bundle_path}")
@@ -266,8 +276,12 @@ def _load_profiles(bundle_path: Path, agent_id: str) -> list[AgentProfileSpec]:
     if not profiles_dir.is_dir():
         raise AgentBundleError(f"Agent bundle profiles path is not a directory: {profiles_dir}")
     profiles: list[AgentProfileSpec] = []
-    for path in sorted(profiles_dir.glob("*.yaml")):
+    for path in sorted(profiles_dir.iterdir()):
         _validate_agent_path(path)
+        if path.is_dir():
+            raise AgentBundleError(f"Agent profile entry is not a file: {path}")
+        if path.suffix.lower() not in SUPPORTED_PROFILE_SUFFIXES:
+            raise AgentBundleError(f"Unsupported agent profile extension: {path.suffix or '<none>'}")
         try:
             profile = AgentProfileSpec.model_validate(_load_yaml_mapping(path))
         except ValidationError as exc:
@@ -306,18 +320,31 @@ def _normalize_agent_data(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_output_path(path: Path) -> Path:
-    output_path = path.expanduser().resolve()
+    expanded = path.expanduser()
+    _reject_symlink_components(expanded)
+    output_path = expanded.resolve()
     _validate_agent_path(output_path)
     return output_path
 
 
 def _validate_agent_path(path: Path) -> None:
+    _reject_symlink_components(path)
     if any(part in FORBIDDEN_AGENT_PATH_PARTS for part in path.parts):
         raise AgentBundleError("Agent bundle path is forbidden by harness safety policy.")
     if path.name.startswith(".env"):
         raise AgentBundleError("Agent bundle path is forbidden by harness safety policy.")
     if path.suffix.lower() in FORBIDDEN_AGENT_SUFFIXES:
         raise AgentBundleError("Agent bundle path is forbidden by harness safety policy.")
+
+
+def _reject_symlink_components(path: Path) -> None:
+    current = Path(path.anchor) if path.is_absolute() else Path(".")
+    parts = path.parts
+    start = 1 if path.is_absolute() else 0
+    for part in parts[start:]:
+        current = current / part
+        if current.is_symlink():
+            raise AgentBundleError("Agent bundle path cannot include symlinks.")
 
 
 def _validation_error(source_path: Path, error: str) -> dict:
