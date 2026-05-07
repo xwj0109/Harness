@@ -1,10 +1,14 @@
 # v0.7.1 Agent Authoring Hardening Plan
 
+Status: complete.
+
 ## Summary
 
 Harden the completed v0.7 agent authoring MVP before adding project-local custom agent import/persistence in v0.8.
 
 This slice keeps agent authoring declarative and explicit-path only. It should improve path safety, diagnostics, deterministic validation behavior, and operator documentation for `harness agents scaffold/validate/preview`. It must not add custom agent import, registry persistence, execution adapters, task generation, scheduling, backend preflight, model calls, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, active repo writes, or workflow behavior.
+
+Completion note: v0.7.1 is implemented and verified. The authoring loader now rejects symlinked bundle/profile/output paths, unsupported profile files, profile directory entries, existing file scaffold destinations, and invalid scaffold kinds with stable schema-versioned errors. Focused and full regression tests passed before the checkpoint commit.
 
 ## Key Changes
 
