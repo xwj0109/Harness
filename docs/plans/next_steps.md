@@ -22,6 +22,7 @@ The v0.8 Project-Local Agent Registry plan is tracked in [v0_8_project_agent_reg
 The v0.9 Agent Lifecycle and Preview plan is tracked in [v0_9_agent_lifecycle_and_preview_plan.md](v0_9_agent_lifecycle_and_preview_plan.md).
 The v1.0 MVP Closure plan is tracked in [v1_0_mvp_closure_plan.md](v1_0_mvp_closure_plan.md).
 The v1.1 CLI UX plan is tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md).
+The v1.2 Post-MVP Polish plan is tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -109,7 +110,11 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is a post-v1.1 decision plan. Recommended candidates are a true interactive terminal UX decision, release packaging/distribution polish, imported-agent refresh semantics, or a separate next-adapter decision. Do not start implementation by default until a decision-complete plan exists.
+The immediate next target is v1.2 Track 1 packaging/distribution polish, tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md). The ranked post-MVP UX/product order is:
+
+1. Packaging/distribution polish first.
+2. Small Typer/Rich-style CLI refinements second.
+3. True interactive TUI/command palette later, behind a separate decision gate.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
