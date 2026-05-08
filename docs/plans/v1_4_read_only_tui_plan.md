@@ -1,6 +1,6 @@
 # v1.4 Read-Only TUI Plan
 
-Status: Slice 2 in progress.
+Status: complete.
 
 ## Summary
 
@@ -133,6 +133,8 @@ Implementation note: Slice 2 adds a Textual-free dashboard model and text render
 - Update [operator_guide.md](../operator_guide.md), [command_catalog.md](../command_catalog.md), and [smoke_checklist.md](../smoke_checklist.md).
 - Mark v1.4 complete only after tests pass and safety boundaries are verified.
 - Keep future command-palette or mutating TUI behavior behind a separate decision plan.
+
+Completion note: v1.4 is complete as a read-only TUI milestone. Slice 1 added the optional `tui` extra, `harness tui`, missing-dependency handling, and packaging smoke coverage. Slice 2 added the dashboard model and Textual rendering surface for project state, summary counts, task status, active leases, recent runs, safety boundaries, and command suggestions. Slice 3 finalized docs and release hygiene. The TUI remains read-only and does not execute commands, mutate queue/project state, run daemon actions, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose secrets.
 
 ## Test Plan
 

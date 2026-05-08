@@ -57,7 +57,7 @@ The dashboard reports initialization state, imported-agent count, objective and 
 
 `harness home` is read-only. It does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, execute adapters, preflight backends, inspect backend settings, run Docker, invoke shell tools, call providers, or expose secrets.
 
-`harness tui` is the planned v1.4 read-only terminal dashboard entrypoint:
+`harness tui` is the v1.4 read-only terminal dashboard entrypoint:
 
 ```bash
 python3 -m pip install "agent-harness[tui]"
