@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete. v1.7 TUI Copy-Only Command Palette is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete. v1.7 TUI Copy-Only Command Palette is complete. v1.8 TUI Usability Polish is planned.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -28,6 +28,7 @@ The v1.4 Read-Only TUI plan is tracked in [v1_4_read_only_tui_plan.md](v1_4_read
 The v1.5 TUI Detail Panes plan is tracked in [v1_5_tui_detail_panes_plan.md](v1_5_tui_detail_panes_plan.md).
 The v1.6 TUI Filter/Search plan is tracked in [v1_6_tui_filter_search_plan.md](v1_6_tui_filter_search_plan.md).
 The v1.7 TUI Copy-Only Command Palette plan is tracked in [v1_7_tui_copy_only_command_palette_plan.md](v1_7_tui_copy_only_command_palette_plan.md).
+The v1.8 TUI Usability Polish plan is tracked in [v1_8_tui_usability_polish_plan.md](v1_8_tui_usability_polish_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -127,13 +128,9 @@ Implemented CLI-only refinements include sectioned text output for high-traffic 
 
 ## Immediate Next Planning Target
 
-There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
+The immediate next target is v1.8 TUI Usability Polish, tracked in [v1_8_tui_usability_polish_plan.md](v1_8_tui_usability_polish_plan.md).
 
-Recommended decision options:
-
-- v1.8 TUI usability polish such as saved local views, pane ordering, or navigation refinements, still read-only.
-- Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
-- Packaging/distribution release hygiene if the current UX milestone should be published.
+v1.8 should improve pane organization, navigation hints, search/no-match states, and command-palette presentation while staying read-only and in-memory only. It must not persist UI preferences, execute commands, spawn subprocesses, invoke shell tools, mutate tasks, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, call providers, or add clipboard bindings.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
