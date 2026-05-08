@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -125,9 +125,13 @@ Implemented CLI-only refinements include sectioned text output for high-traffic 
 
 ## Immediate Next Planning Target
 
-The immediate next target is v1.6 TUI Filter/Search, tracked in [v1_6_tui_filter_search_plan.md](v1_6_tui_filter_search_plan.md).
+There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
 
-v1.6 should add local in-memory search/filtering over the already-loaded read-only TUI panes. It remains read-only: no command execution, task mutation, daemon actions, adapter execution, backend preflight, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, unmanaged daemon loops, filesystem crawling, or artifact-content search.
+Recommended decision options:
+
+- v1.7 copy-only TUI command palette planning, still with no command execution.
+- v1.7 TUI usability polish for saved views or pane ordering, still read-only.
+- Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

@@ -93,5 +93,6 @@ Repo-local planning references are tracked in:
 - [docs/plans/v1_3_interactive_tui_decision_plan.md](docs/plans/v1_3_interactive_tui_decision_plan.md)
 - [docs/plans/v1_4_read_only_tui_plan.md](docs/plans/v1_4_read_only_tui_plan.md)
 - [docs/plans/v1_5_tui_detail_panes_plan.md](docs/plans/v1_5_tui_detail_panes_plan.md)
+- [docs/plans/v1_6_tui_filter_search_plan.md](docs/plans/v1_6_tui_filter_search_plan.md)
 
 Earlier milestone plans remain in [docs/plans/](docs/plans/).

@@ -1,6 +1,6 @@
 # v1.6 TUI Filter/Search Plan
 
-Status: Slice 2 in progress.
+Status: complete.
 
 ## Summary
 
@@ -97,6 +97,8 @@ Implementation note: Slice 2 wires the existing filter model into the optional T
 - Update [operator_guide.md](../operator_guide.md), [command_catalog.md](../command_catalog.md), and [smoke_checklist.md](../smoke_checklist.md).
 - Mark v1.6 complete only after focused and full tests pass.
 - Keep command-palette behavior behind a later decision plan.
+
+Completion note: v1.6 is complete as a read-only TUI filter/search milestone. Slice 1 added `filter_tui_panes(panes, query)` as a Textual-free search model over sanitized, already-loaded pane data. Slice 2 wired that model into the optional Textual app with a search input, match-status line, filtered pane rendering, empty-state text, and keyboard bindings for search focus, clearing search, pane navigation, and quit only. Search remains local and read-only; it does not execute commands, mutate queue/project state, run daemon actions, execute adapters, preflight backends, crawl files, search artifact contents, invoke shell tools, call providers, or expose secrets.
 
 ## Test Plan
 
