@@ -9,6 +9,7 @@ from harness.config import default_config
 from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
+from harness.tui import build_tui_dashboard, render_dashboard_text
 
 
 runner = CliRunner()
@@ -115,6 +116,75 @@ def test_cli_tui_json_probe_does_not_launch_or_mutate(tmp_path, monkeypatch) -> 
         "launched": False,
     }
     assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    rendered = render_dashboard_text(dashboard)
+
+    assert dashboard["schema_version"] == "harness.tui_dashboard/v1"
+    assert dashboard["ok"] is True
+    assert dashboard["initialized"] is False
+    assert dashboard["summary"]["tasks_total"] == 0
+    assert dashboard["guidance"][0]["id"] == "initialize_project"
+    assert "Project" in rendered
+    assert "Initialized: False" in rendered
+    assert "Commands" in rendered
+    assert "Safety" in rendered
+    assert "no_hidden_execution" in rendered
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "tui task",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task.exit_code == 0, task.output
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert tick.exit_code == 0, tick.output
+    created_run = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "tui dashboard run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created_run.exit_code == 0, created_run.output
+
+    dashboard = build_tui_dashboard(tmp_path)
+    rendered = render_dashboard_text(dashboard)
+
+    assert dashboard["initialized"] is True
+    assert dashboard["summary"]["tasks_total"] == 1
+    assert dashboard["summary"]["active_leases"] == 1
+    assert dashboard["summary"]["recent_runs"] == 1
+    assert dashboard["task_status_counts"]["leased"] == 1
+    assert dashboard["recent_runs"][0]["task_type"] == "phase_1a_test"
+    assert "Tasks: 1" in rendered
+    assert "Active leases: 1" in rendered
+    assert "Recent Runs" in rendered
+    assert "harness daemon status --project" in rendered
+    serialized = json.dumps(dashboard)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
 
 
 def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output(tmp_path) -> None:

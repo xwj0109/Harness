@@ -1,6 +1,6 @@
 # v1.4 Read-Only TUI Plan
 
-Status: Slice 1 in progress.
+Status: Slice 2 in progress.
 
 ## Summary
 
@@ -125,6 +125,8 @@ Implementation note: Slice 1 adds the optional `tui` extra, `harness tui`, a mis
 - Include panels for project state, agents, tasks, leases/daemon, recent runs, and safety.
 - Add command-suggestion panel with copyable command text if straightforward; suggestions must not execute.
 - Add tests for rendering/smoke behavior using Textual test utilities when available.
+
+Implementation note: Slice 2 adds a Textual-free dashboard model and text renderer used by the optional Textual app. It reports project initialization, summary counts, task-state counts, active leases, daemon count, recent runs, safety boundaries, and command suggestions without executing commands or mutating project state.
 
 ### Slice 3: Docs And Release Hygiene
 
