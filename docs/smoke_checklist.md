@@ -78,7 +78,7 @@ Expected v1.0 MVP safety properties:
 - `daemon execute-read-only` is the only real MVP adapter and uses only the configured local-only/no-cost read-only route.
 - The MVP does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
 
-## Verify v1.1 Operator Cockpit
+## Verify Operator Cockpit
 
 Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.0 MVP smoke path when checking inspect text output.
 
@@ -99,12 +99,12 @@ harness policy explain --subject-kind task --subject-id "$TASK_ID" --project .
 harness artifacts inspect "$ARTIFACT_ID" --project .
 ```
 
-Expected v1.1 safety properties:
+Expected operator cockpit safety properties:
 
 - `harness home` is read-only and does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, or execute adapters.
-- `harness tui` is read-only and optional; without the TUI extra it returns a stable install hint. With the extra installed it renders a chat-style slash-command interface, project state, summary counts, imported agents, task details, active lease details, daemon event summaries, recent runs, safety reminders, local in-memory search over loaded dashboard/command metadata, in-memory section collapse, palette-only search focus, and a copy-only command palette without initializing projects, importing agents, creating tasks, creating runs, creating artifacts, acquiring leases, mutating daemon state, executing adapters, crawling files, or searching artifact contents.
+- `harness tui` is read-only and optional; without the TUI extra it returns a stable install hint. With the extra installed it renders a light-theme chat-style slash-command interface, project state, summary counts, imported agents, task details, active lease details, daemon event summaries, recent runs, safety reminders, local in-memory search over loaded dashboard/command metadata, in-memory section collapse, palette-only search focus, and a copy-only command palette without initializing projects, importing agents, creating tasks, creating runs, creating artifacts, acquiring leases, mutating daemon state, executing adapters, crawling files, or searching artifact contents.
 - The slash-command and command-palette surfaces show grouped command templates, mutation/safety notes, and selected command text for manual use only. They must not execute commands, spawn subprocesses, invoke a shell, copy to the clipboard, run daemon actions, execute adapters, preflight backends, run Docker, call providers, or expose artifact file contents.
-- The TUI layout keeps chat and dashboard context in stable read-only sections, shows keyboard/navigation hints for `/`, `escape`, `tab`, `shift+tab`, `ctrl+p`, `c`, `shift+c`, `enter`, and `ctrl+q`, reports no-match states, and displays only static generated terminal pixel art without persisting preferences, loading image files at runtime, mutating harness state, or adding command actions.
+- The TUI layout keeps chat and dashboard context in stable read-only sections, shows keyboard/navigation hints for `/`, `escape`, `tab`, `shift+tab`, `ctrl+p`/`F2`, `c`, `shift+c`, `enter`, and `ctrl+q`, reports no-match states, and displays only static generated terminal pixel art without persisting preferences, loading image files at runtime, mutating harness state, or adding command actions.
 - Section collapse and palette-only focus are session-local TUI state only. They must not write project config, user config, `.harness/`, SQLite, static art files, or any preference file.
 - `harness tui-home set-image <image> --output json` explicitly imports a local image into tracked static TUI art files and returns `harness.tui_home_image/v1`; it does not mutate `.harness/`, create tasks, create runs, acquire leases, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents.
 - `harness quickstart agent` prints commands only; it does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, create artifacts, execute adapters, or start daemon work.

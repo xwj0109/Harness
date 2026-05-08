@@ -44,7 +44,7 @@ harness daemon execute-read-only task_lease_abc123def456 --project . --output js
 
 The MVP does not authorize new adapters, automatic task generation, autonomous workflows, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, external messaging, application submission, or active repo write automation.
 
-## v1.1 Operator Cockpit
+## Operator Cockpit
 
 `harness home` is the first post-MVP CLI UX entrypoint. It summarizes the current project state without changing it:
 
@@ -64,7 +64,7 @@ python3 -m pip install "agent-harness[tui]"
 harness tui --project .
 ```
 
-Without the optional TUI extra, `harness tui` returns a clear install hint instead of importing Textual during normal CLI startup. `harness tui --output json` is a non-interactive availability probe and does not launch a terminal UI. With the optional extra installed, the TUI surface renders a chat-style interface with a slash-command prompt, project state, summary counts, imported-agent details, task details, active lease details, daemon event summaries, recent runs, safety reminders, and local in-memory search over already-loaded dashboard and command metadata. Operators can use `ctrl+p` to toggle palette-only search focus, `c` to collapse or expand the current section, and `shift+c` to expand all sections. These UI preferences are in-memory for the running TUI session only.
+Without the optional TUI extra, `harness tui` returns a clear install hint instead of importing Textual during normal CLI startup. `harness tui --output json` is a non-interactive availability probe and does not launch a terminal UI. With the optional extra installed, the TUI surface renders a light-theme chat-style interface with a slash-command prompt, project state, summary counts, imported-agent details, task details, active lease details, daemon event summaries, recent runs, safety reminders, and local in-memory search over already-loaded dashboard and command metadata. Operators can use `ctrl+p` or `F2` to toggle palette-only search focus, `c` to collapse or expand the current section, and `shift+c` to expand all sections. These UI preferences are in-memory for the running TUI session only.
 
 The TUI slash-command prompt is a command discovery surface, not an execution surface. Operators can type commands such as `/help`, `/home`, `/quickstart`, `/scaffold`, `/validate`, `/agents`, `/specs`, `/tasks`, `/lease`, `/inspect-lease`, `/execute-read-only`, `/runs`, `/policy`, `/artifacts`, and `/wheel`. The chat response renders the corresponding CLI command template, whether it would mutate state if manually run, and the safety note. Plain text is not sent to a model or backend.
 
@@ -81,7 +81,7 @@ harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 
 This command imports only the provided image path, stores a local source copy in `assets/tui/home_source.png`, and regenerates `src/harness/tui_assets/pixel_art.py`. It does not initialize projects, mutate `.harness/`, create tasks, create runs, acquire leases, start daemon work, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents in command output.
 
-The CLI/TUI UX milestone is packaged as release `1.1.0`. It is a usability release only; it does not broaden execution permissions or add new adapters.
+The original CLI/TUI UX milestone is packaged as release `1.1.0`. The v1.2 TUI refinements are usability-only additions for in-memory section collapse and palette-only focus; they do not broaden execution permissions or add new adapters.
 
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 

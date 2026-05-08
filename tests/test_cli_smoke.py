@@ -1,4 +1,5 @@
 import json
+import asyncio
 import sqlite3
 import tomllib
 
@@ -19,6 +20,7 @@ from harness.tui import (
     build_chat_welcome_message,
     build_command_palette,
     build_command_palette_panes,
+    create_read_only_tui_app,
     build_slash_commands,
     handle_slash_command,
     filter_command_palette,
@@ -580,7 +582,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "escape",
         "tab",
         "shift+tab",
-        "ctrl+p",
+        "ctrl+p/f2",
         "c",
         "shift+c",
         "ctrl+q",
@@ -704,6 +706,78 @@ def test_tui_palette_focus_filters_palette_without_hiding_dashboard(tmp_path) ->
     assert "base_url" not in serialized
     assert "subprocess" not in serialized
     assert "artifact contents" not in serialized
+
+
+def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Input
+
+    async def run_pilot() -> None:
+        app = create_read_only_tui_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            assert app.use_command_palette is False
+
+            await pilot.press("/")
+            await pilot.pause()
+            assert prompt.value == "/"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert prompt.value == ""
+
+            assert app._section_cursor_index == 0
+            await pilot.press("tab")
+            await pilot.pause()
+            assert app._section_cursor_index == 1
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app._section_cursor_index == 0
+
+            assert app._focus_mode == "dashboard"
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            await pilot.press("f2")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            await pilot.press("f2")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+
+            await pilot.press("c")
+            await pilot.pause()
+            assert app._collapsed_section_ids == {"project_overview"}
+
+            await pilot.press("c")
+            await pilot.pause()
+            assert app._collapsed_section_ids == set()
+
+            await pilot.press("e", "x", "e", "c")
+            await pilot.pause()
+            assert prompt.value == "exec"
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert prompt.value == ""
+
+            app._collapsed_section_ids.add("queue_daemon")
+            await pilot.press("C")
+            await pilot.pause()
+            assert app._collapsed_section_ids == set()
+            assert prompt.value == ""
+
+            app._collapsed_section_ids.add("queue_daemon")
+            await pilot.press("shift+c")
+            await pilot.pause()
+            assert app._collapsed_section_ids == set()
+            assert prompt.value == ""
+
+    asyncio.run(run_pilot())
 
 
 def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:

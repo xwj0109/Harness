@@ -103,11 +103,15 @@ Implemented CLI-only refinements include sectioned text output for high-traffic 
 
 Implemented TUI refinements include optional Textual startup, a chat-style slash-command discovery surface, dashboard context sections, local in-memory search over loaded dashboard and command metadata, keyboard/navigation hints, no-match status, static generated terminal pixel art, and explicit `tui-home set-image` static-art import. These changes remain read-only except for the explicit tracked static-art import command and do not add command execution, providers, hosted fallback, paid fallback, OpenAI API usage, Docker execution, shell access, or persisted TUI preferences.
 
+## Completed v1.2 Read-Only TUI Refinements
+
+The v1.2 read-only TUI refinement implementation is complete. It adds session-local section collapse and palette-only focus for command discovery while preserving the existing read-only TUI boundary: no command execution, subprocess spawning, clipboard writes, provider calls, backend preflight, Docker use, `.harness/` mutation, or persisted preferences.
+
 ## Immediate Next Planning Target
 
-The active implementation target is v1.2 read-only TUI refinements. This is a usability-only milestone for in-memory section collapse and dedicated palette-only focus, without command execution or persisted preferences.
+There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
 
-Recommended follow-up decision options after v1.2:
+Recommended decision options:
 
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
 - Additional read-only TUI refinements, still with no command execution or persisted preferences.

@@ -250,11 +250,11 @@ TUI_VIEW_SECTIONS = [
 ]
 
 TUI_NAVIGATION_HINTS = [
-    {"key": "/", "label": "Focus chat command input"},
+    {"key": "/", "label": "Type slash commands in the prompt"},
     {"key": "escape", "label": "Clear search"},
     {"key": "tab", "label": "Next pane"},
     {"key": "shift+tab", "label": "Previous pane"},
-    {"key": "ctrl+p", "label": "Toggle palette-only focus"},
+    {"key": "ctrl+p/f2", "label": "Toggle palette-only focus"},
     {"key": "c", "label": "Toggle current section collapse"},
     {"key": "shift+c", "label": "Expand all sections"},
     {"key": "ctrl+q", "label": "Quit"},
@@ -1066,8 +1066,9 @@ def _render_navigation_hints(view: dict) -> str:
     return " | ".join(f"{hint['key']}: {hint['label']}" for hint in view["navigation_hints"])
 
 
-def run_read_only_tui(project_root: Path) -> None:
+def create_read_only_tui_app(project_root: Path):
     from textual.app import App, ComposeResult
+    from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.widgets import Footer, Header, Input, Static
 
@@ -1080,7 +1081,32 @@ def run_read_only_tui(project_root: Path) -> None:
     initial_view = build_tui_view_model(initial_filter, initial_palette_filter)
     initial_messages = [build_chat_welcome_message(project_root)]
 
+    class HarnessPromptInput(Input):
+        def on_key(self, event) -> None:
+            if event.key == "tab":
+                event.prevent_default()
+                event.stop()
+                self.app.action_section_next()
+            elif event.key in {"shift+tab", "backtab"}:
+                event.prevent_default()
+                event.stop()
+                self.app.action_section_previous()
+            elif event.key in {"ctrl+p", "f2"}:
+                event.prevent_default()
+                event.stop()
+                self.app.action_toggle_palette_focus()
+            elif event.character == "c" and not self.value:
+                event.prevent_default()
+                event.stop()
+                self.app.action_toggle_section_collapse()
+            elif event.key == "shift+c" or event.character == "C":
+                event.prevent_default()
+                event.stop()
+                self.app.action_expand_all_sections()
+
     class HarnessReadOnlyTui(App):
+        ENABLE_COMMAND_PALETTE = False
+        theme = "textual-light"
         CSS = """
         #layout {
             height: 1fr;
@@ -1126,14 +1152,13 @@ def run_read_only_tui(project_root: Path) -> None:
         }
         """
         BINDINGS = [
-            ("ctrl+q", "quit", "Quit"),
-            ("/", "focus_search", "Search"),
-            ("escape", "clear_search", "Clear input"),
-            ("tab", "focus_next", "Next"),
-            ("shift+tab", "focus_previous", "Previous"),
-            ("ctrl+p", "toggle_palette_focus", "Palette focus"),
-            ("c", "toggle_section_collapse", "Collapse section"),
-            ("shift+c", "expand_all_sections", "Expand all"),
+            Binding("ctrl+q", "quit", "Quit", priority=True),
+            Binding("escape", "clear_search", "Clear input", priority=True),
+            Binding("tab", "section_next", "Next section", priority=True),
+            Binding("shift+tab,backtab", "section_previous", "Previous section", priority=True),
+            Binding("ctrl+p,f2", "toggle_palette_focus", "Palette focus", priority=True),
+            Binding("c", "toggle_section_collapse", "Collapse section"),
+            Binding("C,shift+c", "expand_all_sections", "Expand all", priority=True),
         ]
 
         def __init__(self) -> None:
@@ -1154,7 +1179,7 @@ def run_read_only_tui(project_root: Path) -> None:
                     yield Static(_render_navigation_hints(initial_view), id="palette-status")
                     yield Static("", id="slash-status")
                     yield Static("", id="pane-container")
-            yield Input(placeholder="Type /help or a slash command", id="prompt")
+            yield HarnessPromptInput(placeholder="Type /help or a slash command", id="prompt")
             yield Footer()
 
         def on_mount(self) -> None:
@@ -1183,9 +1208,6 @@ def run_read_only_tui(project_root: Path) -> None:
             self._render_chat()
             self._render_current_view()
 
-        def action_focus_search(self) -> None:
-            self.query_one("#prompt", Input).focus()
-
         def action_clear_search(self) -> None:
             prompt = self.query_one("#prompt", Input)
             if prompt.value:
@@ -1196,10 +1218,10 @@ def run_read_only_tui(project_root: Path) -> None:
                 self._section_cursor_index = 0
                 self._render_current_view()
 
-        def action_focus_next(self) -> None:
+        def action_section_next(self) -> None:
             self._move_section_cursor(1)
 
-        def action_focus_previous(self) -> None:
+        def action_section_previous(self) -> None:
             self._move_section_cursor(-1)
 
         def action_toggle_palette_focus(self) -> None:
@@ -1276,4 +1298,8 @@ def run_read_only_tui(project_root: Path) -> None:
                     rendered.extend([_render_pane_content(pane), ""])
             container.update("\n".join(rendered).strip())
 
-    HarnessReadOnlyTui().run()
+    return HarnessReadOnlyTui()
+
+
+def run_read_only_tui(project_root: Path) -> None:
+    create_read_only_tui_app(project_root).run()
