@@ -163,10 +163,17 @@ def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
     if not records:
         typer.echo("No runs found.")
         return
+    _print_tsv(["run_id", "status", "created_at", "task_type", "goal", "backend"])
     for record in records:
-        typer.echo(
-            f"{record.id}\t{record.status}\t{record.created_at.isoformat()}\t"
-            f"{record.task_type or ''}\t{record.goal or ''}\t{record.backend_name or 'none'}"
+        _print_tsv_row(
+            [
+                record.id,
+                record.status,
+                record.created_at.isoformat(),
+                record.task_type or "",
+                record.goal or "",
+                record.backend_name or "none",
+            ]
         )
 
 
@@ -463,8 +470,9 @@ def tasks_list(
     if not tasks:
         typer.echo("No tasks found.")
         return
+    _print_tsv(["task_id", "status", "priority", "title"])
     for task in tasks:
-        typer.echo(f"{task.id}\t{task.status.value}\t{task.priority}\t{task.title}")
+        _print_tsv_row([task.id, task.status.value, task.priority, task.title])
 
 
 @tasks_app.command("graph")
@@ -921,8 +929,9 @@ def agents_list(project: ProjectOption = Path("."), output: OutputOption = Outpu
     if not records:
         typer.echo("No project agents imported.")
         return
+    _print_tsv(["agent_id", "workbench", "content_sha256", "source_path"])
     for record in records:
-        typer.echo(f"{record.agent_id}\t{record.workbench_id}\t{record.content_sha256}\t{record.source_path}")
+        _print_tsv_row([record.agent_id, record.workbench_id, record.content_sha256, record.source_path])
 
 
 @agents_app.command("inspect")
@@ -1304,8 +1313,10 @@ def daemon_status(project: ProjectOption = Path("."), output: OutputOption = Out
     typer.echo(f"Project: {result.project_root}")
     typer.echo(f"Active daemons: {len(result.active_daemons)}")
     typer.echo(f"Paused tasks: {len(result.paused_tasks)}")
-    for daemon in result.active_daemons:
-        typer.echo(f"{daemon.id}\t{daemon.status.value}\t{daemon.owner}\t{daemon.heartbeat_at.isoformat()}")
+    if result.active_daemons:
+        _print_tsv(["daemon_id", "status", "owner", "heartbeat_at"])
+        for daemon in result.active_daemons:
+            _print_tsv_row([daemon.id, daemon.status.value, daemon.owner, daemon.heartbeat_at.isoformat()])
 
 
 @daemon_app.command("stop")
@@ -2042,6 +2053,14 @@ def _print_compare_result(result: dict) -> None:
 
 def _emit_json(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _print_tsv(headers: list[str]) -> None:
+    _print_tsv_row(headers)
+
+
+def _print_tsv_row(values: list[object]) -> None:
+    typer.echo("\t".join(str(value) for value in values))
 
 
 def _home_result(project_root: Path) -> dict:

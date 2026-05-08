@@ -679,7 +679,27 @@ def test_cli_runs_default_output_remains_text(tmp_path) -> None:
     runs = runner.invoke(app, ["runs", "--project", str(tmp_path)])
     assert runs.exit_code == 0
     assert not runs.output.lstrip().startswith("{")
+    assert runs.output.splitlines()[0] == "run_id\tstatus\tcreated_at\ttask_type\tgoal\tbackend"
     assert "\tcompleted\t" in runs.output
+
+
+def test_cli_common_text_lists_include_stable_headers(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task = runner.invoke(app, ["tasks", "add", "--title", "Text task", "--project", str(tmp_path)])
+    assert task.exit_code == 0, task.output
+    daemon = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path)])
+    assert daemon.exit_code == 0, daemon.output
+
+    tasks = runner.invoke(app, ["tasks", "list", "--project", str(tmp_path)])
+    daemon_status = runner.invoke(app, ["daemon", "status", "--project", str(tmp_path)])
+    agents = runner.invoke(app, ["agents", "list", "--project", str(tmp_path)])
+
+    assert tasks.exit_code == 0, tasks.output
+    assert tasks.output.splitlines()[0] == "task_id\tstatus\tpriority\ttitle"
+    assert daemon_status.exit_code == 0, daemon_status.output
+    assert "daemon_id\tstatus\towner\theartbeat_at" in daemon_status.output
+    assert agents.exit_code == 0, agents.output
+    assert agents.output.strip() == "No project agents imported."
 
 
 def test_cli_tasks_require_initialized_project(tmp_path) -> None:

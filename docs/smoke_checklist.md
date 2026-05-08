@@ -60,6 +60,10 @@ Expected v1.0 MVP safety properties:
 ```bash
 harness home --project . --output json
 harness quickstart agent --project . --output json
+harness runs --project .
+harness tasks list --project .
+harness agents list --project .
+harness daemon status --project .
 ```
 
 Expected v1.1 safety properties:
@@ -68,6 +72,7 @@ Expected v1.1 safety properties:
 - `harness quickstart agent` prints commands only; it does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, create artifacts, execute adapters, or start daemon work.
 - The dashboard does not preflight Codex or local backends, run Docker, invoke shell tools, call providers, start schedulers, or inspect backend settings.
 - JSON output uses `harness.home/v1` and `harness.quickstart_agent/v1` and does not include `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, artifact contents, or secret-like metadata.
+- Text list/status commands use compact tab-separated headers; JSON schemas remain unchanged.
 
 ## Verify Read-Only v0.2 Specs Commands
 

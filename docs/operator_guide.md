@@ -68,6 +68,17 @@ The quickstart output covers scaffold, validate, preview, init, import, inspect,
 
 `harness quickstart agent` does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, execute adapters, preflight backends, inspect backend settings, or start daemon work.
 
+Common list/status commands now use compact tab-separated text headers for operator readability:
+
+```bash
+harness runs --project .
+harness tasks list --project .
+harness agents list --project .
+harness daemon status --project .
+```
+
+The JSON forms of these commands remain unchanged for scripts and tests.
+
 ## Codex Supervised Isolated Editing
 
 `codex_code_edit` uses `CodexCliBackend` as an external agent backend. Codex does not run as a raw model provider, and the harness does not assume Codex internal actions appear as harness-native tool calls. Supervision is done through workspace isolation, Codex subprocess flags, captured output, artifacts, git status, diff inspection, policy validation, and explicit apply-back approval.
