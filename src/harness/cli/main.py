@@ -973,11 +973,13 @@ def agents_inspect(
         payload.update({"ok": True})
         _emit_json(payload)
         return
-    typer.echo(f"Agent: {record.agent_id}")
-    typer.echo(f"Workbench: {record.workbench_id}")
-    typer.echo(f"Source: {record.source_path}")
-    typer.echo(f"Hash: {record.content_sha256}")
-    typer.echo(f"Profiles: {len(record.profiles)}")
+    _print_section("Agent")
+    _print_kv("Agent id", record.agent_id)
+    _print_kv("Workbench", record.workbench_id)
+    _print_kv("Profiles", len(record.profiles))
+    _print_section("Source")
+    _print_kv("Path", record.source_path)
+    _print_kv("Content SHA256", record.content_sha256)
 
 
 @agents_app.command("preview-imported")
@@ -1051,19 +1053,19 @@ def policy_explain(
         payload.update({"ok": True, "policy_sha256": policy_hash, **extra})
         _emit_json(payload)
         return
-    typer.echo(f"Subject: {policy.subject_kind}/{policy.subject_id}")
-    typer.echo(f"Policy: {policy_hash}")
-    typer.echo("Levels:")
+    _print_section("Policy")
+    _print_kv("Subject", f"{policy.subject_kind}/{policy.subject_id}")
+    _print_kv("Policy SHA256", policy_hash)
+    if extra.get("backend_descriptor_sha256"):
+        _print_kv("Backend descriptor SHA256", extra["backend_descriptor_sha256"])
+    _print_section("Levels")
+    _print_tsv(["key", "level"])
     for key, level in policy.levels.items():
-        typer.echo(f"  {key}: {level.value}")
-    typer.echo(
-        "Required approvals: "
-        f"{', '.join(policy.required_approvals) if policy.required_approvals else 'none'}"
-    )
-    typer.echo(
-        "Forbidden reasons: "
-        f"{'; '.join(policy.forbidden_reasons) if policy.forbidden_reasons else 'none'}"
-    )
+        _print_tsv_row([key, level.value])
+    _print_section("Approvals")
+    _print_kv("Required approvals", ", ".join(policy.required_approvals) if policy.required_approvals else "none")
+    _print_section("Forbidden")
+    _print_kv("Reasons", "; ".join(policy.forbidden_reasons) if policy.forbidden_reasons else "none")
 
 
 def _resolve_policy_explain(project_root: Path, subject_kind: str, subject_id: str):
@@ -1121,10 +1123,16 @@ def artifacts_list(
     if not artifacts:
         typer.echo("No artifacts found.")
         return
+    _print_tsv(["artifact_id", "kind", "status", "sha256", "size_bytes"])
     for artifact in artifacts:
-        typer.echo(
-            f"{artifact.id}\t{artifact.kind}\t{artifact.evidence_status}\t"
-            f"{artifact.sha256 or 'none'}\t{artifact.size_bytes if artifact.size_bytes is not None else 'unknown'}"
+        _print_tsv_row(
+            [
+                artifact.id,
+                artifact.kind,
+                artifact.evidence_status,
+                artifact.sha256 or "none",
+                artifact.size_bytes if artifact.size_bytes is not None else "unknown",
+            ]
         )
 
 
@@ -1147,13 +1155,15 @@ def artifacts_inspect(
         payload.update({"ok": True})
         _emit_json(payload)
         return
-    typer.echo(f"Artifact: {artifact.id}")
-    typer.echo(f"Run: {artifact.run_id}")
-    typer.echo(f"Kind: {artifact.kind}")
-    typer.echo(f"Status: {artifact.evidence_status}")
-    typer.echo(f"SHA256: {artifact.sha256 or 'none'}")
-    typer.echo(f"Size: {artifact.size_bytes if artifact.size_bytes is not None else 'unknown'}")
-    typer.echo(f"Path: {artifact.path}")
+    _print_section("Artifact")
+    _print_kv("Artifact id", artifact.id)
+    _print_kv("Run", artifact.run_id)
+    _print_kv("Kind", artifact.kind)
+    _print_kv("Status", artifact.evidence_status)
+    _print_section("Evidence")
+    _print_kv("SHA256", artifact.sha256 or "none")
+    _print_kv("Size bytes", artifact.size_bytes if artifact.size_bytes is not None else "unknown")
+    _print_kv("Path", artifact.path)
 
 
 @tools_app.command("list")
@@ -1445,14 +1455,18 @@ def daemon_inspect_lease(
     if output == OutputFormat.JSON:
         _emit_json(result.model_dump(mode="json"))
         return
-    typer.echo(f"Lease: {result.lease.id}")
-    typer.echo(f"Status: {result.lease.status.value}")
-    typer.echo(f"Task: {result.task.id if result.task else 'missing'}")
-    typer.echo(f"Attempt: {result.attempt.id if result.attempt else 'missing'}")
-    typer.echo(f"Run: {result.run.id if result.run else 'none'}")
-    typer.echo(f"Dry-run eligible: {result.dry_run_eligibility.get('eligible')}")
-    typer.echo(f"Read-only eligible: {result.read_only_eligibility.get('eligible')}")
-    typer.echo(f"Recovery action: {result.recovery_recommendation.get('action')}")
+    _print_section("Lease")
+    _print_kv("Lease id", result.lease.id)
+    _print_kv("Status", result.lease.status.value)
+    _print_section("Links")
+    _print_kv("Task", result.task.id if result.task else "missing")
+    _print_kv("Attempt", result.attempt.id if result.attempt else "missing")
+    _print_kv("Run", result.run.id if result.run else "none")
+    _print_section("Eligibility")
+    _print_kv("Dry-run eligible", result.dry_run_eligibility.get("eligible"))
+    _print_kv("Read-only eligible", result.read_only_eligibility.get("eligible"))
+    _print_section("Recovery")
+    _print_kv("Action", result.recovery_recommendation.get("action"))
 
 
 @backends_app.callback()
@@ -1910,20 +1924,24 @@ def _print_workbench_spec(workbench) -> None:
 
 
 def _print_task(task) -> None:
-    typer.echo(f"Task: {task.id}")
-    typer.echo(f"Title: {task.title}")
-    typer.echo(f"Description: {task.description}")
-    typer.echo(f"Status: {task.status.value}")
-    typer.echo(f"Priority: {task.priority}")
-    typer.echo(f"Objective: {task.objective_id or 'none'}")
-    typer.echo(f"Workbench: {task.workbench_id or 'none'}")
-    typer.echo(f"Agent: {task.agent_id or 'none'}")
-    typer.echo(f"Depends on: {', '.join(task.depends_on) if task.depends_on else 'none'}")
-    typer.echo(
-        "Required approvals: "
-        f"{', '.join(task.required_approvals) if task.required_approvals else 'none'}"
+    _print_section("Task")
+    _print_kv("Task id", task.id)
+    _print_kv("Title", task.title)
+    _print_kv("Description", task.description)
+    _print_kv("Status", task.status.value)
+    _print_kv("Priority", task.priority)
+    _print_section("Scope")
+    _print_kv("Objective", task.objective_id or "none")
+    _print_kv("Workbench", task.workbench_id or "none")
+    _print_kv("Agent", task.agent_id or "none")
+    _print_section("Gates")
+    _print_kv("Depends on", ", ".join(task.depends_on) if task.depends_on else "none")
+    _print_kv(
+        "Required approvals",
+        ", ".join(task.required_approvals) if task.required_approvals else "none",
     )
-    typer.echo(f"Run: {task.run_id or 'none'}")
+    _print_section("Execution")
+    _print_kv("Run", task.run_id or "none")
 
 
 def _print_objective(objective) -> None:

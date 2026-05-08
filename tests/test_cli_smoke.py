@@ -717,6 +717,111 @@ def test_cli_common_text_lists_include_stable_headers(tmp_path) -> None:
     assert agents.output.strip() == "No project agents imported."
 
 
+def test_cli_common_inspect_text_outputs_are_sectioned(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    bundle_path = tmp_path / "agent_bundle"
+    scaffold = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "section_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(bundle_path),
+            "--output-format",
+            "json",
+        ],
+    )
+    assert scaffold.exit_code == 0, scaffold.output
+    imported = runner.invoke(app, ["agents", "import", str(bundle_path), "--project", str(tmp_path), "--output", "json"])
+    assert imported.exit_code == 0, imported.output
+
+    agent_text = runner.invoke(app, ["agents", "inspect", "section_agent", "--project", str(tmp_path)])
+    assert agent_text.exit_code == 0, agent_text.output
+    assert "\nAgent\n" in agent_text.output
+    assert "\nSource\n" in agent_text.output
+
+    created_task = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Section task", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert created_task.exit_code == 0, created_task.output
+    task_id = json.loads(created_task.output)["task"]["id"]
+    task_text = runner.invoke(app, ["tasks", "inspect", task_id, "--project", str(tmp_path)])
+    assert task_text.exit_code == 0, task_text.output
+    assert "\nTask\n" in task_text.output
+    assert "\nScope\n" in task_text.output
+    assert "\nGates\n" in task_text.output
+    assert "\nExecution\n" in task_text.output
+
+    leased = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert leased.exit_code == 0, leased.output
+    lease_id = json.loads(leased.output)["lease"]["id"]
+    lease_text = runner.invoke(app, ["daemon", "inspect-lease", lease_id, "--project", str(tmp_path)])
+    assert lease_text.exit_code == 0, lease_text.output
+    assert "\nLease\n" in lease_text.output
+    assert "\nLinks\n" in lease_text.output
+    assert "\nEligibility\n" in lease_text.output
+    assert "\nRecovery\n" in lease_text.output
+
+    policy_text = runner.invoke(
+        app,
+        [
+            "policy",
+            "explain",
+            "--subject-kind",
+            "agent",
+            "--subject-id",
+            "repo_inspector",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert policy_text.exit_code == 0, policy_text.output
+    assert "\nPolicy\n" in policy_text.output
+    assert "\nLevels\n" in policy_text.output
+    assert "\nApprovals\n" in policy_text.output
+    assert "\nForbidden\n" in policy_text.output
+
+    created_run = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "section artifact run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created_run.exit_code == 0, created_run.output
+    run_id = created_run.output.split("Created run ", 1)[1].splitlines()[0]
+    artifacts_json = runner.invoke(app, ["artifacts", "list", run_id, "--project", str(tmp_path), "--output", "json"])
+    assert artifacts_json.exit_code == 0, artifacts_json.output
+    artifact_id = json.loads(artifacts_json.output)["artifacts"][0]["id"]
+    artifacts_text = runner.invoke(app, ["artifacts", "list", run_id, "--project", str(tmp_path)])
+    assert artifacts_text.exit_code == 0, artifacts_text.output
+    assert artifacts_text.output.splitlines()[0] == "artifact_id\tkind\tstatus\tsha256\tsize_bytes"
+    artifact_text = runner.invoke(app, ["artifacts", "inspect", artifact_id, "--project", str(tmp_path)])
+    assert artifact_text.exit_code == 0, artifact_text.output
+    assert "\nArtifact\n" in artifact_text.output
+    assert "\nEvidence\n" in artifact_text.output
+
+
 def test_cli_tasks_require_initialized_project(tmp_path) -> None:
     result = runner.invoke(
         app,

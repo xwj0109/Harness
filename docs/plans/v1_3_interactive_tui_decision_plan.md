@@ -1,6 +1,6 @@
 # v1.3 Interactive TUI Decision Plan
 
-Status: decided.
+Status: decided; Typer/Rich-first polish implemented.
 
 ## Summary
 
@@ -172,8 +172,8 @@ Recommended next CLI-only improvements:
 
 - Extend `harness home` with a concise `--watch`-free refresh recommendation rather than a live dashboard.
 - Add compact examples to high-traffic command help text where Typer already displays docstrings well.
-- Add consistent text sections for `agents inspect`, `tasks inspect`, `daemon inspect-lease`, and policy/artifact inspection commands.
-- Add a command catalog page in docs that groups common command paths by workflow.
+- Add consistent text sections for `agents inspect`, `tasks inspect`, `daemon inspect-lease`, and policy/artifact inspection commands. Implemented for the primary inspect/explain paths.
+- Add a command catalog page in docs that groups common command paths by workflow. Implemented in `docs/command_catalog.md`.
 - Keep JSON output unchanged.
 
 Non-goals for this next work:

@@ -77,6 +77,8 @@ Expected v1.0 MVP safety properties:
 
 ## Verify v1.1 Operator Cockpit
 
+Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.0 MVP smoke path when checking inspect text output.
+
 ```bash
 harness home --project . --output json
 harness quickstart agent --project . --output json
@@ -86,6 +88,11 @@ harness runs --project .
 harness tasks list --project .
 harness agents list --project .
 harness daemon status --project .
+harness agents inspect smoke_v1_agent --project .
+harness tasks inspect "$TASK_ID" --project .
+harness daemon inspect-lease "$LEASE_ID" --project .
+harness policy explain --subject-kind task --subject-id "$TASK_ID" --project .
+harness artifacts inspect "$ARTIFACT_ID" --project .
 ```
 
 Expected v1.1 safety properties:
@@ -96,6 +103,7 @@ Expected v1.1 safety properties:
 - JSON output uses `harness.home/v1` and `harness.quickstart_agent/v1` and does not include `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, artifact contents, or secret-like metadata.
 - `harness home` and `harness quickstart agent` text output uses simple sections for scanning while keeping JSON unchanged.
 - Text list/status commands use compact tab-separated headers; JSON schemas remain unchanged.
+- Text inspect/explain commands use compact sections for scanning; JSON schemas remain unchanged.
 
 ## Verify Read-Only v0.2 Specs Commands
 

@@ -50,6 +50,7 @@ Spec and agent lifecycle surfaces are inspection/control-plane commands. They do
 Current operator-facing flows are documented in:
 
 - [docs/operator_guide.md](docs/operator_guide.md)
+- [docs/command_catalog.md](docs/command_catalog.md)
 - [docs/smoke_checklist.md](docs/smoke_checklist.md)
 
 Security boundaries and threat-model notes are documented in:

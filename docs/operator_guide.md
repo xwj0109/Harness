@@ -79,7 +79,17 @@ harness agents list --project .
 harness daemon status --project .
 ```
 
-The JSON forms of these commands remain unchanged for scripts and tests.
+Common inspect/explain commands use small section headings so operators can scan them without losing JSON stability:
+
+```bash
+harness agents inspect my_agent --project .
+harness tasks inspect task_abc123def456 --project .
+harness daemon inspect-lease task_lease_abc123def456 --project .
+harness policy explain --subject-kind task --subject-id task_abc123def456 --project .
+harness artifacts inspect artifact_abc123def456 --project .
+```
+
+The JSON forms of these commands remain unchanged for scripts and tests. A grouped command reference is available in [command_catalog.md](command_catalog.md).
 
 ## Codex Supervised Isolated Editing
 

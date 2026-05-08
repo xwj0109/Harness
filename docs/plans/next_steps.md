@@ -110,13 +110,19 @@ The adapter is intentionally narrow. It uses only the configured local-only, no-
 
 The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md). It adds focused coverage for read-only adapter preflight failure, runner failure, duplicate execution, read-only recovery states, inspect-lease evidence, unresolved approvals, forbidden metadata, and unsafe backend descriptors. It does not add another execution path.
 
-## Immediate Next Planning Target
+## Completed v1.3 Typer/Rich-First CLI Polish
 
-The immediate next target is Typer/Rich-first CLI polish, following the decision in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). v1.2 pre-TUI polish is complete and the v1.3 TUI decision is to stay Typer/Rich-first for now. The ranked post-MVP UX/product order is:
+The Typer/Rich-first CLI polish follow-up is tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). v1.2 pre-TUI polish is complete and the v1.3 TUI decision is to stay Typer/Rich-first for now. The ranked post-MVP UX/product order is:
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.
 3. True interactive TUI/command palette later, behind a separate decision gate. Deferred.
+
+Implemented CLI-only refinements include sectioned text output for high-traffic inspect/explain commands and a grouped command catalog in [../command_catalog.md](../command_catalog.md). JSON contracts remain unchanged.
+
+## Immediate Next Planning Target
+
+There is no active TUI implementation target. The next UX/product capability should be chosen by a separate decision-complete plan.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
