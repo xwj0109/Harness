@@ -105,12 +105,12 @@ Implemented TUI refinements include optional Textual startup, a chat-style slash
 
 ## Immediate Next Planning Target
 
-There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
+The active implementation target is v1.2 read-only TUI refinements. This is a usability-only milestone for in-memory section collapse and dedicated palette-only focus, without command execution or persisted preferences.
 
-Recommended decision options:
+Recommended follow-up decision options after v1.2:
 
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
-- v1.2 read-only TUI refinements such as in-memory pane collapse or dedicated palette focus, still with no command execution or persisted preferences.
+- Additional read-only TUI refinements, still with no command execution or persisted preferences.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

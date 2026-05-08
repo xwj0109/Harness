@@ -254,10 +254,15 @@ TUI_NAVIGATION_HINTS = [
     {"key": "escape", "label": "Clear search"},
     {"key": "tab", "label": "Next pane"},
     {"key": "shift+tab", "label": "Previous pane"},
+    {"key": "ctrl+p", "label": "Toggle palette-only focus"},
+    {"key": "c", "label": "Toggle current section collapse"},
+    {"key": "shift+c", "label": "Expand all sections"},
     {"key": "ctrl+q", "label": "Quit"},
     {"key": "enter", "label": "Send slash command"},
     {"key": "copy-only", "label": "Slash commands render command templates only"},
 ]
+
+TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
 
 SLASH_COMMAND_ALIASES = {
     "help": "orientation.quickstart_agent",
@@ -864,7 +869,45 @@ def render_pixel_art():
     return Group(*lines)
 
 
-def build_tui_view_model(filtered: dict, filtered_palette: dict) -> dict:
+def normalize_tui_collapsed_sections(collapsed_section_ids: set[str] | list[str] | tuple[str, ...] | None) -> list[str]:
+    if not collapsed_section_ids:
+        return []
+    valid_section_ids = {section["id"] for section in TUI_VIEW_SECTIONS}
+    return sorted(str(section_id) for section_id in collapsed_section_ids if str(section_id) in valid_section_ids)
+
+
+def build_focused_tui_view_model(
+    panes: list[dict],
+    palette: dict,
+    query: str,
+    *,
+    focus_mode: str = "dashboard",
+    collapsed_section_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    mode = focus_mode if focus_mode in TUI_FOCUS_MODES else "dashboard"
+    if mode == "palette":
+        filtered = filter_tui_panes(panes, "")
+        filtered_palette = filter_command_palette(palette, query)
+    else:
+        filtered = filter_tui_panes(panes, query)
+        filtered_palette = filter_command_palette(palette, query)
+    return build_tui_view_model(
+        filtered,
+        filtered_palette,
+        focus_mode=mode,
+        collapsed_section_ids=collapsed_section_ids,
+    )
+
+
+def build_tui_view_model(
+    filtered: dict,
+    filtered_palette: dict,
+    *,
+    focus_mode: str = "dashboard",
+    collapsed_section_ids: set[str] | list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    mode = focus_mode if focus_mode in TUI_FOCUS_MODES else "dashboard"
+    collapsed_ids = set(normalize_tui_collapsed_sections(collapsed_section_ids))
     no_matches = not filtered["panes"] and not filtered_palette["entries"]
     dashboard_panes = [dict(pane) for pane in filtered["panes"]]
     palette_panes = [] if no_matches else build_command_palette_panes(filtered_palette)
@@ -879,15 +922,18 @@ def build_tui_view_model(filtered: dict, filtered_palette: dict) -> dict:
         ]
         if not section_panes:
             continue
+        collapsed = section["id"] in collapsed_ids
         sections.append(
             {
                 "id": section["id"],
                 "title": section["title"],
                 "pane_ids": [pane["id"] for pane in section_panes],
                 "pane_count": len(section_panes),
+                "collapsed": collapsed,
             }
         )
-        ordered_panes.extend(section_panes)
+        if not collapsed:
+            ordered_panes.extend(section_panes)
     empty_state = None
     if no_matches:
         empty_state = {
@@ -899,6 +945,8 @@ def build_tui_view_model(filtered: dict, filtered_palette: dict) -> dict:
         "schema_version": "harness.tui_view/v1",
         "ok": True,
         "query": filtered["query"] or filtered_palette["query"],
+        "focus_mode": mode,
+        "collapsed_section_ids": sorted(collapsed_ids),
         "sections": sections,
         "panes": ordered_panes,
         "pane_order": [pane["id"] for pane in ordered_panes],
@@ -985,8 +1033,11 @@ def render_palette_status(filtered_palette: dict) -> str:
 def render_view_status(view: dict) -> str:
     query = view["query"] or "none"
     search = view["search"]
+    collapsed = len(view.get("collapsed_section_ids", []))
+    focus_mode = view.get("focus_mode", "dashboard")
     return (
-        f"View search: {query} | Sections: {len(view['sections'])} | Panes: {len(view['panes'])} | "
+        f"View search: {query} | Focus: {focus_mode} | Collapsed: {collapsed} | "
+        f"Sections: {len(view['sections'])} | Panes: {len(view['panes'])} | "
         f"Dashboard matches: {search['dashboard_matches']} | Palette commands: {search['palette_matches']}"
     )
 
@@ -999,10 +1050,12 @@ def _render_pane_content(pane: dict) -> str:
 
 
 def _render_section_content(section: dict) -> str:
+    state = "collapsed" if section.get("collapsed") else "expanded"
     return "\n".join(
         [
             section["title"],
             "",
+            f"State: {state}",
             f"Panes: {section['pane_count']}",
             f"IDs: {', '.join(section['pane_ids'])}",
         ]
@@ -1078,11 +1131,17 @@ def run_read_only_tui(project_root: Path) -> None:
             ("escape", "clear_search", "Clear input"),
             ("tab", "focus_next", "Next"),
             ("shift+tab", "focus_previous", "Previous"),
+            ("ctrl+p", "toggle_palette_focus", "Palette focus"),
+            ("c", "toggle_section_collapse", "Collapse section"),
+            ("shift+c", "expand_all_sections", "Expand all"),
         ]
 
         def __init__(self) -> None:
             super().__init__()
             self._messages = [dict(message) for message in initial_messages]
+            self._focus_mode = "dashboard"
+            self._collapsed_section_ids: set[str] = set()
+            self._section_cursor_index = 0
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
@@ -1101,16 +1160,11 @@ def run_read_only_tui(project_root: Path) -> None:
         def on_mount(self) -> None:
             self.query_one("#prompt", Input).focus()
             self._render_chat()
-            self._render_view(initial_view)
+            self._render_current_view()
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "prompt":
-                self._render_view(
-                    build_tui_view_model(
-                        filter_tui_panes(panes, event.value),
-                        filter_command_palette(palette, event.value),
-                    )
-                )
+                self._render_current_view()
                 filtered_slash = filter_slash_commands(slash_commands, event.value)
                 self.query_one("#slash-status", Static).update(
                     f"Slash commands: {filtered_slash['total_matches']}"
@@ -1127,21 +1181,80 @@ def run_read_only_tui(project_root: Path) -> None:
             self._messages.extend(response["messages"])
             event.input.value = ""
             self._render_chat()
-            self._render_view(initial_view)
+            self._render_current_view()
 
         def action_focus_search(self) -> None:
             self.query_one("#prompt", Input).focus()
 
         def action_clear_search(self) -> None:
             prompt = self.query_one("#prompt", Input)
-            prompt.value = ""
-            self._render_view(initial_view)
+            if prompt.value:
+                prompt.value = ""
+            else:
+                self._focus_mode = "dashboard"
+                self._collapsed_section_ids.clear()
+                self._section_cursor_index = 0
+                self._render_current_view()
+
+        def action_focus_next(self) -> None:
+            self._move_section_cursor(1)
+
+        def action_focus_previous(self) -> None:
+            self._move_section_cursor(-1)
+
+        def action_toggle_palette_focus(self) -> None:
+            self._focus_mode = "palette" if self._focus_mode == "dashboard" else "dashboard"
+            self._render_current_view()
+
+        def action_toggle_section_collapse(self) -> None:
+            view = self._current_view()
+            if not view["sections"]:
+                return
+            self._clamp_section_cursor(view)
+            section_id = view["sections"][self._section_cursor_index]["id"]
+            if section_id in self._collapsed_section_ids:
+                self._collapsed_section_ids.remove(section_id)
+            else:
+                self._collapsed_section_ids.add(section_id)
+            self._render_current_view()
+
+        def action_expand_all_sections(self) -> None:
+            self._collapsed_section_ids.clear()
+            self._render_current_view()
+
+        def _move_section_cursor(self, step: int) -> None:
+            view = self._current_view()
+            if not view["sections"]:
+                self._section_cursor_index = 0
+                return
+            self._section_cursor_index = (self._section_cursor_index + step) % len(view["sections"])
+            self._render_view(view)
+
+        def _current_view(self) -> dict:
+            prompt = self.query_one("#prompt", Input)
+            return build_focused_tui_view_model(
+                panes,
+                palette,
+                prompt.value,
+                focus_mode=self._focus_mode,
+                collapsed_section_ids=self._collapsed_section_ids,
+            )
+
+        def _render_current_view(self) -> None:
+            self._render_view(self._current_view())
+
+        def _clamp_section_cursor(self, view: dict) -> None:
+            if not view["sections"]:
+                self._section_cursor_index = 0
+            elif self._section_cursor_index >= len(view["sections"]):
+                self._section_cursor_index = len(view["sections"]) - 1
 
         def _render_chat(self) -> None:
             transcript = "\n\n".join(render_chat_message(message) for message in self._messages)
             self.query_one("#chat-content", Static).update(transcript)
 
         def _render_view(self, view: dict) -> None:
+            self._clamp_section_cursor(view)
             self.query_one("#search-status", Static).update(render_view_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
             container = self.query_one("#pane-container", Static)
@@ -1150,8 +1263,14 @@ def run_read_only_tui(project_root: Path) -> None:
                 return
             panes_by_id = {pane["id"]: pane for pane in view["panes"]}
             rendered = []
-            for section in view["sections"]:
-                rendered.extend([_render_section_content(section), ""])
+            for index, section in enumerate(view["sections"]):
+                cursor = "> " if index == self._section_cursor_index else ""
+                rendered.append(cursor + _render_section_content(section))
+                rendered.append("")
+                if section.get("collapsed"):
+                    rendered.append("Section collapsed in this TUI session.")
+                    rendered.append("")
+                    continue
                 for pane_id in section["pane_ids"]:
                     pane = panes_by_id[pane_id]
                     rendered.extend([_render_pane_content(pane), ""])

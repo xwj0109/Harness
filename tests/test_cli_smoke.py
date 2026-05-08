@@ -12,6 +12,7 @@ from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLo
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
 from harness.tui import (
+    build_focused_tui_view_model,
     build_tui_dashboard,
     build_tui_panes,
     build_tui_view_model,
@@ -565,15 +566,23 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["pane_order"][:6] == ["overview", "guidance", "commands", "tasks", "leases", "daemon"]
     assert view["pane_order"][-1] == "safety"
     assert view["empty_state"] is None
+    assert view["focus_mode"] == "dashboard"
+    assert view["collapsed_section_ids"] == []
+    assert all(section["collapsed"] is False for section in view["sections"])
     assert view["search"]["dashboard_panes"] == len(panes)
     assert view["search"]["palette_matches"] == len(palette["entries"])
-    assert render_view_status(view).startswith("View search: none | Sections: 6 | Panes:")
+    assert render_view_status(view).startswith(
+        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 6 | Panes:"
+    )
     assert f"Palette commands: {len(palette['entries'])}" in render_view_status(view)
     assert {hint["key"] for hint in view["navigation_hints"]} == {
         "/",
         "escape",
         "tab",
         "shift+tab",
+        "ctrl+p",
+        "c",
+        "shift+c",
         "ctrl+q",
         "enter",
         "copy-only",
@@ -599,11 +608,97 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "palette_groups": 0,
     }
     assert render_view_status(missing_view) == (
-        "View search: does-not-exist | Sections: 0 | Panes: 0 | "
+        "View search: does-not-exist | Focus: dashboard | Collapsed: 0 | Sections: 0 | Panes: 0 | "
         "Dashboard matches: 0 | Palette commands: 0"
     )
 
     serialized = json.dumps({"view": view, "missing": missing_view})
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
+
+
+def test_tui_view_model_supports_in_memory_section_collapse(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
+    palette = build_command_palette()
+
+    expanded = build_focused_tui_view_model(panes, palette, "", focus_mode="dashboard")
+    collapsed = build_focused_tui_view_model(
+        panes,
+        palette,
+        "",
+        focus_mode="dashboard",
+        collapsed_section_ids={"queue_daemon", "not_a_section"},
+    )
+    restored = build_focused_tui_view_model(
+        panes,
+        palette,
+        "",
+        focus_mode="dashboard",
+        collapsed_section_ids=set(),
+    )
+
+    assert expanded["collapsed_section_ids"] == []
+    assert collapsed["collapsed_section_ids"] == ["queue_daemon"]
+    assert [section["id"] for section in collapsed["sections"]] == [
+        section["id"] for section in expanded["sections"]
+    ]
+    queue_section = next(section for section in collapsed["sections"] if section["id"] == "queue_daemon")
+    assert queue_section["collapsed"] is True
+    assert queue_section["pane_ids"] == ["tasks", "leases", "daemon"]
+    assert "tasks" not in collapsed["pane_order"]
+    assert "leases" not in collapsed["pane_order"]
+    assert "daemon" not in collapsed["pane_order"]
+    assert restored["pane_order"] == expanded["pane_order"]
+
+    serialized = json.dumps({"expanded": expanded, "collapsed": collapsed, "restored": restored})
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
+
+
+def test_tui_palette_focus_filters_palette_without_hiding_dashboard(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
+    palette = build_command_palette()
+
+    dashboard_focus = build_focused_tui_view_model(panes, palette, "execute-read-only", focus_mode="dashboard")
+    palette_focus = build_focused_tui_view_model(panes, palette, "execute-read-only", focus_mode="palette")
+    missing_palette_focus = build_focused_tui_view_model(panes, palette, "does-not-exist", focus_mode="palette")
+
+    assert dashboard_focus["focus_mode"] == "dashboard"
+    assert palette_focus["focus_mode"] == "palette"
+    assert palette_focus["search"]["dashboard_panes"] == len(panes)
+    assert palette_focus["search"]["dashboard_matches"] == sum(len(pane["lines"]) for pane in panes)
+    assert palette_focus["search"]["palette_matches"] == 1
+    assert "command_palette_selected" in palette_focus["pane_order"]
+    assert any(
+        pane["id"] == "command_palette_selected"
+        and "harness daemon execute-read-only task_lease_abc123 --project . --output json" in "\n".join(pane["lines"])
+        for pane in palette_focus["panes"]
+    )
+
+    assert missing_palette_focus["focus_mode"] == "palette"
+    assert missing_palette_focus["empty_state"] is None
+    assert missing_palette_focus["search"]["dashboard_panes"] == len(panes)
+    assert missing_palette_focus["search"]["palette_matches"] == 0
+    assert "overview" in missing_palette_focus["pane_order"]
+    assert "command_palette_selected" in missing_palette_focus["pane_order"]
+    selected = next(pane for pane in missing_palette_focus["panes"] if pane["id"] == "command_palette_selected")
+    assert selected["lines"] == ["No matching command template."]
+
+    serialized = json.dumps(
+        {
+            "dashboard_focus": dashboard_focus,
+            "palette_focus": palette_focus,
+            "missing_palette_focus": missing_palette_focus,
+        }
+    )
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
