@@ -9,7 +9,7 @@ from harness.config import default_config
 from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
-from harness.tui import build_tui_dashboard, build_tui_panes, render_dashboard_text
+from harness.tui import build_tui_dashboard, build_tui_panes, filter_tui_panes, render_dashboard_text
 
 
 runner = CliRunner()
@@ -266,6 +266,109 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
+
+
+def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    bundle_path = tmp_path / "search_agent_bundle"
+    scaffold = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "search_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(bundle_path),
+            "--output-format",
+            "json",
+        ],
+    )
+    assert scaffold.exit_code == 0, scaffold.output
+    imported = runner.invoke(app, ["agents", "import", str(bundle_path), "--project", str(tmp_path), "--output", "json"])
+    assert imported.exit_code == 0, imported.output
+    task = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Searchable task",
+            "--agent",
+            "search_agent",
+            "--workbench",
+            "quant",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task.exit_code == 0, task.output
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert tick.exit_code == 0, tick.output
+    created_run = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "searchable dashboard run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created_run.exit_code == 0, created_run.output
+
+    panes = build_tui_panes(build_tui_dashboard(tmp_path))
+    unfiltered = filter_tui_panes(panes, "")
+    agent_filtered = filter_tui_panes(panes, "SEARCH_AGENT")
+    task_filtered = filter_tui_panes(panes, "searchable task")
+    lease_filtered = filter_tui_panes(panes, json.loads(tick.output)["lease"]["id"])
+    run_filtered = filter_tui_panes(panes, "phase_1a_test")
+    daemon_filtered = filter_tui_panes(panes, "daemon")
+    command_filtered = filter_tui_panes(panes, "tasks list")
+
+    assert unfiltered["schema_version"] == "harness.tui_filter/v1"
+    assert [pane["id"] for pane in unfiltered["panes"]] == [pane["id"] for pane in panes]
+    assert [pane["id"] for pane in agent_filtered["panes"]] == ["agents"]
+    assert [pane["id"] for pane in task_filtered["panes"]] == ["tasks"]
+    assert [pane["id"] for pane in lease_filtered["panes"]] == ["leases"]
+    assert [pane["id"] for pane in run_filtered["panes"]] == ["runs"]
+    assert "daemon" in [pane["id"] for pane in daemon_filtered["panes"]]
+    assert [pane["id"] for pane in command_filtered["panes"]] == ["commands"]
+    serialized = json.dumps(
+        {
+            "panes": panes,
+            "agent_filtered": agent_filtered,
+            "task_filtered": task_filtered,
+            "lease_filtered": lease_filtered,
+            "run_filtered": run_filtered,
+            "daemon_filtered": daemon_filtered,
+            "command_filtered": command_filtered,
+        }
+    )
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "Created Phase 1A diagnostic run." not in serialized
 
 
 def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output(tmp_path) -> None:

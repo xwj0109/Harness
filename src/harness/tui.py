@@ -268,6 +268,51 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
     return panes
 
 
+def filter_tui_panes(panes: list[dict], query: str) -> dict:
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return {
+            "schema_version": "harness.tui_filter/v1",
+            "ok": True,
+            "query": "",
+            "total_matches": sum(len(pane["lines"]) for pane in panes),
+            "panes": [
+                {
+                    **pane,
+                    "match_count": len(pane["lines"]),
+                }
+                for pane in panes
+            ],
+        }
+
+    filtered_panes = []
+    total_matches = 0
+    for pane in panes:
+        title_matches = normalized_query in pane["title"].casefold()
+        matched_lines = [
+            line for line in pane["lines"] if normalized_query in str(line).casefold()
+        ]
+        if title_matches and not matched_lines:
+            matched_lines = pane["lines"]
+        if title_matches or matched_lines:
+            match_count = len(matched_lines)
+            total_matches += match_count
+            filtered_panes.append(
+                {
+                    **pane,
+                    "lines": matched_lines,
+                    "match_count": match_count,
+                }
+            )
+    return {
+        "schema_version": "harness.tui_filter/v1",
+        "ok": True,
+        "query": query,
+        "total_matches": total_matches,
+        "panes": filtered_panes,
+    }
+
+
 def render_dashboard_text(dashboard: dict) -> str:
     lines = ["Agent Harness"]
     for pane in build_tui_panes(dashboard):
