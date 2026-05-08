@@ -68,6 +68,8 @@ Without the optional TUI extra, `harness tui` returns a clear install hint inste
 
 The v1.7 TUI also includes a copy-only command palette. It shows workflow-grouped command templates, mutation/safety notes, and selected command text for manual operator use. The palette is discovery-only: it does not execute commands, spawn subprocesses, invoke a shell, copy to the clipboard, mutate tasks, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, call providers, crawl files, search artifact contents, or expose secrets.
 
+The v1.8 TUI polish groups visible panes into stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. It also shows compact keyboard hints and clearer search/no-match status. These are in-memory presentation changes only; no UI preferences are persisted.
+
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 
 ```bash

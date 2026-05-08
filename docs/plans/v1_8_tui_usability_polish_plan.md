@@ -1,6 +1,6 @@
 # v1.8 TUI Usability Polish Plan
 
-Status: Slice 2 in progress.
+Status: Complete.
 
 ## Summary
 
@@ -99,6 +99,8 @@ Implementation note: Slice 2 updates the optional Textual app to render from `bu
 - Update [operator_guide.md](../operator_guide.md), [command_catalog.md](../command_catalog.md), and [smoke_checklist.md](../smoke_checklist.md).
 - Mark v1.8 complete only after focused and full tests pass.
 - Keep persisted layouts, clipboard integration, command execution, or any TUI actions behind later decision-complete plans.
+
+Completion note: v1.8 is complete as read-only TUI usability polish. The Textual-free view model, deterministic section ordering, navigation hints, unified search status, model-level no-match state, Textual section rendering, operator docs, command catalog, and smoke checklist are implemented and verified. No command execution, clipboard integration, persisted layout, state mutation, backend preflight, Docker, provider calls, or daemon controls were added.
 
 ## Test Plan
 
