@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import tomllib
 
 from typer.testing import CliRunner
@@ -13,10 +14,15 @@ from harness.tui import (
     build_tui_dashboard,
     build_tui_panes,
     build_tui_view_model,
+    build_chat_welcome_message,
     build_command_palette,
     build_command_palette_panes,
+    build_slash_commands,
+    handle_slash_command,
     filter_command_palette,
+    filter_slash_commands,
     filter_tui_panes,
+    render_chat_message,
     render_dashboard_text,
     render_filter_status,
     render_palette_status,
@@ -139,12 +145,22 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert dashboard["ok"] is True
     assert dashboard["initialized"] is False
     assert dashboard["summary"]["tasks_total"] == 0
+    assert dashboard["pixel_art"] == [
+        "   /\\_____/\\   ",
+        "  /  o   o  \\  ",
+        " ( ==  ^  == ) ",
+        "  )         (  ",
+        " (           ) ",
+        " ( (  ) (  ) )",
+        "(__(__)_(__)__)",
+    ]
     assert dashboard["agents"] == []
     assert dashboard["tasks"] == []
     assert dashboard["active_leases"] == []
     assert dashboard["daemon"]["latest_events"] == []
     assert dashboard["guidance"][0]["id"] == "initialize_project"
     assert [pane["id"] for pane in panes] == [
+        "pixel_art",
         "overview",
         "agents",
         "tasks",
@@ -156,11 +172,42 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
         "safety",
     ]
     assert "Project" in rendered
+    assert " ( ==  ^  == ) " in rendered
     assert "Initialized: False" in rendered
     assert "Commands" in rendered
     assert "Safety" in rendered
     assert "no_hidden_execution" in rendered
     assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_dashboard_reports_stale_project_database_without_traceback(tmp_path) -> None:
+    harness_dir = tmp_path / ".harness"
+    harness_dir.mkdir()
+    with sqlite3.connect(harness_dir / "harness.sqlite") as conn:
+        conn.execute("CREATE TABLE runs (id TEXT PRIMARY KEY)")
+
+    dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
+    rendered = render_dashboard_text(dashboard)
+    home = runner.invoke(app, ["home", "--project", str(tmp_path), "--output", "json"])
+
+    assert dashboard["ok"] is True
+    assert dashboard["initialized"] is False
+    assert dashboard["state_error"]["type"] == "OperationalError"
+    assert dashboard["guidance"] == [
+        {
+            "id": "repair_project_state",
+            "command": f"harness init --project {tmp_path}",
+            "description": "Repair or migrate local harness persistence for this project.",
+        }
+    ]
+    assert any("repair_project_state" in line for pane in panes for line in pane["lines"])
+    assert "State error: OperationalError" in rendered
+    assert home.exit_code == 0, home.output
+    payload = json.loads(home.output)
+    assert payload["initialized"] is False
+    assert payload["state_error"]["type"] == "OperationalError"
+    assert payload["recommended_actions"][0]["id"] == "repair_project_state"
 
 
 def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
@@ -254,6 +301,7 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["task_status_counts"]["leased"] == 1
     assert dashboard["recent_runs"][0]["task_type"] == "phase_1a_test"
     assert [pane["id"] for pane in panes] == [
+        "pixel_art",
         "overview",
         "agents",
         "tasks",
@@ -263,9 +311,10 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
         "commands",
         "safety",
     ]
-    assert any("tui_agent" in line for line in panes[1]["lines"])
-    assert any("tui task" in line for line in panes[2]["lines"])
-    assert any(dashboard["active_leases"][0]["id"] in line for line in panes[3]["lines"])
+    assert any("tui_agent" in line for line in panes[2]["lines"])
+    assert any("tui task" in line for line in panes[3]["lines"])
+    assert any(dashboard["active_leases"][0]["id"] in line for line in panes[4]["lines"])
+    assert " ( ==  ^  == ) " in rendered
     assert "tui_agent workbench=quant" in rendered
     assert "tui task" in rendered
     assert "Active Leases" in rendered
@@ -477,11 +526,11 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "command_palette",
         "safety",
     ]
-    assert view["sections"][0]["pane_ids"] == ["overview", "guidance", "commands"]
+    assert view["sections"][0]["pane_ids"] == ["pixel_art", "overview", "guidance", "commands"]
     assert view["sections"][1]["pane_ids"] == ["tasks", "leases", "daemon"]
     assert view["sections"][4]["pane_ids"][0] == "command_palette"
     assert view["sections"][4]["pane_ids"][-1] == "command_palette_selected"
-    assert view["pane_order"][:6] == ["overview", "guidance", "commands", "tasks", "leases", "daemon"]
+    assert view["pane_order"][:7] == ["pixel_art", "overview", "guidance", "commands", "tasks", "leases", "daemon"]
     assert view["pane_order"][-1] == "safety"
     assert view["empty_state"] is None
     assert view["search"]["dashboard_panes"] == len(panes)
@@ -493,7 +542,8 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "escape",
         "tab",
         "shift+tab",
-        "q",
+        "ctrl+q",
+        "enter",
         "copy-only",
     }
 
@@ -522,6 +572,100 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     )
 
     serialized = json.dumps({"view": view, "missing": missing_view})
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
+
+
+def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
+    palette = build_command_palette()
+    slash_commands = build_slash_commands(palette)
+
+    names = [command["name"] for command in slash_commands["commands"]]
+    assert slash_commands["schema_version"] == "harness.tui_slash_commands/v1"
+    assert len(names) == len(set(names))
+    assert {
+        "home",
+        "quickstart",
+        "scaffold",
+        "validate",
+        "agents",
+        "specs",
+        "tasks",
+        "lease",
+        "inspect-lease",
+        "execute-read-only",
+        "runs",
+        "policy",
+        "artifacts",
+        "wheel",
+    } <= set(names)
+    assert all(command["slash"].startswith("/") for command in slash_commands["commands"])
+    assert all(
+        set(command)
+        >= {
+            "name",
+            "slash",
+            "entry_id",
+            "group_id",
+            "title",
+            "description",
+            "command",
+            "mutates_when_run",
+            "safety_note",
+        }
+        for command in slash_commands["commands"]
+    )
+
+    read_only = filter_slash_commands(slash_commands, "/execute-read-only")
+    task_matches = filter_slash_commands(slash_commands, "task")
+    missing = filter_slash_commands(slash_commands, "does-not-exist")
+
+    assert read_only["schema_version"] == "harness.tui_slash_command_filter/v1"
+    assert [command["name"] for command in read_only["commands"]] == ["execute-read-only"]
+    assert any(command["name"] == "tasks" for command in task_matches["commands"])
+    assert missing["commands"] == []
+    serialized = json.dumps(slash_commands)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+
+
+def test_tui_chat_slash_command_responses_are_templates_only() -> None:
+    slash_commands = build_slash_commands()
+    welcome = build_chat_welcome_message("/tmp/project")
+
+    help_response = handle_slash_command("/help", slash_commands)
+    command_response = handle_slash_command("/execute-read-only", slash_commands)
+    plain_response = handle_slash_command("run something", slash_commands)
+    unknown_response = handle_slash_command("/does-not-exist", slash_commands)
+
+    assert help_response["schema_version"] == "harness.tui_chat_response/v1"
+    assert " ( ==  ^  == ) " in render_chat_message(welcome)
+    assert help_response["ok"] is True
+    assert help_response["kind"] == "help"
+    assert any("/execute-read-only" in line for line in help_response["messages"][0]["lines"])
+    assert command_response["ok"] is True
+    assert command_response["kind"] == "command_template"
+    assert command_response["command"]["name"] == "execute-read-only"
+    rendered = render_chat_message(command_response["messages"][0])
+    assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in rendered
+    assert "Mutates when run manually: True" in rendered
+    assert "Authorized bounded adapter only when manually run." in rendered
+    assert plain_response["kind"] == "plain_text_unsupported"
+    assert unknown_response["kind"] == "unknown"
+
+    serialized = json.dumps(
+        {
+            "help": help_response,
+            "command": command_response,
+            "plain": plain_response,
+            "unknown": unknown_response,
+        }
+    )
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized

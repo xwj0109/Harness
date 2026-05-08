@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import socket
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -236,6 +237,8 @@ def home(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
     _print_kv("Version", result["version"])
     if not result["initialized"]:
         _print_section("Next Actions")
+        if result.get("state_error"):
+            _print_kv("State error", f"{result['state_error']['type']}: {result['state_error']['message']}")
         for action in result["recommended_actions"]:
             _print_kv(action["description"], action["command"])
         _print_section("Safety")
@@ -2197,12 +2200,27 @@ def _home_result(project_root: Path) -> dict:
         return result
 
     store = SQLiteStore(project_root)
-    agents = store.list_project_agents()
-    objectives = store.list_objectives()
-    tasks = store.list_tasks()
-    leases = store.list_task_leases()
-    runs = store.list_runs()[:5]
-    daemon_status = store.daemon_status()
+    try:
+        agents = store.list_project_agents()
+        objectives = store.list_objectives()
+        tasks = store.list_tasks()
+        leases = store.list_task_leases()
+        runs = store.list_runs()[:5]
+        daemon_status = store.daemon_status()
+    except sqlite3.Error as exc:
+        result["initialized"] = False
+        result["state_error"] = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+        result["recommended_actions"] = [
+            {
+                "id": "repair_project_state",
+                "command": f"harness init --project {project_root}",
+                "description": "Repair or migrate local harness persistence for this project.",
+            }
+        ]
+        return result
     task_status_counts = {status.value: 0 for status in TaskStatus}
     for task in tasks:
         task_status_counts[task.status.value] = task_status_counts.get(task.status.value, 0) + 1

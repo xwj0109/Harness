@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 from harness import __version__
@@ -7,6 +8,16 @@ from harness.config import HARNESS_DIR
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import TaskStatus
 
+
+TUI_PIXEL_ART = [
+    "   /\\_____/\\   ",
+    "  /  o   o  \\  ",
+    " ( ==  ^  == ) ",
+    "  )         (  ",
+    " (           ) ",
+    " ( (  ) (  ) )",
+    "(__(__)_(__)__)",
+]
 
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
@@ -207,7 +218,7 @@ TUI_VIEW_SECTIONS = [
     {
         "id": "project_overview",
         "title": "Project Overview",
-        "pane_ids": ["overview", "guidance", "commands"],
+        "pane_ids": ["pixel_art", "overview", "guidance", "commands"],
     },
     {
         "id": "queue_daemon",
@@ -249,13 +260,38 @@ TUI_VIEW_SECTIONS = [
 ]
 
 TUI_NAVIGATION_HINTS = [
-    {"key": "/", "label": "Search panes and command palette"},
+    {"key": "/", "label": "Focus chat command input"},
     {"key": "escape", "label": "Clear search"},
     {"key": "tab", "label": "Next pane"},
     {"key": "shift+tab", "label": "Previous pane"},
-    {"key": "q", "label": "Quit"},
-    {"key": "copy-only", "label": "Palette commands are displayed only"},
+    {"key": "ctrl+q", "label": "Quit"},
+    {"key": "enter", "label": "Send slash command"},
+    {"key": "copy-only", "label": "Slash commands render command templates only"},
 ]
+
+SLASH_COMMAND_ALIASES = {
+    "help": "orientation.quickstart_agent",
+    "home": "orientation.home",
+    "quickstart": "orientation.quickstart_agent",
+    "scaffold": "agent_authoring.scaffold",
+    "validate": "agent_authoring.validate",
+    "preview": "agent_authoring.preview",
+    "import-agent": "project_agents.import",
+    "agents": "project_agents.list",
+    "agent": "project_agents.inspect",
+    "specs": "built_in_specs.list",
+    "spec": "built_in_specs.preview_agent",
+    "task": "objectives_tasks.add_task",
+    "tasks": "objectives_tasks.list_tasks",
+    "graph": "objectives_tasks.graph",
+    "lease": "daemon_control.run_once",
+    "inspect-lease": "daemon_control.inspect_lease",
+    "execute-read-only": "read_only_adapter.execute",
+    "runs": "runtime_evidence.runs",
+    "policy": "runtime_evidence.policy",
+    "artifacts": "runtime_evidence.artifacts",
+    "wheel": "packaging_smoke.wheel",
+}
 
 
 def build_tui_dashboard(project_root: Path) -> dict:
@@ -266,6 +302,7 @@ def build_tui_dashboard(project_root: Path) -> dict:
         "project_root": str(project_root),
         "initialized": initialized,
         "version": __version__,
+        "pixel_art": list(TUI_PIXEL_ART),
         "summary": {
             "imported_agents": 0,
             "objectives": 0,
@@ -314,12 +351,27 @@ def build_tui_dashboard(project_root: Path) -> dict:
         return dashboard
 
     store = SQLiteStore(project_root)
-    agents = store.list_project_agents()
-    objectives = store.list_objectives()
-    tasks = store.list_tasks()
-    leases = store.list_task_leases()
-    runs = store.list_runs()[:5]
-    daemon_status = store.daemon_status()
+    try:
+        agents = store.list_project_agents()
+        objectives = store.list_objectives()
+        tasks = store.list_tasks()
+        leases = store.list_task_leases()
+        runs = store.list_runs()[:5]
+        daemon_status = store.daemon_status()
+    except sqlite3.Error as exc:
+        dashboard["initialized"] = False
+        dashboard["state_error"] = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+        }
+        dashboard["guidance"] = [
+            {
+                "id": "repair_project_state",
+                "command": f"harness init --project {project_root}",
+                "description": "Repair or migrate local harness persistence for this project.",
+            }
+        ]
+        return dashboard
     active_leases = [lease for lease in leases if lease.status.value == "active"]
     task_status_counts = {status.value: 0 for status in TaskStatus}
     for task in tasks:
@@ -424,6 +476,11 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
     ]
     panes = [
         {
+            "id": "pixel_art",
+            "title": "Agent Harness",
+            "lines": dashboard["pixel_art"],
+        },
+        {
             "id": "overview",
             "title": "Overview",
             "lines": [
@@ -437,6 +494,13 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
                 f"Active daemons: {summary['active_daemons']}",
                 f"Recent runs: {summary['recent_runs']}",
                 f"Task status: {', '.join(active_statuses) if active_statuses else 'none'}",
+                *(
+                    [
+                        f"State error: {dashboard['state_error']['type']}: {dashboard['state_error']['message']}",
+                    ]
+                    if dashboard.get("state_error")
+                    else []
+                ),
             ],
         },
         {
@@ -615,6 +679,194 @@ def build_command_palette_panes(filtered_palette: dict) -> list[dict]:
     return panes
 
 
+def build_slash_commands(palette: dict | None = None) -> dict:
+    palette = palette or build_command_palette()
+    entries_by_id = {entry["id"]: entry for entry in palette["entries"]}
+    commands = []
+    for name, entry_id in SLASH_COMMAND_ALIASES.items():
+        entry = entries_by_id[entry_id]
+        commands.append(
+            {
+                "name": name,
+                "slash": f"/{name}",
+                "entry_id": entry_id,
+                "group_id": entry["group_id"],
+                "title": entry["title"],
+                "description": entry["description"],
+                "command": entry["command"],
+                "mutates_when_run": entry["mutates_when_run"],
+                "safety_note": entry["safety_note"],
+            }
+        )
+    return {
+        "schema_version": "harness.tui_slash_commands/v1",
+        "ok": True,
+        "commands": commands,
+    }
+
+
+def filter_slash_commands(slash_commands: dict, query: str) -> dict:
+    normalized_query = query.strip().lstrip("/").casefold()
+    if not normalized_query:
+        commands = [dict(command) for command in slash_commands["commands"]]
+    else:
+        commands = [
+            dict(command)
+            for command in slash_commands["commands"]
+            if _slash_command_matches(command, normalized_query)
+        ]
+    return {
+        "schema_version": "harness.tui_slash_command_filter/v1",
+        "ok": True,
+        "query": query.strip(),
+        "total_matches": len(commands),
+        "commands": commands,
+    }
+
+
+def _slash_command_matches(command: dict, normalized_query: str) -> bool:
+    haystack = " ".join(
+        str(command[key])
+        for key in ("name", "entry_id", "group_id", "title", "description", "command", "safety_note")
+    )
+    return normalized_query in haystack.casefold()
+
+
+def build_chat_welcome_message(project_root: Path) -> dict:
+    return {
+        "role": "assistant",
+        "title": "Harness chat",
+        "lines": [
+            *TUI_PIXEL_ART,
+            "",
+            f"Project: {project_root}",
+            "Type /help to list slash commands.",
+            "Slash commands render existing CLI command templates for manual operator use.",
+        ],
+    }
+
+
+def handle_slash_command(text: str, slash_commands: dict | None = None) -> dict:
+    slash_commands = slash_commands or build_slash_commands()
+    raw_text = text.strip()
+    if not raw_text:
+        return {
+            "schema_version": "harness.tui_chat_response/v1",
+            "ok": False,
+            "kind": "empty",
+            "request": text,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "title": "No input",
+                    "lines": ["Type /help to list available slash commands."],
+                }
+            ],
+        }
+    if not raw_text.startswith("/"):
+        return {
+            "schema_version": "harness.tui_chat_response/v1",
+            "ok": False,
+            "kind": "plain_text_unsupported",
+            "request": text,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "title": "Slash commands only",
+                    "lines": ["This local TUI accepts slash commands. Type /help to list them."],
+                }
+            ],
+        }
+
+    command_name = raw_text[1:].split(maxsplit=1)[0]
+    if command_name in {"help", "commands"}:
+        filtered = filter_slash_commands(slash_commands, "")
+        return {
+            "schema_version": "harness.tui_chat_response/v1",
+            "ok": True,
+            "kind": "help",
+            "request": text,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "title": "Slash commands",
+                    "lines": [
+                        f"{command['slash']} - {command['title']}"
+                        for command in filtered["commands"]
+                    ],
+                }
+            ],
+        }
+
+    filtered = filter_slash_commands(slash_commands, command_name)
+    exact_matches = [
+        command for command in filtered["commands"] if command["name"] == command_name
+    ]
+    if len(exact_matches) == 1:
+        command = exact_matches[0]
+        return {
+            "schema_version": "harness.tui_chat_response/v1",
+            "ok": True,
+            "kind": "command_template",
+            "request": text,
+            "command": command,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "title": command["title"],
+                    "lines": [
+                        f"Slash: {command['slash']}",
+                        f"Mutates when run manually: {command['mutates_when_run']}",
+                        "Command:",
+                        command["command"],
+                        "Description:",
+                        command["description"],
+                        "Safety:",
+                        command["safety_note"],
+                    ],
+                }
+            ],
+        }
+    if filtered["commands"]:
+        return {
+            "schema_version": "harness.tui_chat_response/v1",
+            "ok": False,
+            "kind": "ambiguous",
+            "request": text,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "title": "Matching slash commands",
+                    "lines": [
+                        f"{command['slash']} - {command['title']}"
+                        for command in filtered["commands"][:10]
+                    ],
+                }
+            ],
+        }
+    return {
+        "schema_version": "harness.tui_chat_response/v1",
+        "ok": False,
+        "kind": "unknown",
+        "request": text,
+        "messages": [
+            {
+                "role": "assistant",
+                "title": "Unknown slash command",
+                "lines": [f"No slash command matched {raw_text}.", "Type /help to list available commands."],
+            }
+        ],
+    }
+
+
+def render_chat_message(message: dict) -> str:
+    role = message["role"]
+    title = message.get("title") or role
+    lines = [f"{role}: {title}", ""]
+    lines.extend(str(line) for line in message.get("lines", []))
+    return "\n".join(lines)
+
+
 def build_tui_view_model(filtered: dict, filtered_palette: dict) -> dict:
     no_matches = not filtered["panes"] and not filtered_palette["entries"]
     dashboard_panes = [dict(pane) for pane in filtered["panes"]]
@@ -710,7 +962,7 @@ def filter_tui_panes(panes: list[dict], query: str) -> dict:
 
 
 def render_dashboard_text(dashboard: dict) -> str:
-    lines = ["Agent Harness"]
+    lines = ["Agent Harness", "", *dashboard["pixel_art"]]
     for pane in build_tui_panes(dashboard):
         pane_lines = _render_pane_content(pane).splitlines()
         lines.extend(["", pane_lines[0]])
@@ -766,42 +1018,55 @@ def _render_navigation_hints(view: dict) -> str:
 
 def run_read_only_tui(project_root: Path) -> None:
     from textual.app import App, ComposeResult
-    from textual.containers import VerticalScroll
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.widgets import Footer, Header, Input, Static
 
     dashboard = build_tui_dashboard(project_root)
     panes = build_tui_panes(dashboard)
     palette = build_command_palette()
+    slash_commands = build_slash_commands(palette)
     initial_filter = filter_tui_panes(panes, "")
     initial_palette_filter = filter_command_palette(palette, "")
     initial_view = build_tui_view_model(initial_filter, initial_palette_filter)
+    initial_messages = [build_chat_welcome_message(project_root)]
 
     class HarnessReadOnlyTui(App):
         CSS = """
-        #search {
-            margin: 1 1 0 1;
+        #layout {
+            height: 1fr;
         }
 
-        #search-status {
-            margin: 0 1 0 1;
-        }
-
-        #palette-status {
-            margin: 0 1 1 1;
-        }
-
-        VerticalScroll {
+        #chat {
+            width: 2fr;
+            border: round $surface;
+            margin: 1 0 1 1;
             padding: 1;
         }
 
-        .pane {
+        #side {
+            width: 1fr;
+            border: round $surface;
+            margin: 1 1 1 0;
+            padding: 1;
+        }
+
+        #prompt {
+            margin: 0 1 1 1;
+        }
+
+        .message {
             border: round $surface;
             margin: 0 0 1 0;
             padding: 1;
         }
 
-        .pane:focus {
+        .message:focus {
             border: round $accent;
+        }
+
+        .pane {
+            margin: 0 0 1 0;
+            padding: 0 1;
         }
 
         .section {
@@ -811,63 +1076,87 @@ def run_read_only_tui(project_root: Path) -> None:
         }
         """
         BINDINGS = [
-            ("q", "quit", "Quit"),
+            ("ctrl+q", "quit", "Quit"),
             ("/", "focus_search", "Search"),
-            ("escape", "clear_search", "Clear search"),
-            ("tab", "focus_next", "Next pane"),
-            ("shift+tab", "focus_previous", "Previous pane"),
+            ("escape", "clear_search", "Clear input"),
+            ("tab", "focus_next", "Next"),
+            ("shift+tab", "focus_previous", "Previous"),
         ]
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._messages = [dict(message) for message in initial_messages]
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
-            yield Input(placeholder="Search read-only panes and command palette", id="search")
-            yield Static(render_view_status(initial_view), id="search-status")
-            yield Static(_render_navigation_hints(initial_view), id="palette-status")
-            yield VerticalScroll(id="pane-container")
+            with Horizontal(id="layout"):
+                with VerticalScroll(id="chat"):
+                    yield Static("", id="chat-content")
+                with VerticalScroll(id="side"):
+                    yield Static(render_view_status(initial_view), id="search-status")
+                    yield Static(_render_navigation_hints(initial_view), id="palette-status")
+                    yield Static("", id="slash-status")
+                    yield Static("", id="pane-container")
+            yield Input(placeholder="Type /help or a slash command", id="prompt")
             yield Footer()
 
         def on_mount(self) -> None:
+            self.query_one("#prompt", Input).focus()
+            self._render_chat()
             self._render_view(initial_view)
 
         def on_input_changed(self, event: Input.Changed) -> None:
-            if event.input.id == "search":
+            if event.input.id == "prompt":
                 self._render_view(
                     build_tui_view_model(
                         filter_tui_panes(panes, event.value),
                         filter_command_palette(palette, event.value),
                     )
                 )
+                filtered_slash = filter_slash_commands(slash_commands, event.value)
+                self.query_one("#slash-status", Static).update(
+                    f"Slash commands: {filtered_slash['total_matches']}"
+                )
+
+        def on_input_submitted(self, event: Input.Submitted) -> None:
+            if event.input.id != "prompt":
+                return
+            request = event.value.strip()
+            if not request:
+                return
+            self._messages.append({"role": "user", "title": request, "lines": []})
+            response = handle_slash_command(request, slash_commands)
+            self._messages.extend(response["messages"])
+            event.input.value = ""
+            self._render_chat()
+            self._render_view(initial_view)
 
         def action_focus_search(self) -> None:
-            self.query_one("#search", Input).focus()
+            self.query_one("#prompt", Input).focus()
 
         def action_clear_search(self) -> None:
-            search = self.query_one("#search", Input)
-            search.value = ""
+            prompt = self.query_one("#prompt", Input)
+            prompt.value = ""
             self._render_view(initial_view)
+
+        def _render_chat(self) -> None:
+            transcript = "\n\n".join(render_chat_message(message) for message in self._messages)
+            self.query_one("#chat-content", Static).update(transcript)
 
         def _render_view(self, view: dict) -> None:
             self.query_one("#search-status", Static).update(render_view_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
-            container = self.query_one("#pane-container", VerticalScroll)
-            container.remove_children()
+            container = self.query_one("#pane-container", Static)
             if view["empty_state"]:
-                empty = Static(view["empty_state"]["message"], id="pane-empty", classes="pane")
-                empty.can_focus = True
-                container.mount(empty)
+                container.update(view["empty_state"]["message"])
                 return
             panes_by_id = {pane["id"]: pane for pane in view["panes"]}
+            rendered = []
             for section in view["sections"]:
-                section_widget = Static(
-                    _render_section_content(section),
-                    id=f"section-{section['id']}",
-                    classes="section",
-                )
-                container.mount(section_widget)
+                rendered.extend([_render_section_content(section), ""])
                 for pane_id in section["pane_ids"]:
                     pane = panes_by_id[pane_id]
-                    widget = Static(_render_pane_content(pane), id=f"pane-{pane['id']}", classes="pane")
-                    widget.can_focus = True
-                    container.mount(widget)
+                    rendered.extend([_render_pane_content(pane), ""])
+            container.update("\n".join(rendered).strip())
 
     HarnessReadOnlyTui().run()
