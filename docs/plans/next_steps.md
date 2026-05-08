@@ -23,6 +23,7 @@ The v0.9 Agent Lifecycle and Preview plan is tracked in [v0_9_agent_lifecycle_an
 The v1.0 MVP Closure plan is tracked in [v1_0_mvp_closure_plan.md](v1_0_mvp_closure_plan.md).
 The v1.1 CLI UX plan is tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md).
 The v1.2 Post-MVP Polish plan is tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md).
+The v1.3 Interactive TUI Decision plan is tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -110,7 +111,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is a true interactive TUI/command palette decision plan, tracked as the gated Track 3 direction in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md). Track 1 packaging/distribution polish and Track 2 small Typer/Rich-style CLI refinements are complete. The ranked post-MVP UX/product order is:
+The immediate next target is the v1.3 interactive TUI decision, tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). Track 1 packaging/distribution polish and Track 2 small Typer/Rich-style CLI refinements are complete. The ranked post-MVP UX/product order is:
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.
