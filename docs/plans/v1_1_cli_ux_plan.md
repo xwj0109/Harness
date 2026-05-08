@@ -1,6 +1,6 @@
 # v1.1 CLI UX Plan
 
-Status: planned.
+Status: complete.
 
 ## Summary
 
@@ -73,3 +73,15 @@ This milestone should add a human-friendly cockpit and guided flows for the exis
 - The first UX slice should improve discoverability and operator confidence without changing execution behavior.
 - Full-screen TUI, multi-session panes, live logs, keybindings, and command palettes are later slices, not the first post-MVP UX step.
 - If an interactive UX dependency becomes necessary, it should be introduced by a separate dependency decision after the first dashboard and quickstart commands are implemented.
+
+## Completion Note
+
+v1.1 is complete as a CLI UX foundation:
+
+- Slice 1 implemented `harness home` with schema `harness.home/v1`.
+- Slice 2 implemented `harness quickstart agent` with schema `harness.quickstart_agent/v1`.
+- Slice 3 added compact tab-separated headers for common text list/status commands while preserving JSON schemas.
+- Operator guide and smoke checklist coverage were updated.
+- Focused and full regression tests passed.
+
+The milestone remains UX-only. It does not add execution adapters, task generation, autonomous workflows, backend preflight, Docker-from-queue, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, external messaging, application submission, or active repo write automation.

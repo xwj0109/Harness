@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -71,6 +71,7 @@ The first v0.2 schema and registry foundations are in place:
 - v0.8 Project-Local Agent Registry is complete.
 - v0.9 Agent Lifecycle and Preview is complete.
 - v1.0 MVP Closure is complete.
+- v1.1 CLI UX is complete.
 - Version bump to `1.0.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
@@ -108,7 +109,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is v1.1 CLI UX, tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md). It should add a human-friendly dashboard and guided command composition for the existing MVP surface without changing execution behavior.
+The immediate next target is a post-v1.1 decision plan. Recommended candidates are a true interactive terminal UX decision, release packaging/distribution polish, imported-agent refresh semantics, or a separate next-adapter decision. Do not start implementation by default until a decision-complete plan exists.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
