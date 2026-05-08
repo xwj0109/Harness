@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -74,6 +74,7 @@ The first v0.2 schema and registry foundations are in place:
 - v0.9 Agent Lifecycle and Preview is complete.
 - v1.0 MVP Closure is complete.
 - v1.1 CLI UX is complete.
+- v1.2 Post-MVP Polish is complete.
 - Version bump to `1.0.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
@@ -111,7 +112,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is the v1.3 interactive TUI decision, tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). Track 1 packaging/distribution polish and Track 2 small Typer/Rich-style CLI refinements are complete. The ranked post-MVP UX/product order is:
+The immediate next target is the v1.3 interactive TUI decision review, tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). v1.2 pre-TUI polish is complete. The ranked post-MVP UX/product order is:
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.

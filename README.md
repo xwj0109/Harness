@@ -86,5 +86,9 @@ Repo-local planning references are tracked in:
 
 - [docs/plans/agent_harness_master_plan.md](docs/plans/agent_harness_master_plan.md)
 - [docs/plans/next_steps.md](docs/plans/next_steps.md)
-- [docs/plans/v0_1_hardening_plan.md](docs/plans/v0_1_hardening_plan.md)
-- [docs/plans/v0_2_0_plan.md](docs/plans/v0_2_0_plan.md)
+- [docs/plans/v1_0_mvp_closure_plan.md](docs/plans/v1_0_mvp_closure_plan.md)
+- [docs/plans/v1_1_cli_ux_plan.md](docs/plans/v1_1_cli_ux_plan.md)
+- [docs/plans/v1_2_post_mvp_polish_plan.md](docs/plans/v1_2_post_mvp_polish_plan.md)
+- [docs/plans/v1_3_interactive_tui_decision_plan.md](docs/plans/v1_3_interactive_tui_decision_plan.md)
+
+Earlier milestone plans remain in [docs/plans/](docs/plans/).

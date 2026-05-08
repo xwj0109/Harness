@@ -1,6 +1,6 @@
 # v1.2 Post-MVP Polish Plan
 
-Status: in progress.
+Status: complete.
 
 ## Summary
 
@@ -115,6 +115,12 @@ Non-goals:
 - No command palette implementation before a decision-complete plan.
 - No hidden execution or automatic task creation from interactive flows.
 
+Completion note:
+
+- The TUI/command-palette decision is tracked separately in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md).
+- v1.2 ends before any TUI dependency or implementation work.
+- The active next target is decision review for v1.3, not automatic implementation.
+
 ## Test Plan
 
 For Track 1 implementation:
@@ -134,7 +140,18 @@ For Track 1 implementation:
 ## Assumptions
 
 - v1.0 MVP and v1.1 CLI UX are complete.
-- Packaging/distribution polish is the next implementation target.
-- Small CLI refinements come after packaging.
+- Packaging/distribution polish is complete.
+- Small CLI refinements are complete.
 - Interactive TUI work requires a separate decision gate.
 - No new execution capability is authorized by this plan.
+
+## Completion Note
+
+v1.2 is complete as a post-MVP polish milestone:
+
+- Track 1 packaging/distribution polish is complete and covered by packaging tests.
+- Track 2 small Typer/Rich-style CLI refinements are complete and covered by CLI smoke tests.
+- Track 3 is preserved as a gated v1.3 decision plan.
+- Full regression tests passed.
+
+No execution adapters, task generation, daemon behavior changes, backend/model calls, Docker-from-queue, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker integrations, live trading, order placement, external messaging, application submission, active repo write automation, or TUI implementation were added.
