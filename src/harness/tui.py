@@ -25,6 +25,14 @@ def build_tui_dashboard(project_root: Path) -> dict:
             "recent_runs": 0,
         },
         "task_status_counts": {status.value: 0 for status in TaskStatus},
+        "agents": [],
+        "tasks": [],
+        "active_leases": [],
+        "daemon": {
+            "active_daemons": 0,
+            "paused_tasks": 0,
+            "latest_events": [],
+        },
         "recent_runs": [],
         "command_suggestions": [
             f"harness home --project {project_root}",
@@ -75,6 +83,41 @@ def build_tui_dashboard(project_root: Path) -> dict:
         "recent_runs": len(runs),
     }
     dashboard["task_status_counts"] = task_status_counts
+    dashboard["agents"] = [
+        {
+            "agent_id": agent.agent_id,
+            "workbench_id": agent.workbench_id,
+            "content_sha256": agent.content_sha256,
+            "source_path": str(agent.source_path),
+            "profiles": len(agent.profiles),
+        }
+        for agent in agents[:10]
+    ]
+    dashboard["tasks"] = [
+        {
+            "id": task.id,
+            "title": task.title,
+            "status": task.status.value,
+            "priority": task.priority,
+            "objective_id": task.objective_id,
+            "agent_id": task.agent_id,
+            "workbench_id": task.workbench_id,
+            "execution_adapter": task.metadata.get("execution_adapter"),
+            "task_type": task.metadata.get("task_type"),
+        }
+        for task in tasks[:10]
+    ]
+    dashboard["active_leases"] = [
+        {
+            "id": lease.id,
+            "task_id": lease.task_id,
+            "attempt_id": lease.attempt_id,
+            "status": lease.status.value,
+            "owner": lease.owner,
+            "expires_at": lease.expires_at.isoformat(),
+        }
+        for lease in active_leases[:10]
+    ]
     dashboard["recent_runs"] = [
         {
             "id": run.id,
@@ -88,6 +131,16 @@ def build_tui_dashboard(project_root: Path) -> dict:
     dashboard["daemon"] = {
         "active_daemons": len(daemon_status.active_daemons),
         "paused_tasks": len(daemon_status.paused_tasks),
+        "latest_events": [
+            {
+                "id": event.id,
+                "daemon_id": event.daemon_id,
+                "event_type": event.event_type,
+                "message": event.message,
+                "created_at": event.created_at.isoformat(),
+            }
+            for event in daemon_status.latest_events[:5]
+        ],
     }
     dashboard["guidance"] = []
     if task_status_counts.get("ready", 0) > 0 and not active_leases:
@@ -138,8 +191,51 @@ def render_dashboard_text(dashboard: dict) -> str:
         "Task Status",
         f"  Counts: {', '.join(active_statuses) if active_statuses else 'none'}",
         "",
-        "Recent Runs",
+        "Agents",
     ]
+    if dashboard["agents"]:
+        for agent in dashboard["agents"]:
+            lines.append(
+                f"  {agent['agent_id']} workbench={agent['workbench_id']} profiles={agent['profiles']}"
+            )
+    else:
+        lines.append("  none")
+    lines.extend(["", "Tasks"])
+    if dashboard["tasks"]:
+        for task in dashboard["tasks"]:
+            lines.append(
+                f"  {task['id']} {task['status']} priority={task['priority']} {task['title']}"
+            )
+    else:
+        lines.append("  none")
+    lines.extend(["", "Active Leases"])
+    if dashboard["active_leases"]:
+        for lease in dashboard["active_leases"]:
+            lines.append(
+                f"  {lease['id']} task={lease['task_id']} attempt={lease['attempt_id'] or 'none'}"
+            )
+    else:
+        lines.append("  none")
+    lines.extend(
+        [
+            "",
+            "Daemon",
+            f"  Active daemons: {dashboard['daemon']['active_daemons']}",
+            f"  Paused tasks: {dashboard['daemon']['paused_tasks']}",
+        ]
+    )
+    if dashboard["daemon"]["latest_events"]:
+        lines.append("  Latest events:")
+        for event in dashboard["daemon"]["latest_events"]:
+            lines.append(f"    {event['event_type']}: {event['message']}")
+    else:
+        lines.append("  Latest events: none")
+    lines.extend(
+        [
+            "",
+            "Recent Runs",
+        ]
+    )
     if dashboard["recent_runs"]:
         for run in dashboard["recent_runs"]:
             lines.append(f"  {run['id']} {run['status']} {run.get('task_type') or 'none'}")

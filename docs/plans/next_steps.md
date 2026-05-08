@@ -25,6 +25,7 @@ The v1.1 CLI UX plan is tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md).
 The v1.2 Post-MVP Polish plan is tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md).
 The v1.3 Interactive TUI Decision plan is tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md).
 The v1.4 Read-Only TUI plan is tracked in [v1_4_read_only_tui_plan.md](v1_4_read_only_tui_plan.md).
+The v1.5 TUI Detail Panes plan is tracked in [v1_5_tui_detail_panes_plan.md](v1_5_tui_detail_panes_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -123,13 +124,9 @@ Implemented CLI-only refinements include sectioned text output for high-traffic 
 
 ## Immediate Next Planning Target
 
-There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
+The immediate next target is v1.5 TUI Detail Panes, tracked in [v1_5_tui_detail_panes_plan.md](v1_5_tui_detail_panes_plan.md).
 
-Recommended decision options:
-
-- v1.5 TUI command-palette planning, copy-only first with no command execution.
-- v1.5 TUI detail panes for agents, tasks, leases, and runs, still read-only.
-- Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
+v1.5 should extend the optional read-only TUI with detail panes for agents, tasks, leases, daemon state, recent runs, safety boundaries, and command suggestions. It remains read-only: no command execution, task mutation, daemon actions, adapter execution, backend preflight, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, or unmanaged daemon loops.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

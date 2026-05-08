@@ -126,6 +126,10 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert dashboard["ok"] is True
     assert dashboard["initialized"] is False
     assert dashboard["summary"]["tasks_total"] == 0
+    assert dashboard["agents"] == []
+    assert dashboard["tasks"] == []
+    assert dashboard["active_leases"] == []
+    assert dashboard["daemon"]["latest_events"] == []
     assert dashboard["guidance"][0]["id"] == "initialize_project"
     assert "Project" in rendered
     assert "Initialized: False" in rendered
@@ -137,6 +141,34 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
 
 def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    bundle_path = tmp_path / "tui_agent_bundle"
+    scaffold = runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "tui_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(bundle_path),
+            "--output-format",
+            "json",
+        ],
+    )
+    assert scaffold.exit_code == 0, scaffold.output
+    imported = runner.invoke(app, ["agents", "import", str(bundle_path), "--project", str(tmp_path), "--output", "json"])
+    assert imported.exit_code == 0, imported.output
     task = runner.invoke(
         app,
         [
@@ -144,6 +176,14 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
             "add",
             "--title",
             "tui task",
+            "--agent",
+            "tui_agent",
+            "--workbench",
+            "quant",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
             "--project",
             str(tmp_path),
             "--output",
@@ -172,11 +212,26 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     rendered = render_dashboard_text(dashboard)
 
     assert dashboard["initialized"] is True
+    assert dashboard["summary"]["imported_agents"] == 1
     assert dashboard["summary"]["tasks_total"] == 1
     assert dashboard["summary"]["active_leases"] == 1
     assert dashboard["summary"]["recent_runs"] == 1
+    assert dashboard["agents"][0]["agent_id"] == "tui_agent"
+    assert dashboard["agents"][0]["workbench_id"] == "quant"
+    assert dashboard["tasks"][0]["title"] == "tui task"
+    assert dashboard["tasks"][0]["agent_id"] == "tui_agent"
+    assert dashboard["tasks"][0]["workbench_id"] == "quant"
+    assert dashboard["tasks"][0]["execution_adapter"] == "read_only_summary"
+    assert dashboard["tasks"][0]["task_type"] == "read_only_repo_summary"
+    assert dashboard["active_leases"][0]["task_id"] == dashboard["tasks"][0]["id"]
+    assert dashboard["active_leases"][0]["status"] == "active"
+    assert dashboard["daemon"]["latest_events"]
     assert dashboard["task_status_counts"]["leased"] == 1
     assert dashboard["recent_runs"][0]["task_type"] == "phase_1a_test"
+    assert "tui_agent workbench=quant" in rendered
+    assert "tui task" in rendered
+    assert "Active Leases" in rendered
+    assert "Daemon" in rendered
     assert "Tasks: 1" in rendered
     assert "Active leases: 1" in rendered
     assert "Recent Runs" in rendered
