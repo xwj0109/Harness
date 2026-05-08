@@ -1,6 +1,6 @@
 # v1.5 TUI Detail Panes Plan
 
-Status: Slice 2 in progress.
+Status: complete.
 
 ## Summary
 
@@ -105,6 +105,8 @@ Implementation note: Slice 2 adds a testable pane model and renders it in the op
 - Update [operator_guide.md](../operator_guide.md), [command_catalog.md](../command_catalog.md), and [smoke_checklist.md](../smoke_checklist.md).
 - Mark v1.5 complete only after focused and full tests pass.
 - Keep command-palette behavior behind a later decision plan.
+
+Completion note: v1.5 is complete as a read-only TUI detail-panes milestone. Slice 1 added sanitized detail lists for agents, tasks, active leases, daemon events, and recent runs. Slice 2 added a testable pane model and optional Textual rendering with focus-only navigation. The TUI remains read-only: no command execution, task mutation, daemon controls, adapter execution, backend preflight, Docker, shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, active repo writes, or unmanaged daemon loops.
 
 ## Test Plan
 
