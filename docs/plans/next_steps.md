@@ -2,33 +2,9 @@
 
 ## Current Phase
 
-v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
+The first MVP is complete. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, and one bounded read-only execution adapter.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete. v1.7 TUI Copy-Only Command Palette is complete. v1.8 TUI Usability Polish is complete. Package release `1.1.0` is complete.
-
-The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
-The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
-The v0.3.5 stabilization plan is tracked in [v0_3_5_control_plane_stabilization_plan.md](v0_3_5_control_plane_stabilization_plan.md).
-The v0.4 local daemon plan is tracked in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md).
-The v0.4.5 execution adapter decision gate is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md).
-The v0.5 read-only execution adapter plan is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md).
-The v0.5.1 read-only hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md).
-The v0.6 Quant Workbench plan is tracked in [v0_6_quant_workbench_plan.md](v0_6_quant_workbench_plan.md).
-The v0.6 Slice 2 agent-group inheritance plan is tracked in [v0_6_2_agent_group_inheritance_plan.md](v0_6_2_agent_group_inheritance_plan.md).
-The v0.6.3 Agent Structure MVP plan is tracked in [v0_6_3_agent_structure_mvp_plan.md](v0_6_3_agent_structure_mvp_plan.md).
-The v0.7 Agent Authoring MVP plan is tracked in [v0_7_agent_authoring_mvp_plan.md](v0_7_agent_authoring_mvp_plan.md).
-The v0.7.1 Agent Authoring Hardening plan is tracked in [v0_7_1_agent_authoring_hardening_plan.md](v0_7_1_agent_authoring_hardening_plan.md).
-The v0.8 Project-Local Agent Registry plan is tracked in [v0_8_project_agent_registry_plan.md](v0_8_project_agent_registry_plan.md).
-The v0.9 Agent Lifecycle and Preview plan is tracked in [v0_9_agent_lifecycle_and_preview_plan.md](v0_9_agent_lifecycle_and_preview_plan.md).
-The v1.0 MVP Closure plan is tracked in [v1_0_mvp_closure_plan.md](v1_0_mvp_closure_plan.md).
-The v1.1 CLI UX plan is tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md).
-The v1.2 Post-MVP Polish plan is tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md).
-The v1.3 Interactive TUI Decision plan is tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md).
-The v1.4 Read-Only TUI plan is tracked in [v1_4_read_only_tui_plan.md](v1_4_read_only_tui_plan.md).
-The v1.5 TUI Detail Panes plan is tracked in [v1_5_tui_detail_panes_plan.md](v1_5_tui_detail_panes_plan.md).
-The v1.6 TUI Filter/Search plan is tracked in [v1_6_tui_filter_search_plan.md](v1_6_tui_filter_search_plan.md).
-The v1.7 TUI Copy-Only Command Palette plan is tracked in [v1_7_tui_copy_only_command_palette_plan.md](v1_7_tui_copy_only_command_palette_plan.md).
-The v1.8 TUI Usability Polish plan is tracked in [v1_8_tui_usability_polish_plan.md](v1_8_tui_usability_polish_plan.md).
+Historical milestone plans were removed after MVP cleanup. Keep this file as the current planning snapshot; use [agent_harness_master_plan.md](agent_harness_master_plan.md) only as a retained roadmap reference, not as blanket implementation approval.
 
 ## Completed v0.2 Foundations
 
@@ -100,27 +76,27 @@ The control-plane evidence that future daemon work will rely on is now implement
 
 ## Completed v0.4 Scheduler Readiness
 
-v0.4 local daemon planning is captured in [v0_4_local_daemon_plan.md](v0_4_local_daemon_plan.md). Slice 1 is implemented: daemon control-plane persistence, `daemon run-once/status/stop`, heartbeat/event evidence, and non-executing scheduler decisions. Slice 2 is implemented: lease renewal, expired lease recovery, and `daemon recover`. Slice 3 is implemented: daemon eligibility now pauses approval-required and daemon-forbidden tasks with inspectable pause reasons.
+Daemon scheduler readiness is implemented: daemon control-plane persistence, `daemon run-once/status/stop`, heartbeat/event evidence, non-executing scheduler decisions, lease renewal, expired lease recovery, `daemon recover`, and daemon eligibility pause reasons.
 
 The v0.4 scheduler-readiness checkpoint is complete. Daemon commands are local control-plane operations only: they may acquire/renew/recover leases and record daemon evidence, but they do not execute tasks, call backends, run Docker, create run artifacts, start unmanaged background work, add hosted fallback, or add paid fallback.
 
 ## Completed v0.4.5 Dry-Run Adapter Milestone
 
-The v0.4.5 dry-run adapter milestone is tracked in [v0_4_5_minimal_execution_adapter_decision_plan.md](v0_4_5_minimal_execution_adapter_decision_plan.md). Slice 1 proves a dry-run lease-to-run contract, and Slice 2 hardens dry-run lease inspection and recovery. The milestone is complete as dry-run evidence only: `daemon execute-dry-run` may create local `phase_1a_test` run evidence from an active lease, but it does not call backends, models, Docker, shell tools, network, hosted providers, paid providers, MCP/A2A, browser/email/calendar tools, or mutate active repo files.
+The dry-run adapter milestone is complete as dry-run evidence only: `daemon execute-dry-run` may create local `phase_1a_test` run evidence from an active lease, but it does not call backends, models, Docker, shell tools, network, hosted providers, paid providers, MCP/A2A, browser/email/calendar tools, or mutate active repo files.
 
 ## Completed v0.5 Read-Only Adapter Milestone
 
-The v0.5 read-only adapter milestone is tracked in [v0_5_read_only_execution_adapter_plan.md](v0_5_read_only_execution_adapter_plan.md). Slice 1 is implemented: `daemon execute-read-only` can bind an existing active daemon lease to the existing `read_only_repo_summary` runner when the task metadata is exactly `execution_adapter=read_only_summary` and `task_type=read_only_repo_summary`.
+The read-only adapter milestone is implemented: `daemon execute-read-only` can bind an existing active daemon lease to the existing `read_only_repo_summary` runner when the task metadata is exactly `execution_adapter=read_only_summary` and `task_type=read_only_repo_summary`.
 
 The adapter is intentionally narrow. It uses only the configured local-only, no-cost `local_openai_compatible` backend and existing read-only tools. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, autonomous planning, generic task execution, or unmanaged daemon loops.
 
 ## Completed v0.5.1 Read-Only Adapter Hardening
 
-The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan.md](v0_5_1_read_only_adapter_hardening_plan.md). It adds focused coverage for read-only adapter preflight failure, runner failure, duplicate execution, read-only recovery states, inspect-lease evidence, unresolved approvals, forbidden metadata, and unsafe backend descriptors. It does not add another execution path.
+Read-only adapter hardening added focused coverage for preflight failure, runner failure, duplicate execution, read-only recovery states, inspect-lease evidence, unresolved approvals, forbidden metadata, and unsafe backend descriptors. It does not add another execution path.
 
 ## Completed v1.3 Typer/Rich-First CLI Polish
 
-The Typer/Rich-first CLI polish follow-up is tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). v1.2 pre-TUI polish is complete and the v1.3 TUI decision is to stay Typer/Rich-first for now. The ranked post-MVP UX/product order is:
+The Typer/Rich-first CLI polish follow-up is complete and the v1.3 TUI decision was to stay Typer/Rich-first for that milestone. The ranked post-MVP UX/product order was:
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.

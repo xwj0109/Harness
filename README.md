@@ -87,12 +87,5 @@ Repo-local planning references are tracked in:
 
 - [docs/plans/agent_harness_master_plan.md](docs/plans/agent_harness_master_plan.md)
 - [docs/plans/next_steps.md](docs/plans/next_steps.md)
-- [docs/plans/v1_0_mvp_closure_plan.md](docs/plans/v1_0_mvp_closure_plan.md)
-- [docs/plans/v1_1_cli_ux_plan.md](docs/plans/v1_1_cli_ux_plan.md)
-- [docs/plans/v1_2_post_mvp_polish_plan.md](docs/plans/v1_2_post_mvp_polish_plan.md)
-- [docs/plans/v1_3_interactive_tui_decision_plan.md](docs/plans/v1_3_interactive_tui_decision_plan.md)
-- [docs/plans/v1_4_read_only_tui_plan.md](docs/plans/v1_4_read_only_tui_plan.md)
-- [docs/plans/v1_5_tui_detail_panes_plan.md](docs/plans/v1_5_tui_detail_panes_plan.md)
-- [docs/plans/v1_6_tui_filter_search_plan.md](docs/plans/v1_6_tui_filter_search_plan.md)
 
-Earlier milestone plans remain in [docs/plans/](docs/plans/).
+Completed milestone plans were removed after the first MVP cleanup. Current operator behavior is documented in the operator docs above.
