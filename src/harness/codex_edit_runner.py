@@ -99,10 +99,27 @@ class CodexCodeEditRunner:
             backend=self.backend.config.model_copy(update={"capabilities": status.capabilities}),
             approval_id=approval.id,
         )
-        paths = self.store.initialize_run_artifacts(run.id)
+        return self.run_existing(
+            run_id=run.id,
+            goal=goal,
+            task_type=task_type,
+            approval=approval,
+            keep_isolation=keep_isolation,
+        )
+
+    def run_existing(
+        self,
+        run_id: str,
+        goal: str,
+        task_type: str,
+        approval: ApprovalProfile,
+        keep_isolation: bool = False,
+    ) -> dict[str, Any]:
+        self.store.get_run(run_id)
+        paths = self.store.initialize_run_artifacts(run_id)
         for kind, path in paths.items():
-            self.store.register_artifact(run.id, kind=kind, path=path)
-        run_dir = self.store.runs_dir / run.id
+            self.store.register_artifact(run_id, kind=kind, path=path)
+        run_dir = self.store.runs_dir / run_id
         workspace = None
         result: CodexRunResult | None = None
         diff_result = None
@@ -124,9 +141,9 @@ class CodexCodeEditRunner:
                 "isolated_diff_stat": diff_stat_path,
             }.items():
                 if path.exists():
-                    self.store.register_artifact(run.id, kind=kind, path=path)
+                    self.store.register_artifact(run_id, kind=kind, path=path)
             self.store.append_event(
-                run.id,
+                run_id,
                 "info",
                 "isolation_created",
                 "Created isolated workspace for Codex edit run.",
@@ -145,20 +162,20 @@ class CodexCodeEditRunner:
             result, detected_capabilities, network_status = self.backend.run_edit(workspace.path, prompt, final_message_path)
             codex_artifacts = write_codex_artifacts(run_dir, result)
             for kind, path in codex_artifacts.items():
-                self.store.register_artifact(run.id, kind=kind, path=path)
+                self.store.register_artifact(run_id, kind=kind, path=path)
             if final_message_path.exists():
                 final_message_path.write_text(
                     str(sanitize_for_logging(final_message_path.read_text(encoding="utf-8", errors="replace"))),
                     encoding="utf-8",
                 )
-                self.store.register_artifact(run.id, "codex_final_message", final_message_path)
+                self.store.register_artifact(run_id, "codex_final_message", final_message_path)
             diff_result = inspect_isolated_diff(workspace.path, workspace.baseline_manifest)
             unified_diff_path.write_text(str(sanitize_for_logging(diff_result.unified_diff)), encoding="utf-8")
             diff_stat_path.write_text(str(sanitize_for_logging(diff_result.diff_stat)), encoding="utf-8")
-            self.store.register_artifact(run.id, "isolated_unified_diff", unified_diff_path)
-            self.store.register_artifact(run.id, "isolated_diff_stat", diff_stat_path)
+            self.store.register_artifact(run_id, "isolated_unified_diff", unified_diff_path)
+            self.store.register_artifact(run_id, "isolated_diff_stat", diff_stat_path)
             self.store.append_event(
-                run.id,
+                run_id,
                 "info",
                 "codex_code_edit_completed",
                 "Codex edit subprocess completed inside isolated workspace.",
@@ -171,7 +188,7 @@ class CodexCodeEditRunner:
                 },
             )
             self.store.append_event(
-                run.id,
+                run_id,
                 "info" if diff_result.valid else "warning",
                 "isolated_diff_inspected",
                 "Inspected isolated workspace diff. Apply-back is not implemented in C2.",
@@ -185,7 +202,7 @@ class CodexCodeEditRunner:
             )
             if result.exit_status == 0 and diff_result.valid and diff_result.allowed_changed_files:
                 apply_back_decision, freshness_result, applied_files, apply_back_failure = self._handle_apply_back(
-                    run_id=run.id,
+                    run_id=run_id,
                     diff_result=diff_result,
                     diff_artifact=unified_diff_path,
                     baseline_hashes=active_hashes,
@@ -193,15 +210,15 @@ class CodexCodeEditRunner:
                 )
             elif result.exit_status == 0 and not diff_result.valid:
                 apply_back_decision = ApplyBackDecision(decision="blocked", reason="Isolated diff failed policy validation.")
-                self._persist_apply_back_decision(run.id, apply_back_decision)
+                self._persist_apply_back_decision(run_id, apply_back_decision)
             elif result.exit_status == 0:
                 apply_back_decision = ApplyBackDecision(decision="not_requested", reason="No valid isolated changes to apply.")
-                self._persist_apply_back_decision(run.id, apply_back_decision)
+                self._persist_apply_back_decision(run_id, apply_back_decision)
             status_value = self._status_value(result.exit_status, diff_result, apply_back_decision, apply_back_failure)
             if result.exit_status != 0:
                 status_value = "failed"
             return_payload = self._complete_run(
-                run_id=run.id,
+                run_id=run_id,
                 status_value=status_value,
                 goal=goal,
                 task_type=task_type,
@@ -224,10 +241,10 @@ class CodexCodeEditRunner:
             )
             return return_payload
         except ActiveRepoDirtyError:
-            self.store.update_run_status(run.id, "failed")
+            self.store.update_run_status(run_id, "failed")
             raise
         except (CodexEditCommandUnavailable, ActiveProjectModifiedError):
-            self.store.update_run_status(run.id, "failed")
+            self.store.update_run_status(run_id, "failed")
             raise
         finally:
             if workspace is not None and not keep_isolation and workspace.cleanup_status == "not_cleaned":
