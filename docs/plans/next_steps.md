@@ -21,6 +21,7 @@ The v0.7.1 Agent Authoring Hardening plan is tracked in [v0_7_1_agent_authoring_
 The v0.8 Project-Local Agent Registry plan is tracked in [v0_8_project_agent_registry_plan.md](v0_8_project_agent_registry_plan.md).
 The v0.9 Agent Lifecycle and Preview plan is tracked in [v0_9_agent_lifecycle_and_preview_plan.md](v0_9_agent_lifecycle_and_preview_plan.md).
 The v1.0 MVP Closure plan is tracked in [v1_0_mvp_closure_plan.md](v1_0_mvp_closure_plan.md).
+The v1.1 CLI UX plan is tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -107,7 +108,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is a post-MVP decision plan. Do not add new execution capability until a separate plan authorizes it. Recommended candidates are imported-agent refresh semantics, a second read-only planning adapter, or release packaging polish.
+The immediate next target is v1.1 CLI UX, tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md). It should add a human-friendly dashboard and guided command composition for the existing MVP surface without changing execution behavior.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
