@@ -1,8 +1,8 @@
 # Agent Harness
 
-Local-first custom agent harness with v0.2 declarative spec inspection.
+Local-first custom agent harness MVP.
 
-The harness includes local infrastructure and read-only v0.2 operator surfaces:
+The v1.0 MVP includes local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, and one bounded read-only execution adapter:
 
 - CLI scaffolding.
 - `.harness/` project state.
@@ -16,14 +16,16 @@ The harness includes local infrastructure and read-only v0.2 operator surfaces:
 - Declarative model profiles, tool policies, memory scopes, agents, and workbenches.
 - Explicit JSON/YAML custom spec bundle validation.
 - Normalized spec export, registry diff, and effective policy preview.
+- Custom agent bundle scaffold, validation, and preview.
+- Project-local imported agent registry with inspect, preview, drift, and remove.
+- Manual durable objectives and task queue.
+- Runtime policy, manifest, artifact, compare/baseline, eval, and trace evidence.
+- Local daemon control-plane commands.
+- Explicit `read_only_summary/read_only_repo_summary` lease adapter.
 
-Later phases added supervised Codex editing and Docker-sandboxed test execution.
-Paid API execution, generic shell execution, workflows, plugins, and MCP remain
-outside the current implemented scope.
+Paid API execution, hosted fallback, generic shell execution, autonomous workflows, MCP/A2A, browser/email/calendar integrations, broker actions, live trading, order placement, and active repo write automation remain outside the v1 MVP scope.
 
-The v0.2 spec surfaces are inspection-only. They do not execute agents, preflight
-backends, persist custom bundles, create tasks, schedule work, or read `.harness/`
-state for custom spec commands.
+Spec and agent lifecycle surfaces are inspection/control-plane commands. They do not execute agents, preflight backends, create runs, schedule work, or authorize tools. The only bounded real execution path in the MVP is the explicit read-only daemon lease adapter.
 
 ## Repository Layout
 

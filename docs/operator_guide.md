@@ -8,6 +8,42 @@ This guide covers the currently implemented operator flows:
 
 The harness does not commit or push changes for these flows. Paid API execution, generic shell execution, workflows, plugins, MCP, browser/email/calendar integrations, hosted fallback, and local fallback are outside the implemented scope.
 
+## v1.0 MVP Workflow
+
+The v1.0 MVP is a local-first workflow for declarative agents, manual durable tasks, inspectable evidence, and one bounded read-only execution adapter. The end-to-end path is:
+
+```bash
+harness agents scaffold my_agent \
+  --workbench quant \
+  --kind specialist \
+  --parent quant_research \
+  --model-profile local_reasoning \
+  --tool-policy read_only \
+  --memory-scope quant \
+  --output agents/my_agent \
+  --output-format json
+harness agents validate agents/my_agent --output json
+harness agents preview agents/my_agent --output json
+harness init --project .
+harness agents import agents/my_agent --project . --output json
+harness agents inspect my_agent --project . --output json
+harness agents preview-imported my_agent --project . --output json
+harness tasks add --title "Read-only summary" \
+  --agent my_agent \
+  --workbench quant \
+  --execution-adapter read_only_summary \
+  --task-type read_only_repo_summary \
+  --project . \
+  --output json
+harness daemon run-once --project . --output json
+harness daemon inspect-lease task_lease_abc123def456 --project . --output json
+harness daemon execute-read-only task_lease_abc123def456 --project . --output json
+```
+
+`daemon run-once` remains select-and-lease only. `daemon execute-read-only` requires an existing active lease and exact allowlisted metadata: `execution_adapter=read_only_summary` and `task_type=read_only_repo_summary`. Imported agents are metadata references; they do not grant new tools or execution permissions.
+
+The MVP does not authorize new adapters, automatic task generation, autonomous workflows, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, external messaging, application submission, or active repo write automation.
+
 ## Codex Supervised Isolated Editing
 
 `codex_code_edit` uses `CodexCliBackend` as an external agent backend. Codex does not run as a raw model provider, and the harness does not assume Codex internal actions appear as harness-native tool calls. Supervision is done through workspace isolation, Codex subprocess flags, captured output, artifacts, git status, diff inspection, policy validation, and explicit apply-back approval.

@@ -15,6 +15,46 @@ git log --oneline --decorate -5
 pytest -q
 ```
 
+## Verify v1.0 MVP Path
+
+This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the already-authorized read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.
+
+```bash
+rm -rf /tmp/harness-v1-agent
+harness agents scaffold smoke_v1_agent \
+  --workbench quant \
+  --kind specialist \
+  --parent quant_research \
+  --model-profile local_reasoning \
+  --tool-policy read_only \
+  --memory-scope quant \
+  --output /tmp/harness-v1-agent \
+  --output-format json
+harness agents validate /tmp/harness-v1-agent --output json
+harness agents preview /tmp/harness-v1-agent --output json
+harness init --project .
+harness agents import /tmp/harness-v1-agent --project . --output json
+harness agents inspect smoke_v1_agent --project . --output json
+harness agents preview-imported smoke_v1_agent --project . --output json
+harness tasks add --title "v1 read-only summary" \
+  --agent smoke_v1_agent \
+  --workbench quant \
+  --execution-adapter read_only_summary \
+  --task-type read_only_repo_summary \
+  --project . \
+  --output json
+harness daemon run-once --project . --output json
+harness daemon inspect-lease "$LEASE_ID" --project . --output json
+harness daemon execute-read-only "$LEASE_ID" --project . --output json
+```
+
+Expected v1.0 MVP safety properties:
+
+- Agent and task lifecycle commands are declarative/control-plane operations only.
+- `daemon run-once` leases work but does not execute it.
+- `daemon execute-read-only` is the only real MVP adapter and uses only the configured local-only/no-cost read-only route.
+- The MVP does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
+
 ## Verify Read-Only v0.2 Specs Commands
 
 Built-in inspection:

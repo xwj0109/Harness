@@ -1,10 +1,14 @@
 # v1.0 MVP Closure Plan
 
+Status: complete.
+
 ## Summary
 
 Close the v1 MVP around the current local-first harness capabilities: declarative built-in and project-local agents, manual durable task queue, runtime evidence, local daemon control-plane readiness, and one bounded read-only execution adapter.
 
 This is a release-closure and integration-polish milestone, not a new capability milestone. It must not add new execution adapters, autonomous workflows, automatic task generation, backend fallback, hosted fallback, paid fallback, OpenAI API usage, Docker-from-queue, generic shell access, MCP/A2A, browser/email/calendar tools, broker integrations, live trading, order placement, external messaging, application submission, or active repo write automation.
+
+Completion note: v1.0 MVP closure is implemented as release hygiene and documentation stabilization. Package metadata is bumped to `1.0.0`, the README/operator guide/smoke checklist describe the end-to-end MVP path, and the release boundary remains one bounded read-only adapter plus declarative/manual control-plane features.
 
 ## Key Changes
 
