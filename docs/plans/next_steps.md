@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete. v1.7 TUI Copy-Only Command Palette is complete. v1.8 TUI Usability Polish is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete. v1.7 TUI Copy-Only Command Palette is complete. v1.8 TUI Usability Polish is complete. Package release `1.1.0` is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -83,6 +83,7 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `1.0.0`.
 - v1.7 TUI Copy-Only Command Palette is complete.
 - v1.8 TUI Usability Polish is complete.
+- Version bump to `1.1.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -133,9 +134,8 @@ There is no active implementation target. The next capability should be selected
 
 Recommended decision options:
 
-- v1.9 TUI release hygiene and package metadata if the TUI UX milestone should be published.
-- v1.9 read-only TUI refinements such as in-memory pane collapse or dedicated palette focus, still with no command execution or persisted preferences.
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
+- v1.9 read-only TUI refinements such as in-memory pane collapse or dedicated palette focus, still with no command execution or persisted preferences.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

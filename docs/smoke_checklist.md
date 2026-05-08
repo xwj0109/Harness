@@ -32,6 +32,7 @@ python3 -m venv --system-site-packages /tmp/harness-install
 Expected packaging properties:
 
 - The installed wheel exposes the `harness` console script.
+- Package metadata reports version `1.1.0`.
 - Packaged built-in YAML specs under `harness/builtin_specs/` are available after wheel install.
 - `harness home` and `harness quickstart agent` remain non-mutating in the temporary project.
 - The base wheel can report the missing optional TUI extra without importing Textual during normal CLI startup; `harness tui --output json` is a non-interactive probe and must not launch the TUI.

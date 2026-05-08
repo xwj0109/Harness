@@ -70,6 +70,8 @@ The v1.7 TUI also includes a copy-only command palette. It shows workflow-groupe
 
 The v1.8 TUI polish groups visible panes into stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. It also shows compact keyboard hints and clearer search/no-match status. These are in-memory presentation changes only; no UI preferences are persisted.
 
+The CLI/TUI UX milestone is packaged as release `1.1.0`. It is a usability release only; it does not broaden execution permissions or add new adapters.
+
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 
 ```bash
