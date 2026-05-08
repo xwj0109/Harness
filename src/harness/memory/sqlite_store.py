@@ -1257,6 +1257,164 @@ class SQLiteStore:
         self._validate_read_only_task_metadata(task)
         return lease, attempt, task
 
+    def validate_execution_lease_for_run(self, lease_id: str) -> tuple[TaskLease, TaskAttempt, TaskRecord]:
+        lease = self.get_task_lease(lease_id)
+        if lease.status != TaskLeaseStatus.ACTIVE:
+            raise ValueError(f"Execution requires active lease: {lease.status.value}")
+        if lease.attempt_id is None:
+            raise ValueError(f"Execution requires linked task attempt: {lease.id}")
+        attempt = self.get_task_attempt(lease.attempt_id)
+        if attempt.run_id is not None:
+            raise ValueError(
+                f"Task attempt already has run_id: {attempt.id}; inspect the lease or run daemon recover"
+            )
+        task = self.get_task(lease.task_id)
+        if task.status != TaskStatus.LEASED:
+            raise ValueError(f"Execution requires leased task status: {task.status.value}")
+        if task.required_approvals:
+            raise ValueError("Execution rejected: task has unresolved required approvals")
+        return lease, attempt, task
+
+    def start_attempt_run(
+        self,
+        lease_id: str,
+        *,
+        task_type: str,
+        backend: BackendConfig | None,
+        approval_id: str | None,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+    ) -> RunRecord:
+        lease, attempt, task = self.validate_execution_lease_for_run(lease_id)
+        goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
+        run = self.create_run(
+            goal=goal,
+            task_type=task_type,
+            status="running",
+            backend=backend,
+            approval_id=approval_id,
+            task_id=task.id,
+            objective_id=task.objective_id,
+        )
+        started_at = now_iso()
+        with self.connect() as conn:
+            validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
+            result = conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?, run_id = ?, started_at = ?
+                WHERE id = ? AND run_id IS NULL
+                """,
+                (TaskStatus.RUNNING.value, run.id, started_at, attempt.id),
+            )
+            if result.rowcount == 0:
+                raise ValueError(f"Task attempt already has run_id: {attempt.id}")
+            conn.execute(
+                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ?",
+                (TaskStatus.RUNNING.value, run.id, started_at, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=TaskStatus.LEASED,
+                to_status=TaskStatus.RUNNING,
+                reason="execution_started",
+                actor=owner,
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                created_at=started_at,
+            )
+        return self.get_run(run.id)
+
+    def finish_attempt_run(
+        self,
+        lease_id: str,
+        *,
+        run_id: str,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+        success: bool,
+        decision: str,
+        run_status: str,
+        failure_code: str | None = None,
+        failure_message: str | None = None,
+    ) -> None:
+        lease = self.get_task_lease(lease_id)
+        if lease.attempt_id is None:
+            raise ValueError(f"Execution requires linked task attempt: {lease.id}")
+        attempt = self.get_task_attempt(lease.attempt_id)
+        task = self.get_task(lease.task_id)
+        if attempt.run_id != run_id:
+            raise ValueError(f"Execution run mismatch for attempt: {attempt.id}")
+        finished_at = now_iso()
+        next_status = TaskStatus.SUCCEEDED if success else TaskStatus.FAILED
+        reason = "execution_succeeded" if success else "execution_failed"
+        self.update_run_status(run_id, run_status)
+        with self.connect() as conn:
+            current_status = task.status
+            if current_status == TaskStatus.LEASED:
+                validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (TaskStatus.RUNNING.value, finished_at, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=TaskStatus.LEASED,
+                    to_status=TaskStatus.RUNNING,
+                    reason=f"{reason}_running",
+                    actor=owner,
+                    metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run_id},
+                    created_at=finished_at,
+                )
+                current_status = TaskStatus.RUNNING
+            if current_status != next_status:
+                validate_task_transition(current_status, next_status)
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (next_status.value, finished_at, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=current_status,
+                    to_status=next_status,
+                    reason=reason,
+                    actor=owner,
+                    metadata={
+                        "lease_id": lease.id,
+                        "attempt_id": attempt.id,
+                        "run_id": run_id,
+                        "decision": decision,
+                    },
+                    created_at=finished_at,
+                )
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?,
+                    finished_at = ?,
+                    failure_code = ?,
+                    failure_message = ?
+                WHERE id = ?
+                """,
+                (next_status.value, finished_at, failure_code, failure_message, attempt.id),
+            )
+            conn.execute(
+                """
+                UPDATE task_leases
+                SET status = ?, released_at = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    TaskLeaseStatus.RELEASED.value,
+                    finished_at,
+                    json.dumps(
+                        sanitize_for_logging({**lease.metadata, "run_id": run_id, "decision": decision}),
+                        sort_keys=True,
+                    ),
+                    lease.id,
+                ),
+            )
+
     def start_read_only_lease_run(
         self,
         lease_id: str,
@@ -1402,6 +1560,8 @@ class SQLiteStore:
             raise ValueError(f"Read-only execution rejected by task metadata: {', '.join(forbidden)}")
 
     def inspect_task_lease(self, lease_id: str) -> DaemonLeaseInspection:
+        from harness.execution import inspect_execution_eligibility
+
         lease = self.get_task_lease(lease_id)
         task: TaskRecord | None = None
         attempt: TaskAttempt | None = None
@@ -1432,6 +1592,7 @@ class SQLiteStore:
             manifest=manifest,
             dry_run_eligibility=self._dry_run_eligibility_for_inspection(lease, task, attempt),
             read_only_eligibility=self._read_only_eligibility_for_inspection(lease, task, attempt),
+            execution_eligibility=inspect_execution_eligibility(self.project_root, lease, task, attempt),
             recovery_recommendation=self._lease_recovery_recommendation(lease, task, attempt, run),
         )
 
