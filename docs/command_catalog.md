@@ -11,11 +11,12 @@ harness --help
 harness home --project .
 harness home --project . --output json
 harness tui --project .
+harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 harness quickstart agent --project .
 harness quickstart agent --project . --output json
 ```
 
-`home`, `tui`, and `quickstart agent` are read-only/non-mutating orientation commands. `tui` requires the optional TUI extra and starts a chat-style terminal interface with slash commands, project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, and local in-memory search over loaded dashboard and command metadata. Slash commands such as `/home`, `/quickstart`, `/tasks`, `/lease`, `/inspect-lease`, `/execute-read-only`, `/runs`, `/policy`, and `/artifacts` render workflow-grouped command templates from this catalog, mutation/safety notes, and selected command text for manual operator use. The TUI does not execute commands, spawn subprocesses, invoke a shell, copy commands to the clipboard, mutate harness state, or call providers. `quickstart agent` prints command sequences for the MVP path but does not run them.
+`home`, `tui`, and `quickstart agent` are read-only/non-mutating orientation commands. `tui` requires the optional TUI extra and starts a chat-style terminal interface with slash commands, project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, static generated terminal pixel art, and local in-memory search over loaded dashboard and command metadata. Slash commands such as `/home`, `/quickstart`, `/tasks`, `/lease`, `/inspect-lease`, `/execute-read-only`, `/runs`, `/policy`, and `/artifacts` render workflow-grouped command templates from this catalog, mutation/safety notes, and selected command text for manual operator use. The TUI does not execute commands, spawn subprocesses, invoke a shell, copy commands to the clipboard, mutate harness state, load image files at runtime, or call providers. `tui-home set-image` is an explicit local visual-customization command that imports the provided image into tracked static TUI art files; it does not touch project runtime state, execute adapters, preflight backends, or expose image contents. `quickstart agent` prints command sequences for the MVP path but does not run them.
 
 ## Agent Authoring
 

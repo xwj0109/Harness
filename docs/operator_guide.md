@@ -70,7 +70,16 @@ The TUI slash-command prompt is a command discovery surface, not an execution su
 
 The command palette and slash-command model are copy-only. They show workflow-grouped command templates, mutation/safety notes, and selected command text for manual operator use. They are discovery-only: they do not execute commands, spawn subprocesses, invoke a shell, copy to the clipboard, mutate tasks, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, call providers, crawl files, search artifact contents, or expose secrets.
 
-The TUI keeps dashboard context available next to the chat transcript, grouped into stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. It also shows compact keyboard hints, clearer search/no-match status, and a static ASCII cat on the TUI home/welcome surface. These are in-memory presentation changes only; no UI preferences or external assets are persisted.
+The TUI keeps dashboard context available next to the chat transcript, grouped into stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. It also shows compact keyboard hints, clearer search/no-match status, and static generated terminal pixel art on the TUI home/welcome surface. Runtime rendering uses committed Python color data; the TUI itself does not load image files, persist UI preferences, or fetch external assets.
+
+To replace the homepage art with an explicit local image, regenerate the static render data:
+
+```bash
+harness tui-home set-image ~/Pictures/home.png --width 80
+harness tui-home set-image ~/Pictures/home.png --width 80 --output json
+```
+
+This command imports only the provided image path, stores a local source copy in `assets/tui/home_source.png`, and regenerates `src/harness/tui_assets/pixel_art.py`. It does not initialize projects, mutate `.harness/`, create tasks, create runs, acquire leases, start daemon work, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents in command output.
 
 The CLI/TUI UX milestone is packaged as release `1.1.0`. It is a usability release only; it does not broaden execution permissions or add new adapters.
 

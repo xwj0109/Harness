@@ -67,6 +67,7 @@ from harness.spec_loader import (
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tool_capabilities import get_tool_capability, list_tool_capabilities
 from harness.traces import export_run_trace, to_otel_json
+from harness.tui_assets import TUI_HOME_IMAGE_SCHEMA_VERSION, TuiHomeImageError, set_tui_home_image
 
 app = typer.Typer(help="Local-first agent harness.")
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
@@ -87,6 +88,7 @@ objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 agents_app = typer.Typer(help="Declarative custom agent authoring.")
 quickstart_app = typer.Typer(help="Guided command composition without hidden execution.")
+tui_home_app = typer.Typer(help="TUI homepage visual customization.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
@@ -103,6 +105,7 @@ app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(agents_app, name="agents")
 app.add_typer(quickstart_app, name="quickstart")
+app.add_typer(tui_home_app, name="tui-home")
 tests_app.add_typer(tests_image_app, name="image")
 specs_app.add_typer(specs_preview_app, name="preview")
 
@@ -169,6 +172,29 @@ def tui(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.
     from harness.tui import run_read_only_tui
 
     run_read_only_tui(project_root)
+
+
+@tui_home_app.command("set-image")
+def tui_home_set_image(
+    image_path: Path,
+    width: Annotated[int, typer.Option("--width", help="Generated terminal art width in cells.")] = 80,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Import a local image as the static TUI homepage pixel art."""
+
+    try:
+        result = set_tui_home_image(image_path, width=width)
+    except TuiHomeImageError as exc:
+        _emit_tui_home_error(str(exc), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo("TUI home image updated.")
+    typer.echo(f"Source image: {result['source_image']}")
+    typer.echo(f"Stored source: {result['stored_source']}")
+    typer.echo(f"Generated module: {result['generated_module']}")
+    typer.echo(f"Terminal size: {result['width']}x{result['terminal_rows']}")
 
 
 @app.command()
@@ -2118,6 +2144,13 @@ def _emit_daemon_error(schema_version: str, message: str, output: OutputFormat) 
         _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
     else:
         typer.echo(f"Daemon command failed: {message}")
+
+
+def _emit_tui_home_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": TUI_HOME_IMAGE_SCHEMA_VERSION, "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"TUI home image command failed: {message}")
 
 
 def _daemon_owner() -> str:

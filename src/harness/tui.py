@@ -9,16 +9,6 @@ from harness.memory.sqlite_store import SQLiteStore
 from harness.models import TaskStatus
 
 
-TUI_PIXEL_ART = [
-    "   /\\_____/\\   ",
-    "  /  o   o  \\  ",
-    " ( ==  ^  == ) ",
-    "  )         (  ",
-    " (           ) ",
-    " ( (  ) (  ) )",
-    "(__(__)_(__)__)",
-]
-
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
     {"id": "agent_authoring", "title": "Agent Authoring"},
@@ -218,7 +208,7 @@ TUI_VIEW_SECTIONS = [
     {
         "id": "project_overview",
         "title": "Project Overview",
-        "pane_ids": ["pixel_art", "overview", "guidance", "commands"],
+        "pane_ids": ["overview", "guidance", "commands"],
     },
     {
         "id": "queue_daemon",
@@ -302,7 +292,6 @@ def build_tui_dashboard(project_root: Path) -> dict:
         "project_root": str(project_root),
         "initialized": initialized,
         "version": __version__,
-        "pixel_art": list(TUI_PIXEL_ART),
         "summary": {
             "imported_agents": 0,
             "objectives": 0,
@@ -475,11 +464,6 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
         if count
     ]
     panes = [
-        {
-            "id": "pixel_art",
-            "title": "Agent Harness",
-            "lines": dashboard["pixel_art"],
-        },
         {
             "id": "overview",
             "title": "Overview",
@@ -737,8 +721,6 @@ def build_chat_welcome_message(project_root: Path) -> dict:
         "role": "assistant",
         "title": "Harness chat",
         "lines": [
-            *TUI_PIXEL_ART,
-            "",
             f"Project: {project_root}",
             "Type /help to list slash commands.",
             "Slash commands render existing CLI command templates for manual operator use.",
@@ -867,6 +849,21 @@ def render_chat_message(message: dict) -> str:
     return "\n".join(lines)
 
 
+def render_pixel_art():
+    from rich.console import Group
+    from rich.text import Text
+
+    from harness.tui_assets.pixel_art import TUI_PIXEL_ART_HALF_BLOCKS
+
+    lines = []
+    for row in TUI_PIXEL_ART_HALF_BLOCKS:
+        line = Text()
+        for foreground, background in row:
+            line.append("▀", style=f"{foreground} on {background}")
+        lines.append(line)
+    return Group(*lines)
+
+
 def build_tui_view_model(filtered: dict, filtered_palette: dict) -> dict:
     no_matches = not filtered["panes"] and not filtered_palette["entries"]
     dashboard_panes = [dict(pane) for pane in filtered["panes"]]
@@ -962,7 +959,7 @@ def filter_tui_panes(panes: list[dict], query: str) -> dict:
 
 
 def render_dashboard_text(dashboard: dict) -> str:
-    lines = ["Agent Harness", "", *dashboard["pixel_art"]]
+    lines = ["Agent Harness"]
     for pane in build_tui_panes(dashboard):
         pane_lines = _render_pane_content(pane).splitlines()
         lines.extend(["", pane_lines[0]])
@@ -1091,6 +1088,7 @@ def run_read_only_tui(project_root: Path) -> None:
             yield Header(show_clock=False)
             with Horizontal(id="layout"):
                 with VerticalScroll(id="chat"):
+                    yield Static(render_pixel_art(), id="pixel-art")
                     yield Static("", id="chat-content")
                 with VerticalScroll(id="side"):
                     yield Static(render_view_status(initial_view), id="search-status")
