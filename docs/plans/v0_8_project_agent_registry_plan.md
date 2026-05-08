@@ -1,10 +1,14 @@
 # v0.8 Project-Local Agent Registry Plan
 
+Status: complete.
+
 ## Summary
 
 Make v0.8 the project-local import and persistence milestone for user-authored agents. Operators should be able to import a validated v0.7 agent bundle into initialized harness persistence, list and inspect imported agents, and reference imported agents from task metadata without changing packaged built-ins.
 
 This milestone remains declarative/control-plane only. It must not execute imported agents, create tasks automatically, start workflows, schedule daemon work, preflight model backends, call providers, run Docker, invoke shell tools, mutate active repo files, connect to brokers, place orders, send messages, submit applications, use hosted fallback, use paid fallback, use OpenAI API, add MCP/A2A, or add browser/email/calendar tools.
+
+Completion note: v0.8 Slice 1 is implemented and verified. Project-local agent imports now persist validated agent/profile metadata, source path, import timestamp, and deterministic content hash; `harness agents import/list/inspect` are available; and task creation can reference imported project agents while preserving `spec_source_kind: project` and the imported bundle source path. Imported agents remain non-executing metadata.
 
 ## Key Changes
 

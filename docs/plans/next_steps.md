@@ -19,6 +19,7 @@ The v0.6.3 Agent Structure MVP plan is tracked in [v0_6_3_agent_structure_mvp_pl
 The v0.7 Agent Authoring MVP plan is tracked in [v0_7_agent_authoring_mvp_plan.md](v0_7_agent_authoring_mvp_plan.md).
 The v0.7.1 Agent Authoring Hardening plan is tracked in [v0_7_1_agent_authoring_hardening_plan.md](v0_7_1_agent_authoring_hardening_plan.md).
 The v0.8 Project-Local Agent Registry plan is tracked in [v0_8_project_agent_registry_plan.md](v0_8_project_agent_registry_plan.md).
+The v0.9 Agent Lifecycle and Preview plan is tracked in [v0_9_agent_lifecycle_and_preview_plan.md](v0_9_agent_lifecycle_and_preview_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -65,6 +66,7 @@ The first v0.2 schema and registry foundations are in place:
 - v0.6.3 Agent Structure MVP is complete.
 - v0.7 Agent Authoring MVP is complete.
 - v0.7.1 Agent Authoring Hardening is complete.
+- v0.8 Project-Local Agent Registry is complete.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -101,7 +103,7 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is v0.8 Project-Local Agent Registry, tracked in [v0_8_project_agent_registry_plan.md](v0_8_project_agent_registry_plan.md). It should import validated v0.7 agent bundles into initialized harness persistence, list and inspect imported agents, and let tasks reference imported agents without executing them or changing immutable built-ins.
+The immediate next target is v0.9 Agent Lifecycle and Preview, tracked in [v0_9_agent_lifecycle_and_preview_plan.md](v0_9_agent_lifecycle_and_preview_plan.md). It should add project-agent effective preview, source drift inspection, and minimal lifecycle behavior for imported agents while keeping agents declarative and non-executing.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
