@@ -15,7 +15,7 @@ harness quickstart agent --project .
 harness quickstart agent --project . --output json
 ```
 
-`home`, `tui`, and `quickstart agent` are read-only/non-mutating orientation commands. `tui` requires the optional TUI extra and starts a read-only dashboard with project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, command suggestions, and local in-memory search over the loaded panes. `quickstart agent` prints command sequences for the MVP path but does not run them.
+`home`, `tui`, and `quickstart agent` are read-only/non-mutating orientation commands. `tui` requires the optional TUI extra and starts a read-only dashboard with project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, and local in-memory search over the loaded panes. The v1.7 TUI also includes a copy-only command palette with workflow-grouped templates from this catalog, mutation/safety notes, and selected command text for manual operator use. It does not execute commands or copy them to the clipboard. `quickstart agent` prints command sequences for the MVP path but does not run them.
 
 ## Agent Authoring
 

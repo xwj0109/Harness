@@ -57,14 +57,16 @@ The dashboard reports initialization state, imported-agent count, objective and 
 
 `harness home` is read-only. It does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, execute adapters, preflight backends, inspect backend settings, run Docker, invoke shell tools, call providers, or expose secrets.
 
-`harness tui` is the v1.4 read-only terminal dashboard entrypoint:
+`harness tui` is the read-only terminal dashboard entrypoint:
 
 ```bash
 python3 -m pip install "agent-harness[tui]"
 harness tui --project .
 ```
 
-Without the optional TUI extra, `harness tui` returns a clear install hint instead of importing Textual during normal CLI startup. `harness tui --output json` is a non-interactive availability probe and does not launch a terminal UI. With the optional extra installed, the TUI surface renders a read-only dashboard with project state, summary counts, imported-agent details, task details, active lease details, daemon event summaries, recent runs, safety reminders, copyable command suggestions, and local in-memory search over those already-loaded panes. It must not initialize projects, create tasks, create runs, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, crawl files, search artifact contents, or expose secrets.
+Without the optional TUI extra, `harness tui` returns a clear install hint instead of importing Textual during normal CLI startup. `harness tui --output json` is a non-interactive availability probe and does not launch a terminal UI. With the optional extra installed, the TUI surface renders a read-only dashboard with project state, summary counts, imported-agent details, task details, active lease details, daemon event summaries, recent runs, safety reminders, and local in-memory search over those already-loaded panes.
+
+The v1.7 TUI also includes a copy-only command palette. It shows workflow-grouped command templates, mutation/safety notes, and selected command text for manual operator use. The palette is discovery-only: it does not execute commands, spawn subprocesses, invoke a shell, copy to the clipboard, mutate tasks, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, call providers, crawl files, search artifact contents, or expose secrets.
 
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 

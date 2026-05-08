@@ -1,6 +1,6 @@
 # v1.7 TUI Copy-Only Command Palette Plan
 
-Status: Slice 2 in progress.
+Status: Complete.
 
 ## Summary
 
@@ -114,6 +114,8 @@ Implementation note: Slice 2 renders palette panes inside the optional Textual a
 - Update [operator_guide.md](../operator_guide.md), [command_catalog.md](../command_catalog.md), and [smoke_checklist.md](../smoke_checklist.md).
 - Mark v1.7 complete only after focused and full tests pass.
 - Keep command execution or confirmed TUI actions behind a later decision plan.
+
+Completion note: v1.7 is complete as a copy-only command discovery milestone. The palette model, local filtering, Textual read-only view, grouped command details, operator docs, command catalog, and smoke checklist are implemented and verified. The TUI still does not execute commands, spawn subprocesses, invoke shell tools, mutate state, call providers, preflight backends, use Docker, or add clipboard bindings.
 
 ## Test Plan
 

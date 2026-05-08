@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete. v1.4 Read-Only TUI is complete. v1.5 TUI Detail Panes is complete. v1.6 TUI Filter/Search is complete. v1.7 TUI Copy-Only Command Palette is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -80,6 +80,7 @@ The first v0.2 schema and registry foundations are in place:
 - v1.1 CLI UX is complete.
 - v1.2 Post-MVP Polish is complete.
 - Version bump to `1.0.0`.
+- v1.7 TUI Copy-Only Command Palette is complete.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -120,15 +121,19 @@ The Typer/Rich-first CLI polish follow-up is tracked in [v1_3_interactive_tui_de
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.
-3. True interactive TUI/command palette later, behind a separate decision gate. Deferred.
+3. True interactive TUI/command palette later, behind a separate decision gate. Complete for the copy-only v1.7 surface.
 
 Implemented CLI-only refinements include sectioned text output for high-traffic inspect/explain commands and a grouped command catalog in [../command_catalog.md](../command_catalog.md). JSON contracts remain unchanged.
 
 ## Immediate Next Planning Target
 
-The immediate next target is v1.7 TUI Copy-Only Command Palette, tracked in [v1_7_tui_copy_only_command_palette_plan.md](v1_7_tui_copy_only_command_palette_plan.md).
+There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
 
-v1.7 should add workflow-grouped command templates to the optional TUI for discovery and manual copy only. It remains non-executing: no command execution, subprocess calls, shell invocation, task mutation, daemon actions, adapter execution, backend preflight, Docker, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, unmanaged daemon loops, or clipboard dependency unless separately justified.
+Recommended decision options:
+
+- v1.8 TUI usability polish such as saved local views, pane ordering, or navigation refinements, still read-only.
+- Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
+- Packaging/distribution release hygiene if the current UX milestone should be published.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
