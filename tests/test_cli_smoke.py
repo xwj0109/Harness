@@ -9,7 +9,7 @@ from harness.config import default_config
 from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
-from harness.tui import build_tui_dashboard, render_dashboard_text
+from harness.tui import build_tui_dashboard, build_tui_panes, render_dashboard_text
 
 
 runner = CliRunner()
@@ -120,6 +120,7 @@ def test_cli_tui_json_probe_does_not_launch_or_mutate(tmp_path, monkeypatch) -> 
 
 def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) -> None:
     dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
     rendered = render_dashboard_text(dashboard)
 
     assert dashboard["schema_version"] == "harness.tui_dashboard/v1"
@@ -131,6 +132,17 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert dashboard["active_leases"] == []
     assert dashboard["daemon"]["latest_events"] == []
     assert dashboard["guidance"][0]["id"] == "initialize_project"
+    assert [pane["id"] for pane in panes] == [
+        "overview",
+        "agents",
+        "tasks",
+        "leases",
+        "daemon",
+        "runs",
+        "commands",
+        "guidance",
+        "safety",
+    ]
     assert "Project" in rendered
     assert "Initialized: False" in rendered
     assert "Commands" in rendered
@@ -209,6 +221,7 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert created_run.exit_code == 0, created_run.output
 
     dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
     rendered = render_dashboard_text(dashboard)
 
     assert dashboard["initialized"] is True
@@ -228,6 +241,19 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["daemon"]["latest_events"]
     assert dashboard["task_status_counts"]["leased"] == 1
     assert dashboard["recent_runs"][0]["task_type"] == "phase_1a_test"
+    assert [pane["id"] for pane in panes] == [
+        "overview",
+        "agents",
+        "tasks",
+        "leases",
+        "daemon",
+        "runs",
+        "commands",
+        "safety",
+    ]
+    assert any("tui_agent" in line for line in panes[1]["lines"])
+    assert any("tui task" in line for line in panes[2]["lines"])
+    assert any(dashboard["active_leases"][0]["id"] in line for line in panes[3]["lines"])
     assert "tui_agent workbench=quant" in rendered
     assert "tui task" in rendered
     assert "Active Leases" in rendered

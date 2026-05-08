@@ -1,6 +1,6 @@
 # v1.5 TUI Detail Panes Plan
 
-Status: Slice 1 in progress.
+Status: Slice 2 in progress.
 
 ## Summary
 
@@ -97,6 +97,8 @@ Implementation note: Slice 1 adds sanitized detail lists to the TUI dashboard mo
 - Add keyboard navigation for moving between sections/items.
 - Keep `q` as the exit path.
 - Do not add action bindings.
+
+Implementation note: Slice 2 adds a testable pane model and renders it in the optional Textual app as focusable read-only panels. Keyboard bindings are limited to `q`, `tab`, and `shift+tab`; command suggestions remain copyable text only.
 
 ### Slice 3: Docs And Hygiene
 

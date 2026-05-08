@@ -164,7 +164,7 @@ def build_tui_dashboard(project_root: Path) -> dict:
     return dashboard
 
 
-def render_dashboard_text(dashboard: dict) -> str:
+def build_tui_panes(dashboard: dict) -> list[dict]:
     summary = dashboard["summary"]
     task_status_counts = dashboard["task_status_counts"]
     active_statuses = [
@@ -172,101 +172,149 @@ def render_dashboard_text(dashboard: dict) -> str:
         for status, count in task_status_counts.items()
         if count
     ]
-    lines = [
-        "Agent Harness",
-        "",
-        "Project",
-        f"  Path: {dashboard['project_root']}",
-        f"  Initialized: {dashboard['initialized']}",
-        f"  Version: {dashboard['version']}",
-        "",
-        "Summary",
-        f"  Imported agents: {summary['imported_agents']}",
-        f"  Objectives: {summary['objectives']}",
-        f"  Tasks: {summary['tasks_total']}",
-        f"  Active leases: {summary['active_leases']}",
-        f"  Active daemons: {summary['active_daemons']}",
-        f"  Recent runs: {summary['recent_runs']}",
-        "",
-        "Task Status",
-        f"  Counts: {', '.join(active_statuses) if active_statuses else 'none'}",
-        "",
-        "Agents",
+    panes = [
+        {
+            "id": "overview",
+            "title": "Overview",
+            "lines": [
+                f"Project: {dashboard['project_root']}",
+                f"Initialized: {dashboard['initialized']}",
+                f"Version: {dashboard['version']}",
+                f"Imported agents: {summary['imported_agents']}",
+                f"Objectives: {summary['objectives']}",
+                f"Tasks: {summary['tasks_total']}",
+                f"Active leases: {summary['active_leases']}",
+                f"Active daemons: {summary['active_daemons']}",
+                f"Recent runs: {summary['recent_runs']}",
+                f"Task status: {', '.join(active_statuses) if active_statuses else 'none'}",
+            ],
+        },
+        {
+            "id": "agents",
+            "title": "Agents",
+            "lines": [
+                f"{agent['agent_id']} workbench={agent['workbench_id']} profiles={agent['profiles']}"
+                for agent in dashboard["agents"]
+            ]
+            or ["none"],
+        },
+        {
+            "id": "tasks",
+            "title": "Tasks",
+            "lines": [
+                f"{task['id']} {task['status']} priority={task['priority']} {task['title']}"
+                for task in dashboard["tasks"]
+            ]
+            or ["none"],
+        },
+        {
+            "id": "leases",
+            "title": "Active Leases",
+            "lines": [
+                f"{lease['id']} task={lease['task_id']} attempt={lease['attempt_id'] or 'none'}"
+                for lease in dashboard["active_leases"]
+            ]
+            or ["none"],
+        },
+        {
+            "id": "daemon",
+            "title": "Daemon",
+            "lines": [
+                f"Active daemons: {dashboard['daemon']['active_daemons']}",
+                f"Paused tasks: {dashboard['daemon']['paused_tasks']}",
+                "Latest events:",
+                *(
+                    [
+                        f"{event['event_type']}: {event['message']}"
+                        for event in dashboard["daemon"]["latest_events"]
+                    ]
+                    or ["none"]
+                ),
+            ],
+        },
+        {
+            "id": "runs",
+            "title": "Recent Runs",
+            "lines": [
+                f"{run['id']} {run['status']} {run.get('task_type') or 'none'}"
+                for run in dashboard["recent_runs"]
+            ]
+            or ["none"],
+        },
+        {
+            "id": "commands",
+            "title": "Commands",
+            "lines": dashboard["command_suggestions"],
+        },
     ]
-    if dashboard["agents"]:
-        for agent in dashboard["agents"]:
-            lines.append(
-                f"  {agent['agent_id']} workbench={agent['workbench_id']} profiles={agent['profiles']}"
-            )
-    else:
-        lines.append("  none")
-    lines.extend(["", "Tasks"])
-    if dashboard["tasks"]:
-        for task in dashboard["tasks"]:
-            lines.append(
-                f"  {task['id']} {task['status']} priority={task['priority']} {task['title']}"
-            )
-    else:
-        lines.append("  none")
-    lines.extend(["", "Active Leases"])
-    if dashboard["active_leases"]:
-        for lease in dashboard["active_leases"]:
-            lines.append(
-                f"  {lease['id']} task={lease['task_id']} attempt={lease['attempt_id'] or 'none'}"
-            )
-    else:
-        lines.append("  none")
-    lines.extend(
-        [
-            "",
-            "Daemon",
-            f"  Active daemons: {dashboard['daemon']['active_daemons']}",
-            f"  Paused tasks: {dashboard['daemon']['paused_tasks']}",
-        ]
-    )
-    if dashboard["daemon"]["latest_events"]:
-        lines.append("  Latest events:")
-        for event in dashboard["daemon"]["latest_events"]:
-            lines.append(f"    {event['event_type']}: {event['message']}")
-    else:
-        lines.append("  Latest events: none")
-    lines.extend(
-        [
-            "",
-            "Recent Runs",
-        ]
-    )
-    if dashboard["recent_runs"]:
-        for run in dashboard["recent_runs"]:
-            lines.append(f"  {run['id']} {run['status']} {run.get('task_type') or 'none'}")
-    else:
-        lines.append("  none")
-    lines.extend(["", "Commands"])
-    for command in dashboard["command_suggestions"]:
-        lines.append(f"  {command}")
     if dashboard.get("guidance"):
-        lines.extend(["", "Guidance"])
-        for item in dashboard["guidance"]:
-            lines.append(f"  {item['id']}: {item['command']}")
-    lines.extend(["", "Safety"])
-    for boundary in dashboard["safety_boundaries"]:
-        lines.append(f"  {boundary}")
+        panes.append(
+            {
+                "id": "guidance",
+                "title": "Guidance",
+                "lines": [
+                    f"{item['id']}: {item['command']}"
+                    for item in dashboard["guidance"]
+                ],
+            }
+        )
+    panes.append(
+        {
+            "id": "safety",
+            "title": "Safety",
+            "lines": dashboard["safety_boundaries"],
+        }
+    )
+    return panes
+
+
+def render_dashboard_text(dashboard: dict) -> str:
+    lines = ["Agent Harness"]
+    for pane in build_tui_panes(dashboard):
+        lines.extend(["", pane["title"]])
+        lines.extend(f"  {line}" for line in pane["lines"])
     lines.extend(["", "Press q to exit."])
     return "\n".join(lines)
 
 
 def run_read_only_tui(project_root: Path) -> None:
     from textual.app import App, ComposeResult
+    from textual.containers import VerticalScroll
     from textual.widgets import Footer, Header, Static
 
-    dashboard_text = render_dashboard_text(build_tui_dashboard(project_root))
+    dashboard = build_tui_dashboard(project_root)
+    panes = build_tui_panes(dashboard)
 
     class HarnessReadOnlyTui(App):
-        BINDINGS = [("q", "quit", "Quit")]
+        CSS = """
+        VerticalScroll {
+            padding: 1;
+        }
+
+        .pane {
+            border: round $surface;
+            margin: 0 0 1 0;
+            padding: 1;
+        }
+
+        .pane:focus {
+            border: round $accent;
+        }
+        """
+        BINDINGS = [
+            ("q", "quit", "Quit"),
+            ("tab", "focus_next", "Next pane"),
+            ("shift+tab", "focus_previous", "Previous pane"),
+        ]
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
-            yield Static(dashboard_text)
+            with VerticalScroll():
+                for pane in panes:
+                    content = "\n".join([pane["title"], "", *pane["lines"]])
+                    widget = Static(content, id=f"pane-{pane['id']}", classes="pane")
+                    widget.can_focus = True
+                    yield widget
             yield Footer()
 
     HarnessReadOnlyTui().run()
