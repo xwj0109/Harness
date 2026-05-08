@@ -54,11 +54,8 @@ The first v0.2 schema and registry foundations are in place:
 - v0.8 Project-Local Agent Registry is complete.
 - v0.9 Agent Lifecycle and Preview is complete.
 - v1.0 MVP Closure is complete.
-- v1.1 CLI UX is complete.
-- v1.2 Post-MVP Polish is complete.
 - Version bump to `1.0.0`.
-- v1.7 TUI Copy-Only Command Palette is complete.
-- v1.8 TUI Usability Polish is complete.
+- v1.1 CLI/TUI UX release is complete, including post-MVP polish, copy-only TUI command discovery, and TUI usability polish.
 - Version bump to `1.1.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
@@ -94,15 +91,17 @@ The adapter is intentionally narrow. It uses only the configured local-only, no-
 
 Read-only adapter hardening added focused coverage for preflight failure, runner failure, duplicate execution, read-only recovery states, inspect-lease evidence, unresolved approvals, forbidden metadata, and unsafe backend descriptors. It does not add another execution path.
 
-## Completed v1.3 Typer/Rich-First CLI Polish
+## Completed v1.1 CLI/TUI UX Release
 
-The Typer/Rich-first CLI polish follow-up is complete and the v1.3 TUI decision was to stay Typer/Rich-first for that milestone. The ranked post-MVP UX/product order was:
+The CLI/TUI UX release is complete and packaged as version `1.1.0`. The release kept the core execution model unchanged while improving operator usability. The ranked post-MVP UX/product order was:
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.
-3. True interactive TUI/command palette later, behind a separate decision gate. Complete for the copy-only v1.7 surface.
+3. True interactive TUI/command palette later, behind a separate decision gate. Complete as a read-only, copy-only command discovery surface in the `1.1.0` release.
 
 Implemented CLI-only refinements include sectioned text output for high-traffic inspect/explain commands and a grouped command catalog in [../command_catalog.md](../command_catalog.md). JSON contracts remain unchanged.
+
+Implemented TUI refinements include optional Textual startup, a chat-style slash-command discovery surface, dashboard context sections, local in-memory search over loaded dashboard and command metadata, keyboard/navigation hints, no-match status, static generated terminal pixel art, and explicit `tui-home set-image` static-art import. These changes remain read-only except for the explicit tracked static-art import command and do not add command execution, providers, hosted fallback, paid fallback, OpenAI API usage, Docker execution, shell access, or persisted TUI preferences.
 
 ## Immediate Next Planning Target
 
@@ -111,7 +110,7 @@ There is no active implementation target. The next capability should be selected
 Recommended decision options:
 
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
-- v1.9 read-only TUI refinements such as in-memory pane collapse or dedicated palette focus, still with no command execution or persisted preferences.
+- v1.2 read-only TUI refinements such as in-memory pane collapse or dedicated palette focus, still with no command execution or persisted preferences.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 
