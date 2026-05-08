@@ -56,7 +56,7 @@ Completion note:
 
 ## Track 2: Small Typer/Rich-Style CLI Refinements
 
-Status: planned.
+Status: complete.
 
 Goal: improve day-to-day terminal ergonomics without changing behavior or adding a full-screen TUI.
 
@@ -79,6 +79,14 @@ Exit criteria:
 - Focused CLI smoke tests cover representative text output.
 - JSON output remains unchanged for existing schemas.
 - Full regression suite passes.
+
+Completion note:
+
+- `harness home` text output now uses section headings for project state, summary, task states, recent runs, next actions, and safety.
+- `harness quickstart agent` text output now uses section headings for project state, steps, and safety.
+- Compact command docstrings include examples for both commands.
+- JSON output schemas and payloads are unchanged.
+- No interactive prompts, TUI dependency, command palette, execution behavior, backend preflight, Docker-from-queue, shell access, hosted fallback, paid fallback, or OpenAI API usage was added.
 
 ## Track 3: Interactive TUI or Command Palette Decision Gate
 

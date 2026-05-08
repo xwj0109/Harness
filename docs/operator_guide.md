@@ -68,7 +68,9 @@ The quickstart output covers scaffold, validate, preview, init, import, inspect,
 
 `harness quickstart agent` does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, execute adapters, preflight backends, inspect backend settings, or start daemon work.
 
-Common list/status commands now use compact tab-separated text headers for operator readability:
+The `home` and `quickstart agent` text views use simple section headings for project state, next actions, steps, and safety reminders. Their JSON forms remain schema-stable for scripts.
+
+Common list/status commands use compact tab-separated text headers for operator readability:
 
 ```bash
 harness runs --project .

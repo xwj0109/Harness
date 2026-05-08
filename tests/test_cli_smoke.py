@@ -70,6 +70,18 @@ def test_cli_home_reports_uninitialized_project_without_mutation(tmp_path) -> No
     assert not (tmp_path / ".harness").exists()
 
 
+def test_cli_home_text_output_is_sectioned_and_non_mutating(tmp_path) -> None:
+    result = runner.invoke(app, ["home", "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Harness Home" in result.output
+    assert "\nProject\n" in result.output
+    assert "\nNext Actions\n" in result.output
+    assert "harness init --project" in result.output
+    assert "\nSafety\n" in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     task = runner.invoke(
@@ -163,7 +175,10 @@ def test_cli_quickstart_agent_initialized_project_does_not_create_queue_state(tm
 
     assert result.exit_code == 0, result.output
     assert "Agent Quickstart" in result.output
+    assert "\nProject\n" in result.output
+    assert "\nSteps\n" in result.output
     assert "harness daemon run-once" in result.output
+    assert "\nSafety\n" in result.output
     store = SQLiteStore(tmp_path)
     assert store.list_project_agents() == []
     assert store.list_tasks() == []

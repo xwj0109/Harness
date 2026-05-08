@@ -179,60 +179,81 @@ def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
 
 @app.command()
 def home(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    """Show a read-only operator dashboard.
+
+    Examples:
+      harness home --project .
+      harness home --project . --output json
+    """
     project_root = resolve_project_root(project)
     result = _home_result(project_root)
     if output == OutputFormat.JSON:
         _emit_json(result)
         return
     typer.echo("Harness Home")
-    typer.echo(f"Project: {result['project_root']}")
-    typer.echo(f"Initialized: {result['initialized']}")
-    typer.echo(f"Version: {result['version']}")
+    _print_section("Project")
+    _print_kv("Root", result["project_root"])
+    _print_kv("Initialized", result["initialized"])
+    _print_kv("Version", result["version"])
     if not result["initialized"]:
-        typer.echo("Next: harness init --project .")
+        _print_section("Next Actions")
+        for action in result["recommended_actions"]:
+            _print_kv(action["description"], action["command"])
+        _print_section("Safety")
+        typer.echo("  Local-first control plane; no hidden execution.")
         return
     summary = result["summary"]
-    typer.echo(
-        "Summary: "
-        f"{summary['imported_agents']} agents, "
-        f"{summary['objectives']} objectives, "
-        f"{summary['tasks_total']} tasks, "
-        f"{summary['active_leases']} active leases, "
-        f"{summary['active_daemons']} active daemons, "
-        f"{summary['recent_runs']} recent runs"
-    )
+    _print_section("Summary")
+    _print_kv("Imported agents", summary["imported_agents"])
+    _print_kv("Objectives", summary["objectives"])
+    _print_kv("Tasks", summary["tasks_total"])
+    _print_kv("Active leases", summary["active_leases"])
+    _print_kv("Active daemons", summary["active_daemons"])
+    _print_kv("Recent runs", summary["recent_runs"])
     task_counts = result["task_status_counts"]
-    typer.echo(
-        "Tasks: "
-        f"ready={task_counts.get('ready', 0)} "
-        f"blocked={task_counts.get('blocked', 0)} "
-        f"waiting_approval={task_counts.get('waiting_approval', 0)} "
-        f"leased={task_counts.get('leased', 0)} "
-        f"running={task_counts.get('running', 0)}"
-    )
+    _print_section("Task States")
+    _print_tsv(["state", "count"])
+    for state in ("ready", "blocked", "waiting_approval", "leased", "running"):
+        _print_tsv_row([state, task_counts.get(state, 0)])
     if result["daemon"]["paused_tasks"]:
-        typer.echo(f"Paused tasks: {len(result['daemon']['paused_tasks'])}")
+        _print_section("Daemon")
+        _print_kv("Paused tasks", len(result["daemon"]["paused_tasks"]))
     if result["recent_runs"]:
-        typer.echo("Recent runs:")
+        _print_section("Recent Runs")
+        _print_tsv(["run_id", "status", "task_type"])
         for run in result["recent_runs"]:
-            typer.echo(f"  {run['id']}\t{run['status']}\t{run.get('task_type') or ''}")
-    typer.echo("Safety: local-first control plane; no hosted fallback, paid fallback, or OpenAI API usage.")
+            _print_tsv_row([run["id"], run["status"], run.get("task_type") or ""])
+    if result["recommended_actions"]:
+        _print_section("Next Actions")
+        for action in result["recommended_actions"]:
+            _print_kv(action["description"], action["command"])
+    _print_section("Safety")
+    typer.echo("  Local-first control plane; no hosted fallback, paid fallback, or OpenAI API usage.")
 
 
 @quickstart_app.command("agent")
 def quickstart_agent(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    """Print the explicit MVP agent command sequence without running it.
+
+    Examples:
+      harness quickstart agent --project .
+      harness quickstart agent --project . --output json
+    """
     project_root = resolve_project_root(project)
     result = _quickstart_agent_result(project_root)
     if output == OutputFormat.JSON:
         _emit_json(result)
         return
     typer.echo("Agent Quickstart")
-    typer.echo(f"Project: {result['project_root']}")
-    typer.echo("Run these commands explicitly:")
+    _print_section("Project")
+    _print_kv("Root", result["project_root"])
+    _print_kv("Initialized", result["initialized"])
+    _print_section("Steps")
     for index, step in enumerate(result["steps"], start=1):
         typer.echo(f"{index}. {step['title']}")
         typer.echo(f"   {step['command']}")
-    typer.echo("Safety: this command only prints commands; it does not run them.")
+    _print_section("Safety")
+    typer.echo("  This command only prints commands; it does not run them.")
 
 
 @app.command()
@@ -2053,6 +2074,14 @@ def _print_compare_result(result: dict) -> None:
 
 def _emit_json(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _print_section(title: str) -> None:
+    typer.echo(f"\n{title}")
+
+
+def _print_kv(label: str, value: object) -> None:
+    typer.echo(f"  {label}: {value}")
 
 
 def _print_tsv(headers: list[str]) -> None:
