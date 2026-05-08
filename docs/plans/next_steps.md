@@ -112,11 +112,11 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is the v1.3 interactive TUI decision review, tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). v1.2 pre-TUI polish is complete. The ranked post-MVP UX/product order is:
+The immediate next target is Typer/Rich-first CLI polish, following the decision in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md). v1.2 pre-TUI polish is complete and the v1.3 TUI decision is to stay Typer/Rich-first for now. The ranked post-MVP UX/product order is:
 
 1. Packaging/distribution polish first. Complete.
 2. Small Typer/Rich-style CLI refinements second. Complete.
-3. True interactive TUI/command palette later, behind a separate decision gate. Active planning target.
+3. True interactive TUI/command palette later, behind a separate decision gate. Deferred.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

@@ -1,18 +1,38 @@
 # v1.3 Interactive TUI Decision Plan
 
-Status: planned.
+Status: decided.
 
 ## Summary
 
-v1.3 should decide whether and how to add a true interactive terminal experience after the v1.2 packaging and lightweight CLI polish tracks. The default recommendation is to start with a read-only interactive operator dashboard and command palette preview, not a mutating workflow engine.
+v1.3 decides whether and how to add a true interactive terminal experience after the v1.2 packaging and lightweight CLI polish tracks.
+
+Decision: choose the Typer/Rich-first path for now. Do not add a TUI dependency or implementation yet. Keep improving the existing CLI and preserve a later TUI/command-palette gate.
 
 This is a decision plan, not implementation. It must not add dependencies, a TUI runtime, command palette code, execution adapters, task-generation automation, daemon-loop changes, backend/model calls, Docker-from-queue, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker integrations, live trading, order placement, external messaging, application submission, or active repo write automation.
+
+## Decision
+
+Selected option: **Option A: Stay Typer/Rich-First**.
+
+Rationale:
+
+- The MVP is still early and benefits more from a stable, scriptable, installable CLI than from a new interactive dependency.
+- The existing `harness home`, `harness quickstart agent`, text sections, tabular list output, and JSON contracts already cover the main operator path.
+- Keeping the base install small matters more than a persistent dashboard right now.
+- Non-TTY, CI, SSH, and plain-terminal behavior remains predictable.
+- A future TUI remains available once the CLI flows and operator vocabulary stabilize further.
+
+Implementation consequence:
+
+- No `textual`, prompt toolkit, TUI extra, or `harness tui` command should be added as part of v1.3.
+- The next implementation work should be Typer/Rich-first CLI polish only.
+- A future TUI requires a new decision checkpoint.
 
 ## Product Direction
 
 The interactive UX should make the existing MVP easier to operate without weakening the explicit-command safety model.
 
-Recommended first surface:
+If a future TUI is reconsidered, the preferred first surface remains:
 
 - A read-only interactive operator dashboard that mirrors `harness home`.
 - A command palette that shows copyable commands from existing public CLI surfaces.
@@ -72,9 +92,9 @@ Cons:
 - Still introduces interactive edge cases.
 - Can drift toward hidden action execution if not constrained.
 
-## Recommendation
+## Deferred TUI Recommendation
 
-Choose Option B only if the next slice is explicitly read-only and dependency-gated:
+Choose Option B only in a later milestone if the next slice is explicitly read-only and dependency-gated:
 
 - Add a `tui` optional extra rather than a required dependency at first.
 - Expose a single command such as `harness tui --project .`.
@@ -103,9 +123,9 @@ Interactive UX must preserve explicit operator control:
 - The TUI must not read or expose secrets, environment variables, backend settings, artifact contents, `.env*`, `*.pem`, `*.key`, `*.sqlite`, `.git/`, `.harness/` internals, or `secrets/`.
 - It may read initialized harness persistence only through existing runtime/store APIs.
 
-## Dependency Gate
+## Deferred Dependency Gate
 
-Before implementation, choose and document:
+Before any future TUI implementation, choose and document:
 
 - dependency name and version range;
 - whether it is required or optional;
@@ -115,13 +135,13 @@ Before implementation, choose and document:
 - test approach for terminal rendering and keyboard events;
 - whether screenshots/golden text snapshots are needed.
 
-Default dependency decision:
+Deferred dependency preference:
 
 - Prefer optional extra: `agent-harness[tui]`.
 - Keep base install unchanged.
 - Do not add the dependency to base `dependencies`.
 
-## Proposed Slices
+## Deferred TUI Slices
 
 ### Slice 1: Optional TUI Dependency Probe
 
@@ -146,9 +166,38 @@ Default dependency decision:
 - Review whether mutating interactive actions are worth planning.
 - If yes, create a separate explicit-confirmation plan.
 
+## Typer/Rich-First Next Work
+
+Recommended next CLI-only improvements:
+
+- Extend `harness home` with a concise `--watch`-free refresh recommendation rather than a live dashboard.
+- Add compact examples to high-traffic command help text where Typer already displays docstrings well.
+- Add consistent text sections for `agents inspect`, `tasks inspect`, `daemon inspect-lease`, and policy/artifact inspection commands.
+- Add a command catalog page in docs that groups common command paths by workflow.
+- Keep JSON output unchanged.
+
+Non-goals for this next work:
+
+- No interactive prompts.
+- No command palette.
+- No full-screen panes.
+- No new dependencies.
+- No hidden execution or automatic task creation.
+
 ## Test Plan
 
-For a future implementation:
+For Typer/Rich-first follow-up:
+
+- Focused CLI smoke tests for text output only.
+- Existing JSON assertions remain unchanged.
+- Packaging smoke still passes with no TUI dependency.
+- Regression tests:
+  - `pytest -q tests/test_cli_smoke.py tests/test_packaging_v1_2.py`;
+  - `pytest -q`;
+  - `git diff --check`;
+  - forbidden target check for `.harness/`, `.git/`, `.env*`, `*.pem`, `*.key`, `*.sqlite`, and `secrets/`.
+
+For any future TUI implementation:
 
 - Unit tests for TUI payload builders independent of terminal rendering.
 - CLI tests for missing dependency behavior.
