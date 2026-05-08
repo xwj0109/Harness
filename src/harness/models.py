@@ -207,6 +207,21 @@ class ToolCapabilityDescriptor(BaseModel):
     policy_keys: list[str] = Field(default_factory=list)
 
 
+class ExecutionAdapterDescriptor(BaseModel):
+    schema_version: str = "harness.execution_adapter/v1"
+    id: str
+    description: str
+    supported_task_types: list[str] = Field(default_factory=list)
+    required_task_metadata: dict[str, Any] = Field(default_factory=dict)
+    rejected_task_metadata: list[str] = Field(default_factory=list)
+    required_approvals: list[str] = Field(default_factory=list)
+    backend_requirements: list[str] = Field(default_factory=list)
+    sandbox_requirements: list[str] = Field(default_factory=list)
+    side_effect_summary: str
+    replay_policy: ToolReplayPolicy
+    safety_notes: list[str] = Field(default_factory=list)
+
+
 class RunRecord(BaseModel):
     id: str
     goal: str | None = None
@@ -488,6 +503,24 @@ class DaemonReadOnlyResult(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class DaemonExecuteResult(BaseModel):
+    schema_version: str = "harness.daemon_execute/v1"
+    ok: bool
+    decision: str
+    adapter_id: str | None = None
+    project_root: Path
+    task: TaskRecord | None = None
+    attempt: TaskAttempt | None = None
+    lease: TaskLease | None = None
+    run: RunRecord | None = None
+    manifest: RunManifest | None = None
+    policy_sha256: str | None = None
+    approval_id: str | None = None
+    rejection_reasons: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    adapter_result: dict[str, Any] = Field(default_factory=dict)
+
+
 class DaemonLeaseInspection(BaseModel):
     schema_version: str = "harness.daemon_lease/v1"
     ok: bool = True
@@ -499,6 +532,7 @@ class DaemonLeaseInspection(BaseModel):
     manifest: RunManifest | None = None
     dry_run_eligibility: dict[str, Any] = Field(default_factory=dict)
     read_only_eligibility: dict[str, Any] = Field(default_factory=dict)
+    execution_eligibility: dict[str, Any] = Field(default_factory=dict)
     recovery_recommendation: dict[str, Any] = Field(default_factory=dict)
 
 

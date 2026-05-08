@@ -37,6 +37,7 @@ from harness.config import HARNESS_DIR, default_config, load_config, write_defau
 from harness.codex_runner import HostedBoundaryApprovalRequired, HostedSecretBlocked, CodexRepoPlanningRunner
 from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
 from harness.daemon_adapters import execute_read_only_summary_lease
+from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.evals import run_safety_smoke
 from harness.isolation import ActiveRepoDirtyError
@@ -1507,6 +1508,67 @@ def daemon_execute_read_only(
     typer.echo(f"Lease: {result.lease.id}")
 
 
+@daemon_app.command("execute")
+def daemon_execute(
+    lease_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    owner = _daemon_owner()
+    try:
+        result = execute_lease(project_root, lease_id, owner=owner)
+    except (KeyError, ValueError) as exc:
+        _emit_daemon_error("harness.daemon_execute/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    typer.echo("Registered-adapter dispatch")
+    typer.echo(f"Decision: {result.decision}")
+    typer.echo(f"Adapter: {result.adapter_id or 'none'}")
+    if result.task is not None:
+        typer.echo(f"Task: {result.task.id}")
+    if result.attempt is not None:
+        typer.echo(f"Attempt: {result.attempt.id}")
+    if result.run is not None:
+        typer.echo(f"Run: {result.run.id}")
+    if result.lease is not None:
+        typer.echo(f"Lease: {result.lease.id}")
+    if result.rejection_reasons:
+        typer.echo(f"Rejected: {'; '.join(result.rejection_reasons)}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@daemon_app.command("adapters")
+def daemon_adapters(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    descriptors = list_execution_adapter_descriptors()
+    payload = {
+        "schema_version": "harness.execution_adapters/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "adapters": [descriptor.model_dump(mode="json") for descriptor in descriptors],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["adapter_id", "task_types", "side_effects"])
+    for descriptor in descriptors:
+        _print_tsv_row(
+            [
+                descriptor.id,
+                ", ".join(descriptor.supported_task_types),
+                descriptor.side_effect_summary,
+            ]
+        )
+
+
 @daemon_app.command("inspect-lease")
 def daemon_inspect_lease(
     lease_id: str,
@@ -1533,6 +1595,8 @@ def daemon_inspect_lease(
     _print_section("Eligibility")
     _print_kv("Dry-run eligible", result.dry_run_eligibility.get("eligible"))
     _print_kv("Read-only eligible", result.read_only_eligibility.get("eligible"))
+    _print_kv("Registered adapter eligible", result.execution_eligibility.get("eligible"))
+    _print_kv("Registered adapter", result.execution_eligibility.get("adapter_id") or "none")
     _print_section("Recovery")
     _print_kv("Action", result.recovery_recommendation.get("action"))
 
@@ -2058,11 +2122,13 @@ def _execution_task_metadata(execution_adapter: str | None, task_type: str | Non
     supported = {
         ("dry_run", "phase_1a_test"),
         ("read_only_summary", "read_only_repo_summary"),
+        ("codex_isolated_edit", "codex_code_edit"),
     }
     if (execution_adapter, task_type) not in supported:
         raise ValueError(
             "Unsupported execution metadata: supported pairs are "
-            "dry_run/phase_1a_test and read_only_summary/read_only_repo_summary"
+            "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
+            "and codex_isolated_edit/codex_code_edit"
         )
     return {"execution_adapter": execution_adapter or "", "task_type": task_type or ""}
 
@@ -2351,7 +2417,7 @@ def _quickstart_agent_result(project_root: Path) -> dict:
             "command": 'harness tasks add --title "Read-only summary" '
             f"--agent {agent_id} --workbench quant --execution-adapter read_only_summary "
             f"--task-type read_only_repo_summary --project {project_arg} --output json",
-            "description": "Creates a manual queue task using the only authorized real adapter metadata.",
+            "description": "Creates a manual queue task using the bounded read-only adapter metadata.",
             "mutates_when_run": True,
         },
         {
