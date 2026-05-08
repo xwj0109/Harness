@@ -84,6 +84,7 @@ daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 agents_app = typer.Typer(help="Declarative custom agent authoring.")
+quickstart_app = typer.Typer(help="Guided command composition without hidden execution.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(approvals_app, name="approvals")
@@ -99,6 +100,7 @@ app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(agents_app, name="agents")
+app.add_typer(quickstart_app, name="quickstart")
 tests_app.add_typer(tests_image_app, name="image")
 specs_app.add_typer(specs_preview_app, name="preview")
 
@@ -208,6 +210,22 @@ def home(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
         for run in result["recent_runs"]:
             typer.echo(f"  {run['id']}\t{run['status']}\t{run.get('task_type') or ''}")
     typer.echo("Safety: local-first control plane; no hosted fallback, paid fallback, or OpenAI API usage.")
+
+
+@quickstart_app.command("agent")
+def quickstart_agent(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = _quickstart_agent_result(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo("Agent Quickstart")
+    typer.echo(f"Project: {result['project_root']}")
+    typer.echo("Run these commands explicitly:")
+    for index, step in enumerate(result["steps"], start=1):
+        typer.echo(f"{index}. {step['title']}")
+        typer.echo(f"   {step['command']}")
+    typer.echo("Safety: this command only prints commands; it does not run them.")
 
 
 @app.command()
@@ -2114,6 +2132,110 @@ def _home_result(project_root: Path) -> dict:
             }
         )
     return result
+
+
+def _quickstart_agent_result(project_root: Path) -> dict:
+    initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
+    agent_id = "my_agent"
+    bundle_path = "agents/my_agent"
+    project_arg = str(project_root)
+    commands = [
+        {
+            "id": "scaffold_agent",
+            "title": "Scaffold a declarative agent bundle",
+            "command": "harness agents scaffold my_agent --workbench quant --kind specialist "
+            "--parent quant_research --model-profile local_reasoning --tool-policy read_only "
+            "--memory-scope quant --output agents/my_agent --output-format json",
+            "description": "Creates agent.yaml and profiles/default.yaml at the explicit output path.",
+            "mutates_when_run": True,
+        },
+        {
+            "id": "validate_agent",
+            "title": "Validate the bundle",
+            "command": f"harness agents validate {bundle_path} --output json",
+            "description": "Validates the explicit-path bundle against packaged built-ins.",
+            "mutates_when_run": False,
+        },
+        {
+            "id": "preview_agent",
+            "title": "Preview effective agent metadata",
+            "command": f"harness agents preview {bundle_path} --output json",
+            "description": "Shows profiles, parent chain, and effective read-only metadata.",
+            "mutates_when_run": False,
+        },
+        {
+            "id": "init_project",
+            "title": "Initialize harness persistence if needed",
+            "command": f"harness init --project {project_arg}",
+            "description": "Creates local harness project persistence.",
+            "mutates_when_run": True,
+            "skip_if_initialized": True,
+        },
+        {
+            "id": "import_agent",
+            "title": "Import the validated agent into this project",
+            "command": f"harness agents import {bundle_path} --project {project_arg} --output json",
+            "description": "Persists validated agent metadata into initialized harness persistence.",
+            "mutates_when_run": True,
+        },
+        {
+            "id": "inspect_agent",
+            "title": "Inspect the imported agent",
+            "command": f"harness agents inspect {agent_id} --project {project_arg} --output json",
+            "description": "Reads imported agent metadata without execution.",
+            "mutates_when_run": False,
+        },
+        {
+            "id": "create_read_only_task",
+            "title": "Create a read-only task for the imported agent",
+            "command": 'harness tasks add --title "Read-only summary" '
+            f"--agent {agent_id} --workbench quant --execution-adapter read_only_summary "
+            f"--task-type read_only_repo_summary --project {project_arg} --output json",
+            "description": "Creates a manual queue task using the only authorized real adapter metadata.",
+            "mutates_when_run": True,
+        },
+        {
+            "id": "lease_task",
+            "title": "Lease the next eligible task",
+            "command": f"harness daemon run-once --project {project_arg} --output json",
+            "description": "Selects and leases work; it does not execute the task.",
+            "mutates_when_run": True,
+        },
+        {
+            "id": "inspect_lease",
+            "title": "Inspect the lease before execution",
+            "command": f"harness daemon inspect-lease task_lease_... --project {project_arg} --output json",
+            "description": "Replace task_lease_... with the lease id returned by daemon run-once.",
+            "mutates_when_run": False,
+        },
+        {
+            "id": "execute_read_only",
+            "title": "Execute the bounded read-only adapter",
+            "command": f"harness daemon execute-read-only task_lease_... --project {project_arg} --output json",
+            "description": "Runs only the allowlisted read_only_summary/read_only_repo_summary adapter.",
+            "mutates_when_run": True,
+        },
+    ]
+    return {
+        "schema_version": "harness.quickstart_agent/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "initialized": initialized,
+        "agent_id": agent_id,
+        "bundle_path": bundle_path,
+        "steps": commands,
+        "safety_boundaries": [
+            "quickstart_prints_only",
+            "no_hidden_execution",
+            "no_backend_preflight",
+            "no_docker",
+            "no_shell",
+            "no_hosted_fallback",
+            "no_paid_fallback",
+            "no_openai_api_usage",
+            "no_secret_exposure",
+        ],
+    }
 
 
 def _doctor_result(project_root: Path) -> dict:

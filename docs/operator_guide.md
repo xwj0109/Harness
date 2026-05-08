@@ -57,6 +57,17 @@ The dashboard reports initialization state, imported-agent count, objective and 
 
 `harness home` is read-only. It does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, execute adapters, preflight backends, inspect backend settings, run Docker, invoke shell tools, call providers, or expose secrets.
 
+`harness quickstart agent` prints the exact command sequence for the MVP agent path:
+
+```bash
+harness quickstart agent --project .
+harness quickstart agent --project . --output json
+```
+
+The quickstart output covers scaffold, validate, preview, init, import, inspect, task creation, daemon lease, lease inspection, and bounded read-only execution. It is command composition only: the operator must run each command explicitly.
+
+`harness quickstart agent` does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, execute adapters, preflight backends, inspect backend settings, or start daemon work.
+
 ## Codex Supervised Isolated Editing
 
 `codex_code_edit` uses `CodexCliBackend` as an external agent backend. Codex does not run as a raw model provider, and the harness does not assume Codex internal actions appear as harness-native tool calls. Supervision is done through workspace isolation, Codex subprocess flags, captured output, artifacts, git status, diff inspection, policy validation, and explicit apply-back approval.

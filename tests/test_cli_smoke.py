@@ -127,6 +127,51 @@ def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output
     assert "base_url" not in serialized
 
 
+def test_cli_quickstart_agent_prints_commands_without_mutation(tmp_path) -> None:
+    result = runner.invoke(app, ["quickstart", "agent", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.quickstart_agent/v1"
+    assert payload["ok"] is True
+    assert payload["initialized"] is False
+    assert [step["id"] for step in payload["steps"]] == [
+        "scaffold_agent",
+        "validate_agent",
+        "preview_agent",
+        "init_project",
+        "import_agent",
+        "inspect_agent",
+        "create_read_only_task",
+        "lease_task",
+        "inspect_lease",
+        "execute_read_only",
+    ]
+    assert "harness agents scaffold my_agent" in payload["steps"][0]["command"]
+    assert "harness daemon execute-read-only task_lease_..." in payload["steps"][-1]["command"]
+    assert not (tmp_path / ".harness").exists()
+    serialized = json.dumps(payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
+def test_cli_quickstart_agent_initialized_project_does_not_create_queue_state(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(app, ["quickstart", "agent", "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Agent Quickstart" in result.output
+    assert "harness daemon run-once" in result.output
+    store = SQLiteStore(tmp_path)
+    assert store.list_project_agents() == []
+    assert store.list_tasks() == []
+    assert store.list_runs() == []
+    assert store.list_task_leases() == []
+    assert store.list_daemons() == []
+
+
 def test_cli_dev_create_run_runs_show(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     created = runner.invoke(
