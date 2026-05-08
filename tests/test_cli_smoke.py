@@ -13,10 +13,12 @@ from harness.tui import (
     build_tui_dashboard,
     build_tui_panes,
     build_command_palette,
+    build_command_palette_panes,
     filter_command_palette,
     filter_tui_panes,
     render_dashboard_text,
     render_filter_status,
+    render_palette_status,
 )
 
 
@@ -420,6 +422,35 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert missing_entries["entries"] == []
     assert missing_entries["groups"] == []
     serialized = json.dumps(palette)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
+
+
+def test_tui_command_palette_panes_show_copy_only_command_details() -> None:
+    palette = build_command_palette()
+    read_only_entries = filter_command_palette(palette, "execute-read-only")
+    missing_entries = filter_command_palette(palette, "does-not-exist")
+
+    panes = build_command_palette_panes(read_only_entries)
+    missing_panes = build_command_palette_panes(missing_entries)
+
+    assert render_palette_status(read_only_entries) == "Palette search: execute-read-only | Commands: 1 | Groups: 1"
+    assert [pane["id"] for pane in panes] == [
+        "command_palette",
+        "command_palette_read_only_adapter",
+        "command_palette_selected",
+    ]
+    assert "Copy-only command templates." in panes[0]["lines"]
+    assert any("read_only_adapter.execute" in line for line in panes[1]["lines"])
+    selected_lines = "\n".join(panes[2]["lines"])
+    assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in selected_lines
+    assert "Authorized bounded adapter only when manually run." in selected_lines
+    assert "No matching command template." in missing_panes[-1]["lines"]
+
+    serialized = json.dumps({"panes": panes, "missing": missing_panes})
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized

@@ -1,6 +1,6 @@
 # v1.7 TUI Copy-Only Command Palette Plan
 
-Status: Slice 1 in progress.
+Status: Slice 2 in progress.
 
 ## Summary
 
@@ -106,6 +106,8 @@ Implementation note: Slice 1 adds `build_command_palette()` and `filter_command_
 - Reuse existing search/filter patterns where practical.
 - Add keyboard navigation only.
 - Do not add execution or clipboard bindings.
+
+Implementation note: Slice 2 renders palette panes inside the optional Textual app using the same search input and keyboard-only pane navigation. The palette view is backed by Textual-free helpers, displays grouped entries and selected command text, and does not execute commands or add clipboard bindings.
 
 ### Slice 3: Docs And Hygiene
 

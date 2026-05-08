@@ -502,6 +502,65 @@ def _palette_entry_matches(entry: dict, normalized_query: str) -> bool:
     return normalized_query in haystack.casefold()
 
 
+def build_command_palette_panes(filtered_palette: dict) -> list[dict]:
+    panes = [
+        {
+            "id": "command_palette",
+            "title": "Command Palette",
+            "lines": [
+                "Copy-only command templates.",
+                "The TUI displays commands for manual use; it does not execute or copy them.",
+                f"Visible commands: {filtered_palette['total_matches']}",
+            ],
+        }
+    ]
+    entries_by_group: dict[str, list[dict]] = {}
+    for entry in filtered_palette["entries"]:
+        entries_by_group.setdefault(entry["group_id"], []).append(entry)
+    for group in filtered_palette["groups"]:
+        group_entries = entries_by_group.get(group["id"], [])
+        panes.append(
+            {
+                "id": f"command_palette_{group['id']}",
+                "title": f"Palette: {group['title']}",
+                "lines": [
+                    f"{entry['id']} | {entry['title']} | mutates_when_run={entry['mutates_when_run']}"
+                    for entry in group_entries
+                ]
+                or ["none"],
+            }
+        )
+    if filtered_palette["entries"]:
+        entry = filtered_palette["entries"][0]
+        panes.append(
+            {
+                "id": "command_palette_selected",
+                "title": "Selected Command",
+                "lines": [
+                    f"ID: {entry['id']}",
+                    f"Group: {entry['group_id']}",
+                    f"Title: {entry['title']}",
+                    f"Mutates when run: {entry['mutates_when_run']}",
+                    "Command:",
+                    entry["command"],
+                    "Description:",
+                    entry["description"],
+                    "Safety:",
+                    entry["safety_note"],
+                ],
+            }
+        )
+    else:
+        panes.append(
+            {
+                "id": "command_palette_selected",
+                "title": "Selected Command",
+                "lines": ["No matching command template."],
+            }
+        )
+    return panes
+
+
 def filter_tui_panes(panes: list[dict], query: str) -> dict:
     normalized_query = query.strip().casefold()
     if not normalized_query:
@@ -563,6 +622,14 @@ def render_filter_status(filtered: dict) -> str:
     return f"Search: {query} | Matches: {filtered['total_matches']} | Panes: {pane_count}"
 
 
+def render_palette_status(filtered_palette: dict) -> str:
+    query = filtered_palette["query"] or "none"
+    return (
+        f"Palette search: {query} | Commands: {filtered_palette['total_matches']} | "
+        f"Groups: {len(filtered_palette['groups'])}"
+    )
+
+
 def _render_pane_content(pane: dict) -> str:
     title = pane["title"]
     if "match_count" in pane:
@@ -577,7 +644,9 @@ def run_read_only_tui(project_root: Path) -> None:
 
     dashboard = build_tui_dashboard(project_root)
     panes = build_tui_panes(dashboard)
+    palette = build_command_palette()
     initial_filter = filter_tui_panes(panes, "")
+    initial_palette_filter = filter_command_palette(palette, "")
 
     class HarnessReadOnlyTui(App):
         CSS = """
@@ -613,17 +682,21 @@ def run_read_only_tui(project_root: Path) -> None:
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
-            yield Input(placeholder="Search read-only panes", id="search")
+            yield Input(placeholder="Search read-only panes and command palette", id="search")
             yield Static(render_filter_status(initial_filter), id="search-status")
+            yield Static(render_palette_status(initial_palette_filter), id="palette-status")
             yield VerticalScroll(id="pane-container")
             yield Footer()
 
         def on_mount(self) -> None:
-            self._render_panes(initial_filter)
+            self._render_panes(initial_filter, initial_palette_filter)
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "search":
-                self._render_panes(filter_tui_panes(panes, event.value))
+                self._render_panes(
+                    filter_tui_panes(panes, event.value),
+                    filter_command_palette(palette, event.value),
+                )
 
         def action_focus_search(self) -> None:
             self.query_one("#search", Input).focus()
@@ -631,18 +704,20 @@ def run_read_only_tui(project_root: Path) -> None:
         def action_clear_search(self) -> None:
             search = self.query_one("#search", Input)
             search.value = ""
-            self._render_panes(initial_filter)
+            self._render_panes(initial_filter, initial_palette_filter)
 
-        def _render_panes(self, filtered: dict) -> None:
+        def _render_panes(self, filtered: dict, filtered_palette: dict) -> None:
             self.query_one("#search-status", Static).update(render_filter_status(filtered))
+            self.query_one("#palette-status", Static).update(render_palette_status(filtered_palette))
             container = self.query_one("#pane-container", VerticalScroll)
             container.remove_children()
-            if not filtered["panes"]:
-                empty = Static("No matching panes.", id="pane-empty", classes="pane")
+            visible_panes = [*filtered["panes"], *build_command_palette_panes(filtered_palette)]
+            if not visible_panes:
+                empty = Static("No matching panes or command templates.", id="pane-empty", classes="pane")
                 empty.can_focus = True
                 container.mount(empty)
                 return
-            for pane in filtered["panes"]:
+            for pane in visible_panes:
                 widget = Static(_render_pane_content(pane), id=f"pane-{pane['id']}", classes="pane")
                 widget.can_focus = True
                 container.mount(widget)
