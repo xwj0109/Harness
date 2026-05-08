@@ -1,6 +1,6 @@
 # v1.6 TUI Filter/Search Plan
 
-Status: Slice 1 in progress.
+Status: Slice 2 in progress.
 
 ## Summary
 
@@ -89,6 +89,8 @@ Implementation note: Slice 1 adds `filter_tui_panes(panes, query)` as a Textual-
 - Show match counts and empty-state messages.
 - Add keyboard bindings for focusing search, clearing search, tab navigation, and quitting.
 - Do not add action bindings for selected results.
+
+Implementation note: Slice 2 wires the existing filter model into the optional Textual app with a search input, match-status line, filtered pane rendering, empty-state text, and keyboard bindings for search focus, clear search, pane navigation, and quit only. Search remains local and read-only over already-loaded pane data.
 
 ### Slice 3: Docs And Hygiene
 

@@ -316,22 +316,45 @@ def filter_tui_panes(panes: list[dict], query: str) -> dict:
 def render_dashboard_text(dashboard: dict) -> str:
     lines = ["Agent Harness"]
     for pane in build_tui_panes(dashboard):
-        lines.extend(["", pane["title"]])
-        lines.extend(f"  {line}" for line in pane["lines"])
+        pane_lines = _render_pane_content(pane).splitlines()
+        lines.extend(["", pane_lines[0]])
+        lines.extend(f"  {line}" for line in pane_lines[2:])
     lines.extend(["", "Press q to exit."])
     return "\n".join(lines)
+
+
+def render_filter_status(filtered: dict) -> str:
+    query = filtered["query"] or "none"
+    pane_count = len(filtered["panes"])
+    return f"Search: {query} | Matches: {filtered['total_matches']} | Panes: {pane_count}"
+
+
+def _render_pane_content(pane: dict) -> str:
+    title = pane["title"]
+    if "match_count" in pane:
+        title = f"{title} ({pane['match_count']})"
+    return "\n".join([title, "", *[str(line) for line in pane["lines"]]])
 
 
 def run_read_only_tui(project_root: Path) -> None:
     from textual.app import App, ComposeResult
     from textual.containers import VerticalScroll
-    from textual.widgets import Footer, Header, Static
+    from textual.widgets import Footer, Header, Input, Static
 
     dashboard = build_tui_dashboard(project_root)
     panes = build_tui_panes(dashboard)
+    initial_filter = filter_tui_panes(panes, "")
 
     class HarnessReadOnlyTui(App):
         CSS = """
+        #search {
+            margin: 1 1 0 1;
+        }
+
+        #search-status {
+            margin: 0 1 1 1;
+        }
+
         VerticalScroll {
             padding: 1;
         }
@@ -348,18 +371,46 @@ def run_read_only_tui(project_root: Path) -> None:
         """
         BINDINGS = [
             ("q", "quit", "Quit"),
+            ("/", "focus_search", "Search"),
+            ("escape", "clear_search", "Clear search"),
             ("tab", "focus_next", "Next pane"),
             ("shift+tab", "focus_previous", "Previous pane"),
         ]
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
-            with VerticalScroll():
-                for pane in panes:
-                    content = "\n".join([pane["title"], "", *pane["lines"]])
-                    widget = Static(content, id=f"pane-{pane['id']}", classes="pane")
-                    widget.can_focus = True
-                    yield widget
+            yield Input(placeholder="Search read-only panes", id="search")
+            yield Static(render_filter_status(initial_filter), id="search-status")
+            yield VerticalScroll(id="pane-container")
             yield Footer()
+
+        def on_mount(self) -> None:
+            self._render_panes(initial_filter)
+
+        def on_input_changed(self, event: Input.Changed) -> None:
+            if event.input.id == "search":
+                self._render_panes(filter_tui_panes(panes, event.value))
+
+        def action_focus_search(self) -> None:
+            self.query_one("#search", Input).focus()
+
+        def action_clear_search(self) -> None:
+            search = self.query_one("#search", Input)
+            search.value = ""
+            self._render_panes(initial_filter)
+
+        def _render_panes(self, filtered: dict) -> None:
+            self.query_one("#search-status", Static).update(render_filter_status(filtered))
+            container = self.query_one("#pane-container", VerticalScroll)
+            container.remove_children()
+            if not filtered["panes"]:
+                empty = Static("No matching panes.", id="pane-empty", classes="pane")
+                empty.can_focus = True
+                container.mount(empty)
+                return
+            for pane in filtered["panes"]:
+                widget = Static(_render_pane_content(pane), id=f"pane-{pane['id']}", classes="pane")
+                widget.can_focus = True
+                container.mount(widget)
 
     HarnessReadOnlyTui().run()

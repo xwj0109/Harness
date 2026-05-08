@@ -9,7 +9,13 @@ from harness.config import default_config
 from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
-from harness.tui import build_tui_dashboard, build_tui_panes, filter_tui_panes, render_dashboard_text
+from harness.tui import (
+    build_tui_dashboard,
+    build_tui_panes,
+    filter_tui_panes,
+    render_dashboard_text,
+    render_filter_status,
+)
 
 
 runner = CliRunner()
@@ -345,15 +351,21 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     run_filtered = filter_tui_panes(panes, "phase_1a_test")
     daemon_filtered = filter_tui_panes(panes, "daemon")
     command_filtered = filter_tui_panes(panes, "tasks list")
+    missing_filtered = filter_tui_panes(panes, "does-not-exist")
 
     assert unfiltered["schema_version"] == "harness.tui_filter/v1"
     assert [pane["id"] for pane in unfiltered["panes"]] == [pane["id"] for pane in panes]
+    assert render_filter_status(unfiltered).startswith("Search: none | Matches:")
     assert [pane["id"] for pane in agent_filtered["panes"]] == ["agents"]
+    assert agent_filtered["panes"][0]["match_count"] == 1
     assert [pane["id"] for pane in task_filtered["panes"]] == ["tasks"]
     assert [pane["id"] for pane in lease_filtered["panes"]] == ["leases"]
     assert [pane["id"] for pane in run_filtered["panes"]] == ["runs"]
     assert "daemon" in [pane["id"] for pane in daemon_filtered["panes"]]
     assert [pane["id"] for pane in command_filtered["panes"]] == ["commands"]
+    assert missing_filtered["panes"] == []
+    assert missing_filtered["total_matches"] == 0
+    assert render_filter_status(missing_filtered) == "Search: does-not-exist | Matches: 0 | Panes: 0"
     serialized = json.dumps(
         {
             "panes": panes,
