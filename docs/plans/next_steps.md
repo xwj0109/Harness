@@ -107,16 +107,25 @@ Implemented TUI refinements include optional Textual startup, a chat-style slash
 
 The v1.2 read-only TUI refinement implementation is complete. It adds session-local section collapse and palette-only focus for command discovery while preserving the existing read-only TUI boundary: no command execution, subprocess spawning, clipboard writes, provider calls, backend preflight, Docker use, `.harness/` mutation, or persisted preferences.
 
+## Completed v1.2-v1.5 Execution Layer Milestones
+
+The staged execution layer is complete:
+
+- v1.2 Registered Execution Dispatcher: static adapter descriptors, generic `daemon execute` dispatch, `daemon adapters`, generic inspect-lease eligibility, and fail-closed pre-run rejection events.
+- v1.3 Execution Lifecycle Hardening: shared active-lease validation, duplicate-run rejection, adapter-owned run binding, terminal task/attempt/lease finish evidence, and sanitized adapter rejection events.
+- v1.4 Codex Runner Binding: `CodexCodeEditRunner.run_existing(...)` lets the execution service own lease/attempt/run binding while the runner owns isolation, Codex execution, diff inspection, and apply-back mechanics.
+- v1.5 Codex Isolated Adapter: `codex_isolated_edit/codex_code_edit` dispatch validates hosted-boundary approval before run creation, uses configured `codex_cli`, preserves deny-by-default apply-back, and records security-relevant applied/denied/no-change/failure decisions.
+
 ## Immediate Next Planning Target
 
-There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
+There is no active implementation target. The execution dispatcher now exists, so any additional adapter should still be selected through a separate decision-complete plan.
 
 Recommended decision options:
 
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
 - Additional read-only TUI refinements, still with no command execution or persisted preferences.
 
-Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
+Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes outside the explicit Codex apply-back path remain unauthorized.
 
 ## Later Work
 

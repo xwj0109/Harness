@@ -91,24 +91,32 @@ Task queue commands are manual SQLite control-plane operations. `tasks run-next`
 
 ```bash
 harness daemon run-once --project . --output json
+harness daemon adapters --project . --output json
 harness daemon status --project .
 harness daemon inspect-lease task_lease_abc123 --project .
 harness daemon inspect-lease task_lease_abc123 --project . --output json
+harness daemon execute task_lease_abc123 --project . --output json
 harness daemon recover --project . --output json
 harness daemon stop --project . --output json
 ```
 
-`daemon run-once` is lease-only. `daemon inspect-lease` is read-only. `daemon recover` reconciles existing linked-run evidence without creating a second run or retrying ambiguous work.
+`daemon run-once` is lease-only. `daemon adapters` lists registered adapter descriptors without preflighting backends or executing anything. `daemon inspect-lease` is read-only and reports generic `execution_eligibility`. `daemon execute` is a registered-adapter dispatcher for already-leased tasks only: no adapter means no execution, unknown adapter means fail closed, and adapter descriptors are documentation and validation metadata rather than permission grants. `daemon recover` reconciles existing linked-run evidence without creating a second run or retrying ambiguous work.
 
-## Authorized Read-Only Adapter
+## Registered Execution Adapters
 
 ```bash
+harness daemon execute-dry-run task_lease_abc123 --project . --output json
 harness daemon execute-read-only task_lease_abc123 --project . --output json
+harness daemon execute task_lease_abc123 --project . --output json
 ```
 
-This is the only bounded real MVP adapter. It requires an existing active daemon lease and exact metadata: `execution_adapter=read_only_summary` plus `task_type=read_only_repo_summary`. It uses only the existing local-only/no-cost read-only route and read-only tools.
+`execute-dry-run` and `execute-read-only` are compatibility commands with their original JSON contracts. The generic `daemon execute` command dispatches the same already-leased tasks through the registered-adapter registry and returns `harness.daemon_execute/v1`.
 
-`daemon execute-read-only` does not authorize Codex execution, Docker-from-queue, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, or generic queued execution.
+The read-only adapter requires an existing active daemon lease and exact metadata: `execution_adapter=read_only_summary` plus `task_type=read_only_repo_summary`. It uses only the existing local-only/no-cost read-only route and read-only tools.
+
+The Codex isolated adapter requires exact metadata `execution_adapter=codex_isolated_edit` plus `task_type=codex_code_edit`, a valid hosted-boundary Codex approval profile, and a safe `codex_cli` backend. Hosted-boundary approval is not apply-back approval: active repo mutation remains denied by default unless the explicit apply-back approval path approves the inspected diff.
+
+Registered adapters do not authorize Docker-from-queue, generic shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, or unmanaged daemon loops.
 
 ## Runtime Evidence
 

@@ -37,12 +37,12 @@ harness tasks add --title "Read-only summary" \
   --output json
 harness daemon run-once --project . --output json
 harness daemon inspect-lease task_lease_abc123def456 --project . --output json
-harness daemon execute-read-only task_lease_abc123def456 --project . --output json
+harness daemon execute task_lease_abc123def456 --project . --output json
 ```
 
-`daemon run-once` remains select-and-lease only. `daemon execute-read-only` requires an existing active lease and exact allowlisted metadata: `execution_adapter=read_only_summary` and `task_type=read_only_repo_summary`. Imported agents are metadata references; they do not grant new tools or execution permissions.
+`daemon run-once` remains select-and-lease only. `daemon execute` dispatches only already-leased tasks to registered adapters. No adapter means no execution, unknown adapter means fail closed, and adapter descriptors are documentation and validation metadata, not permission grants. Imported agents are metadata references; they do not grant new tools or execution permissions.
 
-The MVP does not authorize new adapters, automatic task generation, autonomous workflows, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, external messaging, application submission, or active repo write automation.
+The execution dispatcher does not authorize automatic task generation, autonomous workflows, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, external messaging, application submission, or unmanaged active repo write automation.
 
 ## Operator Cockpit
 
@@ -164,6 +164,41 @@ Notes:
 - If `AGENTS.md` is missing, the harness warns and recommends creating one, but does not auto-create it.
 - If the installed `codex exec` does not expose an internal approval flag, the harness reports that Codex internal command approval was not enforceable and relies on isolated workspace execution plus explicit apply-back approval.
 - Network isolation for Codex subprocesses is only claimed when the installed CLI exposes an enforceable network-control flag.
+
+## Registered Execution Dispatcher
+
+The daemon execution layer is a registered-adapter dispatcher, not a generic executor:
+
+```text
+daemon run-once leases only
+daemon execute dispatches only already-leased tasks to allowlisted adapters
+no adapter means no execution
+unknown adapter means fail closed
+adapter descriptors are documentation and validation metadata, not permission grants
+```
+
+Inspect registered adapters without touching backends:
+
+```bash
+harness daemon adapters --project . --output json
+harness daemon inspect-lease task_lease_abc123def456 --project . --output json
+```
+
+`daemon adapters` lists descriptor metadata only. `daemon inspect-lease` reports generic `execution_eligibility` without preflighting Codex, local model backends, Docker, or providers.
+
+Dispatch an already-leased task:
+
+```bash
+harness daemon execute task_lease_abc123def456 --project . --output json
+```
+
+The dispatcher currently registers:
+
+- `dry_run` for `phase_1a_test`, which writes metadata-only evidence.
+- `read_only_summary` for `read_only_repo_summary`, which uses only the local-only/no-cost read-only backend and read-only repository tools.
+- `codex_isolated_edit` for `codex_code_edit`, which requires a valid hosted-boundary Codex approval before run creation and uses the supervised isolated Codex edit runner.
+
+Codex queued execution uses the same safety split as direct Codex editing: hosted-boundary approval allows sending the isolated task context to Codex, but it is not apply-back approval. Apply-back remains denied by default unless an explicit apply-back approval provider approves the inspected diff. Denied apply-back is a successful safe outcome: the isolated edit completed, the diff was inspected, mutation was denied, and the active project stayed unchanged.
 
 ## Direct Docker Test CLI
 

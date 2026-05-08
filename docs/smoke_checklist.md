@@ -40,7 +40,7 @@ Expected packaging properties:
 
 ## Verify v1.0 MVP Path
 
-This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the already-authorized read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.
+This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the bounded read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.
 
 ```bash
 rm -rf /tmp/harness-v1-agent
@@ -75,8 +75,8 @@ Expected v1.0 MVP safety properties:
 
 - Agent and task lifecycle commands are declarative/control-plane operations only.
 - `daemon run-once` leases work but does not execute it.
-- `daemon execute-read-only` is the only real MVP adapter and uses only the configured local-only/no-cost read-only route.
-- The MVP does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
+- `daemon execute-read-only` uses only the configured local-only/no-cost read-only route.
+- The MVP read-only path does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
 
 ## Verify Operator Cockpit
 
@@ -322,6 +322,16 @@ harness daemon inspect-lease "$LEASE_ID" --project . --output json
 harness daemon execute-read-only "$LEASE_ID" --project . --output json
 ```
 
+Inspect registered adapter dispatch:
+
+```bash
+harness daemon adapters --project . --output json
+harness tasks add --title "Dry-run via dispatcher" --execution-adapter dry_run --task-type phase_1a_test --project . --output json
+harness daemon run-once --project . --output json
+harness daemon inspect-lease "$LEASE_ID" --project . --output json
+harness daemon execute "$LEASE_ID" --project . --output json
+```
+
 Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon control-plane commands after `RUN_ID` setup:
 
 - These commands are local evidence inspection or baseline commands.
@@ -333,9 +343,10 @@ Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon cont
 - v0.4 scheduler commands do not execute tasks, bind task attempts to runs, call backends, run Docker, create run artifacts, add hosted fallback, add paid fallback, or start unmanaged background work.
 - `daemon execute-dry-run` is explicit v0.4.5 contract evidence only: it may bind one active lease to one local `phase_1a_test` run and metadata-only artifacts, but it must not call backends, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted/paid fallback.
 - `daemon execute-read-only` is explicit v0.5 read-only adapter execution only: it may bind one active lease to one `read_only_repo_summary` run through the configured local-only and no-cost `local_openai_compatible` backend and existing read-only tools.
-- `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, read-only eligibility, and recovery recommendation without creating runs or artifacts.
+- `daemon execute` is registered-adapter dispatch only: no adapter means no execution, unknown adapter fails closed, and adapter descriptors are documentation and validation metadata rather than permission grants.
+- `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, read-only eligibility, generic execution eligibility, and recovery recommendation without creating runs or artifacts.
 - `daemon recover` may reconcile existing dry-run or read-only evidence but must not create a second run for a linked attempt.
-- v0.5 does not authorize Codex execution, Docker-from-queue, shell execution, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops.
+- Registered dispatch does not authorize Docker-from-queue, shell execution, hosted fallback, paid fallback, OpenAI API usage, active repo writes without apply-back approval, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops.
 - Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or artifact file contents.
 - `harness compare "$RUN_ID" "$RUN_ID"` and baseline comparison against the same run should report no drift.
 
@@ -396,6 +407,17 @@ harness run "Modify only scratch_codex_edit.py. Add a docstring inside greet(). 
 ```
 
 When prompted, use `view full diff`, `deny all changes`, or `approve all changes` according to the smoke objective. Denial should leave the active file unchanged.
+
+Optional queued Codex dispatcher smoke:
+
+```bash
+harness tasks add --title "Codex queued scratch edit" --execution-adapter codex_isolated_edit --task-type codex_code_edit --project . --output json
+harness daemon run-once --project . --output json
+harness daemon inspect-lease "$LEASE_ID" --project . --output json
+harness daemon execute "$LEASE_ID" --project . --output json
+```
+
+The queued smoke also requires hosted-boundary approval, but hosted-boundary approval is not apply-back approval. Apply-back remains denied by default unless an explicit apply-back approval provider is wired into the operator path.
 
 Verify the active file after denial or apply-back:
 
