@@ -27,6 +27,7 @@ The v1.3 Interactive TUI Decision plan is tracked in [v1_3_interactive_tui_decis
 The v1.4 Read-Only TUI plan is tracked in [v1_4_read_only_tui_plan.md](v1_4_read_only_tui_plan.md).
 The v1.5 TUI Detail Panes plan is tracked in [v1_5_tui_detail_panes_plan.md](v1_5_tui_detail_panes_plan.md).
 The v1.6 TUI Filter/Search plan is tracked in [v1_6_tui_filter_search_plan.md](v1_6_tui_filter_search_plan.md).
+The v1.7 TUI Copy-Only Command Palette plan is tracked in [v1_7_tui_copy_only_command_palette_plan.md](v1_7_tui_copy_only_command_palette_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -125,13 +126,9 @@ Implemented CLI-only refinements include sectioned text output for high-traffic 
 
 ## Immediate Next Planning Target
 
-There is no active implementation target. The next capability should be selected through a separate decision-complete plan.
+The immediate next target is v1.7 TUI Copy-Only Command Palette, tracked in [v1_7_tui_copy_only_command_palette_plan.md](v1_7_tui_copy_only_command_palette_plan.md).
 
-Recommended decision options:
-
-- v1.7 copy-only TUI command palette planning, still with no command execution.
-- v1.7 TUI usability polish for saved views or pane ordering, still read-only.
-- Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
+v1.7 should add workflow-grouped command templates to the optional TUI for discovery and manual copy only. It remains non-executing: no command execution, subprocess calls, shell invocation, task mutation, daemon actions, adapter execution, backend preflight, Docker, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, unmanaged daemon loops, or clipboard dependency unless separately justified.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

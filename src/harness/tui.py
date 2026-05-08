@@ -8,6 +8,202 @@ from harness.memory.sqlite_store import SQLiteStore
 from harness.models import TaskStatus
 
 
+COMMAND_PALETTE_GROUPS = [
+    {"id": "orientation", "title": "Orientation"},
+    {"id": "agent_authoring", "title": "Agent Authoring"},
+    {"id": "project_agents", "title": "Project Agents"},
+    {"id": "built_in_specs", "title": "Built-In Specs"},
+    {"id": "objectives_tasks", "title": "Objectives And Tasks"},
+    {"id": "daemon_control", "title": "Daemon Control Plane"},
+    {"id": "read_only_adapter", "title": "Authorized Read-Only Adapter"},
+    {"id": "runtime_evidence", "title": "Runtime Evidence"},
+    {"id": "packaging_smoke", "title": "Packaging Smoke"},
+]
+
+COMMAND_PALETTE_ENTRIES = [
+    {
+        "id": "orientation.home",
+        "group_id": "orientation",
+        "title": "Open project dashboard",
+        "command": "harness home --project .",
+        "description": "Show local project summary in text form.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only orientation command.",
+    },
+    {
+        "id": "orientation.quickstart_agent",
+        "group_id": "orientation",
+        "title": "Show agent quickstart",
+        "command": "harness quickstart agent --project .",
+        "description": "Print the MVP agent command sequence without running it.",
+        "mutates_when_run": False,
+        "safety_note": "Command composition only.",
+    },
+    {
+        "id": "agent_authoring.scaffold",
+        "group_id": "agent_authoring",
+        "title": "Scaffold an agent bundle",
+        "command": "harness agents scaffold my_agent --workbench quant --kind specialist --parent quant_research --model-profile local_reasoning --tool-policy read_only --memory-scope quant --output agents/my_agent --output-format json",
+        "description": "Create a local explicit-path custom agent bundle.",
+        "mutates_when_run": True,
+        "safety_note": "Creates files only at the explicit output path when manually run.",
+    },
+    {
+        "id": "agent_authoring.validate",
+        "group_id": "agent_authoring",
+        "title": "Validate an agent bundle",
+        "command": "harness agents validate agents/my_agent --output json",
+        "description": "Validate a custom agent bundle against packaged built-ins.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only validation.",
+    },
+    {
+        "id": "agent_authoring.preview",
+        "group_id": "agent_authoring",
+        "title": "Preview an agent bundle",
+        "command": "harness agents preview agents/my_agent --output json",
+        "description": "Preview effective custom agent metadata.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only preview.",
+    },
+    {
+        "id": "project_agents.import",
+        "group_id": "project_agents",
+        "title": "Import a project agent",
+        "command": "harness agents import agents/my_agent --project . --output json",
+        "description": "Persist validated agent metadata into initialized harness state.",
+        "mutates_when_run": True,
+        "safety_note": "Metadata import only when manually run.",
+    },
+    {
+        "id": "project_agents.list",
+        "group_id": "project_agents",
+        "title": "List project agents",
+        "command": "harness agents list --project .",
+        "description": "List imported project agents.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only inspection.",
+    },
+    {
+        "id": "project_agents.inspect",
+        "group_id": "project_agents",
+        "title": "Inspect a project agent",
+        "command": "harness agents inspect my_agent --project .",
+        "description": "Inspect one imported project agent.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only inspection.",
+    },
+    {
+        "id": "built_in_specs.list",
+        "group_id": "built_in_specs",
+        "title": "List built-in specs",
+        "command": "harness specs --output json",
+        "description": "Inspect packaged built-in spec registry.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only registry inspection.",
+    },
+    {
+        "id": "built_in_specs.preview_agent",
+        "group_id": "built_in_specs",
+        "title": "Preview built-in agent policy",
+        "command": "harness specs preview agent commodities_researcher --output json",
+        "description": "Preview effective declarative agent metadata.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only preview.",
+    },
+    {
+        "id": "objectives_tasks.add_task",
+        "group_id": "objectives_tasks",
+        "title": "Add read-only task",
+        "command": "harness tasks add --title \"Read-only summary\" --agent my_agent --workbench quant --execution-adapter read_only_summary --task-type read_only_repo_summary --project . --output json",
+        "description": "Create a manual task record for the authorized read-only adapter.",
+        "mutates_when_run": True,
+        "safety_note": "Queue metadata only; does not execute when manually run.",
+    },
+    {
+        "id": "objectives_tasks.list_tasks",
+        "group_id": "objectives_tasks",
+        "title": "List tasks",
+        "command": "harness tasks list --project .",
+        "description": "List manual task queue records.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only queue inspection.",
+    },
+    {
+        "id": "objectives_tasks.graph",
+        "group_id": "objectives_tasks",
+        "title": "Inspect task graph",
+        "command": "harness tasks graph --project . --output json",
+        "description": "Show task/objective dependency graph.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only graph output.",
+    },
+    {
+        "id": "daemon_control.run_once",
+        "group_id": "daemon_control",
+        "title": "Lease one eligible task",
+        "command": "harness daemon run-once --project . --output json",
+        "description": "Acquire one daemon lease without executing work.",
+        "mutates_when_run": True,
+        "safety_note": "Lease-only control-plane mutation when manually run.",
+    },
+    {
+        "id": "daemon_control.inspect_lease",
+        "group_id": "daemon_control",
+        "title": "Inspect a lease",
+        "command": "harness daemon inspect-lease task_lease_abc123 --project . --output json",
+        "description": "Inspect lease/task/attempt/run linkage.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only lease inspection.",
+    },
+    {
+        "id": "read_only_adapter.execute",
+        "group_id": "read_only_adapter",
+        "title": "Execute authorized read-only adapter",
+        "command": "harness daemon execute-read-only task_lease_abc123 --project . --output json",
+        "description": "Bind an existing active lease to the read-only repo summary adapter.",
+        "mutates_when_run": True,
+        "safety_note": "Authorized bounded adapter only when manually run.",
+    },
+    {
+        "id": "runtime_evidence.runs",
+        "group_id": "runtime_evidence",
+        "title": "List runs",
+        "command": "harness runs --project .",
+        "description": "List run records.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only evidence inspection.",
+    },
+    {
+        "id": "runtime_evidence.policy",
+        "group_id": "runtime_evidence",
+        "title": "Explain task policy",
+        "command": "harness policy explain --subject-kind task --subject-id task_abc123 --project . --output json",
+        "description": "Explain runtime effective policy for a task.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only policy evidence.",
+    },
+    {
+        "id": "runtime_evidence.artifacts",
+        "group_id": "runtime_evidence",
+        "title": "List artifacts",
+        "command": "harness artifacts list run_abc123 --project . --output json",
+        "description": "List artifact metadata and evidence status.",
+        "mutates_when_run": False,
+        "safety_note": "Metadata only; does not print artifact files.",
+    },
+    {
+        "id": "packaging_smoke.wheel",
+        "group_id": "packaging_smoke",
+        "title": "Build local wheel",
+        "command": "python3 -m pip wheel --no-deps --no-build-isolation -w /tmp/harness-wheel .",
+        "description": "Build a local wheel for packaging smoke checks.",
+        "mutates_when_run": True,
+        "safety_note": "Writes only to the explicit temporary wheelhouse when manually run.",
+    },
+]
+
+
 def build_tui_dashboard(project_root: Path) -> dict:
     initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
     dashboard = {
@@ -266,6 +462,44 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
         }
     )
     return panes
+
+
+def build_command_palette() -> dict:
+    return {
+        "schema_version": "harness.tui_command_palette/v1",
+        "ok": True,
+        "groups": [dict(group) for group in COMMAND_PALETTE_GROUPS],
+        "entries": [dict(entry) for entry in COMMAND_PALETTE_ENTRIES],
+    }
+
+
+def filter_command_palette(palette: dict, query: str) -> dict:
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        entries = [dict(entry) for entry in palette["entries"]]
+    else:
+        entries = [
+            dict(entry)
+            for entry in palette["entries"]
+            if _palette_entry_matches(entry, normalized_query)
+        ]
+    group_ids = {entry["group_id"] for entry in entries}
+    return {
+        "schema_version": "harness.tui_command_palette_filter/v1",
+        "ok": True,
+        "query": query.strip(),
+        "total_matches": len(entries),
+        "groups": [dict(group) for group in palette["groups"] if group["id"] in group_ids],
+        "entries": entries,
+    }
+
+
+def _palette_entry_matches(entry: dict, normalized_query: str) -> bool:
+    haystack = " ".join(
+        str(entry[key])
+        for key in ("id", "group_id", "title", "command", "description", "safety_note")
+    )
+    return normalized_query in haystack.casefold()
 
 
 def filter_tui_panes(panes: list[dict], query: str) -> dict:

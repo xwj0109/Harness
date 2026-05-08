@@ -12,6 +12,8 @@ from harness.memory.sqlite_store import SQLiteStore
 from harness.tui import (
     build_tui_dashboard,
     build_tui_panes,
+    build_command_palette,
+    filter_command_palette,
     filter_tui_panes,
     render_dashboard_text,
     render_filter_status,
@@ -381,6 +383,48 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
     assert "Created Phase 1A diagnostic run." not in serialized
+
+
+def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
+    palette = build_command_palette()
+    group_ids = [group["id"] for group in palette["groups"]]
+    entry_ids = [entry["id"] for entry in palette["entries"]]
+
+    assert palette["schema_version"] == "harness.tui_command_palette/v1"
+    assert group_ids == [
+        "orientation",
+        "agent_authoring",
+        "project_agents",
+        "built_in_specs",
+        "objectives_tasks",
+        "daemon_control",
+        "read_only_adapter",
+        "runtime_evidence",
+        "packaging_smoke",
+    ]
+    assert len(entry_ids) == len(set(entry_ids))
+    assert all(set(entry) >= {"id", "group_id", "title", "command", "description", "mutates_when_run", "safety_note"} for entry in palette["entries"])
+    assert all(entry["group_id"] in group_ids for entry in palette["entries"])
+
+    all_entries = filter_command_palette(palette, "")
+    daemon_entries = filter_command_palette(palette, "daemon")
+    read_only_entries = filter_command_palette(palette, "execute-read-only")
+    packaging_entries = filter_command_palette(palette, "wheel")
+    missing_entries = filter_command_palette(palette, "does-not-exist")
+
+    assert all_entries["schema_version"] == "harness.tui_command_palette_filter/v1"
+    assert all_entries["total_matches"] == len(palette["entries"])
+    assert any(entry["id"] == "daemon_control.run_once" for entry in daemon_entries["entries"])
+    assert [entry["id"] for entry in read_only_entries["entries"]] == ["read_only_adapter.execute"]
+    assert [entry["id"] for entry in packaging_entries["entries"]] == ["packaging_smoke.wheel"]
+    assert missing_entries["entries"] == []
+    assert missing_entries["groups"] == []
+    serialized = json.dumps(palette)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
 
 
 def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output(tmp_path) -> None:
