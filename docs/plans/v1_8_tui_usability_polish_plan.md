@@ -1,6 +1,6 @@
 # v1.8 TUI Usability Polish Plan
 
-Status: Slice 1 in progress.
+Status: Slice 2 in progress.
 
 ## Summary
 
@@ -91,6 +91,8 @@ Implementation note: Slice 1 adds `build_tui_view_model()` as a Textual-free hel
 - Improve search status text so pane matches and palette matches are easy to distinguish.
 - Add clearer keyboard help text through existing Textual footer/bindings only.
 - Keep keyboard navigation only; no mouse-only flows and no command execution.
+
+Implementation note: Slice 2 updates the optional Textual app to render from `build_tui_view_model()`, including compact section headers, unified search status, navigation hints, and the model-level no-match state. The app remains read-only and does not add command execution, clipboard bindings, persistence, or daemon controls.
 
 ### Slice 3: Docs And Hygiene
 

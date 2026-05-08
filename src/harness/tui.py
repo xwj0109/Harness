@@ -733,11 +733,35 @@ def render_palette_status(filtered_palette: dict) -> str:
     )
 
 
+def render_view_status(view: dict) -> str:
+    query = view["query"] or "none"
+    search = view["search"]
+    return (
+        f"View search: {query} | Sections: {len(view['sections'])} | Panes: {len(view['panes'])} | "
+        f"Dashboard matches: {search['dashboard_matches']} | Palette commands: {search['palette_matches']}"
+    )
+
+
 def _render_pane_content(pane: dict) -> str:
     title = pane["title"]
     if "match_count" in pane:
         title = f"{title} ({pane['match_count']})"
     return "\n".join([title, "", *[str(line) for line in pane["lines"]]])
+
+
+def _render_section_content(section: dict) -> str:
+    return "\n".join(
+        [
+            section["title"],
+            "",
+            f"Panes: {section['pane_count']}",
+            f"IDs: {', '.join(section['pane_ids'])}",
+        ]
+    )
+
+
+def _render_navigation_hints(view: dict) -> str:
+    return " | ".join(f"{hint['key']}: {hint['label']}" for hint in view["navigation_hints"])
 
 
 def run_read_only_tui(project_root: Path) -> None:
@@ -750,6 +774,7 @@ def run_read_only_tui(project_root: Path) -> None:
     palette = build_command_palette()
     initial_filter = filter_tui_panes(panes, "")
     initial_palette_filter = filter_command_palette(palette, "")
+    initial_view = build_tui_view_model(initial_filter, initial_palette_filter)
 
     class HarnessReadOnlyTui(App):
         CSS = """
@@ -758,6 +783,10 @@ def run_read_only_tui(project_root: Path) -> None:
         }
 
         #search-status {
+            margin: 0 1 0 1;
+        }
+
+        #palette-status {
             margin: 0 1 1 1;
         }
 
@@ -774,6 +803,12 @@ def run_read_only_tui(project_root: Path) -> None:
         .pane:focus {
             border: round $accent;
         }
+
+        .section {
+            margin: 1 0 0 0;
+            padding: 0 1;
+            text-style: bold;
+        }
         """
         BINDINGS = [
             ("q", "quit", "Quit"),
@@ -786,19 +821,21 @@ def run_read_only_tui(project_root: Path) -> None:
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
             yield Input(placeholder="Search read-only panes and command palette", id="search")
-            yield Static(render_filter_status(initial_filter), id="search-status")
-            yield Static(render_palette_status(initial_palette_filter), id="palette-status")
+            yield Static(render_view_status(initial_view), id="search-status")
+            yield Static(_render_navigation_hints(initial_view), id="palette-status")
             yield VerticalScroll(id="pane-container")
             yield Footer()
 
         def on_mount(self) -> None:
-            self._render_panes(initial_filter, initial_palette_filter)
+            self._render_view(initial_view)
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "search":
-                self._render_panes(
-                    filter_tui_panes(panes, event.value),
-                    filter_command_palette(palette, event.value),
+                self._render_view(
+                    build_tui_view_model(
+                        filter_tui_panes(panes, event.value),
+                        filter_command_palette(palette, event.value),
+                    )
                 )
 
         def action_focus_search(self) -> None:
@@ -807,22 +844,30 @@ def run_read_only_tui(project_root: Path) -> None:
         def action_clear_search(self) -> None:
             search = self.query_one("#search", Input)
             search.value = ""
-            self._render_panes(initial_filter, initial_palette_filter)
+            self._render_view(initial_view)
 
-        def _render_panes(self, filtered: dict, filtered_palette: dict) -> None:
-            self.query_one("#search-status", Static).update(render_filter_status(filtered))
-            self.query_one("#palette-status", Static).update(render_palette_status(filtered_palette))
+        def _render_view(self, view: dict) -> None:
+            self.query_one("#search-status", Static).update(render_view_status(view))
+            self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
             container = self.query_one("#pane-container", VerticalScroll)
             container.remove_children()
-            visible_panes = [*filtered["panes"], *build_command_palette_panes(filtered_palette)]
-            if not visible_panes:
-                empty = Static("No matching panes or command templates.", id="pane-empty", classes="pane")
+            if view["empty_state"]:
+                empty = Static(view["empty_state"]["message"], id="pane-empty", classes="pane")
                 empty.can_focus = True
                 container.mount(empty)
                 return
-            for pane in visible_panes:
-                widget = Static(_render_pane_content(pane), id=f"pane-{pane['id']}", classes="pane")
-                widget.can_focus = True
-                container.mount(widget)
+            panes_by_id = {pane["id"]: pane for pane in view["panes"]}
+            for section in view["sections"]:
+                section_widget = Static(
+                    _render_section_content(section),
+                    id=f"section-{section['id']}",
+                    classes="section",
+                )
+                container.mount(section_widget)
+                for pane_id in section["pane_ids"]:
+                    pane = panes_by_id[pane_id]
+                    widget = Static(_render_pane_content(pane), id=f"pane-{pane['id']}", classes="pane")
+                    widget.can_focus = True
+                    container.mount(widget)
 
     HarnessReadOnlyTui().run()

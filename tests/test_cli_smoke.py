@@ -20,6 +20,7 @@ from harness.tui import (
     render_dashboard_text,
     render_filter_status,
     render_palette_status,
+    render_view_status,
 )
 
 
@@ -485,6 +486,8 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["empty_state"] is None
     assert view["search"]["dashboard_panes"] == len(panes)
     assert view["search"]["palette_matches"] == len(palette["entries"])
+    assert render_view_status(view).startswith("View search: none | Sections: 6 | Panes:")
+    assert f"Palette commands: {len(palette['entries'])}" in render_view_status(view)
     assert {hint["key"] for hint in view["navigation_hints"]} == {
         "/",
         "escape",
@@ -513,6 +516,10 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "palette_matches": 0,
         "palette_groups": 0,
     }
+    assert render_view_status(missing_view) == (
+        "View search: does-not-exist | Sections: 0 | Panes: 0 | "
+        "Dashboard matches: 0 | Palette commands: 0"
+    )
 
     serialized = json.dumps({"view": view, "missing": missing_view})
     assert "api_key" not in serialized
