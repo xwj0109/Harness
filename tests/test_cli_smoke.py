@@ -2404,6 +2404,78 @@ def test_cli_daemon_execute_dry_run_links_run_without_backends_or_docker(tmp_pat
     assert "environment" not in serialized
 
 
+def test_cli_daemon_adapters_lists_registered_descriptors_without_preflight(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("adapter listing must not preflight Codex")),
+    )
+    result = runner.invoke(app, ["daemon", "adapters", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.execution_adapters/v1"
+    adapter_ids = {adapter["id"] for adapter in payload["adapters"]}
+    assert {"dry_run", "read_only_summary", "codex_isolated_edit"} <= adapter_ids
+    for adapter in payload["adapters"]:
+        assert "Descriptors are documentation and validation metadata, not permission grants." in adapter["safety_notes"]
+
+
+def test_cli_daemon_execute_dispatches_dry_run_through_registered_adapter(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="Generic dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.daemon_execute/v1"
+    assert payload["ok"] is True
+    assert payload["adapter_id"] == "dry_run"
+    assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["task"]["status"] == "succeeded"
+    assert payload["attempt"]["run_id"] == payload["run"]["id"]
+    assert payload["adapter_result"]["schema_version"] == "harness.daemon_execute_dry_run/v1"
+
+
+def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="Unknown adapter",
+        metadata={"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.daemon_execute/v1"
+    assert payload["ok"] is False
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["adapter_id"] == "unknown_adapter"
+    assert payload["run"] is None
+    assert payload["rejection_reasons"] == ["Unknown execution adapter: unknown_adapter."]
+    assert store.list_runs() == []
+    event = store.list_daemon_events()[0]
+    assert event.event_type == "execution_adapter_rejected"
+    assert event.metadata["reason_code"] == "unknown_adapter"
+
+
 def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
@@ -2831,7 +2903,8 @@ def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) 
     assert payload["ok"] is False
     assert payload["errors"] == [
         "Unsupported execution metadata: supported pairs are "
-        "dry_run/phase_1a_test and read_only_summary/read_only_repo_summary"
+        "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
+        "and codex_isolated_edit/codex_code_edit"
     ]
 
 

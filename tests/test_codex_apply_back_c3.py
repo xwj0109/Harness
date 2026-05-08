@@ -9,7 +9,8 @@ import pytest
 from harness.approvals import ApprovalProfile, ApprovalStore
 from harness.backends.codex_cli import CodexCliBackend, CodexRunResult, NETWORK_NOT_ENFORCEABLE
 from harness.codex_edit_runner import ApplyBackDecision, CodexCodeEditRunner
-from harness.config import default_config
+from harness.config import default_config, write_default_config
+from harness.execution import execute_lease
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import BackendCapabilities, BackendStatus
 
@@ -217,6 +218,7 @@ def test_keep_isolation_remains_correct_after_approved_apply_back(tmp_path) -> N
     init_clean_project(tmp_path)
     store = SQLiteStore(tmp_path)
     store.initialize()
+    write_default_config(tmp_path)
     result = CodexCodeEditRunner(
         tmp_path,
         store,
@@ -294,3 +296,121 @@ def test_true_blocked_paths_still_block_apply_back_even_with_generated_artifacts
     assert any(violation["path"] == ".env" for violation in result["policy_violations"])
     assert result["ignored_generated_artifacts"] == [".DS_Store"]
     assert (tmp_path / "app.py").read_bytes() == before
+
+
+def test_codex_run_existing_uses_existing_run_without_second_run(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    write_default_config(tmp_path)
+    approval_profile = approval(tmp_path)
+    run = store.create_run(
+        goal="change value",
+        task_type="codex_code_edit",
+        status="running",
+        backend=default_config().backends["codex_cli"],
+        approval_id=approval_profile.id,
+    )
+
+    result = CodexCodeEditRunner(
+        tmp_path,
+        store,
+        FakeEditBackend(default_config().backends["codex_cli"]),
+        ApprovalStore(tmp_path),
+    ).run_existing(run.id, "change value", "codex_code_edit", approval_profile)
+
+    assert result["run_id"] == run.id
+    assert len(store.list_runs()) == 1
+    assert store.get_run(run.id).status == "completed_denied"
+    assert {artifact.kind for artifact in store.list_artifacts(run.id)} >= {
+        "events",
+        "transcript",
+        "final_report",
+        "isolated_unified_diff",
+    }
+
+
+def test_codex_isolated_adapter_missing_approval_rejects_before_run(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(
+        title="Codex edit",
+        metadata={"execution_adapter": "codex_isolated_edit", "task_type": "codex_code_edit"},
+    )
+    leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert leased is not None
+
+    result = execute_lease(tmp_path, leased["lease"].id, owner="local_daemon:test:123")
+
+    assert result.ok is False
+    assert result.decision == "codex_isolated_edit_blocked_policy"
+    assert result.run is None
+    assert "Missing valid hosted-provider Codex approval" in result.rejection_reasons[0]
+    assert store.list_runs() == []
+    assert any(event.event_type == "execution_adapter_rejected" for event in store.list_daemon_events())
+
+
+def test_codex_isolated_adapter_denied_apply_back_succeeds_without_mutation(tmp_path, monkeypatch) -> None:
+    init_clean_project(tmp_path)
+    before = (tmp_path / "app.py").read_bytes()
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    write_default_config(tmp_path)
+    ApprovalStore(tmp_path).add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=["codex_code_edit"],
+        duration_days=1,
+    )
+    task = store.create_task(
+        title="Codex edit",
+        metadata={"execution_adapter": "codex_isolated_edit", "task_type": "codex_code_edit"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakeEditBackend)
+
+    result = execute_lease(tmp_path, leased.lease.id, owner="local_daemon:test:123")
+
+    assert result.ok is True
+    assert result.decision == "codex_isolated_edit_completed_denied"
+    assert result.run is not None
+    assert result.run.status == "completed_denied"
+    assert result.task is not None
+    assert result.task.id == task.id
+    assert result.task.status.value == "succeeded"
+    assert result.attempt is not None
+    assert result.attempt.status.value == "succeeded"
+    assert (tmp_path / "app.py").read_bytes() == before
+    assert result.adapter_result["apply_back_decision"] == "denied"
+
+
+def test_codex_isolated_adapter_rejects_requires_hosted_boundary_metadata(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    write_default_config(tmp_path)
+    ApprovalStore(tmp_path).add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=["codex_code_edit"],
+        duration_days=1,
+    )
+    store.create_task(
+        title="Codex edit",
+        metadata={
+            "execution_adapter": "codex_isolated_edit",
+            "task_type": "codex_code_edit",
+            "requires_hosted_boundary": True,
+        },
+    )
+    leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert leased is not None
+
+    result = execute_lease(tmp_path, leased["lease"].id, owner="local_daemon:test:123")
+
+    assert result.ok is False
+    assert result.decision == "execution_adapter_rejected"
+    assert result.run is None
+    assert "requires_hosted_boundary" in result.rejection_reasons[0]
