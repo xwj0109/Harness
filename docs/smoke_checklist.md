@@ -24,6 +24,7 @@ python3 -m venv --system-site-packages /tmp/harness-install
 /tmp/harness-install/bin/python -m pip install --no-deps /tmp/harness-wheel/agent_harness-*.whl
 /tmp/harness-install/bin/harness --help
 /tmp/harness-install/bin/harness home --project /tmp/harness-package-project --output json
+/tmp/harness-install/bin/harness tui --project /tmp/harness-package-project --output json || true
 /tmp/harness-install/bin/harness specs --output json
 /tmp/harness-install/bin/harness quickstart agent --project /tmp/harness-package-project --output json
 ```
@@ -33,6 +34,7 @@ Expected packaging properties:
 - The installed wheel exposes the `harness` console script.
 - Packaged built-in YAML specs under `harness/builtin_specs/` are available after wheel install.
 - `harness home` and `harness quickstart agent` remain non-mutating in the temporary project.
+- The base wheel can report the missing optional TUI extra without importing Textual during normal CLI startup; `harness tui --output json` is a non-interactive probe and must not launch the TUI.
 - The packaging smoke does not preflight backends, call providers, run Docker, create tasks, acquire leases, create runs, execute adapters, expose secrets, or use hosted/paid fallback.
 
 ## Verify v1.0 MVP Path
@@ -81,6 +83,7 @@ Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.0 M
 
 ```bash
 harness home --project . --output json
+harness tui --project . --output json
 harness quickstart agent --project . --output json
 harness home --project .
 harness quickstart agent --project .
@@ -98,6 +101,7 @@ harness artifacts inspect "$ARTIFACT_ID" --project .
 Expected v1.1 safety properties:
 
 - `harness home` is read-only and does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, or execute adapters.
+- `harness tui` is read-only and optional; without the TUI extra it returns a stable install hint and does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, or execute adapters.
 - `harness quickstart agent` prints commands only; it does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, create artifacts, execute adapters, or start daemon work.
 - The dashboard does not preflight Codex or local backends, run Docker, invoke shell tools, call providers, start schedulers, or inspect backend settings.
 - JSON output uses `harness.home/v1` and `harness.quickstart_agent/v1` and does not include `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, artifact contents, or secret-like metadata.

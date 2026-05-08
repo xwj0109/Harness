@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shutil
@@ -122,6 +123,9 @@ PolicySubjectKindOption = Annotated[
 PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy subject id.")]
 TraceFormatOption = Annotated[str, typer.Option("--format", help="Trace format. Only otel-json is supported.")]
 
+TUI_SCHEMA_VERSION = "harness.tui/v1"
+TUI_INSTALL_HINT = 'Install the TUI extra with: python3 -m pip install "agent-harness[tui]"'
+
 GITIGNORE_SECTION = """# Harness local artifacts
 .harness/runs/
 .harness/harness.sqlite
@@ -129,6 +133,41 @@ GITIGNORE_SECTION = """# Harness local artifacts
 .harness/tmp/
 *.egg-info/
 """
+
+
+@app.command("tui")
+def tui(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    textual_available = _has_textual()
+    if output == OutputFormat.JSON and textual_available:
+        _emit_json(
+            {
+                "schema_version": TUI_SCHEMA_VERSION,
+                "ok": True,
+                "project_root": str(project_root),
+                "textual_available": True,
+                "mode": "read_only",
+                "launched": False,
+            }
+        )
+        return
+    if not textual_available:
+        payload = {
+            "schema_version": TUI_SCHEMA_VERSION,
+            "ok": False,
+            "errors": ["Textual is not installed."],
+            "install_hint": TUI_INSTALL_HINT,
+            "project_root": str(project_root),
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo("Textual is not installed.")
+            typer.echo(TUI_INSTALL_HINT)
+        raise typer.Exit(code=1)
+    from harness.tui import run_read_only_tui
+
+    run_read_only_tui(project_root)
 
 
 @app.command()
@@ -2108,6 +2147,10 @@ def _print_tsv(headers: list[str]) -> None:
 
 def _print_tsv_row(values: list[object]) -> None:
     typer.echo("\t".join(str(value) for value in values))
+
+
+def _has_textual() -> bool:
+    return importlib.util.find_spec("textual") is not None
 
 
 def _home_result(project_root: Path) -> dict:

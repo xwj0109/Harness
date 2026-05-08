@@ -4,7 +4,7 @@
 
 v0.1 hardening is complete. The repository now has explicit run modes, backend descriptors, run manifests, stable JSON inspection output, `SECURITY.md`, non-mutating `harness doctor`, and golden v0.1 evidence tests.
 
-v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete.
+v0.2.0 release hygiene is complete. v0.3 manual task queue hardening is complete. v0.3.5 control-plane stabilization is complete. v0.4 local daemon scheduler-readiness is complete. v0.4.5 dry-run adapter milestone is complete. v0.5 read-only execution adapter milestone is complete. v0.5.1 read-only adapter hardening is complete. v1.0 MVP closure is complete. v1.1 CLI UX is complete. v1.2 post-MVP polish is complete. v1.3 Typer/Rich-first CLI polish is complete.
 
 The complete v0.2.0 execution plan is tracked in [v0_2_0_plan.md](v0_2_0_plan.md).
 The v0.3 queue-hardening plan is tracked in [v0_3_task_queue_hardening_plan.md](v0_3_task_queue_hardening_plan.md).
@@ -24,6 +24,7 @@ The v1.0 MVP Closure plan is tracked in [v1_0_mvp_closure_plan.md](v1_0_mvp_clos
 The v1.1 CLI UX plan is tracked in [v1_1_cli_ux_plan.md](v1_1_cli_ux_plan.md).
 The v1.2 Post-MVP Polish plan is tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md).
 The v1.3 Interactive TUI Decision plan is tracked in [v1_3_interactive_tui_decision_plan.md](v1_3_interactive_tui_decision_plan.md).
+The v1.4 Read-Only TUI plan is tracked in [v1_4_read_only_tui_plan.md](v1_4_read_only_tui_plan.md).
 
 ## Completed v0.2 Foundations
 
@@ -122,7 +123,9 @@ Implemented CLI-only refinements include sectioned text output for high-traffic 
 
 ## Immediate Next Planning Target
 
-There is no active TUI implementation target. The next UX/product capability should be chosen by a separate decision-complete plan.
+The immediate next planning target is v1.4 Read-Only TUI, tracked in [v1_4_read_only_tui_plan.md](v1_4_read_only_tui_plan.md).
+
+The first TUI must be read-only and optional. It should mirror `harness home`, show project/agent/task/lease/daemon/recent-run state, and display command suggestions without executing them. It must not add task creation, queue execution, daemon actions, adapter execution, backend preflight, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, or unmanaged daemon loops.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.
 

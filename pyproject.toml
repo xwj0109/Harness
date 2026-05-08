@@ -32,6 +32,9 @@ dev = [
   "build>=1.2",
   "pytest>=8.0",
 ]
+tui = [
+  "textual>=0.86",
+]
 
 [project.scripts]
 harness = "harness.cli.main:app"

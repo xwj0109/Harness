@@ -23,6 +23,8 @@ def test_pyproject_has_distribution_metadata_and_packaged_specs() -> None:
     assert project["scripts"]["harness"] == "harness.cli.main:app"
     assert "Environment :: Console" in project["classifiers"]
     assert not any(classifier.startswith("License ::") for classifier in project["classifiers"])
+    assert "textual" not in project["dependencies"]
+    assert any(dependency.startswith("textual>=") for dependency in pyproject["project"]["optional-dependencies"]["tui"])
 
     package_data = pyproject["tool"]["setuptools"]["package-data"]["harness"]
     assert "builtin_specs/*.yaml" in package_data
@@ -87,6 +89,24 @@ def test_installed_wheel_cli_loads_packaged_specs(tmp_path) -> None:
         capture_output=True,
     )
     assert json.loads(home_result.stdout)["schema_version"] == "harness.home/v1"
+    assert not (project_dir / ".harness").exists()
+
+    tui_result = subprocess.run(
+        [str(harness), "tui", "--project", str(project_dir), "--output", "json"],
+        text=True,
+        check=False,
+        capture_output=True,
+    )
+    tui_payload = json.loads(tui_result.stdout)
+    assert tui_payload["schema_version"] == "harness.tui/v1"
+    if tui_result.returncode == 1:
+        assert tui_payload["ok"] is False
+        assert "agent-harness[tui]" in tui_payload["install_hint"]
+    else:
+        assert tui_result.returncode == 0
+        assert tui_payload["ok"] is True
+        assert tui_payload["mode"] == "read_only"
+        assert tui_payload["launched"] is False
     assert not (project_dir / ".harness").exists()
 
     quickstart_result = subprocess.run(

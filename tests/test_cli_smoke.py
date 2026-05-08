@@ -82,6 +82,41 @@ def test_cli_home_text_output_is_sectioned_and_non_mutating(tmp_path) -> None:
     assert not (tmp_path / ".harness").exists()
 
 
+def test_cli_tui_missing_optional_dependency_returns_hint_without_mutation(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.cli.main._has_textual", lambda: False)
+
+    result = runner.invoke(app, ["tui", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload == {
+        "schema_version": "harness.tui/v1",
+        "ok": False,
+        "errors": ["Textual is not installed."],
+        "install_hint": 'Install the TUI extra with: python3 -m pip install "agent-harness[tui]"',
+        "project_root": str(tmp_path),
+    }
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_tui_json_probe_does_not_launch_or_mutate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.cli.main._has_textual", lambda: True)
+
+    result = runner.invoke(app, ["tui", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload == {
+        "schema_version": "harness.tui/v1",
+        "ok": True,
+        "project_root": str(tmp_path),
+        "textual_available": True,
+        "mode": "read_only",
+        "launched": False,
+    }
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     task = runner.invoke(

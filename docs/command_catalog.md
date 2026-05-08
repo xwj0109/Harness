@@ -10,11 +10,12 @@ Unless a command explicitly says otherwise in the operator guide, these surfaces
 harness --help
 harness home --project .
 harness home --project . --output json
+harness tui --project .
 harness quickstart agent --project .
 harness quickstart agent --project . --output json
 ```
 
-`home` and `quickstart agent` are read-only/non-mutating orientation commands. `quickstart agent` prints command sequences for the MVP path but does not run them.
+`home`, `tui`, and `quickstart agent` are read-only/non-mutating orientation commands. `tui` requires the optional TUI extra and starts a read-only terminal surface. `quickstart agent` prints command sequences for the MVP path but does not run them.
 
 ## Agent Authoring
 

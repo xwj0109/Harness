@@ -57,6 +57,15 @@ The dashboard reports initialization state, imported-agent count, objective and 
 
 `harness home` is read-only. It does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, execute adapters, preflight backends, inspect backend settings, run Docker, invoke shell tools, call providers, or expose secrets.
 
+`harness tui` is the planned v1.4 read-only terminal dashboard entrypoint:
+
+```bash
+python3 -m pip install "agent-harness[tui]"
+harness tui --project .
+```
+
+Without the optional TUI extra, `harness tui` returns a clear install hint instead of importing Textual during normal CLI startup. `harness tui --output json` is a non-interactive availability probe and does not launch a terminal UI. The first TUI surface is read-only: it must not initialize projects, create tasks, create runs, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose secrets.
+
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 
 ```bash
