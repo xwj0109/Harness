@@ -8,6 +8,19 @@ version = "1.0.0"
 description = "Local-first agent harness with durable queue and control-plane evidence"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Agent Harness Contributors" }]
+keywords = ["agent", "cli", "local-first", "automation", "evidence"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development",
+]
 dependencies = [
   "pydantic>=2.7",
   "pyyaml>=6.0",
@@ -16,6 +29,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.2",
   "pytest>=8.0",
 ]
 
@@ -30,6 +44,8 @@ where = ["src"]
 "harness" = [
   "builtin_specs/*.yaml",
   "builtin_specs/agents/**/*.yaml",
+  "builtin_specs/agents/*/*.yaml",
+  "builtin_specs/agents/*/*/*.yaml",
   "builtin_specs/workbenches/*.yaml",
 ]
 

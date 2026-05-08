@@ -15,6 +15,26 @@ git log --oneline --decorate -5
 pytest -q
 ```
 
+## Verify Packaging and Distribution
+
+```bash
+rm -rf /tmp/harness-wheel /tmp/harness-install /tmp/harness-package-project
+python3 -m pip wheel --no-deps --no-build-isolation -w /tmp/harness-wheel .
+python3 -m venv --system-site-packages /tmp/harness-install
+/tmp/harness-install/bin/python -m pip install --no-deps /tmp/harness-wheel/agent_harness-*.whl
+/tmp/harness-install/bin/harness --help
+/tmp/harness-install/bin/harness home --project /tmp/harness-package-project --output json
+/tmp/harness-install/bin/harness specs --output json
+/tmp/harness-install/bin/harness quickstart agent --project /tmp/harness-package-project --output json
+```
+
+Expected packaging properties:
+
+- The installed wheel exposes the `harness` console script.
+- Packaged built-in YAML specs under `harness/builtin_specs/` are available after wheel install.
+- `harness home` and `harness quickstart agent` remain non-mutating in the temporary project.
+- The packaging smoke does not preflight backends, call providers, run Docker, create tasks, acquire leases, create runs, execute adapters, expose secrets, or use hosted/paid fallback.
+
 ## Verify v1.0 MVP Path
 
 This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the already-authorized read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.

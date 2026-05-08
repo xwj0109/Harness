@@ -56,6 +56,30 @@ Security boundaries and threat-model notes are documented in:
 
 - [SECURITY.md](SECURITY.md)
 
+## Install and Verify
+
+For local development, install the package in editable mode:
+
+```bash
+python3 -m pip install -e ".[dev]"
+harness --help
+```
+
+For a clean local wheel smoke, build and install from a temporary wheelhouse:
+
+```bash
+rm -rf /tmp/harness-wheel /tmp/harness-install
+python3 -m pip wheel --no-deps --no-build-isolation -w /tmp/harness-wheel .
+python3 -m venv --system-site-packages /tmp/harness-install
+/tmp/harness-install/bin/python -m pip install --no-deps /tmp/harness-wheel/agent_harness-*.whl
+/tmp/harness-install/bin/harness --help
+/tmp/harness-install/bin/harness specs --output json
+/tmp/harness-install/bin/harness home --project /tmp/harness-project --output json
+/tmp/harness-install/bin/harness quickstart agent --project /tmp/harness-project --output json
+```
+
+The wheel must include packaged built-in YAML specs under `harness/builtin_specs/`. The install smoke is local-only and does not preflight backends, call providers, run Docker, create tasks, acquire leases, or execute adapters.
+
 ## Planning Docs
 
 Repo-local planning references are tracked in:

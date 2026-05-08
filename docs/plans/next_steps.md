@@ -110,10 +110,10 @@ The v0.5.1 hardening plan is tracked in [v0_5_1_read_only_adapter_hardening_plan
 
 ## Immediate Next Planning Target
 
-The immediate next target is v1.2 Track 1 packaging/distribution polish, tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md). The ranked post-MVP UX/product order is:
+The immediate next target is v1.2 Track 2 small Typer/Rich-style CLI refinements, tracked in [v1_2_post_mvp_polish_plan.md](v1_2_post_mvp_polish_plan.md). Track 1 packaging/distribution polish is complete. The ranked post-MVP UX/product order is:
 
-1. Packaging/distribution polish first.
-2. Small Typer/Rich-style CLI refinements second.
+1. Packaging/distribution polish first. Complete.
+2. Small Typer/Rich-style CLI refinements second. Active next.
 3. True interactive TUI/command palette later, behind a separate decision gate.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, `codex_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes remain unauthorized.

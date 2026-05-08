@@ -1,6 +1,6 @@
 # v1.2 Post-MVP Polish Plan
 
-Status: planned.
+Status: in progress.
 
 ## Summary
 
@@ -13,6 +13,8 @@ v1.2 should make the completed MVP easier to install, try, and operate before ad
 This plan is intentionally not an execution-adapter plan. It must not add task-generation automation, new daemon behavior, backend/model calls, Docker-from-queue, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker integrations, live trading, order placement, external messaging, application submission, or active repo write automation.
 
 ## Track 1: Packaging and Distribution Polish
+
+Status: complete.
 
 Goal: make the local-first MVP installable and verifiable in a clean operator environment.
 
@@ -44,7 +46,17 @@ Exit criteria:
 - CLI entrypoint works from the installed wheel.
 - Existing full regression suite passes.
 
+Completion note:
+
+- Package metadata now includes license expression, authors, keywords, classifiers, and dev packaging dependency metadata.
+- Package-data patterns explicitly cover packaged built-in YAML specs.
+- Packaging tests build a local wheel from a temporary source copy, inspect wheel metadata/spec contents, install the wheel into a temporary virtual environment, and verify installed `harness` CLI commands.
+- README and smoke checklist include local wheel install verification.
+- No publishing, remote registry upload, new execution behavior, backend preflight, Docker-from-queue, shell access, hosted fallback, paid fallback, OpenAI API usage, or TUI dependency was added.
+
 ## Track 2: Small Typer/Rich-Style CLI Refinements
+
+Status: planned.
 
 Goal: improve day-to-day terminal ergonomics without changing behavior or adding a full-screen TUI.
 
@@ -69,6 +81,8 @@ Exit criteria:
 - Full regression suite passes.
 
 ## Track 3: Interactive TUI or Command Palette Decision Gate
+
+Status: gated.
 
 Goal: decide whether a true interactive UX is worth adding after packaging and lightweight CLI polish.
 
