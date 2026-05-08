@@ -55,6 +55,18 @@ Expected v1.0 MVP safety properties:
 - `daemon execute-read-only` is the only real MVP adapter and uses only the configured local-only/no-cost read-only route.
 - The MVP does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
 
+## Verify v1.1 Operator Cockpit
+
+```bash
+harness home --project . --output json
+```
+
+Expected v1.1 safety properties:
+
+- `harness home` is read-only and does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, or execute adapters.
+- The dashboard does not preflight Codex or local backends, run Docker, invoke shell tools, call providers, start schedulers, or inspect backend settings.
+- JSON output uses `harness.home/v1` and does not include `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, artifact contents, or secret-like metadata.
+
 ## Verify Read-Only v0.2 Specs Commands
 
 Built-in inspection:

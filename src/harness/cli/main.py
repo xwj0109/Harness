@@ -20,6 +20,7 @@ from harness.agent_authoring import (
     scaffold_agent_bundle,
     validate_agent_bundle,
 )
+from harness import __version__
 from harness.approvals import ApprovalProfile, ApprovalStore
 from harness.backends.codex_cli import (
     AUTH_ERROR,
@@ -165,6 +166,48 @@ def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
             f"{record.id}\t{record.status}\t{record.created_at.isoformat()}\t"
             f"{record.task_type or ''}\t{record.goal or ''}\t{record.backend_name or 'none'}"
         )
+
+
+@app.command()
+def home(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = _home_result(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo("Harness Home")
+    typer.echo(f"Project: {result['project_root']}")
+    typer.echo(f"Initialized: {result['initialized']}")
+    typer.echo(f"Version: {result['version']}")
+    if not result["initialized"]:
+        typer.echo("Next: harness init --project .")
+        return
+    summary = result["summary"]
+    typer.echo(
+        "Summary: "
+        f"{summary['imported_agents']} agents, "
+        f"{summary['objectives']} objectives, "
+        f"{summary['tasks_total']} tasks, "
+        f"{summary['active_leases']} active leases, "
+        f"{summary['active_daemons']} active daemons, "
+        f"{summary['recent_runs']} recent runs"
+    )
+    task_counts = result["task_status_counts"]
+    typer.echo(
+        "Tasks: "
+        f"ready={task_counts.get('ready', 0)} "
+        f"blocked={task_counts.get('blocked', 0)} "
+        f"waiting_approval={task_counts.get('waiting_approval', 0)} "
+        f"leased={task_counts.get('leased', 0)} "
+        f"running={task_counts.get('running', 0)}"
+    )
+    if result["daemon"]["paused_tasks"]:
+        typer.echo(f"Paused tasks: {len(result['daemon']['paused_tasks'])}")
+    if result["recent_runs"]:
+        typer.echo("Recent runs:")
+        for run in result["recent_runs"]:
+            typer.echo(f"  {run['id']}\t{run['status']}\t{run.get('task_type') or ''}")
+    typer.echo("Safety: local-first control plane; no hosted fallback, paid fallback, or OpenAI API usage.")
 
 
 @app.command()
@@ -1981,6 +2024,96 @@ def _print_compare_result(result: dict) -> None:
 
 def _emit_json(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _home_result(project_root: Path) -> dict:
+    initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
+    result = {
+        "schema_version": "harness.home/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "initialized": initialized,
+        "version": __version__,
+        "summary": {
+            "imported_agents": 0,
+            "objectives": 0,
+            "tasks_total": 0,
+            "active_leases": 0,
+            "active_daemons": 0,
+            "recent_runs": 0,
+        },
+        "task_status_counts": {status.value: 0 for status in TaskStatus},
+        "daemon": {
+            "active_daemons": [],
+            "paused_tasks": [],
+            "latest_events": [],
+        },
+        "recent_runs": [],
+        "safety_boundaries": [
+            "local_first",
+            "no_hosted_fallback",
+            "no_paid_fallback",
+            "no_openai_api_usage",
+            "no_secret_exposure",
+            "no_hidden_execution",
+        ],
+        "recommended_actions": [],
+    }
+    if not initialized:
+        result["recommended_actions"] = [
+            {
+                "id": "initialize_project",
+                "command": f"harness init --project {project_root}",
+                "description": "Initialize local harness persistence for this project.",
+            }
+        ]
+        return result
+
+    store = SQLiteStore(project_root)
+    agents = store.list_project_agents()
+    objectives = store.list_objectives()
+    tasks = store.list_tasks()
+    leases = store.list_task_leases()
+    runs = store.list_runs()[:5]
+    daemon_status = store.daemon_status()
+    task_status_counts = {status.value: 0 for status in TaskStatus}
+    for task in tasks:
+        task_status_counts[task.status.value] = task_status_counts.get(task.status.value, 0) + 1
+    active_leases = [lease for lease in leases if lease.status.value == "active"]
+    result["summary"] = {
+        "imported_agents": len(agents),
+        "objectives": len(objectives),
+        "tasks_total": len(tasks),
+        "active_leases": len(active_leases),
+        "active_daemons": len(daemon_status.active_daemons),
+        "recent_runs": len(runs),
+    }
+    result["task_status_counts"] = task_status_counts
+    result["daemon"] = {
+        "active_daemons": [daemon.model_dump(mode="json") for daemon in daemon_status.active_daemons],
+        "paused_tasks": daemon_status.paused_tasks,
+        "latest_events": [event.model_dump(mode="json") for event in daemon_status.latest_events[:5]],
+    }
+    result["recent_runs"] = [run.model_dump(mode="json") for run in runs]
+    if task_status_counts.get("ready", 0) > 0 and not active_leases:
+        result["recommended_actions"].append(
+            {
+                "id": "lease_ready_task",
+                "command": f"harness daemon run-once --project {project_root}",
+                "description": "Lease the highest-priority eligible task without executing it.",
+            }
+        )
+    if not agents:
+        result["recommended_actions"].append(
+            {
+                "id": "author_agent",
+                "command": "harness agents scaffold my_agent --workbench quant --kind specialist "
+                "--parent quant_research --model-profile local_reasoning --tool-policy read_only "
+                "--memory-scope quant --output agents/my_agent",
+                "description": "Scaffold a declarative custom agent bundle.",
+            }
+        )
+    return result
 
 
 def _doctor_result(project_root: Path) -> dict:

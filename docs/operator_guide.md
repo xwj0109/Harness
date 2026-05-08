@@ -44,6 +44,19 @@ harness daemon execute-read-only task_lease_abc123def456 --project . --output js
 
 The MVP does not authorize new adapters, automatic task generation, autonomous workflows, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, external messaging, application submission, or active repo write automation.
 
+## v1.1 Operator Cockpit
+
+`harness home` is the first post-MVP CLI UX entrypoint. It summarizes the current project state without changing it:
+
+```bash
+harness home --project .
+harness home --project . --output json
+```
+
+The dashboard reports initialization state, imported-agent count, objective and task counts, active leases, active daemons, recent runs, and local-first safety reminders. On an uninitialized project it recommends `harness init`, but does not create `.harness/` or any runtime state.
+
+`harness home` is read-only. It does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, execute adapters, preflight backends, inspect backend settings, run Docker, invoke shell tools, call providers, or expose secrets.
+
 ## Codex Supervised Isolated Editing
 
 `codex_code_edit` uses `CodexCliBackend` as an external agent backend. Codex does not run as a raw model provider, and the harness does not assume Codex internal actions appear as harness-native tool calls. Supervision is done through workspace isolation, Codex subprocess flags, captured output, artifacts, git status, diff inspection, policy validation, and explicit apply-back approval.

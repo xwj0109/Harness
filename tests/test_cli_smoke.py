@@ -57,6 +57,76 @@ def test_cli_init_preserves_gitignore_and_does_not_duplicate_partial_entries(tmp
     assert gitignore.count("*.egg-info/") == 1
 
 
+def test_cli_home_reports_uninitialized_project_without_mutation(tmp_path) -> None:
+    result = runner.invoke(app, ["home", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.home/v1"
+    assert payload["ok"] is True
+    assert payload["initialized"] is False
+    assert payload["summary"]["tasks_total"] == 0
+    assert payload["recommended_actions"][0]["id"] == "initialize_project"
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "summarize repo",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task.exit_code == 0, task.output
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert tick.exit_code == 0, tick.output
+    created = runner.invoke(
+        app,
+        [
+            "dev",
+            "create-run",
+            "--goal",
+            "dashboard run",
+            "--task-type",
+            "phase_1a_test",
+            "--project",
+            str(tmp_path),
+        ],
+    )
+    assert created.exit_code == 0, created.output
+
+    result = runner.invoke(app, ["home", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.home/v1"
+    assert payload["ok"] is True
+    assert payload["initialized"] is True
+    assert payload["summary"]["tasks_total"] == 1
+    assert payload["summary"]["active_leases"] == 1
+    assert payload["summary"]["active_daemons"] == 1
+    assert payload["summary"]["recent_runs"] == 1
+    assert payload["task_status_counts"]["leased"] == 1
+    assert payload["daemon"]["active_daemons"]
+    assert payload["recent_runs"][0]["task_type"] == "phase_1a_test"
+    serialized = json.dumps(payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
 def test_cli_dev_create_run_runs_show(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     created = runner.invoke(
