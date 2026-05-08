@@ -1,10 +1,14 @@
 # v0.9 Agent Lifecycle and Preview Plan
 
+Status: complete.
+
 ## Summary
 
 Make v0.9 the project-agent usability and lifecycle hardening milestone. Operators should be able to understand imported project agents from persisted state, detect source-bundle drift, preview effective imported-agent policy/metadata, and make an explicit decision about remove/refresh behavior.
 
 This milestone remains declarative/control-plane only. It must not execute agents, add execution adapters, create tasks automatically, schedule daemon work, preflight model backends, call providers, run Docker, invoke shell tools, mutate active repo files, use hosted fallback, use paid fallback, use OpenAI API, add MCP/A2A, add browser/email/calendar tools, connect to brokers, place orders, send messages, submit applications, or add workflow automation.
+
+Completion note: v0.9 is implemented and verified. Project-local imported agents can be previewed from persisted state with `harness agents preview-imported`, source drift is reported as `verified`, `changed`, `missing`, or `unavailable`, and `harness agents remove` deletes only unused project-local imports. Refresh/replace remains explicitly deferred so imported-agent lifecycle changes stay deliberate.
 
 ## Key Changes
 
