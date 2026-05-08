@@ -128,6 +128,7 @@ harness init --project .
 harness agents import /tmp/harness-agent-authoring-smoke --project . --output json
 harness agents list --project . --output json
 harness agents inspect smoke_agent --project . --output json
+harness agents preview-imported smoke_agent --project . --output json
 harness tasks add --title "Use smoke agent" --agent smoke_agent --workbench quant --project . --output json
 ```
 
@@ -137,6 +138,8 @@ Expected v0.8 safety properties:
 - Import does not modify packaged built-ins and rejects built-in id shadowing or duplicate project-local ids.
 - Imported task references record `spec_source_kind: project` but remain non-executing metadata.
 - Import/list/inspect do not execute agents, call backends, preflight providers, run Docker, invoke shell tools, create runs, create artifacts, start daemon work, or authorize new tools.
+- `agents preview-imported` reports source drift without rewriting the import record.
+- `agents remove` is available only for unused imported agents; it rejects built-ins and task-referenced imports.
 
 ## Verify Manual v0.3 Task Queue
 

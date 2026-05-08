@@ -44,7 +44,10 @@ from harness.models import (
     PolicyLevel,
     run_mode_for_task_type,
 )
-from harness.agent_authoring import LoadedAgentBundle, agent_bundle_content_sha256
+from harness.agent_authoring import AgentBundleError, LoadedAgentBundle, agent_bundle_content_sha256, load_agent_bundle
+from harness.registry import SpecRegistry, builtin_spec_registry
+from harness.spec_loader import preview_agent_effective_policy
+from harness.specs import AgentProfileSpec, AgentSpec
 from harness.policy import (
     backend_descriptor_sha256,
     effective_policy_sha256,
@@ -142,6 +145,14 @@ def parse_dt(value: str) -> datetime:
 
 def normalize_task_status(status: str | TaskStatus) -> TaskStatus:
     return TaskStatus(status.value if isinstance(status, TaskStatus) else status)
+
+
+def _sort_json(value):
+    if isinstance(value, dict):
+        return {key: _sort_json(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        return [_sort_json(item) for item in value]
+    return value
 
 
 def validate_task_transition(from_status: str | TaskStatus, to_status: str | TaskStatus) -> None:
@@ -433,6 +444,71 @@ class SQLiteStore:
             row = conn.execute("SELECT * FROM project_agents WHERE agent_id = ?", (agent_id,)).fetchone()
         if row is None:
             raise KeyError(f"Project agent not found: {agent_id}")
+        return self._row_to_project_agent(row)
+
+    def project_agent_drift_status(self, agent_id: str) -> dict[str, Any]:
+        record = self.get_project_agent(agent_id)
+        if not record.source_path.exists():
+            return {
+                "status": "missing",
+                "imported_sha256": record.content_sha256,
+                "current_sha256": None,
+                "message": f"Source bundle missing: {record.source_path}",
+            }
+        try:
+            loaded = load_agent_bundle(record.source_path)
+            current_sha256 = agent_bundle_content_sha256(loaded)
+        except AgentBundleError as exc:
+            return {
+                "status": "unavailable",
+                "imported_sha256": record.content_sha256,
+                "current_sha256": None,
+                "message": str(exc),
+            }
+        return {
+            "status": "verified" if current_sha256 == record.content_sha256 else "changed",
+            "imported_sha256": record.content_sha256,
+            "current_sha256": current_sha256,
+            "message": None,
+        }
+
+    def preview_project_agent(self, agent_id: str) -> dict[str, Any]:
+        record = self.get_project_agent(agent_id)
+        registry = self._project_agent_registry(record)
+        preview = preview_agent_effective_policy(registry, agent_id)
+        workbench = registry.get_workbench(record.workbench_id)
+        return {
+            "schema_version": "harness.project_agent_preview/v1",
+            "ok": True,
+            "agent_id": record.agent_id,
+            "workbench_id": record.workbench_id,
+            "source_path": str(record.source_path),
+            "imported_at": record.imported_at.isoformat(),
+            "content_sha256": record.content_sha256,
+            "drift": self.project_agent_drift_status(agent_id),
+            "agent": preview["agent"],
+            "profiles": preview["profiles"],
+            "parent_chain": preview["parent_chain"],
+            "effective_agent": preview["effective_agent"],
+            "workbench": _sort_json(workbench.model_dump(mode="json")),
+            "errors": [],
+            "warnings": [],
+        }
+
+    def remove_project_agent(self, agent_id: str) -> ProjectAgentRecord:
+        if agent_id in builtin_spec_registry().agents:
+            raise ValueError(f"Cannot remove built-in agent: {agent_id}")
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM project_agents WHERE agent_id = ?", (agent_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Project agent not found: {agent_id}")
+            task_count = conn.execute(
+                "SELECT COUNT(*) AS count FROM tasks WHERE agent_id = ? AND spec_source_kind = 'project'",
+                (agent_id,),
+            ).fetchone()["count"]
+            if task_count:
+                raise ValueError(f"Cannot remove project agent referenced by tasks: {agent_id}")
+            conn.execute("DELETE FROM project_agents WHERE agent_id = ?", (agent_id,))
         return self._row_to_project_agent(row)
 
     def create_task(
@@ -2857,6 +2933,19 @@ class SQLiteStore:
             content_sha256=row["content_sha256"],
             agent=json.loads(row["agent_json"]),
             profiles=json.loads(row["profiles_json"]),
+        )
+
+    def _project_agent_registry(self, record: ProjectAgentRecord) -> SpecRegistry:
+        builtin = builtin_spec_registry()
+        agent = AgentSpec.model_validate(record.agent)
+        profiles = [AgentProfileSpec.model_validate(profile) for profile in record.profiles]
+        return SpecRegistry(
+            model_profiles=dict(builtin.model_profiles),
+            tool_policies=dict(builtin.tool_policies),
+            memory_scopes=dict(builtin.memory_scopes),
+            agents={**builtin.agents, record.agent_id: agent},
+            agent_profiles={**builtin.agent_profiles, **{profile.id: profile for profile in profiles}},
+            workbenches=dict(builtin.workbenches),
         )
 
     def _row_to_task_dependency(self, row: sqlite3.Row) -> TaskDependency:

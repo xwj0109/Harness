@@ -276,6 +276,18 @@ harness agents list --project . --output json
 harness agents inspect my_agent --project . --output json
 ```
 
+Preview imported-agent effective metadata and drift:
+
+```bash
+harness agents preview-imported my_agent --project . --output json
+```
+
+Remove an unused imported agent:
+
+```bash
+harness agents remove my_agent --project . --output json
+```
+
 The JSON wrappers are:
 
 - `harness.project_agent/v1` for import and inspect.
@@ -290,6 +302,8 @@ harness tasks add --title "Use custom agent" --agent my_agent --workbench quant 
 ```
 
 The task record preserves `spec_source_kind: project` and the imported agent source path. This reference is still metadata only; it does not authorize execution or grant tools.
+
+`preview-imported` recomputes the current source bundle hash and reports drift as `verified`, `changed`, `missing`, or `unavailable`; it does not rewrite the import record. `remove` applies only to project-local imported agents and rejects built-in ids, unknown ids, and imported agents referenced by any task. Refresh/replace remains intentionally deferred so imported-agent lifecycle changes stay explicit.
 
 ## Read-Only Custom Spec Validation
 

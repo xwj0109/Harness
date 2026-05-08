@@ -112,6 +112,68 @@ def test_project_agent_import_rejects_duplicate_and_unknown_inspect(tmp_path) ->
         store.get_project_agent("missing_agent")
 
 
+def test_project_agent_preview_and_drift_statuses(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    bundle_path = tmp_path / "agents" / "custom_quant_researcher"
+    _write_project_agent_bundle(bundle_path)
+    store.import_project_agent(load_agent_bundle(bundle_path))
+
+    preview = store.preview_project_agent("custom_quant_researcher")
+    verified = store.project_agent_drift_status("custom_quant_researcher")
+    (bundle_path / "profiles" / "default.yaml").write_text(
+        (bundle_path / "profiles" / "default.yaml").read_text(encoding="utf-8").replace("commodities", "rates"),
+        encoding="utf-8",
+    )
+    changed = store.project_agent_drift_status("custom_quant_researcher")
+    (bundle_path / "agent.yaml").unlink()
+    unavailable = store.project_agent_drift_status("custom_quant_researcher")
+    (bundle_path / "profiles" / "default.yaml").unlink()
+    (bundle_path / "profiles").rmdir()
+    bundle_path.rmdir()
+    missing = store.project_agent_drift_status("custom_quant_researcher")
+
+    assert preview["schema_version"] == "harness.project_agent_preview/v1"
+    assert preview["ok"] is True
+    assert preview["agent"]["id"] == "custom_quant_researcher"
+    assert [parent["id"] for parent in preview["parent_chain"]] == ["quant_research"]
+    assert preview["effective_agent"]["tool_policy"] == "read_only"
+    assert preview["workbench"]["id"] == "quant"
+    assert verified["status"] == "verified"
+    assert changed["status"] == "changed"
+    assert unavailable["status"] == "unavailable"
+    assert missing["status"] == "missing"
+
+
+def test_project_agent_remove_succeeds_only_when_unused(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    removable_path = tmp_path / "agents" / "removable_agent"
+    used_path = tmp_path / "agents" / "used_agent"
+    _write_project_agent_bundle(removable_path, agent_id="removable_agent")
+    _write_project_agent_bundle(used_path, agent_id="used_agent")
+    store.import_project_agent(load_agent_bundle(removable_path))
+    store.import_project_agent(load_agent_bundle(used_path))
+    store.create_task(
+        title="Uses project agent",
+        agent_id="used_agent",
+        spec_source_kind="project",
+        spec_source_path=used_path.resolve(),
+    )
+
+    removed = store.remove_project_agent("removable_agent")
+
+    assert removed.agent_id == "removable_agent"
+    with pytest.raises(KeyError, match="Project agent not found: removable_agent"):
+        store.get_project_agent("removable_agent")
+    with pytest.raises(ValueError, match="referenced by tasks"):
+        store.remove_project_agent("used_agent")
+    with pytest.raises(ValueError, match="Cannot remove built-in agent: repo_inspector"):
+        store.remove_project_agent("repo_inspector")
+    with pytest.raises(KeyError, match="Project agent not found: missing_agent"):
+        store.remove_project_agent("missing_agent")
+
+
 def test_project_agent_table_initializes_on_existing_project(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

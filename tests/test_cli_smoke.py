@@ -3248,3 +3248,132 @@ def test_cli_agents_import_rejects_duplicates_unknowns_and_mismatched_task_workb
     mismatch_payload = json.loads(mismatch.output)
     assert mismatch_payload["schema_version"] == "harness.task/v1"
     assert mismatch_payload["errors"] == ["Project agent project_agent belongs to workbench quant, not coding"]
+
+
+def test_cli_agents_preview_imported_reports_drift_and_remove_unused_agent(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    destination = tmp_path / "agents" / "project_agent"
+    assert runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "project_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    ).exit_code == 0
+    assert runner.invoke(app, ["agents", "import", str(destination), "--project", str(tmp_path)]).exit_code == 0
+
+    preview = runner.invoke(
+        app,
+        ["agents", "preview-imported", "project_agent", "--project", str(tmp_path), "--output", "json"],
+    )
+    (destination / "profiles" / "default.yaml").write_text(
+        (destination / "profiles" / "default.yaml").read_text(encoding="utf-8").replace(
+            "Default profile", "Changed profile"
+        ),
+        encoding="utf-8",
+    )
+    changed = runner.invoke(
+        app,
+        ["agents", "preview-imported", "project_agent", "--project", str(tmp_path), "--output", "json"],
+    )
+    removed = runner.invoke(
+        app,
+        ["agents", "remove", "project_agent", "--project", str(tmp_path), "--output", "json"],
+    )
+    inspected_after_remove = runner.invoke(
+        app,
+        ["agents", "inspect", "project_agent", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert preview.exit_code == 0, preview.output
+    preview_payload = json.loads(preview.output)
+    assert preview_payload["schema_version"] == "harness.project_agent_preview/v1"
+    assert preview_payload["ok"] is True
+    assert preview_payload["agent"]["id"] == "project_agent"
+    assert preview_payload["drift"]["status"] == "verified"
+    assert [parent["id"] for parent in preview_payload["parent_chain"]] == ["quant_research"]
+    assert changed.exit_code == 0, changed.output
+    changed_payload = json.loads(changed.output)
+    assert changed_payload["drift"]["status"] == "changed"
+    assert removed.exit_code == 0, removed.output
+    removed_payload = json.loads(removed.output)
+    assert removed_payload["schema_version"] == "harness.project_agent/v1"
+    assert removed_payload["ok"] is True
+    assert removed_payload["removed"] is True
+    assert removed_payload["agent"]["agent_id"] == "project_agent"
+    assert inspected_after_remove.exit_code == 1
+
+
+def test_cli_agents_remove_rejects_builtin_unknown_and_task_referenced_agents(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    destination = tmp_path / "agents" / "project_agent"
+    assert runner.invoke(
+        app,
+        [
+            "agents",
+            "scaffold",
+            "project_agent",
+            "--workbench",
+            "quant",
+            "--kind",
+            "specialist",
+            "--parent",
+            "quant_research",
+            "--model-profile",
+            "local_reasoning",
+            "--tool-policy",
+            "read_only",
+            "--memory-scope",
+            "quant",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    ).exit_code == 0
+    assert runner.invoke(app, ["agents", "import", str(destination), "--project", str(tmp_path)]).exit_code == 0
+    assert runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Use project agent",
+            "--agent",
+            "project_agent",
+            "--workbench",
+            "quant",
+            "--project",
+            str(tmp_path),
+        ],
+    ).exit_code == 0
+
+    used = runner.invoke(app, ["agents", "remove", "project_agent", "--project", str(tmp_path), "--output", "json"])
+    builtin = runner.invoke(app, ["agents", "remove", "repo_inspector", "--project", str(tmp_path), "--output", "json"])
+    missing = runner.invoke(app, ["agents", "remove", "missing_agent", "--project", str(tmp_path), "--output", "json"])
+
+    assert used.exit_code == 1
+    assert json.loads(used.output)["errors"] == ["Cannot remove project agent referenced by tasks: project_agent"]
+    assert builtin.exit_code == 1
+    assert json.loads(builtin.output)["errors"] == ["Cannot remove built-in agent: repo_inspector"]
+    assert missing.exit_code == 1
+    assert json.loads(missing.output)["errors"] == ["Project agent not found: missing_agent"]

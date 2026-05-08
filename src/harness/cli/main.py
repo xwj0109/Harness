@@ -889,6 +889,57 @@ def agents_inspect(
     typer.echo(f"Profiles: {len(record.profiles)}")
 
 
+@agents_app.command("preview-imported")
+def agents_preview_imported(
+    agent_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = SQLiteStore(project_root).preview_project_agent(agent_id)
+    except KeyError as exc:
+        _emit_agent_authoring_error("harness.project_agent_preview/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo(f"Project agent preview: {result['agent_id']}")
+    typer.echo(f"Workbench: {result['workbench_id']}")
+    typer.echo(f"Drift: {result['drift']['status']}")
+    typer.echo(
+        "Parent chain: "
+        f"{', '.join(parent['id'] for parent in result['parent_chain']) if result['parent_chain'] else 'none'}"
+    )
+
+
+@agents_app.command("remove")
+def agents_remove(
+    agent_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        record = SQLiteStore(project_root).remove_project_agent(agent_id)
+    except (KeyError, ValueError) as exc:
+        _emit_agent_authoring_error("harness.project_agent/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.project_agent/v1",
+                "ok": True,
+                "removed": True,
+                "agent": record.model_dump(mode="json"),
+            }
+        )
+        return
+    typer.echo(f"Removed project agent {record.agent_id}")
+
+
 @policy_app.command("explain")
 def policy_explain(
     subject_kind: PolicySubjectKindOption,
