@@ -203,6 +203,60 @@ COMMAND_PALETTE_ENTRIES = [
     },
 ]
 
+TUI_VIEW_SECTIONS = [
+    {
+        "id": "project_overview",
+        "title": "Project Overview",
+        "pane_ids": ["overview", "guidance", "commands"],
+    },
+    {
+        "id": "queue_daemon",
+        "title": "Queue And Daemon",
+        "pane_ids": ["tasks", "leases", "daemon"],
+    },
+    {
+        "id": "agents_specs",
+        "title": "Agents And Specs",
+        "pane_ids": ["agents"],
+    },
+    {
+        "id": "runtime_evidence",
+        "title": "Runtime Evidence",
+        "pane_ids": ["runs"],
+    },
+    {
+        "id": "command_palette",
+        "title": "Command Palette",
+        "pane_ids": [
+            "command_palette",
+            "command_palette_orientation",
+            "command_palette_agent_authoring",
+            "command_palette_project_agents",
+            "command_palette_built_in_specs",
+            "command_palette_objectives_tasks",
+            "command_palette_daemon_control",
+            "command_palette_read_only_adapter",
+            "command_palette_runtime_evidence",
+            "command_palette_packaging_smoke",
+            "command_palette_selected",
+        ],
+    },
+    {
+        "id": "safety",
+        "title": "Safety",
+        "pane_ids": ["safety"],
+    },
+]
+
+TUI_NAVIGATION_HINTS = [
+    {"key": "/", "label": "Search panes and command palette"},
+    {"key": "escape", "label": "Clear search"},
+    {"key": "tab", "label": "Next pane"},
+    {"key": "shift+tab", "label": "Previous pane"},
+    {"key": "q", "label": "Quit"},
+    {"key": "copy-only", "label": "Palette commands are displayed only"},
+]
+
 
 def build_tui_dashboard(project_root: Path) -> dict:
     initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
@@ -559,6 +613,55 @@ def build_command_palette_panes(filtered_palette: dict) -> list[dict]:
             }
         )
     return panes
+
+
+def build_tui_view_model(filtered: dict, filtered_palette: dict) -> dict:
+    no_matches = not filtered["panes"] and not filtered_palette["entries"]
+    dashboard_panes = [dict(pane) for pane in filtered["panes"]]
+    palette_panes = [] if no_matches else build_command_palette_panes(filtered_palette)
+    panes_by_id = {pane["id"]: pane for pane in [*dashboard_panes, *palette_panes]}
+    sections = []
+    ordered_panes = []
+    for section in TUI_VIEW_SECTIONS:
+        section_panes = [
+            dict(panes_by_id[pane_id])
+            for pane_id in section["pane_ids"]
+            if pane_id in panes_by_id
+        ]
+        if not section_panes:
+            continue
+        sections.append(
+            {
+                "id": section["id"],
+                "title": section["title"],
+                "pane_ids": [pane["id"] for pane in section_panes],
+                "pane_count": len(section_panes),
+            }
+        )
+        ordered_panes.extend(section_panes)
+    empty_state = None
+    if no_matches:
+        empty_state = {
+            "title": "No matches",
+            "message": "No matching panes or command templates.",
+            "query": filtered["query"] or filtered_palette["query"],
+        }
+    return {
+        "schema_version": "harness.tui_view/v1",
+        "ok": True,
+        "query": filtered["query"] or filtered_palette["query"],
+        "sections": sections,
+        "panes": ordered_panes,
+        "pane_order": [pane["id"] for pane in ordered_panes],
+        "navigation_hints": [dict(hint) for hint in TUI_NAVIGATION_HINTS],
+        "empty_state": empty_state,
+        "search": {
+            "dashboard_matches": filtered["total_matches"],
+            "dashboard_panes": len(filtered["panes"]),
+            "palette_matches": filtered_palette["total_matches"],
+            "palette_groups": len(filtered_palette["groups"]),
+        },
+    }
 
 
 def filter_tui_panes(panes: list[dict], query: str) -> dict:

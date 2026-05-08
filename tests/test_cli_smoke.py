@@ -12,6 +12,7 @@ from harness.memory.sqlite_store import SQLiteStore
 from harness.tui import (
     build_tui_dashboard,
     build_tui_panes,
+    build_tui_view_model,
     build_command_palette,
     build_command_palette_panes,
     filter_command_palette,
@@ -451,6 +452,69 @@ def test_tui_command_palette_panes_show_copy_only_command_details() -> None:
     assert "No matching command template." in missing_panes[-1]["lines"]
 
     serialized = json.dumps({"panes": panes, "missing": missing_panes})
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
+
+
+def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
+    palette = build_command_palette()
+    filtered = filter_tui_panes(panes, "")
+    filtered_palette = filter_command_palette(palette, "")
+    view = build_tui_view_model(filtered, filtered_palette)
+
+    assert view["schema_version"] == "harness.tui_view/v1"
+    assert [section["id"] for section in view["sections"]] == [
+        "project_overview",
+        "queue_daemon",
+        "agents_specs",
+        "runtime_evidence",
+        "command_palette",
+        "safety",
+    ]
+    assert view["sections"][0]["pane_ids"] == ["overview", "guidance", "commands"]
+    assert view["sections"][1]["pane_ids"] == ["tasks", "leases", "daemon"]
+    assert view["sections"][4]["pane_ids"][0] == "command_palette"
+    assert view["sections"][4]["pane_ids"][-1] == "command_palette_selected"
+    assert view["pane_order"][:6] == ["overview", "guidance", "commands", "tasks", "leases", "daemon"]
+    assert view["pane_order"][-1] == "safety"
+    assert view["empty_state"] is None
+    assert view["search"]["dashboard_panes"] == len(panes)
+    assert view["search"]["palette_matches"] == len(palette["entries"])
+    assert {hint["key"] for hint in view["navigation_hints"]} == {
+        "/",
+        "escape",
+        "tab",
+        "shift+tab",
+        "q",
+        "copy-only",
+    }
+
+    missing_view = build_tui_view_model(
+        filter_tui_panes(panes, "does-not-exist"),
+        filter_command_palette(palette, "does-not-exist"),
+    )
+
+    assert missing_view["sections"] == []
+    assert missing_view["panes"] == []
+    assert missing_view["pane_order"] == []
+    assert missing_view["empty_state"] == {
+        "title": "No matches",
+        "message": "No matching panes or command templates.",
+        "query": "does-not-exist",
+    }
+    assert missing_view["search"] == {
+        "dashboard_matches": 0,
+        "dashboard_panes": 0,
+        "palette_matches": 0,
+        "palette_groups": 0,
+    }
+
+    serialized = json.dumps({"view": view, "missing": missing_view})
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized

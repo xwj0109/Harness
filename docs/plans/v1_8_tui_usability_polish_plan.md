@@ -1,6 +1,6 @@
 # v1.8 TUI Usability Polish Plan
 
-Status: Planned.
+Status: Slice 1 in progress.
 
 ## Summary
 
@@ -82,6 +82,8 @@ v1.8 should reduce operator friction without changing the safety model. The poli
 - Add a Textual-free helper that combines dashboard panes and command palette panes into sectioned, ordered view metadata.
 - Keep pane ids stable and deterministic.
 - Add tests for section membership, pane ordering, no-match behavior, and sanitized output.
+
+Implementation note: Slice 1 adds `build_tui_view_model()` as a Textual-free helper that combines filtered dashboard panes and filtered command palette panes into deterministic sections, pane order metadata, navigation hints, search counts, and explicit no-match state. The helper is read-only and in-memory only.
 
 ### Slice 2: Textual Presentation Polish
 
