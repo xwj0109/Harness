@@ -8,6 +8,7 @@ import pytest
 
 from harness.approvals import ApprovalProfile, ApprovalStore
 from harness.backends.codex_cli import CodexCliBackend, CodexRunResult, NETWORK_NOT_ENFORCEABLE
+from harness.chat import ChatSessionState, handle_chat_input
 from harness.codex_edit_runner import ApplyBackDecision, CodexCodeEditRunner
 from harness.config import default_config, write_default_config
 from harness.execution import execute_lease
@@ -384,6 +385,38 @@ def test_codex_isolated_adapter_denied_apply_back_succeeds_without_mutation(tmp_
     assert result.attempt.status.value == "succeeded"
     assert (tmp_path / "app.py").read_bytes() == before
     assert result.adapter_result["apply_back_decision"] == "denied"
+
+
+def test_chat_orchestrated_codex_flow_uses_registered_adapter_with_denied_apply_back(tmp_path, monkeypatch) -> None:
+    init_clean_project(tmp_path)
+    before = (tmp_path / "app.py").read_bytes()
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    write_default_config(tmp_path)
+    ApprovalStore(tmp_path).add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=["codex_code_edit"],
+        duration_days=1,
+    )
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakeEditBackend)
+    state = ChatSessionState()
+
+    draft = handle_chat_input("fix the failing test with Codex", tmp_path, state)
+    result = handle_chat_input("yes", tmp_path, state)
+
+    assert draft["kind"] == "orchestration_draft"
+    assert result["kind"] == "orchestration_result"
+    assert result["ok"] is True
+    assert len(store.list_objectives()) == 1
+    assert len(store.list_tasks(objective_id=state.latest_objective_id)) == 4
+    assert [item["decision"] for item in result["orchestration"]["results"]] == [
+        "codex_isolated_edit_completed_denied",
+        "codex_isolated_edit_completed_denied",
+        "codex_isolated_edit_completed_denied",
+        "codex_isolated_edit_completed_denied",
+    ]
+    assert (tmp_path / "app.py").read_bytes() == before
 
 
 def test_codex_isolated_adapter_rejects_requires_hosted_boundary_metadata(tmp_path) -> None:

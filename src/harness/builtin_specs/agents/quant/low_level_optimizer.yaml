@@ -1,7 +1,7 @@
 id: low_level_optimizer
 kind: specialist
 role: Draft optimization notes for local research code without mutating active repositories.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 parent: quant_development

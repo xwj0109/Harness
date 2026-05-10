@@ -35,6 +35,7 @@ NETWORK_NOT_ENFORCEABLE = "network isolation is not enforceable by the harness f
 DANGEROUS_CODEX_FLAGS = {"--dangerously-bypass-approvals-and-sandbox", "--yolo"}
 SANDBOX_FLAG = "--sandbox"
 DANGER_FULL_ACCESS = "danger-full-access"
+ALLOWED_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh"}
 
 
 @dataclass
@@ -135,6 +136,7 @@ class CodexCliBackend:
         model = self.config.settings.get("model")
         if model and capabilities.supports_model_arg:
             command.extend(["--model", str(model)])
+        command.extend(self._reasoning_effort_args())
         command.extend(["--sandbox", "read-only"])
         if final_message_path and capabilities.supports_output_last_message:
             command.extend(["--output-last-message", str(final_message_path)])
@@ -194,6 +196,7 @@ class CodexCliBackend:
         model = self.config.settings.get("model")
         if model and capabilities.supports_model_arg:
             command.extend(["--model", str(model)])
+        command.extend(self._reasoning_effort_args())
         if capabilities.supports_json_events:
             command.append("--json")
         if final_message_path and capabilities.supports_output_last_message:
@@ -269,6 +272,15 @@ class CodexCliBackend:
 
     def _run_help(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, text=True, capture_output=True, timeout=15, env=_codex_env())
+
+    def _reasoning_effort_args(self) -> list[str]:
+        effort = self.config.settings.get("model_reasoning_effort")
+        if effort is None:
+            return []
+        effort_value = str(effort)
+        if effort_value not in ALLOWED_REASONING_EFFORTS:
+            raise CodexDangerousFlagError(f"Unsupported Codex reasoning effort: {effort_value}")
+        return ["-c", f'model_reasoning_effort="{effort_value}"']
 
 
 def _parse_jsonl_events(stdout: str) -> list[dict[str, Any]]:

@@ -1,7 +1,7 @@
 id: volatility_researcher
 kind: specialist
 role: Draft volatility research notes and risk context without trading actions.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 parent: quant_research

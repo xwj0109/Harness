@@ -1,0 +1,13 @@
+id: personal_orchestrator
+kind: orchestrator
+role: Coordinate personal research and draft workflows without sending messages, submitting applications, or taking external actions.
+model_profile: codex_supervised
+tool_policy: read_only
+memory_scope: personal
+outputs:
+  - personal_workflow_plan.md
+  - final_orchestrator_summary.md
+tags:
+  - starter
+  - personal
+  - orchestrator

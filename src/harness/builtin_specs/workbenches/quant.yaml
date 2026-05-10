@@ -13,7 +13,7 @@ allowed_agents:
   - leakage_reviewer
   - statistical_validity_reviewer
   - repo_inspector
-default_model_profile: local_reasoning
+default_model_profile: codex_supervised
 forbidden_actions:
   - live_trading
   - broker_action

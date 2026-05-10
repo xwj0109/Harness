@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 
 from harness.approvals import ApprovalStore
 from harness.backends.codex_cli import CodexRunResult
+from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
 from harness.config import default_config
 from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
 from harness.cli.main import app
@@ -20,7 +21,8 @@ from harness.tui import (
     build_chat_welcome_message,
     build_command_palette,
     build_command_palette_panes,
-    create_read_only_tui_app,
+    build_right_panel_model,
+    create_harness_app,
     build_slash_commands,
     handle_slash_command,
     filter_command_palette,
@@ -30,6 +32,8 @@ from harness.tui import (
     render_dashboard_text,
     render_filter_status,
     render_palette_status,
+    render_right_panel,
+    render_right_panel_status,
     render_view_status,
 )
 
@@ -105,21 +109,184 @@ def test_cli_home_text_output_is_sectioned_and_non_mutating(tmp_path) -> None:
     assert not (tmp_path / ".harness").exists()
 
 
-def test_cli_tui_missing_optional_dependency_returns_hint_without_mutation(tmp_path, monkeypatch) -> None:
+def test_cli_root_launches_unified_app(tmp_path, monkeypatch) -> None:
+    launched = {}
+
+    def fake_run(project_root):
+        launched["project_root"] = str(project_root)
+
+    monkeypatch.setattr("harness.cli.main._run_unified_app", fake_run)
+
+    result = runner.invoke(app, ["--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert launched["project_root"] == str(tmp_path)
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_root_plain_runs_line_chat(tmp_path) -> None:
+    result = runner.invoke(app, ["--project", str(tmp_path), "--plain"], input="/orchestrators\n/quit\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Harness chat" in result.output
+    assert "Orchestrators" in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_root_codex_like_plain_starts_action_mode(tmp_path) -> None:
+    result = runner.invoke(app, ["--project", str(tmp_path), "--plain", "--codex-like"], input="/mode\n/quit\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Mode: codex-like" in result.output
+    assert "Current mode: codex-like" in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_root_missing_textual_returns_repair_hint_without_mutation(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr("harness.cli.main._has_textual", lambda: False)
 
-    result = runner.invoke(app, ["tui", "--project", str(tmp_path), "--output", "json"])
+    result = runner.invoke(app, ["--project", str(tmp_path)])
 
     assert result.exit_code == 1
+    assert "Textual is not installed." in result.output
+    assert "Install Harness with its default dependencies" in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_root_help_keeps_chat_and_tui_as_hidden_aliases() -> None:
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "Local-first agent harness" in result.output
+    assert "│ chat" not in result.output
+    assert "│ tui " not in result.output
+    assert "daemon" in result.output
+    assert "tasks" in result.output
+
+
+def test_cli_chat_json_reports_context_without_backend_preflight(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("chat context must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("chat context must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("chat context must not touch Docker")),
+    )
+
+    result = runner.invoke(app, ["--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload == {
-        "schema_version": "harness.tui/v1",
-        "ok": False,
-        "errors": ["Textual is not installed."],
-        "install_hint": 'Install the TUI extra with: python3 -m pip install "agent-harness[tui]"',
-        "project_root": str(tmp_path),
+    assert payload["schema_version"] == "harness.chat/v1"
+    assert payload["ok"] is True
+    assert payload["initialized"] is False
+    assert {adapter["id"] for adapter in payload["registered_adapters"]} >= {
+        "dry_run",
+        "read_only_summary",
+        "codex_isolated_edit",
     }
     assert not (tmp_path / ".harness").exists()
+
+
+def test_chat_slash_commands_and_plain_text_guidance_without_backend(tmp_path, monkeypatch) -> None:
+    def fail_backend(*args, **kwargs):
+        raise AssertionError("chat guidance must not construct a backend")
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", fail_backend)
+    help_response = handle_chat_input("/help", tmp_path, ChatSessionState())
+    plain_response = handle_chat_input("hello model", tmp_path, ChatSessionState())
+
+    assert help_response["schema_version"] == "harness.chat_response/v1"
+    assert help_response["ok"] is True
+    assert "/tasks" in "\n".join(help_response["lines"])
+    assert plain_response["ok"] is True
+    assert plain_response["kind"] == "deterministic_guidance"
+    assert "I do not call Codex, Docker, shell, providers, or model backends directly from chat." in plain_response["lines"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_chat_interactive_smoke_exits_without_mutation(tmp_path) -> None:
+    result = runner.invoke(app, ["--project", str(tmp_path), "--plain"], input="/help\nshow tasks\n/quit\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Harness chat" in result.output
+    assert "Commands" in result.output
+    assert "Goodbye" in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_chat_plain_text_replies_with_deterministic_guidance(tmp_path) -> None:
+    result = runner.invoke(app, ["--project", str(tmp_path), "--plain"], input="hello\n/quit\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Harness: Harness Guidance" in result.output
+    assert "I can inspect local Harness state and prepare explicit actions." in result.output
+    assert "Intent Routing Disabled" not in result.output
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_chat_handles_incomplete_sqlite_without_traceback(tmp_path) -> None:
+    harness_dir = tmp_path / ".harness"
+    harness_dir.mkdir()
+    sqlite3.connect(harness_dir / "harness.sqlite").close()
+
+    json_result = runner.invoke(app, ["--project", str(tmp_path), "--output", "json"])
+    text_result = runner.invoke(app, ["--project", str(tmp_path), "--plain"], input="/tasks\n/quit\n")
+
+    assert json_result.exit_code == 0, json_result.output
+    payload = json.loads(json_result.output)
+    assert payload["schema_version"] == "harness.chat/v1"
+    assert payload["initialized"] is False
+    assert text_result.exit_code == 0, text_result.output
+    assert "Project Not Initialized" in text_result.output
+    assert "Traceback" not in text_result.output
+
+
+def test_chat_init_command_initializes_project_in_app(tmp_path) -> None:
+    state = ChatSessionState()
+
+    initialized = handle_chat_input("/init", tmp_path, state)
+    initialized_again = handle_chat_input("initialize this project", tmp_path, state)
+
+    assert initialized["kind"] == "project_initialized"
+    assert initialized["ok"] is True
+    assert initialized["already_initialized"] is False
+    assert initialized_again["kind"] == "project_initialized"
+    assert initialized_again["already_initialized"] is True
+    assert (tmp_path / ".harness" / "config.yaml").exists()
+    assert (tmp_path / ".harness" / "harness.sqlite").exists()
+    assert (tmp_path / ".harness" / "approvals.yaml").exists()
+    assert (tmp_path / ".gitignore").read_text(encoding="utf-8").count(".harness/harness.sqlite") == 1
+
+
+def test_chat_read_only_intent_routing() -> None:
+    assert route_chat_intent("show tasks")["intent"] == "show_tasks"
+    assert route_chat_intent("what adapters are available?")["intent"] == "show_adapters"
+    assert route_chat_intent("what is blocked?")["intent"] == "show_blocked"
+    assert route_chat_intent("what should I do next?")["intent"] == "recommend_next"
+    assert route_chat_intent("what is the current project state?")["intent"] == "show_status"
+    assert route_chat_intent("summarize this repo")["intent"] == "draft_read_only_summary"
+    assert route_chat_intent("initialize this project")["intent"] == "init_project"
+
+
+def test_chat_next_recommendation_uses_local_state(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(title="Ready task", metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"})
+    state = ChatSessionState()
+
+    response = handle_chat_input("what should I do next?", tmp_path, state)
+
+    assert response["kind"] == "next_recommendation"
+    assert response["ok"] is True
+    assert response["recommendation"]["id"] == "lease_ready_task"
+    assert task.id in "\n".join(response["lines"])
+    assert "harness daemon run-once" in "\n".join(response["lines"])
 
 
 def test_cli_tui_json_probe_does_not_launch_or_mutate(tmp_path, monkeypatch) -> None:
@@ -129,14 +296,11 @@ def test_cli_tui_json_probe_does_not_launch_or_mutate(tmp_path, monkeypatch) -> 
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
-    assert payload == {
-        "schema_version": "harness.tui/v1",
-        "ok": True,
-        "project_root": str(tmp_path),
-        "textual_available": True,
-        "mode": "read_only",
-        "launched": False,
-    }
+    assert payload["schema_version"] == "harness.tui/v1"
+    assert payload["ok"] is True
+    assert payload["project_root"] == str(tmp_path)
+    assert payload["mode"] == "unified_app"
+    assert payload["launched"] is False
     assert not (tmp_path / ".harness").exists()
 
 
@@ -664,6 +828,67 @@ def test_tui_view_model_supports_in_memory_section_collapse(tmp_path) -> None:
     assert "artifact contents" not in serialized
 
 
+def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+
+    model = build_right_panel_model(
+        dashboard,
+        {
+            "palette": palette,
+            "active_section_index": 0,
+            "collapsed_section_ids": set(),
+            "active_orchestrator": "coding_orchestrator",
+            "chat_mode": "normal",
+        },
+        "",
+        "dashboard",
+    )
+    rendered = render_right_panel(model)
+
+    assert model["schema_version"] == "harness.tui_right_panel/v1"
+    assert [section["id"] for section in model["sections"]] == [
+        "project",
+        "now",
+        "queue",
+        "recent",
+        "adapters",
+        "next",
+    ]
+    assert model["active_section_id"] == "project"
+    assert model["summary"]["initialized"] is False
+    assert "/init" in rendered
+    assert "summarize this repo" in rendered
+    assert "State:" not in rendered
+    assert "Panes:" not in rendered
+    assert "IDs:" not in rendered
+    assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" not in rendered
+    assert "no_openai_api_usage" not in rendered
+    assert render_right_panel_status(model) == "Context | project | ready"
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+
+    task_search = build_right_panel_model(dashboard, {"palette": palette}, "tasks", "dashboard")
+    palette_focus = build_right_panel_model(dashboard, {"palette": palette}, "execute-read-only", "palette")
+    missing = build_right_panel_model(dashboard, {"palette": palette}, "does-not-exist", "dashboard")
+
+    assert [section["id"] for section in task_search["sections"]] == ["queue", "commands"]
+    assert "Queue" in render_right_panel(task_search)
+    assert "harness tasks list --project ." in render_right_panel(task_search)
+    assert palette_focus["mode"] == "palette"
+    assert "project" in [section["id"] for section in palette_focus["sections"]]
+    assert palette_focus["sections"][-1]["id"] == "commands"
+    assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in render_right_panel(palette_focus)
+    assert render_right_panel_status(palette_focus).startswith("Context | palette | 1 commands")
+    assert missing["empty_state"]["message"] == "No matches. Try /help, tasks, runs, adapters."
+    assert render_right_panel(missing) == "No matches. Try /help, tasks, runs, adapters."
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_tui_palette_focus_filters_palette_without_hiding_dashboard(tmp_path) -> None:
     dashboard = build_tui_dashboard(tmp_path)
     panes = build_tui_panes(dashboard)
@@ -713,7 +938,7 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
     from textual.widgets import Input
 
     async def run_pilot() -> None:
-        app = create_read_only_tui_app(tmp_path)
+        app = create_harness_app(tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:
             prompt = app.query_one("#prompt", Input)
             assert app.use_command_palette is False
@@ -751,11 +976,21 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
 
             await pilot.press("c")
             await pilot.pause()
-            assert app._collapsed_section_ids == {"project_overview"}
-
-            await pilot.press("c")
-            await pilot.pause()
+            assert prompt.value == "c"
             assert app._collapsed_section_ids == set()
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert prompt.value == ""
+
+            await pilot.press("c", "o", "d", "e", "x")
+            await pilot.pause()
+            assert prompt.value == "codex"
+            assert app._collapsed_section_ids == set()
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert prompt.value == ""
 
             await pilot.press("e", "x", "e", "c")
             await pilot.pause()
@@ -768,14 +1003,29 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             app._collapsed_section_ids.add("queue_daemon")
             await pilot.press("C")
             await pilot.pause()
-            assert app._collapsed_section_ids == set()
+            assert app._collapsed_section_ids == {"queue_daemon"}
+            assert prompt.value == "C"
+
+            await pilot.press("escape")
+            await pilot.pause()
             assert prompt.value == ""
 
             app._collapsed_section_ids.add("queue_daemon")
             await pilot.press("shift+c")
             await pilot.pause()
-            assert app._collapsed_section_ids == set()
+            assert app._collapsed_section_ids == {"queue_daemon"}
             assert prompt.value == ""
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert prompt.value == ""
+
+            await pilot.press("/", "o", "r", "c", "h", "e", "s", "t", "r", "a", "t", "o", "r", "s")
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = "\n".join(render_chat_message(message) for message in app._messages)
+            assert "Orchestrators" in rendered
+            assert "coding_orchestrator" in rendered
 
     asyncio.run(run_pilot())
 
@@ -2476,33 +2726,244 @@ def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> Non
     assert event.metadata["reason_code"] == "unknown_adapter"
 
 
+def test_chat_task_draft_confirm_and_decline_flows(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+
+    draft = handle_chat_input("create dry run task", tmp_path, state)
+    assert draft["kind"] == "task_draft"
+    assert draft["draft"]["execution_adapter"] == "dry_run"
+    assert SQLiteStore(tmp_path).list_tasks() == []
+
+    created = handle_chat_input("yes", tmp_path, state)
+    assert created["kind"] == "task_created"
+    assert len(SQLiteStore(tmp_path).list_tasks()) == 1
+    assert SQLiteStore(tmp_path).list_tasks()[0].metadata == {
+        "execution_adapter": "dry_run",
+        "task_type": "phase_1a_test",
+    }
+
+    read_only_draft = handle_chat_input("read only summary", tmp_path, state)
+    assert read_only_draft["draft"]["execution_adapter"] == "read_only_summary"
+    declined = handle_chat_input("no", tmp_path, state)
+    assert declined["kind"] == "declined"
+    assert len(SQLiteStore(tmp_path).list_tasks()) == 1
+
+    codex_draft = handle_chat_input("fix this bug with Codex", tmp_path, state)
+    assert codex_draft["kind"] == "orchestration_draft"
+    assert codex_draft["draft"]["tasks"][0]["execution_adapter"] == "codex_isolated_edit"
+    assert "Hosted-boundary approval is not apply-back approval." in codex_draft["draft"]["safety_notes"]
+
+
+def test_chat_dry_run_end_to_end_dispatch_flow(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+
+    handle_chat_input("create dry run task", tmp_path, state)
+    created = handle_chat_input("/confirm", tmp_path, state)
+    leased = handle_chat_input("lease the next task", tmp_path, state)
+    inspected = handle_chat_input("inspect the lease", tmp_path, state)
+    prepared = handle_chat_input("run the registered adapter", tmp_path, state)
+    executed = handle_chat_input("yes", tmp_path, state)
+
+    assert created["kind"] == "task_created"
+    assert leased["kind"] == "lease_acquired"
+    assert inspected["kind"] == "lease_inspection"
+    assert prepared["kind"] == "execute_confirmation_required"
+    assert executed["kind"] == "execute_result"
+    assert executed["ok"] is True
+    assert executed["result"]["decision"] == "dry_run_no_tool_execution"
+    assert executed["result"]["task"]["status"] == "succeeded"
+    assert executed["result"]["lease"]["status"] == "released"
+    assert state.latest_run_id == executed["result"]["run"]["id"]
+    assert any(line.startswith("adapter decision") for line in state.progress)
+
+
+def test_chat_codex_like_dry_run_confirmation_runs_foreground(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState(codex_like_mode=True)
+
+    draft = handle_chat_input("create dry run task", tmp_path, state)
+    executed = handle_chat_input("yes", tmp_path, state)
+
+    assert draft["kind"] == "task_draft"
+    assert "create this task and run it" in "\n".join(draft["lines"])
+    assert executed["kind"] == "codex_like_task_result"
+    assert executed["ok"] is True
+    assert executed["execution"]["decision"] == "dry_run_no_tool_execution"
+    store = SQLiteStore(tmp_path)
+    assert len(store.list_tasks()) == 1
+    assert len(store.list_runs()) == 1
+
+
+def test_chat_codex_like_read_only_missing_approval_prompts_in_app_recovery(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState(codex_like_mode=True)
+
+    draft = handle_chat_input("summarize this repo", tmp_path, state)
+    rejected = handle_chat_input("yes", tmp_path, state)
+    pending_approval = state.pending_hosted_approval
+    approval = handle_chat_input("yes", tmp_path, state)
+
+    rendered = "\n".join(rejected["lines"])
+    assert draft["kind"] == "task_draft"
+    assert draft["draft"]["execution_adapter"] == "read_only_summary"
+    assert rejected["kind"] == "codex_like_task_result"
+    assert rejected["ok"] is False
+    assert rejected["execution"]["decision"] == "execution_adapter_rejected"
+    assert rejected["execution"]["run"] is None
+    assert pending_approval is True
+    assert "Hosted-boundary approval is required before Codex run creation." in rendered
+    assert approval["kind"] == "hosted_approval_created"
+    assert ApprovalStore(tmp_path).find_valid("codex_cli", "hosted_provider", "read_only_repo_summary") is not None
+    assert ApprovalStore(tmp_path).find_valid("codex_cli", "hosted_provider", "codex_code_edit") is not None
+    assert SQLiteStore(tmp_path).list_runs() == []
+
+
+def test_chat_unknown_adapter_fail_closed_without_run(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(title="Unknown", metadata={"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"})
+    leased = store.select_next_task_for_lease(owner="chat-test")
+    assert leased is not None
+    state = ChatSessionState(latest_lease_id=leased["lease"].id)
+
+    prepared = handle_chat_input("run the registered adapter", tmp_path, state)
+
+    assert prepared["kind"] == "execute_ineligible"
+    assert prepared["ok"] is False
+    assert store.list_runs() == []
+
+
+def test_chat_duplicate_execute_is_rejected(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+    handle_chat_input("create dry run task", tmp_path, state)
+    handle_chat_input("yes", tmp_path, state)
+    handle_chat_input("lease the next task", tmp_path, state)
+    handle_chat_input("run the registered adapter", tmp_path, state)
+    first = handle_chat_input("yes", tmp_path, state)
+    assert first["ok"] is True
+
+    state.pending_execute_lease_id = state.latest_lease_id
+    duplicate = handle_chat_input("yes", tmp_path, state)
+
+    assert duplicate["ok"] is False
+    assert duplicate["result"]["decision"] == "execution_adapter_rejected"
+    assert duplicate["result"]["run"] is None
+    assert len(SQLiteStore(tmp_path).list_runs()) == 1
+
+
+def test_chat_codex_missing_hosted_approval_rejects_before_run(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+
+    draft = handle_chat_input("fix this bug with Codex", tmp_path, state)
+    rejected = handle_chat_input("yes", tmp_path, state)
+
+    rendered = "\n".join(rejected["lines"])
+    assert draft["kind"] == "orchestration_draft"
+    assert draft["draft"]["orchestrator_id"] == "coding_orchestrator"
+    assert draft["draft"]["tasks"][0]["execution_adapter"] == "codex_isolated_edit"
+    assert rejected["ok"] is False
+    assert rejected["kind"] == "orchestration_result"
+    assert rejected["orchestration"]["results"][0]["decision"] == "codex_isolated_edit_blocked_policy"
+    assert rejected["orchestration"]["results"][0]["run"] is None
+    assert state.pending_hosted_approval is True
+    assert "Hosted-boundary approval is not apply-back approval." in rendered
+    assert "sk-test-secret" not in json.dumps(rejected)
+    assert SQLiteStore(tmp_path).list_runs() == []
+
+
+def test_chat_orchestrator_slash_commands_are_session_local(tmp_path) -> None:
+    state = ChatSessionState()
+
+    listed = handle_chat_input("/orchestrators", tmp_path, state)
+    selected = handle_chat_input("/use quant_orchestrator", tmp_path, state)
+    agents = handle_chat_input("/agents", tmp_path, state)
+    dashboard = handle_chat_input("/dashboard", tmp_path, state)
+
+    assert listed["kind"] == "orchestrators"
+    assert {"coding_orchestrator", "personal_orchestrator", "quant_orchestrator"} <= {
+        item["id"] for item in listed["orchestrators"]
+    }
+    assert selected["ok"] is True
+    assert state.selected_orchestrator_id == "quant_orchestrator"
+    assert agents["workbench_id"] == "quant"
+    assert dashboard["kind"] == "status"
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_chat_orchestration_decline_creates_no_graph(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+
+    draft = handle_chat_input("fix the failing test with Codex", tmp_path, state)
+    declined = handle_chat_input("no", tmp_path, state)
+
+    assert draft["kind"] == "orchestration_draft"
+    assert declined["kind"] == "declined"
+    store = SQLiteStore(tmp_path)
+    assert store.list_objectives() == []
+    assert store.list_tasks() == []
+
+
+def test_chat_session_reset_clears_references_without_history_file(tmp_path) -> None:
+    state = ChatSessionState(latest_task_id="task_demo", latest_lease_id="lease_demo", latest_run_id="run_demo")
+    state.transcript.append({"role": "user", "content": "show tasks"})
+    state.progress.append("task created: task_demo")
+
+    reset = handle_chat_input("/reset", tmp_path, state)
+
+    assert reset["kind"] == "reset"
+    assert state.latest_task_id is None
+    assert state.latest_lease_id is None
+    assert state.latest_run_id is None
+    assert state.transcript == []
+    assert state.progress == []
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     (tmp_path / "README.md").write_text("# Demo\n", encoding="utf-8")
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
     class FakeBackend:
         def __init__(self, config):
             self.config = config
             self.name = config.name
-            self.responses = [
-                '{"command":"list_files","arguments":{"path":"."}}',
-                '{"command":"final_answer","arguments":{"answer":"Read-only lease summary."}}',
-            ]
 
         def preflight(self):
             return BackendStatus(
                 available=True,
                 metadata=self.config.metadata,
-                capabilities=self.config.capabilities,
+                capabilities=self.config.capabilities.model_copy(
+                    update={
+                        "supports_read_only_sandbox": True,
+                        "supports_cd": True,
+                        "supports_model_arg": True,
+                        "supports_output_last_message": True,
+                    }
+                ),
             )
 
-        def complete(self, messages):
-            return self.responses.pop(0)
+        def run_read_only(self, project_root, prompt, final_message_path):
+            final_message_path.write_text("Read-only lease summary.", encoding="utf-8")
+            return CodexRunResult(
+                command=["codex", "exec", "--cd", str(project_root), "--model", "gpt-5.5", "-c", 'model_reasoning_effort="low"', "--sandbox", "read-only", prompt],
+                stdout="",
+                stderr="",
+                exit_status=0,
+                json_events=[],
+                final_message="Read-only lease summary.",
+            )
 
-    monkeypatch.setattr("harness.daemon_adapters.LocalOpenAICompatibleBackend", FakeBackend)
+    monkeypatch.setattr("harness.daemon_adapters.CodexCliBackend", FakeBackend)
     monkeypatch.setattr(
-        "harness.cli.main.CodexCliBackend",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only adapter must not preflight Codex")),
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only adapter must not preflight local backend")),
     )
     monkeypatch.setattr(
         "harness.cli.main.DockerImageManager",
@@ -2597,6 +3058,7 @@ def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, mon
 
 def test_cli_daemon_execute_read_only_preflight_failure_leaves_lease_unchanged(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
     class UnavailableBackend:
         def __init__(self, config):
@@ -2606,12 +3068,12 @@ def test_cli_daemon_execute_read_only_preflight_failure_leaves_lease_unchanged(t
         def preflight(self):
             return BackendStatus(
                 available=False,
-                reason="local backend unavailable for test",
+                reason="codex backend unavailable for test",
                 metadata=self.config.metadata,
                 capabilities=self.config.capabilities,
             )
 
-    monkeypatch.setattr("harness.daemon_adapters.LocalOpenAICompatibleBackend", UnavailableBackend)
+    monkeypatch.setattr("harness.daemon_adapters.CodexCliBackend", UnavailableBackend)
     task_result = runner.invoke(
         app,
         [
@@ -2643,7 +3105,52 @@ def test_cli_daemon_execute_read_only_preflight_failure_leaves_lease_unchanged(t
     assert executed.exit_code == 1
     payload = json.loads(executed.output)
     assert payload["schema_version"] == "harness.daemon_execute_read_only/v1"
-    assert payload["errors"] == ["local backend unavailable for test"]
+    assert payload["errors"] == ["codex backend unavailable for test"]
+    store = SQLiteStore(tmp_path)
+    assert store.list_runs() == []
+    assert store.get_task(task_id).status.value == "leased"
+    assert store.get_task_attempt(attempt_id).status.value == "leased"
+    assert store.get_task_attempt(attempt_id).run_id is None
+    assert store.get_task_lease(lease_id).status.value == "active"
+
+
+def test_cli_daemon_execute_read_only_missing_hosted_approval_leaves_no_run(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr(
+        "harness.daemon_adapters.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("missing approval must not preflight Codex")),
+    )
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Read-only missing approval",
+            "--execution-adapter",
+            "read_only_summary",
+            "--task-type",
+            "read_only_repo_summary",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    task_id = json.loads(task_result.output)["task"]["id"]
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    lease_id = json.loads(tick.output)["lease"]["id"]
+    attempt_id = json.loads(tick.output)["attempt"]["id"]
+
+    executed = runner.invoke(
+        app,
+        ["daemon", "execute-read-only", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert executed.exit_code == 1
+    payload = json.loads(executed.output)
+    assert payload["schema_version"] == "harness.daemon_execute_read_only/v1"
+    assert payload["errors"] == ["Missing valid hosted-provider Codex approval for read_only_repo_summary."]
     store = SQLiteStore(tmp_path)
     assert store.list_runs() == []
     assert store.get_task(task_id).status.value == "leased"
@@ -2657,6 +3164,7 @@ def test_cli_daemon_execute_read_only_runner_failure_marks_terminal_without_dupl
     monkeypatch,
 ) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
     class FailingBackend:
         def __init__(self, config):
@@ -2667,13 +3175,13 @@ def test_cli_daemon_execute_read_only_runner_failure_marks_terminal_without_dupl
             return BackendStatus(
                 available=True,
                 metadata=self.config.metadata,
-                capabilities=self.config.capabilities,
+                capabilities=self.config.capabilities.model_copy(update={"supports_read_only_sandbox": True}),
             )
 
-        def complete(self, messages):
-            raise RuntimeError("model loop failed in test")
+        def run_read_only(self, project_root, prompt, final_message_path):
+            raise RuntimeError("codex read-only failed in test")
 
-    monkeypatch.setattr("harness.daemon_adapters.LocalOpenAICompatibleBackend", FailingBackend)
+    monkeypatch.setattr("harness.daemon_adapters.CodexCliBackend", FailingBackend)
     task_result = runner.invoke(
         app,
         [
@@ -2708,7 +3216,7 @@ def test_cli_daemon_execute_read_only_runner_failure_marks_terminal_without_dupl
     assert executed.exit_code == 1
     payload = json.loads(executed.output)
     assert payload["schema_version"] == "harness.daemon_execute_read_only/v1"
-    assert payload["errors"] == ["model loop failed in test"]
+    assert payload["errors"] == ["codex read-only failed in test"]
     store = SQLiteStore(tmp_path)
     runs = store.list_runs()
     assert len(runs) == 1
@@ -2725,13 +3233,12 @@ def test_cli_daemon_execute_read_only_runner_failure_marks_terminal_without_dupl
 
 def test_cli_daemon_execute_read_only_rejects_unsafe_backend_descriptor(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
     cfg = default_config()
-    cfg.backends["local_openai_compatible"].metadata.billing_mode = BillingMode.PAID_API
-    cfg.backends["local_openai_compatible"].metadata.execution_location = ExecutionLocation.HOSTED
-    cfg.backends["local_openai_compatible"].metadata.data_boundary = DataBoundary.HOSTED_PROVIDER
+    cfg.backends["codex_cli"].metadata.billing_mode = BillingMode.PAID_API
     monkeypatch.setattr("harness.daemon_adapters.load_config", lambda _project_root: cfg)
     monkeypatch.setattr(
-        "harness.daemon_adapters.LocalOpenAICompatibleBackend",
+        "harness.daemon_adapters.CodexCliBackend",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsafe backend must not instantiate")),
     )
     task_result = runner.invoke(
@@ -2762,7 +3269,7 @@ def test_cli_daemon_execute_read_only_rejects_unsafe_backend_descriptor(tmp_path
     assert task_result.exit_code == 0
     assert executed.exit_code == 1
     payload = json.loads(executed.output)
-    assert payload["errors"] == ["Read-only execution requires local_no_api_cost backend"]
+    assert payload["errors"] == ["Read-only execution requires subscription codex_cli backend"]
     assert SQLiteStore(tmp_path).list_runs() == []
 
 
@@ -3085,6 +3592,58 @@ def test_cli_doctor_supports_json_output_without_sensitive_backend_settings(tmp_
     assert "api_key_env" not in serialized
 
 
+def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(title="Waiting", required_approvals=["hosted_provider"])
+    store.create_run(goal="failed", task_type="phase_1a_test", status="failed")
+
+    def fail_preflight(*args, **kwargs):
+        raise AssertionError("release diagnostics must not preflight backends")
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", fail_preflight)
+    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", fail_preflight)
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    result = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.doctor/v1"
+    assert payload["mode"] == "release"
+    assert payload["version"] == "1.5.0"
+    checks = {check["id"]: check for check in payload["checks"]}
+    assert checks["codex_cli_metadata"]["details"]["preflight_performed"] is False
+    assert checks["docker_metadata"]["details"]["version_check_performed"] is False
+    assert {adapter["id"] for adapter in checks["registered_adapters"]["details"]["adapters"]} >= {
+        "dry_run",
+        "read_only_summary",
+        "codex_isolated_edit",
+    }
+    runtime = checks["release_runtime_state"]["details"]
+    assert runtime["blocked_or_waiting_tasks"][0]["title"] == "Waiting"
+    assert runtime["latest_failed_run"]["status"] == "failed"
+    serialized = json.dumps(payload)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
+def test_cli_doctor_release_uninitialized_is_non_mutating_warning(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+
+    result = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["mode"] == "release"
+    checks = {check["id"]: check for check in payload["checks"]}
+    assert checks["initialized"]["status"] == "warn"
+    assert checks["config_loadable"]["status"] == "warn"
+    assert checks["release_runtime_state"]["details"]["initialized"] is False
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_cli_policy_explain_supports_runtime_subjects_without_preflight_or_settings(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
@@ -3219,7 +3778,7 @@ def test_cli_specs_agent_supports_json_output() -> None:
     assert payload["schema_version"] == "harness.agent_spec/v1"
     assert payload["agent"]["id"] == "repo_inspector"
     assert payload["agent"]["kind"] == "specialist"
-    assert payload["agent"]["model_profile"] == "local_reasoning"
+    assert payload["agent"]["model_profile"] == "codex_supervised"
     assert payload["agent"]["tool_policy"] == "read_only"
     assert payload["agent"]["memory_scope"] == "project"
 
@@ -3231,8 +3790,8 @@ def test_cli_specs_workbench_supports_json_output() -> None:
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.workbench_spec/v1"
     assert payload["workbench"]["id"] == "coding"
-    assert payload["workbench"]["default_model_profile"] == "local_reasoning"
-    assert {"repo_inspector", "code_editor", "test_runner"} <= set(payload["workbench"]["allowed_agents"])
+    assert payload["workbench"]["default_model_profile"] == "codex_supervised"
+    assert {"coding_orchestrator", "repo_inspector", "code_editor", "test_runner"} <= set(payload["workbench"]["allowed_agents"])
 
 
 def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runtime_leaks(tmp_path) -> None:
@@ -3274,7 +3833,7 @@ def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runti
         assert agent_payload["schema_version"] == "harness.agent_spec/v1"
         agent = agent_payload["agent"]
         assert agent["id"] == agent_id
-        assert agent["model_profile"] == "local_reasoning"
+        assert agent["model_profile"] == "codex_supervised"
         assert agent["tool_policy"] == "read_only"
         assert agent["memory_scope"] == "quant"
 
@@ -3321,7 +3880,7 @@ def test_cli_specs_default_outputs_remain_text() -> None:
     assert workbench.exit_code == 0
     assert not workbench.output.lstrip().startswith("{")
     assert "Workbench: coding" in workbench.output
-    assert "Allowed agents: repo_inspector, code_editor, test_runner" in workbench.output
+    assert "Allowed agents: coding_orchestrator, repo_inspector, code_editor, test_runner" in workbench.output
 
 
 def test_cli_specs_missing_ids_fail_without_creating_harness_dir(tmp_path) -> None:
@@ -3513,30 +4072,41 @@ def test_cli_specs_validate_unsupported_schema_version_supports_json_error(tmp_p
     assert not (tmp_path / ".harness").exists()
 
 
-def test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monkeypatch) -> None:
+def test_cli_run_read_only_repo_summary_with_mocked_codex_backend(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
     class FakeBackend:
         def __init__(self, config):
             self.config = config
             self.name = config.name
-            self.base_url = str(config.settings["base_url"]).rstrip("/")
-            self.responses = [
-                '{"command":"list_files","arguments":{"path":"."}}',
-                '{"command":"final_answer","arguments":{"answer":"Local summary."}}',
-            ]
 
         def preflight(self):
             return BackendStatus(
                 available=True,
                 metadata=self.config.metadata,
-                capabilities=self.config.capabilities,
+                capabilities=self.config.capabilities.model_copy(
+                    update={
+                        "supports_read_only_sandbox": True,
+                        "supports_cd": True,
+                        "supports_model_arg": True,
+                        "supports_output_last_message": True,
+                    }
+                ),
             )
 
-        def complete(self, messages):
-            return self.responses.pop(0)
+        def run_read_only(self, project_root, prompt, final_message_path):
+            final_message_path.write_text("Codex subscription summary.", encoding="utf-8")
+            return CodexRunResult(
+                command=["codex", "exec", "--cd", str(project_root), "--model", "gpt-5.5", "-c", 'model_reasoning_effort="low"', "--sandbox", "read-only", prompt],
+                stdout="",
+                stderr="",
+                exit_status=0,
+                json_events=[],
+                final_message="Codex subscription summary.",
+            )
 
-    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeBackend)
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeBackend)
     result = runner.invoke(
         app,
         [
@@ -3550,14 +4120,18 @@ def test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monk
     )
     assert result.exit_code == 0
     assert "Created run" in result.output
-    assert "Local summary." in result.output
+    assert "Codex subscription summary." in result.output
     run_id = result.output.split("Created run ", 1)[1].splitlines()[0]
     report = tmp_path / ".harness" / "runs" / run_id / "final_report.md"
-    assert "local_openai_compatible" in report.read_text(encoding="utf-8")
+    report_text = report.read_text(encoding="utf-8")
+    assert "codex_cli" in report_text
+    assert "gpt-5.5" in report_text
+    assert "low" in report_text
 
 
-def test_cli_run_local_backend_unavailable_fails_with_guidance(tmp_path, monkeypatch) -> None:
+def test_cli_run_codex_backend_unavailable_fails_with_guidance(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
     class FakeBackend:
         def __init__(self, config):
@@ -3566,12 +4140,12 @@ def test_cli_run_local_backend_unavailable_fails_with_guidance(tmp_path, monkeyp
         def preflight(self):
             return BackendStatus(
                 available=False,
-                reason="Local OpenAI-compatible endpoint is unavailable. Start Ollama.",
+                reason="Codex CLI is unavailable. Run codex login.",
                 metadata=self.config.metadata,
                 capabilities=self.config.capabilities,
             )
 
-    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeBackend)
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeBackend)
     result = runner.invoke(
         app,
         [
@@ -3584,35 +4158,48 @@ def test_cli_run_local_backend_unavailable_fails_with_guidance(tmp_path, monkeyp
         ],
     )
     assert result.exit_code != 0
-    assert "Local OpenAI-compatible endpoint is unavailable" in result.output
+    assert "Codex CLI is unavailable" in result.output
 
 
-def test_cli_run_does_not_execute_codex_or_paid_fallback(tmp_path, monkeypatch) -> None:
+def test_cli_run_read_only_uses_codex_subscription_without_local_or_paid_fallback(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
-    subprocess_calls = []
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
-    def forbidden_subprocess(*args, **kwargs):
-        subprocess_calls.append(args)
-        raise AssertionError("No subprocess commands should run for final-answer-only local backend.")
-
-    class FakeBackend:
+    class FakeCodexBackend:
         def __init__(self, config):
             self.config = config
             self.name = config.name
-            self.base_url = str(config.settings["base_url"]).rstrip("/")
 
         def preflight(self):
             return BackendStatus(
                 available=True,
                 metadata=self.config.metadata,
-                capabilities=self.config.capabilities,
+                capabilities=self.config.capabilities.model_copy(
+                    update={
+                        "supports_read_only_sandbox": True,
+                        "supports_cd": True,
+                        "supports_model_arg": True,
+                        "supports_output_last_message": True,
+                    }
+                ),
             )
 
-        def complete(self, messages):
-            return '{"command":"final_answer","arguments":{"answer":"No external fallback."}}'
+        def run_read_only(self, project_root, prompt, final_message_path):
+            final_message_path.write_text("Codex subscription route.", encoding="utf-8")
+            return CodexRunResult(
+                command=["codex", "exec", "--cd", str(project_root), "--model", "gpt-5.5", "-c", 'model_reasoning_effort="low"', "--sandbox", "read-only", prompt],
+                stdout="",
+                stderr="",
+                exit_status=0,
+                json_events=[],
+                final_message="Codex subscription route.",
+            )
 
-    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeBackend)
-    monkeypatch.setattr("subprocess.run", forbidden_subprocess)
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("read-only summary must not use local backend")),
+    )
     result = runner.invoke(
         app,
         [
@@ -3625,8 +4212,7 @@ def test_cli_run_does_not_execute_codex_or_paid_fallback(tmp_path, monkeypatch) 
         ],
     )
     assert result.exit_code == 0
-    assert not subprocess_calls
-    assert "No external fallback." in result.output
+    assert "Codex subscription route." in result.output
 
 
 def test_cli_backends_preflight_reports_codex_without_paid_preflight(tmp_path, monkeypatch) -> None:
@@ -3870,8 +4456,8 @@ def test_cli_repo_planning_uses_valid_approval_profile(tmp_path, monkeypatch) ->
     assert "Plan from Codex." in report.read_text(encoding="utf-8")
 
 
-def test_existing_local_read_only_route_still_works(tmp_path, monkeypatch) -> None:
-    test_cli_run_read_only_repo_summary_with_mocked_local_backend(tmp_path, monkeypatch)
+def test_existing_read_only_route_uses_codex_subscription(tmp_path, monkeypatch) -> None:
+    test_cli_run_read_only_repo_summary_with_mocked_codex_backend(tmp_path, monkeypatch)
 
 
 def test_cli_simple_code_edit_routes_to_local_backend_only(tmp_path, monkeypatch) -> None:

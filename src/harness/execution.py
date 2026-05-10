@@ -6,7 +6,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 
 from harness.approvals import ApprovalStore
-from harness.backends.codex_cli import CodexCliBackend
+from harness.backends.codex_cli import CodexCliBackend, CodexSandboxUnavailable, CodexUnavailable
 from harness.backends.local_openai import LocalEndpointUnavailable
 from harness.codex_edit_runner import CodexCodeEditRunner
 from harness.config import load_config
@@ -120,7 +120,7 @@ class ReadOnlySummaryExecutionAdapter:
     id = READ_ONLY_EXECUTION_ADAPTER
     descriptor = ExecutionAdapterDescriptor(
         id=READ_ONLY_EXECUTION_ADAPTER,
-        description="Execute the bounded read-only repository summary adapter through the configured local-only, no-cost backend and read-only tools.",
+        description="Execute the bounded read-only repository summary adapter through the supervised Codex CLI subscription backend in read-only sandbox mode.",
         supported_task_types=[READ_ONLY_TASK_TYPE],
         required_task_metadata={"execution_adapter": READ_ONLY_EXECUTION_ADAPTER, "task_type": READ_ONLY_TASK_TYPE},
         rejected_task_metadata=[
@@ -131,19 +131,20 @@ class ReadOnlySummaryExecutionAdapter:
             "requires_paid_provider",
             "requires_hosted_boundary",
         ],
-        required_approvals=[],
+        required_approvals=["hosted_provider_codex"],
         backend_requirements=[
-            "local_openai_compatible backend",
-            "billing_mode=local_no_api_cost",
-            "execution_location=local_machine",
-            "data_boundary=local_only",
+            "codex_cli backend",
+            "billing_mode=subscription",
+            "execution_location=mixed or hosted",
+            "data_boundary=hosted_provider",
             "allow_network=false",
         ],
-        sandbox_requirements=[],
-        side_effect_summary="Writes harness run/task/lease/artifact evidence and executes read-only repository tools.",
+        sandbox_requirements=["Codex CLI --cd support", "Codex CLI read-only sandbox support"],
+        side_effect_summary="Writes harness run/task/lease/artifact evidence and runs Codex CLI in read-only sandbox mode.",
         replay_policy=ToolReplayPolicy.REQUIRES_FRESH_APPROVAL,
         safety_notes=[
             "Descriptors are documentation and validation metadata, not permission grants.",
+            "Hosted-boundary approval is validated before run creation.",
             "Execution still performs backend, policy, lease, and exact metadata checks.",
         ],
     )
@@ -480,7 +481,7 @@ def execute_lease(
     adapter = builtin_execution_adapters()[str(adapter_id)]
     try:
         return adapter.execute(project_root, lease_id, owner=owner)
-    except (KeyError, ValueError, LocalEndpointUnavailable) as exc:
+    except (KeyError, ValueError, LocalEndpointUnavailable, CodexUnavailable, CodexSandboxUnavailable) as exc:
         sanitized = str(sanitize_for_logging(str(exc)))
         refreshed_lease = store.get_task_lease(lease.id)
         refreshed_attempt = _safe_get_attempt(store, refreshed_lease.attempt_id)

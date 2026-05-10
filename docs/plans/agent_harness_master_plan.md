@@ -45,7 +45,7 @@ Implemented capabilities include:
 - Runtime EffectivePolicy evidence, manifest v1.1, artifact checksum/size evidence, tool capability descriptors, compare/baseline, safety-smoke evals, and trace export.
 - Local daemon scheduler-readiness commands with heartbeat/status/stop, lease renewal, expired lease recovery, approval/policy pause evidence, and daemon status pause reasons.
 - A dry-run lease-to-run adapter proving task attempt/run/manifest/artifact linkage without provider or tool execution.
-- A bounded read-only lease adapter that executes `read_only_repo_summary` only through the local-only `local_openai_compatible` backend and existing read-only tools.
+- A bounded read-only lease adapter that executes `read_only_repo_summary` through the supervised `codex_cli` subscription backend in read-only sandbox mode after hosted-boundary approval.
 
 This should not be treated as a throwaway prototype. It is the security and evidence substrate for the later autonomous system.
 

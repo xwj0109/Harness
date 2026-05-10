@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-harness"
-version = "1.1.0"
+version = "1.5.0"
 description = "Local-first agent harness with durable queue and control-plane evidence"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
   "pydantic>=2.7",
   "pyyaml>=6.0",
+  "textual>=0.86",
   "typer>=0.12",
 ]
 
@@ -32,9 +33,7 @@ dev = [
   "build>=1.2",
   "pytest>=8.0",
 ]
-tui = [
-  "textual>=0.86",
-]
+tui = []
 
 [project.scripts]
 harness = "harness.cli.main:app"

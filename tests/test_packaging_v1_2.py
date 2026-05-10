@@ -17,14 +17,14 @@ def test_pyproject_has_distribution_metadata_and_packaged_specs() -> None:
 
     project = pyproject["project"]
     assert project["name"] == "agent-harness"
-    assert project["version"] == "1.1.0"
+    assert project["version"] == "1.5.0"
     assert project["license"] == "MIT"
     assert project["requires-python"] == ">=3.11"
     assert project["scripts"]["harness"] == "harness.cli.main:app"
     assert "Environment :: Console" in project["classifiers"]
     assert not any(classifier.startswith("License ::") for classifier in project["classifiers"])
-    assert "textual" not in project["dependencies"]
-    assert any(dependency.startswith("textual>=") for dependency in pyproject["project"]["optional-dependencies"]["tui"])
+    assert any(dependency.startswith("textual>=") for dependency in project["dependencies"])
+    assert pyproject["project"]["optional-dependencies"]["tui"] == []
 
     package_data = pyproject["tool"]["setuptools"]["package-data"]["harness"]
     assert "builtin_specs/*.yaml" in package_data
@@ -43,12 +43,13 @@ def test_wheel_includes_packaged_specs_and_console_entrypoint(tmp_path) -> None:
         assert "harness/builtin_specs/agents/quant/profiles/commodities_researcher.default.yaml" in names
         assert "harness/builtin_specs/workbenches/quant.yaml" in names
 
-        metadata = archive.read("agent_harness-1.1.0.dist-info/METADATA").decode("utf-8")
+        metadata = archive.read("agent_harness-1.5.0.dist-info/METADATA").decode("utf-8")
         assert "Name: agent-harness" in metadata
-        assert "Version: 1.1.0" in metadata
+        assert "Version: 1.5.0" in metadata
         assert "Classifier: Environment :: Console" in metadata
+        assert "Requires-Dist: textual" in metadata
 
-        entrypoints = archive.read("agent_harness-1.1.0.dist-info/entry_points.txt").decode("utf-8")
+        entrypoints = archive.read("agent_harness-1.5.0.dist-info/entry_points.txt").decode("utf-8")
         assert "harness = harness.cli.main:app" in entrypoints
 
 
@@ -91,22 +92,17 @@ def test_installed_wheel_cli_loads_packaged_specs(tmp_path) -> None:
     assert json.loads(home_result.stdout)["schema_version"] == "harness.home/v1"
     assert not (project_dir / ".harness").exists()
 
-    tui_result = subprocess.run(
-        [str(harness), "tui", "--project", str(project_dir), "--output", "json"],
+    app_result = subprocess.run(
+        [str(harness), "--project", str(project_dir), "--output", "json"],
         text=True,
-        check=False,
+        check=True,
         capture_output=True,
     )
-    tui_payload = json.loads(tui_result.stdout)
-    assert tui_payload["schema_version"] == "harness.tui/v1"
-    if tui_result.returncode == 1:
-        assert tui_payload["ok"] is False
-        assert "agent-harness[tui]" in tui_payload["install_hint"]
-    else:
-        assert tui_result.returncode == 0
-        assert tui_payload["ok"] is True
-        assert tui_payload["mode"] == "read_only"
-        assert tui_payload["launched"] is False
+    app_payload = json.loads(app_result.stdout)
+    assert app_payload["schema_version"] == "harness.chat/v1"
+    assert app_payload["ok"] is True
+    assert app_payload["initialized"] is False
+    assert app_payload["project_root"] == str(project_dir)
     assert not (project_dir / ".harness").exists()
 
     quickstart_result = subprocess.run(

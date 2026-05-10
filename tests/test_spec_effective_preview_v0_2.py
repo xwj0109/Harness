@@ -26,7 +26,7 @@ def test_cli_specs_preview_builtin_agent_json_resolves_references(tmp_path, monk
     assert payload["source"] == {"kind": "builtin", "path": None}
     assert payload["target"] == {"kind": "agent", "id": "repo_inspector"}
     assert payload["preview"]["agent"]["id"] == "repo_inspector"
-    assert payload["preview"]["model_profile"]["id"] == "local_reasoning"
+    assert payload["preview"]["model_profile"]["id"] == "codex_supervised"
     assert payload["preview"]["tool_policy"]["active_repo_write"] == "forbidden"
     assert payload["preview"]["memory_scope"]["id"] == "project"
     assert payload["preview"]["parent"] is None
@@ -48,7 +48,7 @@ def test_cli_specs_preview_builtin_grouped_quant_agent_resolves_parent_chain(tmp
     assert preview["parent"] == "quant_research"
     assert [parent["id"] for parent in preview["parent_chain"]] == ["quant_research"]
     assert preview["effective_agent"]["parent_chain"] == ["quant_research"]
-    assert preview["effective_agent"]["model_profile"] == "local_reasoning"
+    assert preview["effective_agent"]["model_profile"] == "codex_supervised"
     assert preview["effective_agent"]["tool_policy"] == "read_only"
     assert preview["effective_agent"]["memory_scope"] == "quant"
     assert preview["effective_agent"]["tags"] == ["starter", "quant", "group", "research", "commodities"]
@@ -67,8 +67,8 @@ def test_cli_specs_preview_builtin_workbench_json_resolves_allowed_agents(tmp_pa
     assert payload["schema_version"] == "harness.spec_effective_preview/v1"
     preview = payload["preview"]
     assert preview["workbench"]["id"] == "coding"
-    assert preview["default_model_profile"]["id"] == "local_reasoning"
-    assert list(preview["allowed_agents"]) == ["code_editor", "repo_inspector", "test_runner"]
+    assert preview["default_model_profile"]["id"] == "codex_supervised"
+    assert list(preview["allowed_agents"]) == ["code_editor", "coding_orchestrator", "repo_inspector", "test_runner"]
     assert preview["allowed_agents"]["repo_inspector"]["tool_policy"]["network"] == "forbidden"
     assert preview["allowed_agents"]["repo_inspector"]["parent_chain"] == []
     assert preview["allowed_agents"]["repo_inspector"]["profiles"] == []

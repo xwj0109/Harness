@@ -1,7 +1,7 @@
 id: review
 kind: group
 role: Group defaults for methodology, leakage, and statistical-validity reviewers.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 outputs:

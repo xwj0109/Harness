@@ -1,7 +1,7 @@
 id: leakage_reviewer
 kind: reviewer
 role: Review strategy and data plans for lookahead, survivorship, and leakage risks.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 parent: review

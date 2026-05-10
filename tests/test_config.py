@@ -18,6 +18,10 @@ def test_default_config_has_exclusions_and_backends() -> None:
     assert ".harness/" in cfg.context_excludes
     assert set(DEFAULT_CONTEXT_EXCLUDES).issubset(set(cfg.context_excludes))
     assert {"codex_cli", "local_openai_compatible", "paid_openai_compatible"} <= set(cfg.backends)
+    assert cfg.backends["codex_cli"].settings["auth_mode"] == "chatgpt"
+    assert cfg.backends["codex_cli"].settings["use_subscription_credits"] is True
+    assert cfg.backends["codex_cli"].settings["model"] == "gpt-5.5"
+    assert cfg.backends["codex_cli"].settings["model_reasoning_effort"] == "low"
     assert cfg.backends["local_openai_compatible"].metadata.data_boundary == DataBoundary.LOCAL_ONLY
     assert cfg.sandbox.install_project is False
     assert cfg.sandbox.install_project_no_build_isolation is True

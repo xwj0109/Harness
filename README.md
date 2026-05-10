@@ -1,8 +1,8 @@
 # Agent Harness
 
-Local-first custom agent harness MVP.
+Local-first custom agent harness.
 
-The v1.0 MVP includes local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, and one bounded read-only execution adapter:
+The v1.5 release includes local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, a unified chat/TUI operator app, and bounded registered adapters:
 
 - CLI scaffolding.
 - `.harness/` project state.
@@ -21,11 +21,15 @@ The v1.0 MVP includes local infrastructure, declarative agent structure, manual 
 - Manual durable objectives and task queue.
 - Runtime policy, manifest, artifact, compare/baseline, eval, and trace evidence.
 - Local daemon control-plane commands.
+- Registered execution adapter dispatcher and `daemon adapters`.
+- Explicit `dry_run/phase_1a_test` evidence adapter.
 - Explicit `read_only_summary/read_only_repo_summary` lease adapter.
+- Explicit `codex_isolated_edit/codex_code_edit` adapter with hosted-boundary approval and isolated apply-back review.
+- Unified `harness` app with passive dashboard context, deterministic chat actions, in-memory transcript/progress, and `--plain` fallback.
 
 Paid API execution, hosted fallback, generic shell execution, autonomous workflows, MCP/A2A, browser/email/calendar integrations, broker actions, live trading, order placement, and active repo write automation remain outside the v1 MVP scope.
 
-Spec and agent lifecycle surfaces are inspection/control-plane commands. They do not execute agents, preflight backends, create runs, schedule work, or authorize tools. The only bounded real execution path in the MVP is the explicit read-only daemon lease adapter.
+Spec and agent lifecycle surfaces are inspection/control-plane commands. They do not execute agents, preflight backends, create runs, schedule work, or authorize tools. Bounded execution happens only through active leases and registered adapters. Chat is an operator surface over those same control-plane operations; it does not call Codex, Docker, shell, providers, or model backends directly.
 
 ## Repository Layout
 
@@ -74,9 +78,11 @@ python3 -m pip wheel --no-deps --no-build-isolation -w /tmp/harness-wheel .
 python3 -m venv --system-site-packages /tmp/harness-install
 /tmp/harness-install/bin/python -m pip install --no-deps /tmp/harness-wheel/agent_harness-*.whl
 /tmp/harness-install/bin/harness --help
+/tmp/harness-install/bin/harness --project /tmp/harness-project --output json
 /tmp/harness-install/bin/harness specs --output json
 /tmp/harness-install/bin/harness home --project /tmp/harness-project --output json
 /tmp/harness-install/bin/harness quickstart agent --project /tmp/harness-project --output json
+/tmp/harness-install/bin/harness doctor --release --project /tmp/harness-project --output json
 ```
 
 The wheel must include packaged built-in YAML specs under `harness/builtin_specs/`. The install smoke is local-only and does not preflight backends, call providers, run Docker, create tasks, acquire leases, or execute adapters.

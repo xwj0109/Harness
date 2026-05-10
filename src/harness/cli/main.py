@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import socket
 import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -33,8 +34,14 @@ from harness.backends.codex_cli import (
     CodexUnavailable,
 )
 from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAICompatibleBackend
+from harness.chat import chat_context, run_chat_loop
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
-from harness.codex_runner import HostedBoundaryApprovalRequired, HostedSecretBlocked, CodexRepoPlanningRunner
+from harness.codex_runner import (
+    CodexReadOnlyRepoSummaryRunner,
+    CodexRepoPlanningRunner,
+    HostedBoundaryApprovalRequired,
+    HostedSecretBlocked,
+)
 from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
 from harness.daemon_adapters import execute_read_only_summary_lease
 from harness.execution import execute_lease, list_execution_adapter_descriptors
@@ -53,7 +60,6 @@ from harness.policy import (
     resolve_workbench_effective_policy,
 )
 from harness.registry import builtin_spec_registry
-from harness.runner import ReadOnlyRepoSummaryRunner
 from harness.sandbox import CommandValidationError, DockerImageManager
 from harness.spec_loader import (
     SpecBundleError,
@@ -70,7 +76,7 @@ from harness.tool_capabilities import get_tool_capability, list_tool_capabilitie
 from harness.traces import export_run_trace, to_otel_json
 from harness.tui_assets import TUI_HOME_IMAGE_SCHEMA_VERSION, TuiHomeImageError, set_tui_home_image
 
-app = typer.Typer(help="Local-first agent harness.")
+app = typer.Typer(help="Local-first agent harness.", invoke_without_command=True)
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
 backends_app = typer.Typer(help="Configured backend metadata and preflight checks.", invoke_without_command=True)
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
@@ -129,7 +135,7 @@ PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy
 TraceFormatOption = Annotated[str, typer.Option("--format", help="Trace format. Only otel-json is supported.")]
 
 TUI_SCHEMA_VERSION = "harness.tui/v1"
-TUI_INSTALL_HINT = 'Install the TUI extra with: python3 -m pip install "agent-harness[tui]"'
+TUI_INSTALL_HINT = "Install Harness with its default dependencies, including Textual."
 
 GITIGNORE_SECTION = """# Harness local artifacts
 .harness/runs/
@@ -140,39 +146,74 @@ GITIGNORE_SECTION = """# Harness local artifacts
 """
 
 
-@app.command("tui")
+@app.callback()
+def main(
+    ctx: typer.Context,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    plain: Annotated[bool, typer.Option("--plain", help="Run the line-oriented chat fallback.")] = False,
+    codex_like: Annotated[
+        bool,
+        typer.Option("--codex-like", help="Start the app in foreground Codex-like action mode."),
+    ] = False,
+) -> None:
+    """Launch the unified Harness app when no subcommand is provided."""
+
+    if ctx.invoked_subcommand is not None:
+        return
+    project_root = resolve_project_root(project)
+    if output == OutputFormat.JSON:
+        _emit_json(chat_context(project_root))
+        raise typer.Exit()
+    if plain:
+        raise typer.Exit(code=run_chat_loop(project_root, sys.stdin, sys.stdout, codex_like=codex_like))
+    if codex_like:
+        _run_unified_app(project_root, codex_like=True)
+    else:
+        _run_unified_app(project_root)
+    raise typer.Exit()
+
+
+@app.command("tui", hidden=True)
 def tui(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
-    textual_available = _has_textual()
-    if output == OutputFormat.JSON and textual_available:
-        _emit_json(
-            {
-                "schema_version": TUI_SCHEMA_VERSION,
-                "ok": True,
-                "project_root": str(project_root),
-                "textual_available": True,
-                "mode": "read_only",
-                "launched": False,
-            }
-        )
+    if output == OutputFormat.JSON:
+        payload = chat_context(project_root)
+        payload["schema_version"] = TUI_SCHEMA_VERSION
+        payload["mode"] = "unified_app"
+        payload["launched"] = False
+        _emit_json(payload)
         return
-    if not textual_available:
-        payload = {
-            "schema_version": TUI_SCHEMA_VERSION,
-            "ok": False,
-            "errors": ["Textual is not installed."],
-            "install_hint": TUI_INSTALL_HINT,
-            "project_root": str(project_root),
-        }
-        if output == OutputFormat.JSON:
-            _emit_json(payload)
-        else:
-            typer.echo("Textual is not installed.")
-            typer.echo(TUI_INSTALL_HINT)
-        raise typer.Exit(code=1)
-    from harness.tui import run_read_only_tui
+    _run_unified_app(project_root)
 
-    run_read_only_tui(project_root)
+
+@app.command("chat", hidden=True)
+def chat(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    plain: Annotated[bool, typer.Option("--plain", help="Run the line-oriented chat fallback.")] = False,
+    codex_like: Annotated[
+        bool,
+        typer.Option("--codex-like", help="Start the alias in foreground Codex-like action mode."),
+    ] = False,
+) -> None:
+    """Compatibility alias for the unified Harness app."""
+
+    project_root = resolve_project_root(project)
+    if output == OutputFormat.JSON:
+        _emit_json(chat_context(project_root))
+        return
+    if not plain:
+        if codex_like:
+            _run_unified_app(project_root, codex_like=True)
+        else:
+            _run_unified_app(project_root)
+        return
+    try:
+        raise typer.Exit(code=run_chat_loop(project_root, sys.stdin, sys.stdout, codex_like=codex_like))
+    except ValueError as exc:
+        typer.echo(f"Chat command failed: {exc}")
+        raise typer.Exit(code=1) from exc
 
 
 @tui_home_app.command("set-image")
@@ -382,13 +423,21 @@ def compare(
 
 
 @app.command()
-def doctor(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+def doctor(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    release: Annotated[
+        bool,
+        typer.Option("--release", help="Run release-readiness checks without backend/provider preflight."),
+    ] = False,
+) -> None:
     project_root = resolve_project_root(project)
-    result = _doctor_result(project_root)
+    result = _doctor_result(project_root, release=release)
     if output == OutputFormat.JSON:
         _emit_json(result)
     else:
         typer.echo(f"Project: {result['project_root']}")
+        typer.echo(f"Mode: {result['mode']}")
         typer.echo(f"Overall: {'pass' if result['ok'] else 'fail'}")
         for check in result["checks"]:
             typer.echo(f"{check['status']}\t{check['id']}\t{check['message']}")
@@ -1495,7 +1544,7 @@ def daemon_execute_read_only(
     owner = _daemon_owner()
     try:
         result = execute_read_only_summary_lease(project_root, lease_id, owner=owner)
-    except (KeyError, ValueError, LocalEndpointUnavailable) as exc:
+    except (KeyError, ValueError, LocalEndpointUnavailable, CodexUnavailable, CodexSandboxUnavailable) as exc:
         _emit_daemon_error("harness.daemon_execute_read_only/v1", str(exc).strip("'"), output)
         raise typer.Exit(code=1) from exc
     if output == OutputFormat.JSON:
@@ -1686,12 +1735,25 @@ def run(
     cfg = load_config(project_root)
     store = SQLiteStore(project_root)
     if task_type == "read_only_repo_summary":
-        backend_config = cfg.backends["local_openai_compatible"]
-        backend = LocalOpenAICompatibleBackend(backend_config)
-        runner = ReadOnlyRepoSummaryRunner(project_root, cfg, store, backend)
+        backend_config = cfg.backends["codex_cli"]
+        backend = CodexCliBackend(backend_config)
+        approvals = ApprovalStore(project_root)
+        approval = approvals.find_valid("codex_cli", "hosted_provider", task_type)
+        if approval is None:
+            approval = _obtain_hosted_boundary_approval(
+                project_root=project_root,
+                task_type=task_type,
+                approve_flag=approve_hosted_boundary,
+            )
+        runner = CodexReadOnlyRepoSummaryRunner(project_root, store, backend, approvals)
         try:
-            result = runner.run(goal=goal, task_type=task_type)
-        except LocalEndpointUnavailable as exc:
+            result = runner.run(
+                goal=goal,
+                task_type=task_type,
+                approval=approval,
+                approve_secret_context=approve_secret_context,
+            )
+        except (CodexUnavailable, CodexSandboxUnavailable, HostedBoundaryApprovalRequired, HostedSecretBlocked) as exc:
             raise typer.BadParameter(str(exc)) from exc
         typer.echo(f"Created run {result['run_id']}")
         typer.echo(result["final_summary"])
@@ -2255,6 +2317,16 @@ def _has_textual() -> bool:
     return importlib.util.find_spec("textual") is not None
 
 
+def _run_unified_app(project_root: Path, *, codex_like: bool = False) -> None:
+    if not _has_textual():
+        typer.echo("Textual is not installed.")
+        typer.echo(TUI_INSTALL_HINT)
+        raise typer.Exit(code=1)
+    from harness.tui import run_harness_app
+
+    run_harness_app(project_root, codex_like=codex_like)
+
+
 def _home_result(project_root: Path) -> dict:
     initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
     result = {
@@ -2464,7 +2536,7 @@ def _quickstart_agent_result(project_root: Path) -> dict:
     }
 
 
-def _doctor_result(project_root: Path) -> dict:
+def _doctor_result(project_root: Path, *, release: bool = False) -> dict:
     checks: list[dict] = []
     harness_dir = project_root / HARNESS_DIR
     config = None
@@ -2472,7 +2544,7 @@ def _doctor_result(project_root: Path) -> dict:
     _add_check(
         checks,
         "initialized",
-        "pass" if (harness_dir / "harness.sqlite").exists() else "fail",
+        "pass" if (harness_dir / "harness.sqlite").exists() else ("warn" if release else "fail"),
         "Harness SQLite state exists." if (harness_dir / "harness.sqlite").exists() else "Project is not initialized.",
         {"path": str(harness_dir / "harness.sqlite")},
     )
@@ -2483,7 +2555,7 @@ def _doctor_result(project_root: Path) -> dict:
         _add_check(
             checks,
             "config_loadable",
-            "fail",
+            "warn" if release else "fail",
             "Harness config could not be loaded.",
             {"path": str(harness_dir / "config.yaml"), "error": str(exc)},
         )
@@ -2508,16 +2580,25 @@ def _doctor_result(project_root: Path) -> dict:
         {"path": str(gitignore_path), "missing": missing_ignores},
     )
 
-    if config is not None:
+    if release:
+        if config is not None:
+            _doctor_backend_descriptors(checks, config)
+            _doctor_sandbox_safety(checks, config)
+        _doctor_release_cli_metadata(checks)
+        _doctor_release_runtime_state(checks, project_root)
+    elif config is not None:
         _doctor_backend_descriptors(checks, config)
-        _doctor_backend_preflight(checks, config)
-        _doctor_docker_binary(checks)
-        _doctor_dockerfile_validation(checks, project_root, config)
+        if not release:
+            _doctor_backend_preflight(checks, config)
+            _doctor_docker_binary(checks)
+            _doctor_dockerfile_validation(checks, project_root, config)
         _doctor_sandbox_safety(checks, config)
 
     return {
         "schema_version": "harness.doctor/v1",
         "project_root": str(project_root),
+        "mode": "release" if release else "standard",
+        "version": __version__,
         "ok": all(check["status"] != "fail" for check in checks),
         "checks": checks,
     }
@@ -2592,6 +2673,75 @@ def _doctor_backend_preflight(checks: list[dict], config) -> None:
         "pass" if all(item["status"] == "pass" for item in results) else "warn",
         "Backend preflight completed.",
         {"backends": results},
+    )
+
+
+def _doctor_release_cli_metadata(checks: list[dict]) -> None:
+    codex_binary = shutil.which("codex")
+    _add_check(
+        checks,
+        "codex_cli_metadata",
+        "pass" if codex_binary else "warn",
+        "Codex CLI binary is present." if codex_binary else "Codex CLI binary was not found on PATH.",
+        {"binary": codex_binary, "preflight_performed": False},
+    )
+    docker_binary = shutil.which("docker")
+    _add_check(
+        checks,
+        "docker_metadata",
+        "pass" if docker_binary else "warn",
+        "Docker binary is present for sandboxed test flows." if docker_binary else "Docker binary was not found on PATH.",
+        {"binary": docker_binary, "version_check_performed": False},
+    )
+    descriptors = [descriptor.model_dump(mode="json") for descriptor in list_execution_adapter_descriptors()]
+    _add_check(
+        checks,
+        "registered_adapters",
+        "pass" if descriptors else "fail",
+        "Registered execution adapters are available." if descriptors else "No registered execution adapters are available.",
+        {"adapters": descriptors},
+    )
+
+
+def _doctor_release_runtime_state(checks: list[dict], project_root: Path) -> None:
+    if not (project_root / HARNESS_DIR / "harness.sqlite").exists():
+        _add_check(
+            checks,
+            "release_runtime_state",
+            "warn",
+            "Project is not initialized; runtime queue checks were skipped.",
+            {"initialized": False},
+        )
+        return
+    try:
+        store = SQLiteStore(project_root)
+        tasks = store.list_tasks()
+        leases = store.list_task_leases()
+        runs = store.list_runs()
+    except sqlite3.Error as exc:
+        _add_check(
+            checks,
+            "release_runtime_state",
+            "fail",
+            "Harness runtime state could not be inspected.",
+            {"error": str(exc)},
+        )
+        return
+    active_leases = [lease for lease in leases if lease.status.value == "active"]
+    blocked_tasks = [task for task in tasks if task.status.value in {"blocked", "waiting_approval"}]
+    failed_runs = [run for run in runs if run.status == "failed"]
+    _add_check(
+        checks,
+        "release_runtime_state",
+        "pass",
+        "Harness runtime state inspected.",
+        {
+            "initialized": True,
+            "tasks_total": len(tasks),
+            "active_leases": [lease.model_dump(mode="json") for lease in active_leases[:5]],
+            "blocked_or_waiting_tasks": [task.model_dump(mode="json") for task in blocked_tasks[:5]],
+            "latest_failed_run": failed_runs[0].model_dump(mode="json") if failed_runs else None,
+        },
     )
 
 

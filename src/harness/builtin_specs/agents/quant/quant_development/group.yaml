@@ -1,7 +1,7 @@
 id: quant_development
 kind: group
 role: Group defaults for quant development planning specialists without execution or active repo mutation.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 outputs:

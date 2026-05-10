@@ -8,15 +8,23 @@ Unless a command explicitly says otherwise in the operator guide, these surfaces
 
 ```bash
 harness --help
+harness --project .
+harness --project . --output json
+harness --project . --plain
+harness --project . --plain --codex-like
 harness home --project .
 harness home --project . --output json
-harness tui --project .
+harness doctor --release --project . --output json
 harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 harness quickstart agent --project .
 harness quickstart agent --project . --output json
 ```
 
-`home`, `tui`, and `quickstart agent` are read-only/non-mutating orientation commands. `tui` requires the optional TUI extra and starts a chat-style terminal interface with slash commands, project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, static generated terminal pixel art, local in-memory search over loaded dashboard and command metadata, session-local section collapse, and palette-only focus. Slash commands such as `/home`, `/quickstart`, `/tasks`, `/lease`, `/inspect-lease`, `/execute-read-only`, `/runs`, `/policy`, and `/artifacts` render workflow-grouped command templates from this catalog, mutation/safety notes, and selected command text for manual operator use. The TUI does not execute commands, spawn subprocesses, invoke a shell, copy commands to the clipboard, mutate harness state, persist UI preferences, load image files at runtime, or call providers. `tui-home set-image` is an explicit local visual-customization command that imports the provided image into tracked static TUI art files; it does not touch project runtime state, execute adapters, preflight backends, or expose image contents. `quickstart agent` prints command sequences for the MVP path but does not run them.
+Bare `harness` is the primary operator application. It launches the unified Textual app: passive dashboard context, palette/search sections, and the real chat/orchestrator prompt in one terminal surface. `harness --output json` is a read-only context probe that reports `harness.chat/v1` without launching the UI. `harness --plain` runs the line-oriented chat fallback for tests and unsuitable terminals. `--codex-like` starts the session in a testing-friendly foreground action mode where one explicit confirmation can create the approved Harness records and drive registered-adapter dispatch.
+
+The unified app is a conversational operator shell over explicit harness actions: it can initialize project state with `/init`, provide deterministic local guidance, inspect state, select an orchestrator, draft objective/task graphs, ask for confirmation, acquire daemon run-once leases, and dispatch already-leased work only through registered adapters. Repository summaries route to `read_only_summary/read_only_repo_summary`; orchestrated edit work routes generated tasks to `codex_isolated_edit/codex_code_edit` through the registered dispatcher. It does not call providers directly, run a generic shell, preflight backends for context display, persist chat history, or mutate active repository files from chat/model text.
+
+The dashboard, palette, and slash-command sections remain passive read-only context. They show project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, static generated terminal pixel art, local in-memory search over loaded dashboard and command metadata, session-local section collapse, and palette-only focus. They do not execute commands, spawn subprocesses, invoke a shell, copy commands to the clipboard, mutate harness state, persist UI preferences, load image files at runtime, or call providers. `home` and `quickstart agent` remain read-only/non-mutating orientation commands. `tui-home set-image` is an explicit local visual-customization command that imports the provided image into tracked static TUI art files; it does not touch project runtime state, execute adapters, preflight backends, or expose image contents.
 
 ## Agent Authoring
 
@@ -112,7 +120,7 @@ harness daemon execute task_lease_abc123 --project . --output json
 
 `execute-dry-run` and `execute-read-only` are compatibility commands with their original JSON contracts. The generic `daemon execute` command dispatches the same already-leased tasks through the registered-adapter registry and returns `harness.daemon_execute/v1`.
 
-The read-only adapter requires an existing active daemon lease and exact metadata: `execution_adapter=read_only_summary` plus `task_type=read_only_repo_summary`. It uses only the existing local-only/no-cost read-only route and read-only tools.
+The read-only adapter requires an existing active daemon lease, exact metadata `execution_adapter=read_only_summary` plus `task_type=read_only_repo_summary`, and a valid hosted-boundary Codex approval profile for `read_only_repo_summary`. It uses the supervised `codex_cli` subscription backend with ChatGPT auth, `gpt-5.5`, low reasoning effort, and Codex read-only sandbox mode. It does not use the local model backend as a fallback.
 
 The Codex isolated adapter requires exact metadata `execution_adapter=codex_isolated_edit` plus `task_type=codex_code_edit`, a valid hosted-boundary Codex approval profile, and a safe `codex_cli` backend. Hosted-boundary approval is not apply-back approval: active repo mutation remains denied by default unless the explicit apply-back approval path approves the inspected diff.
 

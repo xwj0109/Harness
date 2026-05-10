@@ -1,0 +1,13 @@
+id: coding_orchestrator
+kind: orchestrator
+role: Coordinate coding task planning, specialist handoffs, review, and synthesis through supervised Codex workflows.
+model_profile: codex_supervised
+tool_policy: isolated_code_edit
+memory_scope: project
+outputs:
+  - coding_workflow_plan.md
+  - final_orchestrator_summary.md
+tags:
+  - starter
+  - coding
+  - orchestrator

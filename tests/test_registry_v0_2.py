@@ -95,7 +95,7 @@ def test_builtin_quant_workbench_contains_v0_6_agent_set_with_safety_boundaries(
     for agent_id in QUANT_AGENT_IDS:
         agent = registry.get_agent(agent_id)
         policy = registry.tool_policies[agent.tool_policy]
-        assert agent.model_profile == "local_reasoning"
+        assert agent.model_profile == "codex_supervised"
         assert agent.memory_scope == "quant"
         assert "quant" in agent.tags
         assert policy.network == ToolPermission.FORBIDDEN
@@ -119,7 +119,7 @@ def test_builtin_quant_groups_and_parent_chains_are_resolved() -> None:
 
     resolved = registry.resolve_agent_effective_spec("commodities_researcher")
     assert resolved["parent_chain"] == ["quant_research"]
-    assert resolved["model_profile"] == "local_reasoning"
+    assert resolved["model_profile"] == "codex_supervised"
     assert resolved["tool_policy"] == "read_only"
     assert resolved["memory_scope"] == "quant"
     assert resolved["tags"] == ["starter", "quant", "group", "research", "commodities"]

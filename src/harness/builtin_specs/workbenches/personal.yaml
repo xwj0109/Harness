@@ -1,8 +1,9 @@
 id: personal
 description: Personal productivity workbench for drafts and research only.
 allowed_agents:
+  - personal_orchestrator
   - job_researcher
-default_model_profile: local_reasoning
+default_model_profile: codex_supervised
 forbidden_actions:
   - email_send
   - application_submit

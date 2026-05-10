@@ -1420,6 +1420,7 @@ class SQLiteStore:
         lease_id: str,
         *,
         backend: BackendConfig,
+        approval_id: str | None = None,
         owner: str = DEFAULT_TASK_LEASE_OWNER,
     ) -> RunRecord:
         lease, attempt, task = self.validate_read_only_lease_for_execution(lease_id)
@@ -1429,6 +1430,7 @@ class SQLiteStore:
             task_type=READ_ONLY_TASK_TYPE,
             status="running",
             backend=backend,
+            approval_id=approval_id,
             task_id=task.id,
             objective_id=task.objective_id,
         )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from harness.backends.codex_cli import AUTH_ERROR, CodexCliBackend, CodexSandboxUnavailable
+from harness.backends.codex_cli import AUTH_ERROR, CodexDangerousFlagError, CodexCliBackend, CodexSandboxUnavailable
 from harness.config import default_config
 
 
@@ -70,9 +70,58 @@ def test_codex_command_construction_uses_detected_capabilities(monkeypatch, tmp_
     assert command[:2] == ["codex", "exec"]
     assert "--json" in command
     assert ["--cd", str(tmp_path)] == command[command.index("--cd") : command.index("--cd") + 2]
+    assert ["--model", "gpt-5.5"] == command[command.index("--model") : command.index("--model") + 2]
+    assert ["-c", 'model_reasoning_effort="low"'] in [
+        command[index : index + 2] for index, value in enumerate(command[:-1]) if value == "-c"
+    ]
     assert ["--sandbox", "read-only"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
     assert "--output-last-message" in command
     assert "plan" == command[-1]
+
+
+def test_codex_edit_command_uses_model_and_low_reasoning(monkeypatch, tmp_path) -> None:
+    exec_help = EXEC_HELP + "\n  --ask-for-approval <APPROVAL_POLICY>\n"
+
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=exec_help)
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    command, _capabilities, _network_status = CodexCliBackend(codex_config()).build_edit_command(
+        tmp_path,
+        "edit safely",
+        tmp_path / "final.md",
+    )
+
+    assert ["--cd", str(tmp_path)] == command[command.index("--cd") : command.index("--cd") + 2]
+    assert ["--model", "gpt-5.5"] == command[command.index("--model") : command.index("--model") + 2]
+    assert ["-c", 'model_reasoning_effort="low"'] in [
+        command[index : index + 2] for index, value in enumerate(command[:-1]) if value == "-c"
+    ]
+    assert ["--sandbox", "workspace-write"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
+
+
+def test_codex_rejects_invalid_reasoning_effort_before_execution(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=EXEC_HELP)
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args, stdout="")
+
+    cfg = codex_config().model_copy(deep=True)
+    cfg.settings["model_reasoning_effort"] = "danger-full-access"
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(CodexDangerousFlagError, match="Unsupported Codex reasoning effort"):
+        CodexCliBackend(cfg).build_read_only_command(tmp_path, "plan", None)
 
 
 def test_codex_unauthenticated_failure(monkeypatch) -> None:

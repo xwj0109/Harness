@@ -8,9 +8,9 @@ This guide covers the currently implemented operator flows:
 
 The harness does not commit or push changes for these flows. Paid API execution, generic shell execution, workflows, plugins, MCP, browser/email/calendar integrations, hosted fallback, and local fallback are outside the implemented scope.
 
-## v1.0 MVP Workflow
+## v1.5 Operator Workflow
 
-The v1.0 MVP is a local-first workflow for declarative agents, manual durable tasks, inspectable evidence, and one bounded read-only execution adapter. The end-to-end path is:
+The v1.5 release is a local-first workflow for declarative agents, manual durable tasks, inspectable evidence, registered adapter dispatch, and a unified operator app. The end-to-end read-only path is:
 
 ```bash
 harness agents scaffold my_agent \
@@ -46,7 +46,29 @@ The execution dispatcher does not authorize automatic task generation, autonomou
 
 ## Operator Cockpit
 
-`harness home` is the first post-MVP CLI UX entrypoint. It summarizes the current project state without changing it:
+`harness` is the primary operator application. With no subcommand it starts one Textual terminal app that combines the passive dashboard and the chat/orchestrator prompt:
+
+```bash
+harness
+harness --project .
+harness --project . --output json
+harness --project . --plain
+harness --project . --plain --codex-like
+```
+
+The default app shows project state, dashboard sections, search and palette context, safety reminders, recent runs, active leases, registered adapters, and a chat prompt in one surface. The dashboard side is passive and read-only. The prompt side is the explicit action layer: it can inspect state, select an orchestrator, draft visible objective/task graphs, ask for confirmation, acquire daemon run-once leases, and dispatch already-leased tasks only through registered adapters.
+
+`harness --output json` returns the same read-only `harness.chat/v1` context without launching the terminal UI. `harness --plain` starts the line-oriented chat fallback for tests and terminals where Textual is unsuitable. `--codex-like` starts the session in foreground action mode, where one explicit confirmation can create Harness records and drive registered-adapter dispatch for the approved task or graph. Textual is a normal install dependency for the app experience; it is no longer an optional operator path.
+
+The invariant is: user asks, chat proposes an explicit harness action, harness records or leases or dispatches, and evidence returns to chat. Chat does not call providers directly, preflight backends for context display, run Docker, invoke a generic shell, persist history, create hidden background work, or mutate active repository files from model text. Codex hosted-boundary approval and apply-back approval remain separate; apply-back is denied by default unless the existing inspected-diff approval path approves it.
+
+On first run, the app can initialize project state in place with `/init` or a natural request such as “initialize this project.” Until initialization, deterministic local chat guidance can still explain available Harness actions, while task, lease, run, and dispatch actions offer the in-app initialization path instead of requiring the operator to leave the app. Chat does not call Codex directly; model-backed work is available only through registered adapter dispatch after explicit task and lease state exists.
+
+For chat-first orchestration, natural-language requests such as “summarize this repo” or “fix the failing test with Codex” draft a visible action first. Repository summaries use `read_only_summary/read_only_repo_summary` through the registered dispatcher and the supervised Codex CLI subscription path. Editing requests draft a visible objective and task graph. The default chat orchestrator is `coding_orchestrator`; operators can switch to another built-in orchestrator with `/use quant_orchestrator` or `/use personal_orchestrator`. In normal mode, the chat keeps draft-before-confirm behavior. In codex-like mode, after one explicit foreground run approval, chat creates the objective and tasks, then repeatedly uses the existing daemon run-once lease path and registered `codex_isolated_edit` adapter until the graph is terminal, blocked, rejected, or stopped. This is a bounded foreground loop, not a hidden daemon or generic executor.
+
+Within the unified app, slash commands such as `/help`, `/init`, `/mode`, `/home`, `/dashboard`, `/orchestrators`, `/use`, `/agents`, `/tasks`, `/runs`, `/leases`, `/adapters`, `/lease`, `/execute`, `/plan`, `/run`, `/stop`, `/progress`, `/reset`, and `/quit` operate through the same control-plane APIs as the non-interactive commands. The UI keeps dashboard context next to the transcript in stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. Operators can use `ctrl+p` or `F2` to toggle palette-only search focus. When the prompt is not focused, `c` collapses or expands the current section and `shift+c` expands all sections. These preferences are in-memory for the running app session only.
+
+`harness home` remains a read-only snapshot command for scripts and diagnostics:
 
 ```bash
 harness home --project .
@@ -57,21 +79,6 @@ The dashboard reports initialization state, imported-agent count, objective and 
 
 `harness home` is read-only. It does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, execute adapters, preflight backends, inspect backend settings, run Docker, invoke shell tools, call providers, or expose secrets.
 
-`harness tui` is the read-only terminal dashboard entrypoint:
-
-```bash
-python3 -m pip install "agent-harness[tui]"
-harness tui --project .
-```
-
-Without the optional TUI extra, `harness tui` returns a clear install hint instead of importing Textual during normal CLI startup. `harness tui --output json` is a non-interactive availability probe and does not launch a terminal UI. With the optional extra installed, the TUI surface renders a light-theme chat-style interface with a slash-command prompt, project state, summary counts, imported-agent details, task details, active lease details, daemon event summaries, recent runs, safety reminders, and local in-memory search over already-loaded dashboard and command metadata. Operators can use `ctrl+p` or `F2` to toggle palette-only search focus, `c` to collapse or expand the current section, and `shift+c` to expand all sections. These UI preferences are in-memory for the running TUI session only.
-
-The TUI slash-command prompt is a command discovery surface, not an execution surface. Operators can type commands such as `/help`, `/home`, `/quickstart`, `/scaffold`, `/validate`, `/agents`, `/specs`, `/tasks`, `/lease`, `/inspect-lease`, `/execute-read-only`, `/runs`, `/policy`, `/artifacts`, and `/wheel`. The chat response renders the corresponding CLI command template, whether it would mutate state if manually run, and the safety note. Plain text is not sent to a model or backend.
-
-The command palette and slash-command model are copy-only. They show workflow-grouped command templates, mutation/safety notes, and selected command text for manual operator use. They are discovery-only: they do not execute commands, spawn subprocesses, invoke a shell, copy to the clipboard, mutate tasks, acquire leases, run daemon actions, execute adapters, preflight backends, run Docker, call providers, crawl files, search artifact contents, or expose secrets.
-
-The TUI keeps dashboard context available next to the chat transcript, grouped into stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. Section collapse hides pane details while keeping the section header/status visible, and palette-only focus filters command templates without hiding dashboard panes. It also shows compact keyboard hints, clearer search/no-match status, and static generated terminal pixel art on the TUI home/welcome surface. Runtime rendering uses committed Python color data; the TUI itself does not load image files, persist UI preferences, or fetch external assets.
-
 To replace the homepage art with an explicit local image, regenerate the static render data:
 
 ```bash
@@ -81,7 +88,7 @@ harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 
 This command imports only the provided image path, stores a local source copy in `assets/tui/home_source.png`, and regenerates `src/harness/tui_assets/pixel_art.py`. It does not initialize projects, mutate `.harness/`, create tasks, create runs, acquire leases, start daemon work, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents in command output.
 
-The original CLI/TUI UX milestone is packaged as release `1.1.0`. The v1.2 TUI refinements are usability-only additions for in-memory section collapse and palette-only focus; they do not broaden execution permissions or add new adapters.
+The CLI/TUI, registered dispatcher, Codex isolated adapter, and unified app stabilization are packaged together as release `1.5.0`. The unified app keeps read-only dashboard refinements and routes prompt actions through the real chat/orchestration engine; it does not broaden execution permissions or add unplanned adapters.
 
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 
@@ -195,7 +202,7 @@ harness daemon execute task_lease_abc123def456 --project . --output json
 The dispatcher currently registers:
 
 - `dry_run` for `phase_1a_test`, which writes metadata-only evidence.
-- `read_only_summary` for `read_only_repo_summary`, which uses only the local-only/no-cost read-only backend and read-only repository tools.
+- `read_only_summary` for `read_only_repo_summary`, which uses the supervised Codex CLI subscription backend with ChatGPT auth, `gpt-5.5`, low reasoning effort, and Codex read-only sandbox mode.
 - `codex_isolated_edit` for `codex_code_edit`, which requires a valid hosted-boundary Codex approval before run creation and uses the supervised isolated Codex edit runner.
 
 Codex queued execution uses the same safety split as direct Codex editing: hosted-boundary approval allows sending the isolated task context to Codex, but it is not apply-back approval. Apply-back remains denied by default unless an explicit apply-back approval provider approves the inspected diff. Denied apply-back is a successful safe outcome: the isolated edit completed, the diff was inspected, mutation was denied, and the active project stayed unchanged.
@@ -770,7 +777,9 @@ harness daemon inspect-lease task_lease_abc123def456 --project . --output json
 harness daemon execute-read-only task_lease_abc123def456 --project . --output json
 ```
 
-`daemon execute-read-only` requires an existing active lease id. It does not select work itself. It links the leased task attempt to one `read_only_repo_summary` run, uses the configured local-only and no-cost `local_openai_compatible` backend, executes only the existing read-only tools, records manifest/artifact/trace evidence through existing harness runtime APIs, marks the task and attempt terminal, and releases the lease. It returns `harness.daemon_execute_read_only/v1`.
+`daemon execute-read-only` requires an existing active lease id and a valid hosted-boundary Codex approval profile for `read_only_repo_summary`. It does not select work itself. It links the leased task attempt to one `read_only_repo_summary` run, uses the configured `codex_cli` subscription backend in Codex read-only sandbox mode, records manifest/artifact/trace evidence through existing harness runtime APIs, marks the task and attempt terminal, and releases the lease. It returns `harness.daemon_execute_read_only/v1`.
+
+The compatibility command name and JSON schema are unchanged, but the backend route is now Codex subscription rather than the local OpenAI-compatible backend. Missing hosted-boundary approval or unavailable Codex CLI fails before run creation. The read-only summary route does not use paid API fallback, hosted fallback outside Codex CLI, `OPENAI_API_KEY`, the local model backend, Docker, generic shell execution, or active repository mutation.
 
 The read-only adapter can use only `list_files`, `read_file`, `git_status`, `git_diff`, and `final_answer`. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops. `daemon inspect-lease` reports read-only eligibility, and `daemon recover` may reconcile existing read-only linked-run evidence without creating a second run.
 

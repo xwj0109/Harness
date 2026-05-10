@@ -23,22 +23,24 @@ python3 -m pip wheel --no-deps --no-build-isolation -w /tmp/harness-wheel .
 python3 -m venv --system-site-packages /tmp/harness-install
 /tmp/harness-install/bin/python -m pip install --no-deps /tmp/harness-wheel/agent_harness-*.whl
 /tmp/harness-install/bin/harness --help
+/tmp/harness-install/bin/harness --project /tmp/harness-package-project --output json
 /tmp/harness-install/bin/harness home --project /tmp/harness-package-project --output json
-/tmp/harness-install/bin/harness tui --project /tmp/harness-package-project --output json || true
 /tmp/harness-install/bin/harness specs --output json
 /tmp/harness-install/bin/harness quickstart agent --project /tmp/harness-package-project --output json
+/tmp/harness-install/bin/harness doctor --release --project /tmp/harness-package-project --output json
 ```
 
 Expected packaging properties:
 
 - The installed wheel exposes the `harness` console script.
-- Package metadata reports version `1.1.0`.
+- Package metadata reports version `1.5.0`.
 - Packaged built-in YAML specs under `harness/builtin_specs/` are available after wheel install.
-- `harness home` and `harness quickstart agent` remain non-mutating in the temporary project.
-- The base wheel can report the missing optional TUI extra without importing Textual during normal CLI startup; `harness tui --output json` is a non-interactive probe and must not launch the TUI.
+- `harness --output json`, `harness home`, and `harness quickstart agent` remain non-mutating in the temporary project.
+- `harness doctor --release --output json` reports release-readiness metadata without backend/provider preflight.
+- Textual is a normal dependency for the installed app. `harness --output json` is a non-interactive probe and must not launch the terminal UI.
 - The packaging smoke does not preflight backends, call providers, run Docker, create tasks, acquire leases, create runs, execute adapters, expose secrets, or use hosted/paid fallback.
 
-## Verify v1.0 MVP Path
+## Verify v1.5 Registered Adapter Path
 
 This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the bounded read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.
 
@@ -71,21 +73,23 @@ harness daemon inspect-lease "$LEASE_ID" --project . --output json
 harness daemon execute-read-only "$LEASE_ID" --project . --output json
 ```
 
-Expected v1.0 MVP safety properties:
+Expected v1.5 safety properties:
 
 - Agent and task lifecycle commands are declarative/control-plane operations only.
 - `daemon run-once` leases work but does not execute it.
-- `daemon execute-read-only` uses only the configured local-only/no-cost read-only route.
+- `daemon execute-read-only` uses only the configured Codex CLI subscription route in read-only sandbox mode and requires hosted-boundary approval for `read_only_repo_summary`.
 - The MVP read-only path does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
 
 ## Verify Operator Cockpit
 
-Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.0 MVP smoke path when checking inspect text output.
+Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.5 registered adapter smoke path when checking inspect text output.
 
 ```bash
+harness --project . --output json
 harness home --project . --output json
-harness tui --project . --output json
 harness quickstart agent --project . --output json
+harness --project . --plain
+harness --project . --plain --codex-like
 harness home --project .
 harness quickstart agent --project .
 harness runs --project .
@@ -101,10 +105,15 @@ harness artifacts inspect "$ARTIFACT_ID" --project .
 
 Expected operator cockpit safety properties:
 
+- Bare `harness` is the single primary app surface. It combines passive dashboard context with the chat/orchestrator prompt in one Textual terminal app. `harness --plain` is a line-oriented fallback for tests/dev use, not a separate product surface.
 - `harness home` is read-only and does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, or execute adapters.
-- `harness tui` is read-only and optional; without the TUI extra it returns a stable install hint. With the extra installed it renders a light-theme chat-style slash-command interface, project state, summary counts, imported agents, task details, active lease details, daemon event summaries, recent runs, safety reminders, local in-memory search over loaded dashboard/command metadata, in-memory section collapse, palette-only search focus, and a copy-only command palette without initializing projects, importing agents, creating tasks, creating runs, creating artifacts, acquiring leases, mutating daemon state, executing adapters, crawling files, or searching artifact contents.
+- `harness --output json` is read-only and returns `harness.chat/v1` context without launching a prompt, preflighting backends, calling providers, touching Docker, or initializing `.harness/`.
+- The unified app and `--plain` fallback keep session state in memory only. `/help`, `/init`, `/mode`, `/home`, `/dashboard`, `/orchestrators`, `/use`, `/agents`, `/tasks`, `/adapters`, and `/quit` should work without traceback on an uninitialized project. `/init` is the explicit in-app setup path; `harness --output json`, dashboard refresh, and passive slash commands must not initialize. Task creation, orchestrated graph creation, lease acquisition, and registered-adapter dispatch require explicit confirmation and use the normal objective, task, daemon run-once, and daemon execute paths.
+- In normal mode, chat drafts before confirmation. In `--codex-like` or `/mode codex-like`, one explicit confirmation may create the approved task/objective graph and run it in the foreground through registered adapters. Missing hosted-boundary approval should be offered as an explicit in-app approval step; apply-back remains separate and denied by default.
+- Chat-first orchestration should draft the full objective/task graph before creation. The foreground `/run` path may drive only the approved graph through `daemon run-once` and `daemon execute`; it must stop on blocked dependencies, rejection, missing hosted approval, operator `/stop`, or terminal graph completion.
+- The dashboard side renders a light-theme chat-style interface, project state, summary counts, imported agents, task details, active lease details, daemon event summaries, recent runs, safety reminders, local in-memory search over loaded dashboard/command metadata, in-memory section collapse, palette-only search focus, and a copy-only command palette without initializing projects, importing agents, creating tasks, creating runs, creating artifacts, acquiring leases, mutating daemon state, executing adapters, crawling files, or searching artifact contents.
 - The slash-command and command-palette surfaces show grouped command templates, mutation/safety notes, and selected command text for manual use only. They must not execute commands, spawn subprocesses, invoke a shell, copy to the clipboard, run daemon actions, execute adapters, preflight backends, run Docker, call providers, or expose artifact file contents.
-- The TUI layout keeps chat and dashboard context in stable read-only sections, shows keyboard/navigation hints for `/`, `escape`, `tab`, `shift+tab`, `ctrl+p`/`F2`, `c`, `shift+c`, `enter`, and `ctrl+q`, reports no-match states, and displays only static generated terminal pixel art without persisting preferences, loading image files at runtime, mutating harness state, or adding command actions.
+- The TUI layout keeps chat and dashboard context in stable read-only sections, shows keyboard/navigation hints for `/`, `escape`, `tab`, `shift+tab`, `ctrl+p`/`F2`, prompt-unfocused `c`, prompt-unfocused `shift+c`, `enter`, and `ctrl+q`, reports no-match states, and displays only static generated terminal pixel art without persisting preferences, loading image files at runtime, mutating harness state, or adding command actions.
 - Section collapse and palette-only focus are session-local TUI state only. They must not write project config, user config, `.harness/`, SQLite, static art files, or any preference file.
 - `harness tui-home set-image <image> --output json` explicitly imports a local image into tracked static TUI art files and returns `harness.tui_home_image/v1`; it does not mutate `.harness/`, create tasks, create runs, acquire leases, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents.
 - `harness quickstart agent` prints commands only; it does not create files, initialize projects, import agents, create tasks, acquire leases, create runs, create artifacts, execute adapters, or start daemon work.
@@ -342,7 +351,7 @@ Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon cont
 - `daemon recover` may expire stale active leases and return tasks to `ready`, `blocked`, or `waiting_approval`, but it must not retry terminal tasks automatically.
 - v0.4 scheduler commands do not execute tasks, bind task attempts to runs, call backends, run Docker, create run artifacts, add hosted fallback, add paid fallback, or start unmanaged background work.
 - `daemon execute-dry-run` is explicit v0.4.5 contract evidence only: it may bind one active lease to one local `phase_1a_test` run and metadata-only artifacts, but it must not call backends, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted/paid fallback.
-- `daemon execute-read-only` is explicit v0.5 read-only adapter execution only: it may bind one active lease to one `read_only_repo_summary` run through the configured local-only and no-cost `local_openai_compatible` backend and existing read-only tools.
+- `daemon execute-read-only` is explicit read-only adapter execution only: it may bind one active lease to one `read_only_repo_summary` run through the configured `codex_cli` subscription backend in read-only sandbox mode after hosted-boundary approval.
 - `daemon execute` is registered-adapter dispatch only: no adapter means no execution, unknown adapter fails closed, and adapter descriptors are documentation and validation metadata rather than permission grants.
 - `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, read-only eligibility, generic execution eligibility, and recovery recommendation without creating runs or artifacts.
 - `daemon recover` may reconcile existing dry-run or read-only evidence but must not create a second run for a linked attempt.

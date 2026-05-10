@@ -1,7 +1,7 @@
 id: risk_reviewer
 kind: reviewer
 role: Review quant hypotheses for risk, operational limits, and unsafe trading assumptions.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 parent: trading_analysis

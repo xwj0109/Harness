@@ -24,6 +24,238 @@ class HostedSecretBlocked(RuntimeError):
     pass
 
 
+class CodexReadOnlyRepoSummaryRunner:
+    def __init__(
+        self,
+        project_root: Path,
+        store: SQLiteStore,
+        backend: CodexCliBackend,
+        approval_store: ApprovalStore,
+    ) -> None:
+        self.project_root = project_root.resolve()
+        self.store = store
+        self.backend = backend
+        self.approval_store = approval_store
+
+    def run(
+        self,
+        goal: str,
+        task_type: str,
+        approval: ApprovalProfile | None,
+        approve_secret_context: bool = False,
+    ) -> dict[str, Any]:
+        status = self.backend.preflight()
+        if not status.available:
+            raise CodexUnavailable(status.reason or "Codex CLI is unavailable.")
+        if not status.capabilities.supports_read_only_sandbox:
+            raise CodexSandboxUnavailable("Codex read-only sandbox is unavailable; refusing to run Codex.")
+        if approval is None:
+            raise HostedBoundaryApprovalRequired("Hosted data-boundary approval is required for codex_cli.")
+        payload = self._build_payload(goal, task_type)
+        findings = scan_text_for_secrets(payload)
+        if findings and not approve_secret_context:
+            raise HostedSecretBlocked(
+                "Hosted Codex payload appears to contain secret-like content. Refusing to send it."
+            )
+        backend_config = self.backend.config.model_copy(update={"capabilities": status.capabilities})
+        run = self.store.create_run(
+            goal=goal,
+            task_type=task_type,
+            status="running",
+            backend=backend_config,
+            approval_id=approval.id,
+        )
+        return self.run_existing(
+            run_id=run.id,
+            goal=goal,
+            task_type=task_type,
+            approval=approval,
+            approve_secret_context=approve_secret_context,
+        )
+
+    def run_existing(
+        self,
+        run_id: str,
+        goal: str,
+        task_type: str,
+        approval: ApprovalProfile,
+        approve_secret_context: bool = False,
+    ) -> dict[str, Any]:
+        payload = self._build_payload(goal, task_type)
+        findings = scan_text_for_secrets(payload)
+        if findings and not approve_secret_context:
+            raise HostedSecretBlocked(
+                "Hosted Codex payload appears to contain secret-like content. Refusing to send it."
+            )
+        paths = self.store.initialize_run_artifacts(run_id)
+        for kind, path in paths.items():
+            self.store.register_artifact(run_id, kind=kind, path=path)
+        run_dir = self.store.runs_dir / run_id
+        final_message_path = run_dir / "codex_final_message.md"
+        pre_status = self._git_status_porcelain()
+        self.store.append_event(
+            run_id,
+            "info",
+            "hosted_boundary_approval_used",
+            "Using hosted data-boundary approval for Codex read-only summary.",
+            {"approval_id": approval.id, "backend": self.backend.name, "task_type": task_type},
+        )
+        self.store.append_event(
+            run_id,
+            "info",
+            "pre_git_status",
+            "Recorded pre-run git status.",
+            {"status": pre_status},
+        )
+        append_jsonl(paths["transcript"], {"role": "user", "content": sanitize_for_logging(payload)})
+        result = self.backend.run_read_only(self.project_root, payload, final_message_path)
+        codex_artifacts = write_codex_artifacts(run_dir, result)
+        for kind, path in codex_artifacts.items():
+            self.store.register_artifact(run_id, kind=kind, path=path)
+        if final_message_path.exists():
+            final_message_path.write_text(
+                str(sanitize_for_logging(final_message_path.read_text(encoding="utf-8", errors="replace"))),
+                encoding="utf-8",
+            )
+            self.store.register_artifact(run_id, "codex_final_message", final_message_path)
+        post_status = self._git_status_porcelain()
+        policy_violation = pre_status != post_status
+        self.store.append_event(
+            run_id,
+            "info",
+            "codex_completed",
+            "Codex read-only summary process completed.",
+            {
+                "exit_status": result.exit_status,
+                "command": _redacted_command(result.command),
+                "json_event_count": len(result.json_events),
+            },
+        )
+        self.store.append_event(
+            run_id,
+            "info",
+            "post_git_status",
+            "Recorded post-run git status.",
+            {"status": post_status},
+        )
+        if policy_violation:
+            self.store.append_event(
+                run_id,
+                "error",
+                "policy_violation",
+                "Read-only Codex summary changed project git status.",
+                {"pre_status": pre_status, "post_status": post_status},
+            )
+        status_value = "policy_violation" if policy_violation else ("completed" if result.exit_status == 0 else "failed")
+        self.store.update_run_status(run_id, status_value)
+        final_summary = result.final_message or "Codex read-only summary ended without a final message."
+        self._write_report(
+            run_id=run_id,
+            goal=goal,
+            task_type=task_type,
+            approval_id=approval.id,
+            pre_status=pre_status,
+            post_status=post_status,
+            policy_violation=policy_violation,
+            result=result,
+            final_summary=final_summary,
+            artifact_paths={**paths, **codex_artifacts, "codex_final_message": final_message_path},
+        )
+        return {
+            "run_id": run_id,
+            "status": status_value,
+            "approval_id": approval.id,
+            "final_summary": str(sanitize_for_logging(final_summary)),
+            "policy_violation": policy_violation,
+            "invalid_model_command_count": 0,
+            "tools_executed": [],
+            "artifacts": {key: str(path) for key, path in {**paths, **codex_artifacts}.items()},
+        }
+
+    def _build_payload(self, goal: str, task_type: str) -> str:
+        return (
+            "You are Codex running under a supervised Harness read-only summary adapter.\n"
+            "Use only read-only inspection. Do not edit files. Do not run write commands. Do not access secrets.\n"
+            "Summarize the repository or requested scope for an operator.\n"
+            f"Task type: {task_type}\n"
+            f"Project root: {self.project_root}\n"
+            f"Goal: {goal}\n"
+            "Return a concise repository summary, important files or components, risks, and suggested next steps."
+        )
+
+    def _git_status_porcelain(self) -> str:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.project_root,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return f"GIT_STATUS_UNAVAILABLE: {(result.stderr or result.stdout).strip()}"
+        return result.stdout
+
+    def _write_report(
+        self,
+        run_id: str,
+        goal: str,
+        task_type: str,
+        approval_id: str,
+        pre_status: str,
+        post_status: str,
+        policy_violation: bool,
+        result: Any,
+        final_summary: str,
+        artifact_paths: dict[str, Path],
+    ) -> None:
+        metadata = self.backend.config.metadata
+        settings = self.backend.config.settings
+        lines = [
+            f"# Run {run_id}",
+            "",
+            f"- Goal: {sanitize_for_logging(goal)}",
+            f"- Task type: {task_type}",
+            f"- Backend name: {self.backend.name}",
+            f"- Backend kind: {self.backend.config.kind.value}",
+            f"- Billing mode: {metadata.billing_mode.value}",
+            f"- Execution location: {metadata.execution_location.value}",
+            f"- Data boundary: {metadata.data_boundary.value}",
+            f"- Approval id: {approval_id}",
+            f"- Model: {sanitize_for_logging(settings.get('model', ''))}",
+            f"- Reasoning effort: {sanitize_for_logging(settings.get('model_reasoning_effort', ''))}",
+            f"- Exit status: {result.exit_status}",
+            f"- Policy violation: {policy_violation}",
+            "",
+            "## Policy Status",
+            "",
+            (
+                "POLICY VIOLATION: read-only Codex summary changed git status."
+                if policy_violation
+                else "No read-only policy violation detected."
+            ),
+            "",
+            "## Summary",
+            "",
+            str(sanitize_for_logging(final_summary)),
+            "",
+            "## Git Status",
+            "",
+            "### Pre-run",
+            "```",
+            str(sanitize_for_logging(pre_status)),
+            "```",
+            "### Post-run",
+            "```",
+            str(sanitize_for_logging(post_status)),
+            "```",
+            "",
+            "## Artifacts",
+            "",
+        ]
+        lines.extend(f"- {kind}: {path}" for kind, path in artifact_paths.items())
+        (self.store.runs_dir / run_id / "final_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
 class CodexRepoPlanningRunner:
     def __init__(
         self,

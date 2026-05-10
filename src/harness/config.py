@@ -87,6 +87,7 @@ def default_backend_configs() -> dict[str, BackendConfig]:
                 "command": "codex",
                 "auth_mode": "chatgpt",
                 "model": "gpt-5.5",
+                "model_reasoning_effort": "low",
                 "timeout_seconds": 900,
                 "use_subscription_credits": True,
             },

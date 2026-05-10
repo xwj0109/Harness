@@ -1,7 +1,7 @@
 id: quant_researcher
 kind: specialist
 role: Draft quant research briefs and data requirement notes.
-model_profile: local_reasoning
+model_profile: codex_supervised
 tool_policy: read_only
 memory_scope: quant
 parent: quant_research

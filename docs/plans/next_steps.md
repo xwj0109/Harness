@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-The first MVP is complete. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, and one bounded read-only execution adapter.
+The v1.5 release-readiness pass is current. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, bounded read-only and Codex isolated adapters, and the unified chat/TUI operator app.
 
 Historical milestone plans were removed after MVP cleanup. Keep this file as the current planning snapshot; use [agent_harness_master_plan.md](agent_harness_master_plan.md) only as a retained roadmap reference, not as blanket implementation approval.
 
@@ -57,6 +57,8 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `1.0.0`.
 - v1.1 CLI/TUI UX release is complete, including post-MVP polish, copy-only TUI command discovery, and TUI usability polish.
 - Version bump to `1.1.0`.
+- v1.5 release-readiness stabilization reconciles package/docs versioning, removes direct model-backed chat calls, adds deterministic next-step guidance, improves chat recovery guidance, and adds no-preflight `doctor --release` diagnostics.
+- Version bump to `1.5.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -85,7 +87,7 @@ The dry-run adapter milestone is complete as dry-run evidence only: `daemon exec
 
 The read-only adapter milestone is implemented: `daemon execute-read-only` can bind an existing active daemon lease to the existing `read_only_repo_summary` runner when the task metadata is exactly `execution_adapter=read_only_summary` and `task_type=read_only_repo_summary`.
 
-The adapter is intentionally narrow. It uses only the configured local-only, no-cost `local_openai_compatible` backend and existing read-only tools. It does not authorize Codex execution, Docker, shell access, hosted fallback, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, autonomous planning, generic task execution, or unmanaged daemon loops.
+The adapter was originally intentionally narrow around the configured local-only, no-cost `local_openai_compatible` backend and existing read-only tools. The current implementation target has moved model-backed app work to supervised `codex_cli` subscription execution with hosted-boundary approval while preserving the same daemon lease and registered-adapter evidence model. It still does not authorize Docker, shell access, paid fallback, OpenAI API usage, active repo writes, MCP/A2A, browser/email/calendar tools, autonomous planning, generic task execution, or unmanaged daemon loops.
 
 ## Completed v0.5.1 Read-Only Adapter Hardening
 
@@ -101,7 +103,7 @@ The CLI/TUI UX release is complete and packaged as version `1.1.0`. The release 
 
 Implemented CLI-only refinements include sectioned text output for high-traffic inspect/explain commands and a grouped command catalog in [../command_catalog.md](../command_catalog.md). JSON contracts remain unchanged.
 
-Implemented TUI refinements include optional Textual startup, a chat-style slash-command discovery surface, dashboard context sections, local in-memory search over loaded dashboard and command metadata, keyboard/navigation hints, no-match status, static generated terminal pixel art, and explicit `tui-home set-image` static-art import. These changes remain read-only except for the explicit tracked static-art import command and do not add command execution, providers, hosted fallback, paid fallback, OpenAI API usage, Docker execution, shell access, or persisted TUI preferences.
+Implemented TUI refinements include Textual app startup, a chat-style slash-command discovery surface, dashboard context sections, local in-memory search over loaded dashboard and command metadata, keyboard/navigation hints, no-match status, static generated terminal pixel art, and explicit `tui-home set-image` static-art import. These changes remain read-only except for the explicit tracked static-art import command and do not add command execution, providers, hosted fallback, paid fallback, OpenAI API usage, Docker execution, shell access, or persisted TUI preferences.
 
 ## Completed v1.2 Read-Only TUI Refinements
 
@@ -118,10 +120,26 @@ The staged execution layer is complete:
 
 ## Immediate Next Planning Target
 
-There is no active implementation target. The execution dispatcher now exists, so any additional adapter should still be selected through a separate decision-complete plan.
+The current implementation target is release readiness for the unified Harness app described in [chat_cli_experience_plan.md](chat_cli_experience_plan.md). The chat layer sits above the existing control plane and registered execution dispatcher. It is an operator surface, not a separate execution authority.
 
-Recommended decision options:
+Current chat implementation status:
 
+- Milestone 1 Chat Shell Foundation: implemented through root `harness`, `harness --output json`, `harness --plain`, slash commands, and no backend/Docker preflight.
+- Milestone 2 Read-Only Chat Context: implemented with deterministic local state inspection, selected task/run/artifact details, registered adapter listing, and rule-based read-only aliases.
+- Milestone 3 Task Drafting And Preview: implemented for `dry_run/phase_1a_test`, `read_only_summary/read_only_repo_summary`, and `codex_isolated_edit/codex_code_edit` with explicit confirmation.
+- Milestone 4 Lease And Dispatch Flow: implemented through the existing daemon run-once lease path and registered `daemon execute` dispatcher only.
+- Milestone 5 Read-Only Summary Chat Flow: implemented through the `read_only_summary` adapter only; chat does not call Codex directly, and the adapter now uses supervised Codex CLI subscription execution with hosted-boundary approval.
+- Milestone 6 Codex Isolated Edit Chat Flow: implemented as queued `codex_isolated_edit` dispatch through the registered adapter only, preserving hosted-boundary approval and apply-back separation.
+- Milestone 7 Conversational Result Memory: implemented as session-local references only, cleared by `/reset`, with no history file.
+- Milestone 8 Streaming And Progress Rendering: implemented as local progress summaries from chat/session and harness execution evidence, with JSON mode kept stable.
+- Milestone 9 Apply-Back Review UX: implemented as inspected-artifact review and explicit safe deny/keep handling. Chat does not parse patches from text or perform apply-back approval outside the existing approval provider path.
+- Milestone 10 Polished OpenCode-Style UX: implemented as compact line-oriented prompts, status blocks, deterministic next-step recommendations, refusal/recovery messages, equivalent command previews, and in-memory transcript/progress state.
+- Chat-first multi-agent orchestration: implemented as selectable built-in orchestrators, visible Codex-backed objective/task graph drafts, and a bounded foreground one-run approval loop over daemon run-once plus registered `codex_isolated_edit` dispatch.
+- Unified application surface: implemented as bare `harness`, combining passive dashboard/TUI context with the real chat/orchestration engine. Legacy chat and dashboard entrypoints remain hidden compatibility aliases only.
+
+Recommended decision options after release verification:
+
+- Package and publish the coherent `1.5.0` local release after regression and wheel smokes pass.
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
 - Additional read-only TUI refinements, still with no command execution or persisted preferences.
 

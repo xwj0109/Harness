@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 
-from harness import __version__
-from harness.config import HARNESS_DIR
-from harness.memory.sqlite_store import SQLiteStore
-from harness.models import TaskStatus
+from harness.operator_context import build_tui_dashboard
 
 
 COMMAND_PALETTE_GROUPS = [
@@ -250,19 +246,20 @@ TUI_VIEW_SECTIONS = [
 ]
 
 TUI_NAVIGATION_HINTS = [
-    {"key": "/", "label": "Type slash commands in the prompt"},
-    {"key": "escape", "label": "Clear search"},
-    {"key": "tab", "label": "Next pane"},
-    {"key": "shift+tab", "label": "Previous pane"},
-    {"key": "ctrl+p/f2", "label": "Toggle palette-only focus"},
-    {"key": "c", "label": "Toggle current section collapse"},
-    {"key": "shift+c", "label": "Expand all sections"},
+    {"key": "/", "label": "Search"},
+    {"key": "escape", "label": "Clear"},
+    {"key": "tab", "label": "Next"},
+    {"key": "shift+tab", "label": "Previous"},
+    {"key": "ctrl+p/f2", "label": "Palette"},
+    {"key": "c", "label": "Collapse"},
+    {"key": "shift+c", "label": "Expand"},
     {"key": "ctrl+q", "label": "Quit"},
-    {"key": "enter", "label": "Send slash command"},
-    {"key": "copy-only", "label": "Slash commands render command templates only"},
+    {"key": "enter", "label": "Send"},
+    {"key": "copy-only", "label": "Read-only context"},
 ]
 
 TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
+RIGHT_PANEL_SECTION_IDS = ("project", "now", "queue", "recent", "adapters", "next", "commands")
 
 SLASH_COMMAND_ALIASES = {
     "help": "orientation.quickstart_agent",
@@ -287,177 +284,6 @@ SLASH_COMMAND_ALIASES = {
     "artifacts": "runtime_evidence.artifacts",
     "wheel": "packaging_smoke.wheel",
 }
-
-
-def build_tui_dashboard(project_root: Path) -> dict:
-    initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
-    dashboard = {
-        "schema_version": "harness.tui_dashboard/v1",
-        "ok": True,
-        "project_root": str(project_root),
-        "initialized": initialized,
-        "version": __version__,
-        "summary": {
-            "imported_agents": 0,
-            "objectives": 0,
-            "tasks_total": 0,
-            "active_leases": 0,
-            "active_daemons": 0,
-            "recent_runs": 0,
-        },
-        "task_status_counts": {status.value: 0 for status in TaskStatus},
-        "agents": [],
-        "tasks": [],
-        "active_leases": [],
-        "daemon": {
-            "active_daemons": 0,
-            "paused_tasks": 0,
-            "latest_events": [],
-        },
-        "recent_runs": [],
-        "command_suggestions": [
-            f"harness home --project {project_root}",
-            f"harness quickstart agent --project {project_root}",
-            f"harness agents list --project {project_root}",
-            f"harness tasks list --project {project_root}",
-            f"harness daemon status --project {project_root}",
-            f"harness runs --project {project_root}",
-        ],
-        "safety_boundaries": [
-            "read_only_tui",
-            "no_hidden_execution",
-            "no_backend_preflight",
-            "no_docker",
-            "no_shell",
-            "no_hosted_fallback",
-            "no_paid_fallback",
-            "no_openai_api_usage",
-        ],
-    }
-    if not initialized:
-        dashboard["guidance"] = [
-            {
-                "id": "initialize_project",
-                "command": f"harness init --project {project_root}",
-                "description": "Initialize local harness persistence for this project.",
-            }
-        ]
-        return dashboard
-
-    store = SQLiteStore(project_root)
-    try:
-        agents = store.list_project_agents()
-        objectives = store.list_objectives()
-        tasks = store.list_tasks()
-        leases = store.list_task_leases()
-        runs = store.list_runs()[:5]
-        daemon_status = store.daemon_status()
-    except sqlite3.Error as exc:
-        dashboard["initialized"] = False
-        dashboard["state_error"] = {
-            "type": exc.__class__.__name__,
-            "message": str(exc),
-        }
-        dashboard["guidance"] = [
-            {
-                "id": "repair_project_state",
-                "command": f"harness init --project {project_root}",
-                "description": "Repair or migrate local harness persistence for this project.",
-            }
-        ]
-        return dashboard
-    active_leases = [lease for lease in leases if lease.status.value == "active"]
-    task_status_counts = {status.value: 0 for status in TaskStatus}
-    for task in tasks:
-        task_status_counts[task.status.value] = task_status_counts.get(task.status.value, 0) + 1
-    dashboard["summary"] = {
-        "imported_agents": len(agents),
-        "objectives": len(objectives),
-        "tasks_total": len(tasks),
-        "active_leases": len(active_leases),
-        "active_daemons": len(daemon_status.active_daemons),
-        "recent_runs": len(runs),
-    }
-    dashboard["task_status_counts"] = task_status_counts
-    dashboard["agents"] = [
-        {
-            "agent_id": agent.agent_id,
-            "workbench_id": agent.workbench_id,
-            "content_sha256": agent.content_sha256,
-            "source_path": str(agent.source_path),
-            "profiles": len(agent.profiles),
-        }
-        for agent in agents[:10]
-    ]
-    dashboard["tasks"] = [
-        {
-            "id": task.id,
-            "title": task.title,
-            "status": task.status.value,
-            "priority": task.priority,
-            "objective_id": task.objective_id,
-            "agent_id": task.agent_id,
-            "workbench_id": task.workbench_id,
-            "execution_adapter": task.metadata.get("execution_adapter"),
-            "task_type": task.metadata.get("task_type"),
-        }
-        for task in tasks[:10]
-    ]
-    dashboard["active_leases"] = [
-        {
-            "id": lease.id,
-            "task_id": lease.task_id,
-            "attempt_id": lease.attempt_id,
-            "status": lease.status.value,
-            "owner": lease.owner,
-            "expires_at": lease.expires_at.isoformat(),
-        }
-        for lease in active_leases[:10]
-    ]
-    dashboard["recent_runs"] = [
-        {
-            "id": run.id,
-            "status": run.status,
-            "task_type": run.task_type,
-            "goal": run.goal,
-            "created_at": run.created_at.isoformat(),
-        }
-        for run in runs
-    ]
-    dashboard["daemon"] = {
-        "active_daemons": len(daemon_status.active_daemons),
-        "paused_tasks": len(daemon_status.paused_tasks),
-        "latest_events": [
-            {
-                "id": event.id,
-                "daemon_id": event.daemon_id,
-                "event_type": event.event_type,
-                "message": event.message,
-                "created_at": event.created_at.isoformat(),
-            }
-            for event in daemon_status.latest_events[:5]
-        ],
-    }
-    dashboard["guidance"] = []
-    if task_status_counts.get("ready", 0) > 0 and not active_leases:
-        dashboard["guidance"].append(
-            {
-                "id": "lease_ready_task",
-                "command": f"harness daemon run-once --project {project_root}",
-                "description": "Lease the highest-priority eligible task without executing it.",
-            }
-        )
-    if not agents:
-        dashboard["guidance"].append(
-            {
-                "id": "author_agent",
-                "command": "harness agents scaffold my_agent --workbench quant --kind specialist "
-                "--parent quant_research --model-profile local_reasoning --tool-policy read_only "
-                "--memory-scope quant --output agents/my_agent",
-                "description": "Scaffold a declarative custom agent bundle.",
-            }
-        )
-    return dashboard
 
 
 def build_tui_panes(dashboard: dict) -> list[dict]:
@@ -668,6 +494,237 @@ def build_command_palette_panes(filtered_palette: dict) -> list[dict]:
     return panes
 
 
+def build_right_panel_model(
+    dashboard: dict,
+    view_state: dict | None,
+    query: str,
+    focus_mode: str,
+) -> dict:
+    state = view_state or {}
+    mode = focus_mode if focus_mode in TUI_FOCUS_MODES else "dashboard"
+    normalized_query = query.strip().casefold()
+    collapsed_ids = {
+        str(section_id)
+        for section_id in state.get("collapsed_section_ids", set())
+        if str(section_id) in RIGHT_PANEL_SECTION_IDS
+    }
+    palette = state.get("palette") or build_command_palette()
+    sections = _right_panel_base_sections(dashboard, state)
+    command_matches = _right_panel_command_rows(palette, query, mode=mode)
+    if mode == "palette" or normalized_query:
+        command_section = {
+            "id": "commands",
+            "title": "Commands",
+            "rows": command_matches or ["No matching commands."],
+        }
+        sections = [*sections, command_section]
+    if normalized_query and mode == "dashboard":
+        sections = _filter_right_panel_sections(sections, normalized_query)
+    for section in sections:
+        section["collapsed"] = section["id"] in collapsed_ids
+        section["match_count"] = len(section.get("rows", []))
+    active_index = int(state.get("active_section_index", 0) or 0)
+    active_section_id = sections[active_index % len(sections)]["id"] if sections else None
+    empty_state = None
+    if not sections:
+        empty_state = {
+            "title": "No matches",
+            "message": "No matches. Try /help, tasks, runs, adapters.",
+            "query": query.strip(),
+        }
+    return {
+        "schema_version": "harness.tui_right_panel/v1",
+        "ok": True,
+        "mode": mode,
+        "query": query.strip(),
+        "sections": sections,
+        "active_section_id": active_section_id,
+        "collapsed_section_ids": sorted(collapsed_ids),
+        "empty_state": empty_state,
+        "summary": {
+            "initialized": bool(dashboard.get("initialized")),
+            "tasks_total": dashboard["summary"]["tasks_total"],
+            "active_leases": dashboard["summary"]["active_leases"],
+            "recent_runs": dashboard["summary"]["recent_runs"],
+            "registered_adapters": len(dashboard.get("registered_adapters", [])),
+        },
+        "search": {
+            "context_matches": sum(section.get("match_count", 0) for section in sections),
+            "command_matches": len(command_matches),
+        },
+        "navigation_hints": [dict(hint) for hint in TUI_NAVIGATION_HINTS],
+    }
+
+
+def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
+    summary = dashboard["summary"]
+    active_orchestrator = state.get("active_orchestrator") or "coding_orchestrator"
+    chat_mode = state.get("chat_mode") or "normal"
+    branch = dashboard.get("branch") or "unknown"
+    sections = [
+        {
+            "id": "project",
+            "title": "Project",
+            "rows": [
+                f"{'Ready' if dashboard.get('initialized') else 'Setup needed'} | {Path(dashboard['project_root']).name}",
+                f"Branch: {branch}",
+                f"Mode: {chat_mode}",
+                f"Orchestrator: {active_orchestrator}",
+            ],
+        },
+        {
+            "id": "now",
+            "title": "Now",
+            "rows": _right_panel_now_rows(dashboard),
+        },
+        {
+            "id": "queue",
+            "title": "Queue",
+            "rows": _right_panel_queue_rows(dashboard),
+        },
+        {
+            "id": "recent",
+            "title": "Recent",
+            "rows": _right_panel_recent_rows(dashboard),
+        },
+        {
+            "id": "adapters",
+            "title": "Adapters",
+            "rows": _right_panel_adapter_rows(dashboard),
+        },
+        {
+            "id": "next",
+            "title": "Next",
+            "rows": _right_panel_next_rows(dashboard),
+        },
+    ]
+    return sections
+
+
+def _right_panel_now_rows(dashboard: dict) -> list[str]:
+    if dashboard.get("active_leases"):
+        lease = dashboard["active_leases"][0]
+        return [f"Running: {lease['task_id']}", f"Lease: {lease['id']}"]
+    waiting = dashboard["task_status_counts"].get("waiting_approval", 0)
+    if waiting:
+        return [f"Needs approval: {waiting} task{'s' if waiting != 1 else ''}"]
+    ready = dashboard["task_status_counts"].get("ready", 0)
+    if ready:
+        return [f"Ready: {ready} task{'s' if ready != 1 else ''}", "Action: /run or lease next"]
+    if dashboard.get("recent_runs"):
+        run = dashboard["recent_runs"][0]
+        return [f"Latest run: {run['status']}", run["id"]]
+    return ["Idle", "Ask Harness what to do next."]
+
+
+def _right_panel_queue_rows(dashboard: dict) -> list[str]:
+    labels = {
+        "ready": "Ready",
+        "leased": "Running",
+        "waiting_approval": "Needs approval",
+        "blocked": "Blocked",
+        "failed": "Failed",
+        "succeeded": "Done",
+    }
+    rows = [
+        f"{label}: {dashboard['task_status_counts'].get(status, 0)}"
+        for status, label in labels.items()
+        if dashboard["task_status_counts"].get(status, 0)
+    ]
+    if not rows:
+        rows = ["No queued tasks."]
+    rows.append(
+        "Total: "
+        f"{dashboard['summary']['tasks_total']} | "
+        f"Objectives: {dashboard['summary']['objectives']} | "
+        f"Leases: {dashboard['summary']['active_leases']}"
+    )
+    return rows
+
+
+def _right_panel_recent_rows(dashboard: dict) -> list[str]:
+    rows = []
+    if dashboard.get("tasks"):
+        task = dashboard["tasks"][0]
+        rows.append(f"Task: {task['status']} | {task['title']}")
+    if dashboard.get("recent_runs"):
+        run = dashboard["recent_runs"][0]
+        rows.append(f"Run: {run['status']} | {run.get('task_type') or 'unknown'}")
+    return rows or ["No recent task or run."]
+
+
+def _right_panel_adapter_rows(dashboard: dict) -> list[str]:
+    adapters = [adapter["id"] for adapter in dashboard.get("registered_adapters", [])]
+    if not adapters:
+        return ["No registered adapters."]
+    return [", ".join(adapters[:4])]
+
+
+def _right_panel_next_rows(dashboard: dict) -> list[str]:
+    if not dashboard.get("initialized"):
+        return ["/init", "Then try: summarize this repo"]
+    if dashboard.get("active_leases"):
+        return ["/run", "/leases"]
+    if dashboard["task_status_counts"].get("ready", 0):
+        return ["lease the next task", "run the registered adapter"]
+    return ["summarize this repo", "/tasks /runs /adapters"]
+
+
+def _right_panel_command_rows(palette: dict, query: str, *, mode: str) -> list[str]:
+    if mode == "palette":
+        filtered = filter_command_palette(palette, query)
+        entries = filtered["entries"]
+    elif query.strip():
+        filtered = filter_command_palette(palette, query)
+        entries = filtered["entries"][:5]
+    else:
+        entries = []
+    rows = []
+    for entry in entries[:8]:
+        rows.append(f"{entry['title']} | {entry['command']}")
+    return rows
+
+
+def _filter_right_panel_sections(sections: list[dict], normalized_query: str) -> list[dict]:
+    filtered = []
+    for section in sections:
+        title_matches = normalized_query in section["title"].casefold()
+        rows = [row for row in section["rows"] if normalized_query in str(row).casefold()]
+        if title_matches and not rows:
+            rows = section["rows"]
+        if title_matches or rows:
+            filtered.append({**section, "rows": rows})
+    return filtered
+
+
+def render_right_panel(model: dict) -> str:
+    if model.get("empty_state"):
+        return model["empty_state"]["message"]
+    lines = []
+    active_id = model.get("active_section_id")
+    for section in model["sections"]:
+        marker = "> " if section["id"] == active_id else "  "
+        collapsed = section.get("collapsed", False)
+        lines.append(f"{marker}{section['title']}")
+        if collapsed:
+            lines.append("  hidden")
+            lines.append("")
+            continue
+        for row in section.get("rows", []):
+            lines.append(f"  {row}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def render_right_panel_status(model: dict) -> str:
+    mode = model.get("mode", "dashboard")
+    query = model.get("query") or "ready"
+    active = model.get("active_section_id") or "none"
+    if mode == "palette":
+        return f"Context | palette | {model['search']['command_matches']} commands | {query}"
+    return f"Context | {active} | {query}"
+
+
 def build_slash_commands(palette: dict | None = None) -> dict:
     palette = palette or build_command_palette()
     entries_by_id = {entry["id"]: entry for entry in palette["entries"]}
@@ -727,8 +784,8 @@ def build_chat_welcome_message(project_root: Path) -> dict:
         "title": "Harness chat",
         "lines": [
             f"Project: {project_root}",
-            "Type /help to list slash commands.",
-            "Slash commands render existing CLI command templates for manual operator use.",
+            "Type naturally to chat with the supervised Codex-backed assistant.",
+            "Slash commands inspect Harness state and prepare explicit actions.",
         ],
     }
 
@@ -1067,19 +1124,44 @@ def _render_navigation_hints(view: dict) -> str:
 
 
 def create_read_only_tui_app(project_root: Path):
+    return create_harness_app(project_root)
+
+
+def create_harness_app(project_root: Path, *, codex_like: bool = False):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.widgets import Footer, Header, Input, Static
+    from harness.chat import ChatSessionState, handle_chat_input
 
     dashboard = build_tui_dashboard(project_root)
     panes = build_tui_panes(dashboard)
     palette = build_command_palette()
     slash_commands = build_slash_commands(palette)
-    initial_filter = filter_tui_panes(panes, "")
-    initial_palette_filter = filter_command_palette(palette, "")
-    initial_view = build_tui_view_model(initial_filter, initial_palette_filter)
+    initial_view = build_right_panel_model(
+        dashboard,
+        {
+            "palette": palette,
+            "active_section_index": 0,
+            "collapsed_section_ids": set(),
+            "active_orchestrator": "coding_orchestrator",
+            "chat_mode": "codex-like" if codex_like else "normal",
+        },
+        "",
+        "dashboard",
+    )
     initial_messages = [build_chat_welcome_message(project_root)]
+    if codex_like:
+        initial_messages.append(
+            {
+                "role": "assistant",
+                "title": "Codex-Like Mode",
+                "lines": [
+                    "One confirmation creates Harness records and drives foreground registered-adapter dispatch.",
+                    "Apply-back remains a separate explicit review.",
+                ],
+            }
+        )
 
     class HarnessPromptInput(Input):
         def on_key(self, event) -> None:
@@ -1095,16 +1177,8 @@ def create_read_only_tui_app(project_root: Path):
                 event.prevent_default()
                 event.stop()
                 self.app.action_toggle_palette_focus()
-            elif event.character == "c" and not self.value:
-                event.prevent_default()
-                event.stop()
-                self.app.action_toggle_section_collapse()
-            elif event.key == "shift+c" or event.character == "C":
-                event.prevent_default()
-                event.stop()
-                self.app.action_expand_all_sections()
 
-    class HarnessReadOnlyTui(App):
+    class HarnessUnifiedApp(App):
         ENABLE_COMMAND_PALETTE = False
         theme = "textual-light"
         CSS = """
@@ -1157,13 +1231,12 @@ def create_read_only_tui_app(project_root: Path):
             Binding("tab", "section_next", "Next section", priority=True),
             Binding("shift+tab,backtab", "section_previous", "Previous section", priority=True),
             Binding("ctrl+p,f2", "toggle_palette_focus", "Palette focus", priority=True),
-            Binding("c", "toggle_section_collapse", "Collapse section"),
-            Binding("C,shift+c", "expand_all_sections", "Expand all", priority=True),
         ]
 
         def __init__(self) -> None:
             super().__init__()
             self._messages = [dict(message) for message in initial_messages]
+            self._chat_state = ChatSessionState(codex_like_mode=codex_like)
             self._focus_mode = "dashboard"
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
@@ -1175,17 +1248,29 @@ def create_read_only_tui_app(project_root: Path):
                     yield Static(render_pixel_art(), id="pixel-art")
                     yield Static("", id="chat-content")
                 with VerticalScroll(id="side"):
-                    yield Static(render_view_status(initial_view), id="search-status")
+                    yield Static(render_right_panel_status(initial_view), id="search-status")
                     yield Static(_render_navigation_hints(initial_view), id="palette-status")
                     yield Static("", id="slash-status")
                     yield Static("", id="pane-container")
-            yield HarnessPromptInput(placeholder="Type /help or a slash command", id="prompt")
+            yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
             yield Footer()
 
         def on_mount(self) -> None:
             self.query_one("#prompt", Input).focus()
             self._render_chat()
             self._render_current_view()
+
+        def on_key(self, event) -> None:
+            if isinstance(self.focused, Input):
+                return
+            if event.character == "c":
+                event.prevent_default()
+                event.stop()
+                self.action_toggle_section_collapse()
+            elif event.key == "shift+c" or event.character == "C":
+                event.prevent_default()
+                event.stop()
+                self.action_expand_all_sections()
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "prompt":
@@ -1202,11 +1287,13 @@ def create_read_only_tui_app(project_root: Path):
             if not request:
                 return
             self._messages.append({"role": "user", "title": request, "lines": []})
-            response = handle_slash_command(request, slash_commands)
-            self._messages.extend(response["messages"])
+            response = handle_chat_input(request, project_root, self._chat_state)
+            self._messages.append(_chat_response_to_tui_message(response))
             event.input.value = ""
             self._render_chat()
             self._render_current_view()
+            if response.get("kind") == "quit":
+                self.exit()
 
         def action_clear_search(self) -> None:
             prompt = self.query_one("#prompt", Input)
@@ -1250,16 +1337,22 @@ def create_read_only_tui_app(project_root: Path):
                 self._section_cursor_index = 0
                 return
             self._section_cursor_index = (self._section_cursor_index + step) % len(view["sections"])
-            self._render_view(view)
+            self._render_current_view()
 
         def _current_view(self) -> dict:
             prompt = self.query_one("#prompt", Input)
-            return build_focused_tui_view_model(
-                panes,
-                palette,
+            refreshed_dashboard = build_tui_dashboard(project_root)
+            return build_right_panel_model(
+                refreshed_dashboard,
+                {
+                    "palette": palette,
+                    "active_section_index": self._section_cursor_index,
+                    "collapsed_section_ids": self._collapsed_section_ids,
+                    "active_orchestrator": self._chat_state.selected_orchestrator_id or "coding_orchestrator",
+                    "chat_mode": "codex-like" if self._chat_state.codex_like_mode else "normal",
+                },
                 prompt.value,
                 focus_mode=self._focus_mode,
-                collapsed_section_ids=self._collapsed_section_ids,
             )
 
         def _render_current_view(self) -> None:
@@ -1277,29 +1370,25 @@ def create_read_only_tui_app(project_root: Path):
 
         def _render_view(self, view: dict) -> None:
             self._clamp_section_cursor(view)
-            self.query_one("#search-status", Static).update(render_view_status(view))
+            self.query_one("#search-status", Static).update(render_right_panel_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
             container = self.query_one("#pane-container", Static)
-            if view["empty_state"]:
-                container.update(view["empty_state"]["message"])
-                return
-            panes_by_id = {pane["id"]: pane for pane in view["panes"]}
-            rendered = []
-            for index, section in enumerate(view["sections"]):
-                cursor = "> " if index == self._section_cursor_index else ""
-                rendered.append(cursor + _render_section_content(section))
-                rendered.append("")
-                if section.get("collapsed"):
-                    rendered.append("Section collapsed in this TUI session.")
-                    rendered.append("")
-                    continue
-                for pane_id in section["pane_ids"]:
-                    pane = panes_by_id[pane_id]
-                    rendered.extend([_render_pane_content(pane), ""])
-            container.update("\n".join(rendered).strip())
+            container.update(render_right_panel(view))
 
-    return HarnessReadOnlyTui()
+    return HarnessUnifiedApp()
+
+
+def run_harness_app(project_root: Path, *, codex_like: bool = False) -> None:
+    create_harness_app(project_root, codex_like=codex_like).run()
 
 
 def run_read_only_tui(project_root: Path) -> None:
-    create_read_only_tui_app(project_root).run()
+    run_harness_app(project_root)
+
+
+def _chat_response_to_tui_message(response: dict) -> dict:
+    return {
+        "role": "assistant",
+        "title": response.get("title") or response.get("kind") or "Harness",
+        "lines": response.get("lines", []),
+    }
