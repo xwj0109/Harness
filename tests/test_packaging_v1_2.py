@@ -17,7 +17,7 @@ def test_pyproject_has_distribution_metadata_and_packaged_specs() -> None:
 
     project = pyproject["project"]
     assert project["name"] == "agent-harness"
-    assert project["version"] == "1.5.0"
+    assert project["version"] == "1.6.0"
     assert project["license"] == "MIT"
     assert project["requires-python"] == ">=3.11"
     assert project["scripts"]["harness"] == "harness.cli.main:app"
@@ -43,13 +43,13 @@ def test_wheel_includes_packaged_specs_and_console_entrypoint(tmp_path) -> None:
         assert "harness/builtin_specs/agents/quant/profiles/commodities_researcher.default.yaml" in names
         assert "harness/builtin_specs/workbenches/quant.yaml" in names
 
-        metadata = archive.read("agent_harness-1.5.0.dist-info/METADATA").decode("utf-8")
+        metadata = archive.read("agent_harness-1.6.0.dist-info/METADATA").decode("utf-8")
         assert "Name: agent-harness" in metadata
-        assert "Version: 1.5.0" in metadata
+        assert "Version: 1.6.0" in metadata
         assert "Classifier: Environment :: Console" in metadata
         assert "Requires-Dist: textual" in metadata
 
-        entrypoints = archive.read("agent_harness-1.5.0.dist-info/entry_points.txt").decode("utf-8")
+        entrypoints = archive.read("agent_harness-1.6.0.dist-info/entry_points.txt").decode("utf-8")
         assert "harness = harness.cli.main:app" in entrypoints
 
 

@@ -3,14 +3,15 @@
 This guide covers the currently implemented operator flows:
 
 - supervised isolated `codex_code_edit`;
+- supervised read-only `repo_planning`;
 - direct Docker-sandboxed test execution;
 - model-visible Docker `run_tests` for `simple_code_edit`.
 
 The harness does not commit or push changes for these flows. Paid API execution, generic shell execution, workflows, plugins, MCP, browser/email/calendar integrations, hosted fallback, and local fallback are outside the implemented scope.
 
-## v1.5 Operator Workflow
+## v1.6 Operator Workflow
 
-The v1.5 release is a local-first workflow for declarative agents, manual durable tasks, inspectable evidence, registered adapter dispatch, and a unified operator app. The end-to-end read-only path is:
+The v1.6 release is a local-first workflow for declarative agents, manual durable tasks, inspectable evidence, registered adapter dispatch, and a unified operator app. The end-to-end read-only path is:
 
 ```bash
 harness agents scaffold my_agent \
@@ -88,7 +89,7 @@ harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 
 This command imports only the provided image path, stores a local source copy in `assets/tui/home_source.png`, and regenerates `src/harness/tui_assets/pixel_art.py`. It does not initialize projects, mutate `.harness/`, create tasks, create runs, acquire leases, start daemon work, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents in command output.
 
-The CLI/TUI, registered dispatcher, Codex isolated adapter, and unified app stabilization are packaged together as release `1.5.0`. The unified app keeps read-only dashboard refinements and routes prompt actions through the real chat/orchestration engine; it does not broaden execution permissions or add unplanned adapters.
+The CLI/TUI, registered dispatcher, Codex isolated adapter, repo planning adapter, and unified app stabilization are packaged together as release `1.6.0`. The unified app keeps read-only dashboard refinements and routes prompt actions through the real chat/orchestration engine; it does not broaden execution permissions beyond registered, approved adapters.
 
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 
@@ -204,6 +205,7 @@ The dispatcher currently registers:
 - `dry_run` for `phase_1a_test`, which writes metadata-only evidence.
 - `read_only_summary` for `read_only_repo_summary`, which uses the supervised Codex CLI subscription backend with ChatGPT auth, `gpt-5.5`, low reasoning effort, and Codex read-only sandbox mode.
 - `codex_isolated_edit` for `codex_code_edit`, which requires a valid hosted-boundary Codex approval before run creation and uses the supervised isolated Codex edit runner.
+- `repo_planning` for `repo_planning`, which requires a valid hosted-boundary Codex approval before run creation and uses the supervised Codex CLI read-only sandbox to produce planning artifacts.
 
 Codex queued execution uses the same safety split as direct Codex editing: hosted-boundary approval allows sending the isolated task context to Codex, but it is not apply-back approval. Apply-back remains denied by default unless an explicit apply-back approval provider approves the inspected diff. Denied apply-back is a successful safe outcome: the isolated edit completed, the diff was inspected, mutation was denied, and the active project stayed unchanged.
 

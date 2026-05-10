@@ -90,6 +90,38 @@ class FakeEditBackend(CodexCliBackend):
         )
 
 
+class FakePlanningBackend(CodexCliBackend):
+    def __init__(self, config, final_message="implementation plan", exit_status=0):
+        super().__init__(config)
+        self.final_message = final_message
+        self.exit_status = exit_status
+
+    def preflight(self):
+        return BackendStatus(
+            available=True,
+            metadata=self.config.metadata,
+            capabilities=BackendCapabilities(
+                supports_exec=True,
+                supports_cd=True,
+                supports_read_only_sandbox=True,
+                supports_json_events=True,
+                supports_output_last_message=True,
+            ),
+        )
+
+    def run_read_only(self, project_root, prompt, final_message_path):
+        if final_message_path:
+            final_message_path.write_text(self.final_message, encoding="utf-8")
+        return CodexRunResult(
+            ["codex", "exec", "--cd", str(project_root), "--sandbox", "read-only"],
+            "",
+            "",
+            self.exit_status,
+            [],
+            self.final_message,
+        )
+
+
 def run_edit(project: Path, backend: CodexCliBackend, decision: str):
     store = SQLiteStore(project)
     store.initialize()
@@ -350,6 +382,108 @@ def test_codex_isolated_adapter_missing_approval_rejects_before_run(tmp_path) ->
     assert "Missing valid hosted-provider Codex approval" in result.rejection_reasons[0]
     assert store.list_runs() == []
     assert any(event.event_type == "execution_adapter_rejected" for event in store.list_daemon_events())
+
+
+def test_repo_planning_adapter_missing_approval_rejects_before_run(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(
+        title="Plan change",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert leased is not None
+
+    result = execute_lease(tmp_path, leased["lease"].id, owner="local_daemon:test:123")
+
+    assert result.ok is False
+    assert result.decision == "repo_planning_blocked_policy"
+    assert result.run is None
+    assert "Missing valid hosted-provider Codex approval" in result.rejection_reasons[0]
+    assert store.list_runs() == []
+    assert any(event.event_type == "execution_adapter_rejected" for event in store.list_daemon_events())
+
+
+def test_repo_planning_adapter_completes_without_mutation(tmp_path, monkeypatch) -> None:
+    init_clean_project(tmp_path)
+    before = (tmp_path / "app.py").read_bytes()
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    write_default_config(tmp_path)
+    ApprovalStore(tmp_path).add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=["repo_planning"],
+        duration_days=1,
+    )
+    task = store.create_task(
+        title="Plan change",
+        description="Find the smallest safe implementation.",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakePlanningBackend)
+
+    result = execute_lease(tmp_path, leased.lease.id, owner="local_daemon:test:123")
+
+    assert result.ok is True
+    assert result.decision == "repo_planning_completed"
+    assert result.run is not None
+    assert result.run.task_type == "repo_planning"
+    assert result.run.status == "completed"
+    assert result.task is not None
+    assert result.task.id == task.id
+    assert result.task.status.value == "succeeded"
+    assert result.attempt is not None
+    assert result.attempt.status.value == "succeeded"
+    assert result.lease is not None
+    assert result.lease.status.value == "released"
+    assert result.adapter_result["status"] == "completed"
+    assert (tmp_path / "app.py").read_bytes() == before
+    assert len(store.list_runs()) == 1
+
+
+def test_repo_planning_adapter_policy_violation_fails_task_and_preserves_run_status(tmp_path, monkeypatch) -> None:
+    init_clean_project(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    write_default_config(tmp_path)
+    ApprovalStore(tmp_path).add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=["repo_planning"],
+        duration_days=1,
+    )
+    store.create_task(
+        title="Plan change",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakePlanningBackend)
+
+    original_git = subprocess.run
+    statuses = iter(["", " M app.py\n"])
+
+    def fake_git(args, **kwargs):
+        if args == ["git", "status", "--porcelain"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=next(statuses), stderr="")
+        return original_git(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_git)
+
+    result = execute_lease(tmp_path, leased.lease.id, owner="local_daemon:test:123")
+
+    assert result.ok is False
+    assert result.decision == "repo_planning_blocked_policy"
+    assert result.run is not None
+    assert result.run.status == "policy_violation"
+    assert result.task is not None
+    assert result.task.status.value == "failed"
+    assert result.attempt is not None
+    assert result.attempt.failure_code == "repo_planning_policy_violation"
 
 
 def test_codex_isolated_adapter_denied_apply_back_succeeds_without_mutation(tmp_path, monkeypatch) -> None:

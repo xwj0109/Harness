@@ -297,6 +297,59 @@ class CodexRepoPlanningRunner:
             backend=backend_config,
             approval_id=approval.id,
         )
+        return self._run_existing_checked(
+            run_id=run.id,
+            goal=goal,
+            task_type=task_type,
+            approval=approval,
+            payload=payload,
+            findings=findings,
+            capabilities=status.capabilities.model_dump(mode="json"),
+        )
+
+    def run_existing(
+        self,
+        run_id: str,
+        goal: str,
+        task_type: str,
+        approval: ApprovalProfile | None,
+        approve_secret_context: bool = False,
+    ) -> dict[str, Any]:
+        status = self.backend.preflight()
+        if not status.available:
+            raise CodexUnavailable(status.reason or "Codex CLI is unavailable.")
+        if not status.capabilities.supports_read_only_sandbox:
+            raise CodexSandboxUnavailable("Codex read-only sandbox is unavailable; refusing to run Codex.")
+        if approval is None:
+            raise HostedBoundaryApprovalRequired("Hosted data-boundary approval is required for codex_cli.")
+        payload = self._build_payload(goal, task_type)
+        findings = scan_text_for_secrets(payload)
+        if findings and not approve_secret_context:
+            raise HostedSecretBlocked(
+                "Hosted Codex payload appears to contain secret-like content. Refusing to send it."
+            )
+        return self._run_existing_checked(
+            run_id=run_id,
+            goal=goal,
+            task_type=task_type,
+            approval=approval,
+            payload=payload,
+            findings=findings,
+            capabilities=status.capabilities.model_dump(mode="json"),
+        )
+
+    def _run_existing_checked(
+        self,
+        *,
+        run_id: str,
+        goal: str,
+        task_type: str,
+        approval: ApprovalProfile,
+        payload: str,
+        findings: list[Any],
+        capabilities: dict[str, Any],
+    ) -> dict[str, Any]:
+        run = self.store.get_run(run_id)
         paths = self.store.initialize_run_artifacts(run.id)
         for kind, path in paths.items():
             self.store.register_artifact(run.id, kind=kind, path=path)
@@ -371,7 +424,7 @@ class CodexRepoPlanningRunner:
             goal=goal,
             task_type=task_type,
             approval_id=approval.id,
-            capabilities=status.capabilities.model_dump(mode="json"),
+            capabilities=capabilities,
             pre_status=pre_status,
             post_status=post_status,
             policy_violation=policy_violation,

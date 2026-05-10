@@ -2185,12 +2185,13 @@ def _execution_task_metadata(execution_adapter: str | None, task_type: str | Non
         ("dry_run", "phase_1a_test"),
         ("read_only_summary", "read_only_repo_summary"),
         ("codex_isolated_edit", "codex_code_edit"),
+        ("repo_planning", "repo_planning"),
     }
     if (execution_adapter, task_type) not in supported:
         raise ValueError(
             "Unsupported execution metadata: supported pairs are "
             "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
-            "and codex_isolated_edit/codex_code_edit"
+            "codex_isolated_edit/codex_code_edit, and repo_planning/repo_planning"
         )
     return {"execution_adapter": execution_adapter or "", "task_type": task_type or ""}
 

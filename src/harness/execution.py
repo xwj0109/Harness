@@ -9,6 +9,7 @@ from harness.approvals import ApprovalStore
 from harness.backends.codex_cli import CodexCliBackend, CodexSandboxUnavailable, CodexUnavailable
 from harness.backends.local_openai import LocalEndpointUnavailable
 from harness.codex_edit_runner import CodexCodeEditRunner
+from harness.codex_runner import CodexRepoPlanningRunner
 from harness.config import load_config
 from harness.daemon_adapters import execute_read_only_summary_lease
 from harness.memory.sqlite_store import (
@@ -42,6 +43,8 @@ EXECUTION_ADAPTER_REJECTED = "execution_adapter_rejected"
 EXECUTION_DUPLICATE_REJECTED = "execution_duplicate_rejected"
 CODEX_ISOLATED_EDIT_ADAPTER = "codex_isolated_edit"
 CODEX_CODE_EDIT_TASK_TYPE = "codex_code_edit"
+REPO_PLANNING_EXECUTION_ADAPTER = "repo_planning"
+REPO_PLANNING_TASK_TYPE = "repo_planning"
 
 
 class ExecutionAdapter(Protocol):
@@ -400,11 +403,254 @@ class CodexIsolatedEditExecutionAdapter:
             )
 
 
+class RepoPlanningExecutionAdapter:
+    id = REPO_PLANNING_EXECUTION_ADAPTER
+    descriptor = ExecutionAdapterDescriptor(
+        id=REPO_PLANNING_EXECUTION_ADAPTER,
+        description="Run Codex as a supervised external agent in read-only sandbox mode to produce an implementation plan and evidence artifacts.",
+        supported_task_types=[REPO_PLANNING_TASK_TYPE],
+        required_task_metadata={
+            "execution_adapter": REPO_PLANNING_EXECUTION_ADAPTER,
+            "task_type": REPO_PLANNING_TASK_TYPE,
+        },
+        rejected_task_metadata=[
+            "daemon_policy_forbidden",
+            "requires_active_repo_write",
+            "requires_external_network",
+            "requires_docker",
+            "requires_paid_provider",
+            "requires_hosted_boundary",
+        ],
+        required_approvals=["hosted_provider_codex"],
+        backend_requirements=[
+            "codex_cli backend",
+            "kind=external_agent",
+            "data_boundary=hosted_provider",
+            "billing_mode=subscription",
+            "allow_network=false",
+        ],
+        sandbox_requirements=["Codex CLI --cd support", "Codex CLI read-only sandbox support"],
+        side_effect_summary="Writes harness run/task/lease/artifact evidence and runs Codex CLI in read-only sandbox mode.",
+        replay_policy=ToolReplayPolicy.REQUIRES_FRESH_APPROVAL,
+        safety_notes=[
+            "Descriptors are documentation and validation metadata, not permission grants.",
+            "Hosted-boundary approval is validated before run creation.",
+            "Execution still performs backend, policy, lease, and exact metadata checks.",
+        ],
+    )
+
+    def inspect_eligibility(
+        self,
+        project_root: Path,
+        lease: TaskLease,
+        task: TaskRecord | None,
+        attempt: TaskAttempt | None,
+    ) -> dict[str, Any]:
+        return _base_adapter_eligibility(self.descriptor, lease, task, attempt)
+
+    def execute(
+        self,
+        project_root: Path,
+        lease_id: str,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+    ) -> DaemonExecuteResult:
+        store = SQLiteStore(project_root)
+        lease, attempt, task = store.validate_execution_lease_for_run(lease_id)
+        try:
+            _validate_task_against_descriptor(self.descriptor, task)
+        except ValueError as exc:
+            reason = str(sanitize_for_logging(str(exc)))
+            _record_adapter_rejection(
+                store,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                adapter_id=self.id,
+                reason_code="unsafe_metadata",
+                rejection_reasons=[reason],
+            )
+            return _rejected_result(store, lease, task, attempt, self.id, "repo_planning_blocked_policy", [reason])
+
+        approval = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", REPO_PLANNING_TASK_TYPE)
+        if approval is None:
+            reason = "Missing valid hosted-provider Codex approval for repo_planning."
+            _record_adapter_rejection(
+                store,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                adapter_id=self.id,
+                reason_code="missing_hosted_approval",
+                rejection_reasons=[reason],
+            )
+            return _rejected_result(store, lease, task, attempt, self.id, "repo_planning_blocked_policy", [reason])
+
+        cfg = load_config(project_root)
+        backend_config = cfg.backends.get("codex_cli")
+        backend_reasons = _codex_backend_rejection_reasons(backend_config, adapter_label="Repo planning")
+        if backend_reasons:
+            _record_adapter_rejection(
+                store,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                adapter_id=self.id,
+                reason_code="unsafe_backend",
+                rejection_reasons=backend_reasons,
+            )
+            return _rejected_result(store, lease, task, attempt, self.id, "repo_planning_blocked_policy", backend_reasons)
+
+        backend = CodexCliBackend(backend_config)
+        status = backend.preflight()
+        if not status.available:
+            reason = status.reason or "Codex CLI is unavailable."
+            _record_adapter_rejection(
+                store,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                adapter_id=self.id,
+                reason_code="backend_unavailable",
+                rejection_reasons=[reason],
+            )
+            return DaemonExecuteResult(
+                ok=False,
+                decision="repo_planning_failed",
+                adapter_id=self.id,
+                project_root=store.project_root,
+                task=task,
+                attempt=attempt,
+                lease=lease,
+                policy_sha256=effective_policy_sha256(resolve_task_effective_policy(task)),
+                errors=[reason],
+            )
+        if not status.capabilities.supports_read_only_sandbox:
+            reason = "Codex read-only sandbox is unavailable; refusing to run Codex."
+            _record_adapter_rejection(
+                store,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                adapter_id=self.id,
+                reason_code="sandbox_unavailable",
+                rejection_reasons=[reason],
+            )
+            return _rejected_result(store, lease, task, attempt, self.id, "repo_planning_blocked_policy", [reason])
+
+        backend_with_capabilities = backend_config.model_copy(update={"capabilities": status.capabilities})
+        run = store.start_attempt_run(
+            lease.id,
+            task_type=REPO_PLANNING_TASK_TYPE,
+            backend=backend_with_capabilities,
+            approval_id=approval.id,
+            owner=owner,
+        )
+        runner = CodexRepoPlanningRunner(
+            project_root,
+            store,
+            CodexCliBackend(backend_with_capabilities),
+            ApprovalStore(project_root),
+        )
+        goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
+        try:
+            adapter_payload = runner.run_existing(
+                run_id=run.id,
+                goal=goal,
+                task_type=REPO_PLANNING_TASK_TYPE,
+                approval=approval,
+            )
+            decision, success, run_status, failure_code = _repo_planning_decision_from_status(
+                str(adapter_payload.get("status", ""))
+            )
+            store.finish_attempt_run(
+                lease.id,
+                run_id=run.id,
+                owner=owner,
+                success=success,
+                decision=decision,
+                run_status=run_status,
+                failure_code=failure_code,
+                failure_message=None if success else decision,
+            )
+            daemon = store.ensure_daemon(owner=lease.owner)
+            store.record_daemon_event(
+                daemon.id,
+                event_type="execute_repo_planning",
+                message="Repo planning adapter linked lease to run evidence.",
+                metadata={
+                    "lease_id": lease.id,
+                    "attempt_id": attempt.id,
+                    "task_id": task.id,
+                    "run_id": run.id,
+                    "decision": decision,
+                    "approval_id": approval.id,
+                },
+            )
+            store.write_run_manifest(run.id)
+            return DaemonExecuteResult(
+                ok=success,
+                decision=decision,
+                adapter_id=self.id,
+                project_root=store.project_root,
+                task=store.get_task(task.id),
+                attempt=store.get_task_attempt(attempt.id),
+                lease=store.get_task_lease(lease.id),
+                run=store.get_run(run.id),
+                manifest=store.build_run_manifest(run.id),
+                policy_sha256=effective_policy_sha256(resolve_task_effective_policy(task)),
+                approval_id=approval.id,
+                errors=[] if success else [decision],
+                adapter_result=sanitize_for_logging(adapter_payload),
+            )
+        except Exception as exc:
+            reason = str(sanitize_for_logging(str(exc)))
+            store.finish_attempt_run(
+                lease.id,
+                run_id=run.id,
+                owner=owner,
+                success=False,
+                decision="repo_planning_failed",
+                run_status="failed",
+                failure_code="repo_planning_failed",
+                failure_message=reason,
+            )
+            daemon = store.ensure_daemon(owner=lease.owner)
+            store.record_daemon_event(
+                daemon.id,
+                event_type="execute_repo_planning",
+                message="Repo planning adapter failed after run creation.",
+                metadata={
+                    "lease_id": lease.id,
+                    "attempt_id": attempt.id,
+                    "task_id": task.id,
+                    "run_id": run.id,
+                    "decision": "repo_planning_failed",
+                    "error": reason,
+                },
+            )
+            store.write_run_manifest(run.id)
+            return DaemonExecuteResult(
+                ok=False,
+                decision="repo_planning_failed",
+                adapter_id=self.id,
+                project_root=store.project_root,
+                task=store.get_task(task.id),
+                attempt=store.get_task_attempt(attempt.id),
+                lease=store.get_task_lease(lease.id),
+                run=store.get_run(run.id),
+                manifest=store.build_run_manifest(run.id),
+                policy_sha256=effective_policy_sha256(resolve_task_effective_policy(task)),
+                approval_id=approval.id,
+                errors=[reason],
+            )
+
+
 def builtin_execution_adapters() -> dict[str, ExecutionAdapter]:
     adapters: list[ExecutionAdapter] = [
         DryRunExecutionAdapter(),
         ReadOnlySummaryExecutionAdapter(),
         CodexIsolatedEditExecutionAdapter(),
+        RepoPlanningExecutionAdapter(),
     ]
     return {adapter.id: adapter for adapter in adapters}
 
@@ -645,22 +891,22 @@ def _validate_task_against_descriptor(descriptor: ExecutionAdapterDescriptor, ta
         raise ValueError(" ".join(reasons))
 
 
-def _codex_backend_rejection_reasons(backend_config: Any) -> list[str]:
+def _codex_backend_rejection_reasons(backend_config: Any, *, adapter_label: str = "Codex isolated edit") -> list[str]:
     if backend_config is None:
-        return ["Codex isolated edit requires configured codex_cli backend."]
+        return [f"{adapter_label} requires configured codex_cli backend."]
     reasons: list[str] = []
     if backend_config.name != "codex_cli":
-        reasons.append("Codex isolated edit requires backend name codex_cli.")
+        reasons.append(f"{adapter_label} requires backend name codex_cli.")
     if backend_config.kind != BackendKind.EXTERNAL_AGENT:
-        reasons.append("Codex isolated edit requires external_agent backend.")
+        reasons.append(f"{adapter_label} requires external_agent backend.")
     if backend_config.metadata.billing_mode == BillingMode.PAID_API:
-        reasons.append("Codex isolated edit must not use paid API billing.")
+        reasons.append(f"{adapter_label} must not use paid API billing.")
     if backend_config.metadata.data_boundary != DataBoundary.HOSTED_PROVIDER:
-        reasons.append("Codex isolated edit requires hosted_provider data boundary.")
+        reasons.append(f"{adapter_label} requires hosted_provider data boundary.")
     if backend_config.metadata.execution_location not in {ExecutionLocation.MIXED, ExecutionLocation.HOSTED}:
-        reasons.append("Codex isolated edit requires hosted or mixed execution location.")
+        reasons.append(f"{adapter_label} requires hosted or mixed execution location.")
     if backend_config.metadata.allow_network:
-        reasons.append("Codex isolated edit requires backend allow_network=false.")
+        reasons.append(f"{adapter_label} requires backend allow_network=false.")
     return reasons
 
 
@@ -678,6 +924,14 @@ def _codex_decision_from_status(status: str) -> tuple[str, bool, str]:
     if status == "failed":
         return "codex_isolated_edit_failed", False, "failed"
     return "codex_isolated_edit_failed", False, "failed"
+
+
+def _repo_planning_decision_from_status(status: str) -> tuple[str, bool, str, str | None]:
+    if status == "completed":
+        return "repo_planning_completed", True, "completed", None
+    if status == "policy_violation":
+        return "repo_planning_blocked_policy", False, "policy_violation", "repo_planning_policy_violation"
+    return "repo_planning_failed", False, "failed", "repo_planning_failed"
 
 
 def _rejected_result(

@@ -95,6 +95,48 @@ def test_codex_runner_persists_metadata_and_artifacts(tmp_path, monkeypatch) -> 
     assert {"codex_stdout", "codex_stderr", "codex_events", "codex_final_message"} <= artifacts
 
 
+def test_codex_repo_planning_run_existing_uses_existing_run_without_second_run(tmp_path, monkeypatch) -> None:
+    subprocess_outputs = iter(["", ""])
+
+    def fake_git(args, **kwargs):
+        assert args == ["git", "status", "--porcelain"]
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout=next(subprocess_outputs), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_git)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    approval_profile = approval(tmp_path)
+    run = store.create_run(
+        goal="plan safest fix",
+        task_type="repo_planning",
+        status="running",
+        backend=default_config().backends["codex_cli"],
+        approval_id=approval_profile.id,
+    )
+    result = CodexRunResult(
+        command=["codex", "exec", "--sandbox", "read-only", "plan"],
+        stdout="",
+        stderr="",
+        exit_status=0,
+        json_events=[],
+        final_message="Plan safely.",
+    )
+    backend = FakeCodexBackend(default_config().backends["codex_cli"], result)
+
+    output = CodexRepoPlanningRunner(tmp_path, store, backend, ApprovalStore(tmp_path)).run_existing(
+        run.id,
+        "plan safest fix",
+        "repo_planning",
+        approval_profile,
+    )
+
+    assert output["run_id"] == run.id
+    assert len(store.list_runs()) == 1
+    assert store.get_run(run.id).status == "completed"
+    artifacts = {artifact.kind for artifact in store.list_artifacts(run.id)}
+    assert {"events", "transcript", "final_report", "codex_final_message"} <= artifacts
+
+
 def test_codex_runner_detects_policy_violation_on_dirty_post_status(tmp_path, monkeypatch) -> None:
     subprocess_outputs = iter(["", " M file.py\n"])
 

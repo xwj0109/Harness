@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-The v1.5 release-readiness pass is current. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, bounded read-only and Codex isolated adapters, and the unified chat/TUI operator app.
+The v1.6 repo-planning adapter pass is current. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, bounded read-only, repo-planning, and Codex isolated adapters, and the unified chat/TUI operator app.
 
 Historical milestone plans were removed after MVP cleanup. Keep this file as the current planning snapshot; use [agent_harness_master_plan.md](agent_harness_master_plan.md) only as a retained roadmap reference, not as blanket implementation approval.
 
@@ -59,6 +59,8 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `1.1.0`.
 - v1.5 release-readiness stabilization reconciles package/docs versioning, removes direct model-backed chat calls, adds deterministic next-step guidance, improves chat recovery guidance, and adds no-preflight `doctor --release` diagnostics.
 - Version bump to `1.5.0`.
+- v1.6 repo-planning adapter registers `repo_planning/repo_planning` behind the task, lease, daemon, run, artifact, and evidence flow while preserving Codex hosted-boundary approval and read-only sandbox execution.
+- Version bump to `1.6.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -109,7 +111,7 @@ Implemented TUI refinements include Textual app startup, a chat-style slash-comm
 
 The v1.2 read-only TUI refinement implementation is complete. It adds session-local section collapse and palette-only focus for command discovery while preserving the existing read-only TUI boundary: no command execution, subprocess spawning, clipboard writes, provider calls, backend preflight, Docker use, `.harness/` mutation, or persisted preferences.
 
-## Completed v1.2-v1.5 Execution Layer Milestones
+## Completed v1.2-v1.6 Execution Layer Milestones
 
 The staged execution layer is complete:
 
@@ -117,6 +119,7 @@ The staged execution layer is complete:
 - v1.3 Execution Lifecycle Hardening: shared active-lease validation, duplicate-run rejection, adapter-owned run binding, terminal task/attempt/lease finish evidence, and sanitized adapter rejection events.
 - v1.4 Codex Runner Binding: `CodexCodeEditRunner.run_existing(...)` lets the execution service own lease/attempt/run binding while the runner owns isolation, Codex execution, diff inspection, and apply-back mechanics.
 - v1.5 Codex Isolated Adapter: `codex_isolated_edit/codex_code_edit` dispatch validates hosted-boundary approval before run creation, uses configured `codex_cli`, preserves deny-by-default apply-back, and records security-relevant applied/denied/no-change/failure decisions.
+- v1.6 Repo Planning Adapter: `repo_planning/repo_planning` dispatch validates hosted-boundary approval before run creation, uses configured `codex_cli` read-only sandbox execution, and fails closed on policy violation, unsafe backend metadata, missing approval, or duplicate execution.
 
 ## Immediate Next Planning Target
 
@@ -139,11 +142,11 @@ Current chat implementation status:
 
 Recommended decision options after release verification:
 
-- Package and publish the coherent `1.5.0` local release after regression and wheel smokes pass.
+- Package and publish the coherent `1.6.0` local release after regression and wheel smokes pass.
 - Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
 - Additional read-only TUI refinements, still with no command execution or persisted preferences.
 
-Do not add another execution adapter until a separate decision-complete plan authorizes it. `repo_planning`, `simple_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes outside the explicit Codex apply-back path remain unauthorized.
+Do not add another execution adapter until a separate decision-complete plan authorizes it. `simple_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes outside the explicit Codex apply-back path remain unauthorized.
 
 ## Later Work
 

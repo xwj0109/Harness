@@ -2666,7 +2666,7 @@ def test_cli_daemon_adapters_lists_registered_descriptors_without_preflight(tmp_
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.execution_adapters/v1"
     adapter_ids = {adapter["id"] for adapter in payload["adapters"]}
-    assert {"dry_run", "read_only_summary", "codex_isolated_edit"} <= adapter_ids
+    assert {"dry_run", "read_only_summary", "codex_isolated_edit", "repo_planning"} <= adapter_ids
     for adapter in payload["adapters"]:
         assert "Descriptors are documentation and validation metadata, not permission grants." in adapter["safety_notes"]
 
@@ -2724,6 +2724,109 @@ def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> Non
     event = store.list_daemon_events()[0]
     assert event.event_type == "execution_adapter_rejected"
     assert event.metadata["reason_code"] == "unknown_adapter"
+
+
+def test_cli_tasks_add_accepts_repo_planning_execution_metadata(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Plan change",
+            "--execution-adapter",
+            "repo_planning",
+            "--task-type",
+            "repo_planning",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["task"]["metadata"] == {
+        "execution_adapter": "repo_planning",
+        "task_type": "repo_planning",
+    }
+
+
+def test_cli_daemon_execute_dispatches_repo_planning_through_registered_adapter(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["repo_planning"], 1)
+
+    class FakeBackend:
+        def __init__(self, config):
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities.model_copy(
+                    update={
+                        "supports_read_only_sandbox": True,
+                        "supports_cd": True,
+                        "supports_model_arg": True,
+                        "supports_output_last_message": True,
+                    }
+                ),
+            )
+
+        def run_read_only(self, project_root, prompt, final_message_path):
+            final_message_path.write_text("Plan only.", encoding="utf-8")
+            return CodexRunResult(
+                command=["codex", "exec", "--cd", str(project_root), "--sandbox", "read-only"],
+                stdout="",
+                stderr="",
+                exit_status=0,
+                json_events=[],
+                final_message="Plan only.",
+            )
+
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakeBackend)
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Plan change",
+            "--execution-adapter",
+            "repo_planning",
+            "--task-type",
+            "repo_planning",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    assert tick.exit_code == 0, tick.output
+    lease_id = json.loads(tick.output)["lease"]["id"]
+
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", lease_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.daemon_execute/v1"
+    assert payload["ok"] is True
+    assert payload["adapter_id"] == "repo_planning"
+    assert payload["decision"] == "repo_planning_completed"
+    assert payload["task"]["status"] == "succeeded"
+    assert payload["attempt"]["run_id"] == payload["run"]["id"]
+    assert payload["run"]["task_type"] == "repo_planning"
+    assert payload["manifest"]["schema_version"] == "harness.manifest/v1.1"
 
 
 def test_chat_task_draft_confirm_and_decline_flows(tmp_path) -> None:
@@ -3411,7 +3514,7 @@ def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) 
     assert payload["errors"] == [
         "Unsupported execution metadata: supported pairs are "
         "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
-        "and codex_isolated_edit/codex_code_edit"
+        "codex_isolated_edit/codex_code_edit, and repo_planning/repo_planning"
     ]
 
 
@@ -3611,7 +3714,7 @@ def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, mo
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.doctor/v1"
     assert payload["mode"] == "release"
-    assert payload["version"] == "1.5.0"
+    assert payload["version"] == "1.6.0"
     checks = {check["id"]: check for check in payload["checks"]}
     assert checks["codex_cli_metadata"]["details"]["preflight_performed"] is False
     assert checks["docker_metadata"]["details"]["version_check_performed"] is False
@@ -3619,6 +3722,7 @@ def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, mo
         "dry_run",
         "read_only_summary",
         "codex_isolated_edit",
+        "repo_planning",
     }
     runtime = checks["release_runtime_state"]["details"]
     assert runtime["blocked_or_waiting_tasks"][0]["title"] == "Waiting"

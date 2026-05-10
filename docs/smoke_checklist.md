@@ -33,14 +33,14 @@ python3 -m venv --system-site-packages /tmp/harness-install
 Expected packaging properties:
 
 - The installed wheel exposes the `harness` console script.
-- Package metadata reports version `1.5.0`.
+- Package metadata reports version `1.6.0`.
 - Packaged built-in YAML specs under `harness/builtin_specs/` are available after wheel install.
 - `harness --output json`, `harness home`, and `harness quickstart agent` remain non-mutating in the temporary project.
 - `harness doctor --release --output json` reports release-readiness metadata without backend/provider preflight.
 - Textual is a normal dependency for the installed app. `harness --output json` is a non-interactive probe and must not launch the terminal UI.
 - The packaging smoke does not preflight backends, call providers, run Docker, create tasks, acquire leases, create runs, execute adapters, expose secrets, or use hosted/paid fallback.
 
-## Verify v1.5 Registered Adapter Path
+## Verify v1.6 Registered Adapter Path
 
 This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the bounded read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.
 
@@ -73,16 +73,17 @@ harness daemon inspect-lease "$LEASE_ID" --project . --output json
 harness daemon execute-read-only "$LEASE_ID" --project . --output json
 ```
 
-Expected v1.5 safety properties:
+Expected v1.6 safety properties:
 
 - Agent and task lifecycle commands are declarative/control-plane operations only.
 - `daemon run-once` leases work but does not execute it.
 - `daemon execute-read-only` uses only the configured Codex CLI subscription route in read-only sandbox mode and requires hosted-boundary approval for `read_only_repo_summary`.
 - The MVP read-only path does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
+- The repo planning adapter is available only through exact `repo_planning/repo_planning` metadata, an active lease, a valid hosted-boundary Codex approval, and Codex read-only sandbox execution through the registered dispatcher.
 
 ## Verify Operator Cockpit
 
-Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.5 registered adapter smoke path when checking inspect text output.
+Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.6 registered adapter smoke path when checking inspect text output.
 
 ```bash
 harness --project . --output json
