@@ -9,9 +9,9 @@ This guide covers the currently implemented operator flows:
 
 The harness does not commit or push changes for these flows. Paid API execution, generic shell execution, workflows, plugins, MCP, browser/email/calendar integrations, hosted fallback, and local fallback are outside the implemented scope.
 
-## v1.6 Operator Workflow
+## v1.8 Operator Workflow
 
-The v1.6 release is a local-first workflow for declarative agents, manual durable tasks, inspectable evidence, registered adapter dispatch, and a unified operator app. The end-to-end read-only path is:
+The v1.8 release is a local-first supervised agent app for declarative agents, manual durable tasks, inspectable evidence, registered adapter dispatch, explicit local memory, capability discovery, orchestration progress, and a unified operator app. The end-to-end read-only path is:
 
 ```bash
 harness agents scaffold my_agent \
@@ -67,7 +67,7 @@ On first run, the app can initialize project state in place with `/init` or a na
 
 For chat-first orchestration, natural-language requests such as “summarize this repo” or “fix the failing test with Codex” draft a visible action first. Repository summaries use `read_only_summary/read_only_repo_summary` through the registered dispatcher and the supervised Codex CLI subscription path. Editing requests draft a visible objective and task graph. The default chat orchestrator is `coding_orchestrator`; operators can switch to another built-in orchestrator with `/use quant_orchestrator` or `/use personal_orchestrator`. In normal mode, the chat keeps draft-before-confirm behavior. In codex-like mode, after one explicit foreground run approval, chat creates the objective and tasks, then repeatedly uses the existing daemon run-once lease path and registered `codex_isolated_edit` adapter until the graph is terminal, blocked, rejected, or stopped. This is a bounded foreground loop, not a hidden daemon or generic executor.
 
-Within the unified app, slash commands such as `/help`, `/init`, `/mode`, `/home`, `/dashboard`, `/orchestrators`, `/use`, `/agents`, `/tasks`, `/runs`, `/leases`, `/adapters`, `/lease`, `/execute`, `/plan`, `/run`, `/stop`, `/progress`, `/reset`, and `/quit` operate through the same control-plane APIs as the non-interactive commands. The UI keeps dashboard context next to the transcript in stable sections for project overview, queue and daemon state, agents and specs, runtime evidence, command palette, and safety. Operators can use `ctrl+p` or `F2` to toggle palette-only search focus. When the prompt is not focused, `c` collapses or expands the current section and `shift+c` expands all sections. These preferences are in-memory for the running app session only.
+Within the unified app, slash commands such as `/help`, `/init`, `/mode`, `/home`, `/dashboard`, `/orchestrators`, `/use`, `/agents`, `/tasks`, `/runs`, `/leases`, `/capabilities`, `/adapters`, `/memory`, `/remember`, `/forget`, `/progress`, `/lease`, `/execute`, `/plan`, `/run`, `/stop`, `/reset`, and `/quit` operate through the same control-plane APIs as the non-interactive commands. Natural aliases such as “show capabilities”, “what can Harness do here?”, “show memory”, “show progress”, and “where are we” route to deterministic local renderers. The UI keeps dashboard context next to the transcript in stable sections for project overview, queue and daemon state, agents and specs, capabilities, memory, progress, runtime evidence, command palette, and safety. Operators can use `ctrl+p` or `F2` to toggle palette-only search focus. When the prompt is not focused, `c` collapses or expands the current section and `shift+c` expands all sections. These preferences are in-memory for the running app session only.
 
 `harness home` remains a read-only snapshot command for scripts and diagnostics:
 
@@ -89,7 +89,39 @@ harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 
 This command imports only the provided image path, stores a local source copy in `assets/tui/home_source.png`, and regenerates `src/harness/tui_assets/pixel_art.py`. It does not initialize projects, mutate `.harness/`, create tasks, create runs, acquire leases, start daemon work, execute adapters, preflight backends, run Docker, invoke shell tools, call providers, or expose image contents in command output.
 
-The CLI/TUI, registered dispatcher, Codex isolated adapter, repo planning adapter, and unified app stabilization are packaged together as release `1.6.0`. The unified app keeps read-only dashboard refinements and routes prompt actions through the real chat/orchestration engine; it does not broaden execution permissions beyond registered, approved adapters.
+The CLI/TUI, registered dispatcher, Codex isolated adapter, repo planning adapter, capability catalog, explicit local memory notes, orchestration progress, and unified app stabilization are packaged together as release `1.8.0`. The unified app keeps read-only dashboard refinements and routes prompt actions through the real chat/orchestration engine; it does not broaden execution permissions beyond registered, approved adapters.
+
+## v1.8 Local App Surfaces
+
+Capability catalog commands expose the registered adapter set as Harness-native local capabilities:
+
+```bash
+harness capabilities list --project . --output json
+harness capabilities inspect dry_run --project . --output json
+```
+
+The JSON wrapper is `harness.capability_catalog/v1`. Capability rows include supported task types, required approvals, sandbox/readiness notes, runtime control availability, and equivalent commands. They are read-only display and dispatch metadata; they do not preflight Codex, local model endpoints, Docker, shell, network, providers, or execute adapters.
+
+Explicit memory commands manage local operator notes:
+
+```bash
+harness memory save-note --scope project --summary "Remember this local preference" --project . --output json
+harness memory list --project . --output json
+harness memory inspect memory_abc123 --project . --output json
+harness memory forget memory_abc123 --project . --output json
+```
+
+The JSON wrappers are `harness.memory_record/v1` and `harness.memory_records/v1`. Memory records are scoped, local-only, redacted before persistence when secret-looking content appears, and never grant tools, approvals, backend access, hosted-boundary permission, apply-back permission, or execution authority. `/reset` clears session-local chat references only; it does not delete explicit memory records.
+
+Progress inspection exposes objective/task/lease/run state without doing work:
+
+```bash
+harness progress --objective obj_abc123 --project . --output json
+```
+
+The JSON wrapper is `harness.orchestration_progress/v1`. It reports objective mode, task rows, active lease/run ids, blocked reasons, and deterministic next commands. Chat `/progress [objective_id]` and the TUI right-panel Progress section render the same read-only payload. Progress inspection does not create tasks, acquire leases, create runs, dispatch adapters, call providers, touch Docker, or mutate active repository files.
+
+Blocked-state explanations are normalized across CLI, chat, and the TUI. `daemon inspect-lease`, `daemon execute`, `capabilities inspect`, `progress`, chat prompts such as “why is this blocked?” and “security blockers”, and the TUI right panel can show stable codes including `missing_approval`, `disabled_adapter`, `unsafe_metadata`, `unknown_adapter`, `sandbox_profile_mismatch`, `breaker_open`, and `forbidden_path_or_secret_like_content`. These explanations are read-only summaries of existing evidence; they do not create approvals, tasks, leases, runs, memory, artifacts, or execution.
 
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:
 
@@ -670,6 +702,15 @@ harness traces export run_abc123def456 --format otel-json --project . --output j
 ```
 
 The JSON wrappers are `harness.evals.safety_smoke/v1` and `harness.trace_export/v1`. Safety-smoke checks runtime policy evidence, backend boundaries, sandbox network settings, artifact drift, and task queue non-execution using existing local persistence. Trace export links run, event, artifact, backend, approval, and policy metadata where present.
+
+The security-layer completion audit is available through:
+
+```bash
+harness evals run --suite security-layer --project . --output json
+harness security audit --project . --output json
+```
+
+The audit returns `harness.security_layer_audit/v1` and verifies the local-first security-layer completion scope: typed decisions, adapter sandbox profiles, manifest evidence, controls, detections, integrity checks, context/memory authority boundaries, and blocked-state explanations. It is read-only and does not create runtime records, execute adapters, preflight backends, call providers, run Docker, or remediate state.
 
 These commands are evidence-only. They do not execute tools, preflight backends, run Docker, create runs, create artifacts, mutate tasks, inspect environment variables, or export artifact contents.
 

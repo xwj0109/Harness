@@ -1,13 +1,33 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
+from harness.approvals import ApprovalStore
+from harness.capabilities import build_capability_catalog
 from harness.config import HarnessConfig
+from harness.execution import list_execution_adapter_descriptors
+from harness.integrity import run_integrity_check
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import PolicyLevel, SafetySmokeCheck, SafetySmokeResult, TaskStatus
+from harness.models import (
+    DataBoundary,
+    PolicyLevel,
+    SafetySmokeCheck,
+    SafetySmokeResult,
+    SecurityCheckResult,
+    SecurityFinding,
+    SecurityFindingSeverity,
+    SecurityFindingStatus,
+    SecurityLayerAuditCheck,
+    SecurityLayerAuditResult,
+    TaskStatus,
+)
+from harness.operator_context import build_operator_context
 from harness.policy import resolve_backend_effective_policy
-from harness.security import sanitize_for_logging
+from harness.sandbox_profiles import get_sandbox_profile
+from harness.security import sanitize_for_logging, scan_text_for_secrets
 
 
 def run_safety_smoke(project_root: Path, config: HarnessConfig, store: SQLiteStore) -> SafetySmokeResult:
@@ -19,6 +39,528 @@ def run_safety_smoke(project_root: Path, config: HarnessConfig, store: SQLiteSto
         _manifest_policy_check(store),
     ]
     return SafetySmokeResult(ok=all(check.status == "pass" for check in checks), checks=checks)
+
+
+def run_security_check(project_root: Path, store: SQLiteStore) -> SecurityCheckResult:
+    project_root = project_root.resolve()
+    findings: list[SecurityFinding] = []
+    findings.extend(_daemon_rejection_findings(store))
+    findings.extend(_run_manifest_findings(project_root, store))
+    findings.extend(_secret_metadata_findings(project_root, store))
+    findings.sort(key=lambda item: (item.status.value, item.severity.value, item.check_id, item.id))
+    summary = {
+        "total": len(findings),
+        "pass": sum(1 for finding in findings if finding.status == SecurityFindingStatus.PASS),
+        "fail": sum(1 for finding in findings if finding.status == SecurityFindingStatus.FAIL),
+        "high": sum(1 for finding in findings if finding.severity == SecurityFindingSeverity.HIGH),
+        "warning": sum(1 for finding in findings if finding.severity == SecurityFindingSeverity.WARNING),
+        "info": sum(1 for finding in findings if finding.severity == SecurityFindingSeverity.INFO),
+    }
+    return SecurityCheckResult(
+        ok=all(finding.status == SecurityFindingStatus.PASS for finding in findings),
+        project_root=project_root,
+        findings=findings,
+        summary=summary,
+    )
+
+
+def run_security_layer_audit(project_root: Path) -> SecurityLayerAuditResult:
+    project_root = project_root.resolve()
+    checks: list[SecurityLayerAuditCheck] = []
+    initialized = (project_root / ".harness" / "harness.sqlite").exists()
+    checks.append(_registered_adapter_audit_check())
+    checks.append(_integrity_audit_check(project_root))
+    checks.append(_operator_context_audit_check(project_root))
+    if not initialized:
+        checks.extend(
+            [
+                _audit_check(
+                    "runtime_controls_inspectable",
+                    "skipped",
+                    "Project runtime state is not initialized; runtime controls were not inspected.",
+                    {"initialized": False},
+                ),
+                _audit_check(
+                    "runtime_manifest_evidence",
+                    "skipped",
+                    "Project runtime state is not initialized; run manifests were not inspected.",
+                    {"initialized": False},
+                ),
+                _audit_check(
+                    "security_detections_callable",
+                    "skipped",
+                    "Project runtime state is not initialized; security detections were not inspected.",
+                    {"initialized": False},
+                ),
+            ]
+        )
+    else:
+        store = SQLiteStore(project_root)
+        checks.append(_runtime_controls_audit_check(store))
+        checks.append(_runtime_manifest_audit_check(store))
+        checks.append(_security_detection_audit_check(project_root, store))
+        checks.append(_memory_boundary_audit_check(store))
+        checks.append(_progress_blocked_state_audit_check(project_root, store))
+    checks.sort(key=lambda item: item.id)
+    summary = {
+        "total": len(checks),
+        "pass": sum(1 for check in checks if check.status == "pass"),
+        "fail": sum(1 for check in checks if check.status == "fail"),
+        "skipped": sum(1 for check in checks if check.status == "skipped"),
+    }
+    return SecurityLayerAuditResult(
+        ok=all(check.status != "fail" for check in checks),
+        project_root=project_root,
+        checks=checks,
+        summary=summary,
+    )
+
+
+def _registered_adapter_audit_check() -> SecurityLayerAuditCheck:
+    failures = []
+    evidence = []
+    for descriptor in list_execution_adapter_descriptors():
+        profile = get_sandbox_profile(descriptor.sandbox_profile_id) if descriptor.sandbox_profile_id else None
+        evidence.append(
+            {
+                "adapter_id": descriptor.id,
+                "schema_version": descriptor.schema_version,
+                "sandbox_profile_id": descriptor.sandbox_profile_id,
+                "required_approvals": descriptor.required_approvals,
+            }
+        )
+        if profile is None:
+            failures.append(f"{descriptor.id}: missing or unknown sandbox profile")
+    return _audit_check(
+        "registered_adapters_have_sandbox_profiles",
+        "pass" if not failures else "fail",
+        "Registered adapters declare valid sandbox profiles." if not failures else "; ".join(failures),
+        {"adapters": evidence},
+    )
+
+
+def _integrity_audit_check(project_root: Path) -> SecurityLayerAuditCheck:
+    result = run_integrity_check(project_root)
+    return _audit_check(
+        "integrity_checks_pass",
+        "pass" if result.ok else "fail",
+        "Local integrity checks pass." if result.ok else "Local integrity checks reported failures.",
+        {"summary": result.summary},
+    )
+
+
+def _operator_context_audit_check(project_root: Path) -> SecurityLayerAuditCheck:
+    context = build_operator_context(project_root)
+    capability_rows = context.get("capabilities", {}).get("capabilities", [])
+    has_blocked_field = all("blocked_state_explanations" in row for row in capability_rows)
+    progress_rows = context.get("progress", {}).get("tasks", [])
+    progress_has_blocked_field = all("blocked_state_explanations" in row for row in progress_rows)
+    ok = bool(context.get("safety_boundaries")) and has_blocked_field and progress_has_blocked_field
+    return _audit_check(
+        "operator_context_surfaces_security_layer",
+        "pass" if ok else "fail",
+        "Operator context exposes security-layer summaries."
+        if ok
+        else "Operator context is missing security-layer summary fields.",
+        {
+            "initialized": context.get("initialized"),
+            "capabilities": len(capability_rows),
+            "progress_tasks": len(progress_rows),
+            "safety_boundaries": context.get("safety_boundaries", []),
+        },
+    )
+
+
+def _runtime_controls_audit_check(store: SQLiteStore) -> SecurityLayerAuditCheck:
+    try:
+        controls = store.list_execution_controls()
+        breakers = store.list_adapter_breaker_states([descriptor.id for descriptor in list_execution_adapter_descriptors()])
+    except Exception as exc:
+        return _audit_check(
+            "runtime_controls_inspectable",
+            "fail",
+            "Runtime controls could not be inspected.",
+            {"error": str(exc)},
+        )
+    return _audit_check(
+        "runtime_controls_inspectable",
+        "pass",
+        "Runtime controls and adapter breakers are inspectable.",
+        {"controls": len(controls), "breakers": len(breakers)},
+    )
+
+
+def _runtime_manifest_audit_check(store: SQLiteStore) -> SecurityLayerAuditCheck:
+    failures = []
+    evidence = []
+    for run in store.list_runs():
+        manifest = store.build_run_manifest(run.id)
+        adapter_id = _adapter_id_for_run(store, run.task_id)
+        item = {
+            "run_id": run.id,
+            "adapter_id": adapter_id,
+            "effective_policy_sha256": manifest.effective_policy_sha256,
+            "backend_descriptor_sha256": manifest.backend_descriptor_sha256,
+            "sandbox_profile_id": manifest.sandbox_profile.get("id") if manifest.sandbox_profile else None,
+            "artifacts": len(manifest.artifacts),
+            "context_provenance": len(manifest.context_provenance),
+        }
+        evidence.append(item)
+        if adapter_id:
+            if not manifest.effective_policy_sha256:
+                failures.append(f"{run.id}: missing policy hash")
+            if manifest.sandbox_profile is None:
+                failures.append(f"{run.id}: missing sandbox profile evidence")
+            if not manifest.context_provenance:
+                failures.append(f"{run.id}: missing context provenance")
+            for artifact in manifest.artifacts:
+                if not artifact.redaction_state:
+                    failures.append(f"{run.id}:{artifact.kind}: missing redaction state")
+                if artifact.provenance is None:
+                    failures.append(f"{run.id}:{artifact.kind}: missing artifact provenance")
+    return _audit_check(
+        "runtime_manifest_evidence",
+        "pass" if not failures else "fail",
+        "Run manifests expose security-layer evidence." if not failures else "; ".join(failures),
+        {"runs": evidence},
+    )
+
+
+def _security_detection_audit_check(project_root: Path, store: SQLiteStore) -> SecurityLayerAuditCheck:
+    result = run_security_check(project_root, store)
+    return _audit_check(
+        "security_detections_callable",
+        "pass",
+        "Security detections are callable and sanitized.",
+        {"ok": result.ok, "summary": result.summary},
+    )
+
+
+def _memory_boundary_audit_check(store: SQLiteStore) -> SecurityLayerAuditCheck:
+    failures = []
+    for memory in store.list_memory_records(include_forgotten=True):
+        lineage = memory.lineage
+        if lineage.get("permission_granting") is not False:
+            failures.append(f"{memory.id}: permission_granting not false")
+        if lineage.get("policy_authority") is not False:
+            failures.append(f"{memory.id}: policy_authority not false")
+        if lineage.get("approval_authority") is not False:
+            failures.append(f"{memory.id}: approval_authority not false")
+    return _audit_check(
+        "memory_context_not_authority",
+        "pass" if not failures else "fail",
+        "Memory/context provenance cannot grant authority." if not failures else "; ".join(failures),
+        {"memory_records": len(store.list_memory_records(include_forgotten=True))},
+    )
+
+
+def _progress_blocked_state_audit_check(project_root: Path, store: SQLiteStore) -> SecurityLayerAuditCheck:
+    from harness.progress import build_orchestration_progress
+
+    failures = []
+    inspected = 0
+    for objective in store.list_objectives():
+        progress = build_orchestration_progress(project_root, objective.id)
+        for task in progress.tasks:
+            inspected += 1
+            if task.blocked_reasons and not task.blocked_state_explanations:
+                failures.append(f"{task.task_id}: missing blocked state explanations")
+    return _audit_check(
+        "progress_blocked_states_explained",
+        "pass" if not failures else "fail",
+        "Progress blocked states expose structured explanations." if not failures else "; ".join(failures),
+        {"progress_tasks": inspected},
+    )
+
+
+def _audit_check(check_id: str, status: str, message: str, evidence: dict[str, Any]) -> SecurityLayerAuditCheck:
+    return SecurityLayerAuditCheck(
+        id=check_id,
+        status=status,
+        message=str(sanitize_for_logging(message)),
+        evidence=sanitize_for_logging(evidence),
+    )
+
+
+def _daemon_rejection_findings(store: SQLiteStore) -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
+    for event in store.list_daemon_events(limit=1000):
+        if event.event_type != "execution_adapter_rejected":
+            continue
+        reason_code = str(event.metadata.get("reason_code") or "")
+        adapter_id = _optional_str(event.metadata.get("adapter_id"))
+        if reason_code == "unknown_adapter":
+            findings.append(
+                _finding(
+                    "unknown_adapter_dispatch_attempt",
+                    SecurityFindingSeverity.WARNING,
+                    "Unknown registered adapter dispatch was rejected.",
+                    event.created_at,
+                    evidence={"daemon_event_id": event.id, "reason_code": reason_code},
+                    adapter_id=adapter_id,
+                    task_id=_optional_str(event.metadata.get("task_id")),
+                    attempt_id=_optional_str(event.metadata.get("attempt_id")),
+                    lease_id=_optional_str(event.metadata.get("lease_id")),
+                    security_decision_id=_optional_str(event.metadata.get("security_decision_id")),
+                    policy_sha256=_optional_str(event.metadata.get("policy_sha256")),
+                )
+            )
+        if reason_code == "breaker_open":
+            findings.append(
+                _finding(
+                    "breaker_open_execution_attempt",
+                    SecurityFindingSeverity.WARNING,
+                    "Execution was attempted while the adapter breaker was open.",
+                    event.created_at,
+                    evidence={"daemon_event_id": event.id, "reason_code": reason_code},
+                    adapter_id=adapter_id,
+                    task_id=_optional_str(event.metadata.get("task_id")),
+                    attempt_id=_optional_str(event.metadata.get("attempt_id")),
+                    lease_id=_optional_str(event.metadata.get("lease_id")),
+                    security_decision_id=_optional_str(event.metadata.get("security_decision_id")),
+                    policy_sha256=_optional_str(event.metadata.get("policy_sha256")),
+                )
+            )
+        if reason_code in {"missing_required_approval", "unresolved_task_approvals"} and _is_codex_adapter(adapter_id):
+            findings.append(
+                _finding(
+                    "high_risk_adapter_without_approval",
+                    SecurityFindingSeverity.HIGH,
+                    "High-risk registered adapter was attempted without required approval.",
+                    event.created_at,
+                    evidence={"daemon_event_id": event.id, "reason_code": reason_code},
+                    adapter_id=adapter_id,
+                    task_id=_optional_str(event.metadata.get("task_id")),
+                    attempt_id=_optional_str(event.metadata.get("attempt_id")),
+                    lease_id=_optional_str(event.metadata.get("lease_id")),
+                    security_decision_id=_optional_str(event.metadata.get("security_decision_id")),
+                    policy_sha256=_optional_str(event.metadata.get("policy_sha256")),
+                )
+            )
+    return findings
+
+
+def _run_manifest_findings(project_root: Path, store: SQLiteStore) -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
+    approvals = ApprovalStore(project_root)
+    for run in store.list_runs():
+        manifest = store.build_run_manifest(run.id)
+        adapter_id = _adapter_id_for_run(store, run.task_id)
+        sandbox_profile_id = manifest.sandbox_profile.get("id") if manifest.sandbox_profile else None
+        if run.data_boundary == DataBoundary.HOSTED_PROVIDER:
+            approval_valid = False
+            if run.approval_id:
+                approval = _approval_by_id(approvals, run.approval_id)
+                approval_valid = bool(
+                    approval
+                    and run.task_type
+                    and approval.is_valid_for("codex_cli", project_root, "hosted_provider", run.task_type)
+                )
+            if not approval_valid:
+                findings.append(
+                    _finding(
+                        "hosted_boundary_without_approval",
+                        SecurityFindingSeverity.HIGH,
+                        "Hosted-boundary run is missing valid approval evidence.",
+                        run.updated_at,
+                        evidence={"data_boundary": run.data_boundary.value, "approval_present": bool(run.approval_id)},
+                        run_id=run.id,
+                        task_id=run.task_id,
+                        adapter_id=adapter_id,
+                        policy_sha256=manifest.effective_policy_sha256,
+                        approval_id=run.approval_id,
+                        sandbox_profile_id=sandbox_profile_id,
+                    )
+                )
+        if adapter_id and sandbox_profile_id is None:
+            findings.append(
+                _finding(
+                    "missing_sandbox_profile_evidence",
+                    SecurityFindingSeverity.WARNING,
+                    "Registered-adapter run is missing sandbox profile evidence.",
+                    run.updated_at,
+                    evidence={"adapter_id": adapter_id, "task_type": run.task_type},
+                    run_id=run.id,
+                    task_id=run.task_id,
+                    adapter_id=adapter_id,
+                    policy_sha256=manifest.effective_policy_sha256,
+                )
+            )
+        events = store.list_events(run.id)
+        if any(event.event_type == "apply_back_applied" for event in events):
+            has_diff = any(event.event_type == "isolated_diff_inspected" for event in events)
+            has_approved = any(
+                event.event_type == "apply_back_decision" and event.payload.get("decision") == "approved"
+                for event in events
+            )
+            if not (has_diff and has_approved):
+                findings.append(
+                    _finding(
+                        "apply_back_without_inspected_approval",
+                        SecurityFindingSeverity.HIGH,
+                        "Apply-back was applied without complete inspected-diff approval evidence.",
+                        run.updated_at,
+                        evidence={"has_diff_inspection": has_diff, "has_approved_decision": has_approved},
+                        run_id=run.id,
+                        task_id=run.task_id,
+                        adapter_id=adapter_id,
+                        policy_sha256=manifest.effective_policy_sha256,
+                        approval_id=run.approval_id,
+                        sandbox_profile_id=sandbox_profile_id,
+                    )
+                )
+        if any(_docker_network_enabled(event.payload) for event in events) or _docker_network_enabled(
+            manifest.model_dump(mode="json")
+        ):
+            findings.append(
+                _finding(
+                    "docker_network_enabled",
+                    SecurityFindingSeverity.HIGH,
+                    "Docker or test evidence indicates network access was enabled.",
+                    run.updated_at,
+                    evidence={"run_id": run.id},
+                    run_id=run.id,
+                    task_id=run.task_id,
+                    adapter_id=adapter_id,
+                    policy_sha256=manifest.effective_policy_sha256,
+                    sandbox_profile_id=sandbox_profile_id,
+                )
+            )
+    return findings
+
+
+def _secret_metadata_findings(project_root: Path, store: SQLiteStore) -> list[SecurityFinding]:
+    findings: list[SecurityFinding] = []
+    checked: list[tuple[str, Any, dict[str, Any]]] = []
+    for event in store.list_daemon_events(limit=1000):
+        checked.append((f"daemon_event:{event.id}", event.metadata, {"created_at": event.created_at}))
+    for memory in store.list_memory_records(include_forgotten=True):
+        checked.append((f"memory:{memory.id}", {"summary": memory.summary, "lineage": memory.lineage}, {"created_at": memory.updated_at}))
+    for run in store.list_runs():
+        manifest = store.build_run_manifest(run.id).model_dump(mode="json")
+        checked.append((f"manifest:{run.id}", manifest, {"created_at": run.updated_at, "run_id": run.id}))
+        for event in store.list_events(run.id):
+            checked.append((f"run_event:{event.id}", event.payload, {"created_at": event.created_at, "run_id": run.id}))
+        for artifact in store.list_artifacts(run.id):
+            checked.append(
+                (
+                    f"artifact:{artifact.id}",
+                    {
+                        "kind": artifact.kind,
+                        "producer": artifact.producer,
+                        "redaction_state": artifact.redaction_state,
+                        "metadata": artifact.metadata,
+                    },
+                    {"created_at": artifact.created_at, "run_id": run.id},
+                )
+            )
+    for location, payload, meta in checked:
+        findings_found = scan_text_for_secrets(json.dumps(payload, sort_keys=True, default=str))
+        if findings_found:
+            findings.append(
+                _finding(
+                    "secret_like_metadata_output",
+                    SecurityFindingSeverity.HIGH,
+                    "Secret-like value detected in persisted metadata.",
+                    meta["created_at"],
+                    evidence={
+                        "location": location,
+                        "finding_types": sorted({finding.kind for finding in findings_found}),
+                    },
+                    run_id=meta.get("run_id"),
+                )
+            )
+    return findings
+
+
+def _finding(
+    check_id: str,
+    severity: SecurityFindingSeverity,
+    message: str,
+    created_at,
+    *,
+    evidence: dict[str, Any],
+    run_id: str | None = None,
+    task_id: str | None = None,
+    attempt_id: str | None = None,
+    lease_id: str | None = None,
+    adapter_id: str | None = None,
+    security_decision_id: str | None = None,
+    policy_sha256: str | None = None,
+    approval_id: str | None = None,
+    sandbox_profile_id: str | None = None,
+) -> SecurityFinding:
+    stable = {
+        "check_id": check_id,
+        "run_id": run_id,
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "lease_id": lease_id,
+        "adapter_id": adapter_id,
+        "evidence": sanitize_for_logging(evidence),
+    }
+    finding_id = "secfind_" + hashlib.sha256(
+        json.dumps(stable, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+    return SecurityFinding(
+        id=finding_id,
+        check_id=check_id,
+        status=SecurityFindingStatus.FAIL,
+        severity=severity,
+        message=str(sanitize_for_logging(message)),
+        evidence=sanitize_for_logging(evidence),
+        run_id=run_id,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        lease_id=lease_id,
+        adapter_id=adapter_id,
+        security_decision_id=security_decision_id,
+        policy_sha256=policy_sha256,
+        approval_id=approval_id,
+        sandbox_profile_id=sandbox_profile_id,
+        created_at=created_at,
+    )
+
+
+def _adapter_id_for_run(store: SQLiteStore, task_id: str | None) -> str | None:
+    if not task_id:
+        return None
+    try:
+        task = store.get_task(task_id)
+    except KeyError:
+        return None
+    value = task.metadata.get("execution_adapter")
+    return str(value) if isinstance(value, str) else None
+
+
+def _approval_by_id(store: ApprovalStore, approval_id: str):
+    for approval in store.list():
+        if approval.id == approval_id:
+            return approval
+    return None
+
+
+def _docker_network_enabled(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).lower()
+            if normalized in {"network", "allow_network", "network_enabled"} and item is True:
+                return True
+            if normalized in {"network_mode"} and str(item).lower() not in {"", "none", "disabled", "false"}:
+                return True
+            if _docker_network_enabled(item):
+                return True
+    if isinstance(value, list):
+        return any(_docker_network_enabled(item) for item in value)
+    return False
+
+
+def _is_codex_adapter(adapter_id: str | None) -> bool:
+    return adapter_id in {"read_only_summary", "repo_planning", "codex_isolated_edit"}
+
+
+def _optional_str(value: Any) -> str | None:
+    return str(value) if value is not None else None
 
 
 def _sandbox_network_check(config: HarnessConfig) -> SafetySmokeCheck:

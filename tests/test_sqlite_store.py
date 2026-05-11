@@ -7,7 +7,8 @@ import pytest
 from harness.agent_authoring import load_agent_bundle
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import ObjectiveStatus, TaskLeaseStatus, TaskStatus
+from harness.models import BreakerStatus, KillSwitchTargetKind, ObjectiveStatus, TaskLeaseStatus, TaskStatus
+from harness.security import SecretBlockedError
 
 
 def _write_project_agent_bundle(path, *, agent_id: str = "custom_quant_researcher") -> None:
@@ -73,6 +74,59 @@ def test_store_create_run_event_artifact_and_report(tmp_path) -> None:
     assert paths["events"].read_text(encoding="utf-8")
     assert report.exists()
     assert "Run " in report.read_text(encoding="utf-8")
+
+
+def test_execution_controls_are_idempotent_and_sanitized(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    first = store.disable_execution_control(
+        KillSwitchTargetKind.ADAPTER,
+        "dry_run",
+        reason="pause OPENAI_API_KEY=secret",
+        actor="tester",
+    )
+    second = store.disable_execution_control(
+        "adapter",
+        "dry_run",
+        reason="still paused",
+        actor="tester",
+    )
+    enabled = store.enable_execution_control("adapter", "dry_run", actor="tester")
+
+    assert first.schema_version == "harness.kill_switch/v1"
+    assert first.id == second.id == enabled.id
+    assert "OPENAI_API_KEY=secret" not in first.reason
+    assert second.reason == "still paused"
+    assert enabled.disabled is False
+    assert len(store.list_execution_controls()) == 1
+
+
+def test_adapter_breaker_reset_suppresses_prior_failures(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    daemon = store.ensure_daemon(owner="test")
+    for index in range(3):
+        store.record_daemon_event(
+            daemon.id,
+            event_type="execution_adapter_rejected",
+            message="Adapter failed.",
+            metadata={
+                "adapter_id": "dry_run",
+                "reason_code": "adapter_execution_failed",
+                "error": f"failure {index}",
+            },
+        )
+
+    opened = store.adapter_breaker_state("dry_run")
+    reset = store.reset_adapter_breaker("dry_run", reason="reviewed", actor="tester")
+
+    assert opened.schema_version == "harness.adapter_breaker/v1"
+    assert opened.status == BreakerStatus.OPEN
+    assert opened.failure_count == 3
+    assert reset.status == BreakerStatus.CLOSED
+    assert reset.failure_count == 0
+    assert reset.last_reset_at is not None
 
 
 def test_project_agent_import_persists_lists_and_inspects(tmp_path) -> None:
@@ -228,11 +282,15 @@ def test_store_writes_and_refreshes_run_manifest(tmp_path) -> None:
             "sha256": hashlib.sha256(b"").hexdigest(),
             "size_bytes": 0,
             "producer": None,
-            "redaction_state": "unknown",
+            "redaction_state": "not_required",
             "evidence_status": "verified",
-            "metadata": {"required": True},
+            "metadata": artifact_entry["metadata"],
+            "provenance": artifact_entry["provenance"],
         }
     ]
+    assert artifact_entry["metadata"]["required"] is True
+    assert artifact_entry["metadata"]["provenance"]["schema_version"] == "harness.artifact_provenance/v1"
+    assert artifact_entry["provenance"]["schema_version"] == "harness.artifact_provenance/v1"
 
     store.update_run_status(run.id, "completed")
     completed = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -940,6 +998,59 @@ def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None
     assert store.verify_artifact(artifact.id).evidence_status == "missing"
 
 
+def test_store_artifact_registration_marks_clean_evidence_not_required(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="artifact run", task_type="phase_1a_test")
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "clean.txt"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("clean evidence", encoding="utf-8")
+
+    artifact = store.register_artifact(run.id, "clean", artifact_path, metadata={"secret": "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz"})
+
+    assert artifact.path == artifact_path
+    assert artifact.redaction_state == "not_required"
+    assert artifact.metadata["secret"] == "[REDACTED_SECRET]"
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in json.dumps(store.build_run_manifest(run.id).model_dump(mode="json"))
+
+
+def test_store_artifact_registration_derives_redacted_evidence_for_secret_content(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="artifact run", task_type="phase_1a_test")
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "secret.txt"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("token OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\n", encoding="utf-8")
+
+    artifact = store.register_artifact(run.id, "secret", artifact_path)
+    serialized = json.dumps(store.build_run_manifest(run.id).model_dump(mode="json"))
+
+    assert artifact.redaction_state == "redacted"
+    assert artifact.path != artifact_path
+    assert artifact.path.name == "secret.redacted.txt"
+    assert artifact_path.read_text(encoding="utf-8").endswith("sk-abcdefghijklmnopqrstuvwxyz\n")
+    assert "[REDACTED_SECRET]" in artifact.path.read_text(encoding="utf-8")
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in serialized
+    assert artifact.metadata["redaction_lineage"]["source_sha256"]
+    assert artifact.metadata["redaction_lineage"]["findings"][0]["kind"] == "openai_key"
+
+
+def test_store_artifact_registration_blocks_secret_like_paths(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="artifact run", task_type="phase_1a_test")
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "secret.key"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("not actually secret", encoding="utf-8")
+
+    try:
+        store.register_artifact(run.id, "secret_path", artifact_path)
+    except SecretBlockedError as exc:
+        assert "Blocked secret-like artifact path: secret.key" in str(exc)
+    else:
+        raise AssertionError("secret-like artifact path should be blocked")
+
+
 def test_store_rejects_missing_artifact_registration(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -1037,6 +1148,29 @@ def test_store_compare_reports_artifact_evidence_drift_without_contents(tmp_path
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
+
+
+def test_store_manifest_includes_artifact_provenance_and_descriptor_evidence(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="provenance", task_type="phase_1a_test")
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "events.jsonl"
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text("{}", encoding="utf-8")
+
+    artifact = store.register_artifact(run.id, "events", artifact_path, producer="harness.runner")
+    manifest = store.build_run_manifest(run.id)
+    manifest_artifact = manifest.artifacts[0]
+    snapshot = store.build_run_evidence_snapshot(run.id)
+
+    assert artifact.provenance is not None
+    assert artifact.provenance.schema_version == "harness.artifact_provenance/v1"
+    assert artifact.provenance.producer == "harness.runner"
+    assert artifact.provenance.output_sha256 == artifact.sha256
+    assert manifest_artifact.provenance is not None
+    assert manifest_artifact.provenance.id == artifact.provenance.id
+    assert snapshot["adapter_descriptors"]
+    assert {entry["id"] for entry in snapshot["adapter_descriptors"]} >= {"dry_run"}
 
 
 def test_store_baseline_errors_are_stable(tmp_path) -> None:

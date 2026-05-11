@@ -160,6 +160,34 @@ def test_approved_apply_back_modifies_only_validated_existing_text_files(tmp_pat
     assert result["freshness_result"]["ok"] is True
 
 
+def test_active_repo_apply_back_kill_switch_denies_mutation_after_isolated_edit(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.disable_execution_control(
+        "active_repo_apply_back",
+        "*",
+        reason="operator paused active repo mutation",
+        actor="test",
+    )
+    before = (tmp_path / "app.py").read_bytes()
+
+    result = CodexCodeEditRunner(
+        tmp_path,
+        store,
+        FakeEditBackend(default_config().backends["codex_cli"]),
+        ApprovalStore(tmp_path),
+        apply_back_approval_provider=StaticApplyBackApproval("approved"),
+    ).run("change value", "codex_code_edit", approval(tmp_path))
+
+    assert result["status"] == "completed_denied"
+    assert result["apply_back_decision"] == "denied"
+    assert result["applied_files"] == []
+    assert (tmp_path / "app.py").read_bytes() == before
+    events = SQLiteStore(tmp_path).list_events(result["run_id"])
+    assert any(event.event_type == "apply_back_control_disabled" for event in events)
+
+
 def test_apply_back_never_uses_codex_final_message(tmp_path) -> None:
     init_clean_project(tmp_path)
     backend = FakeEditBackend(
@@ -377,9 +405,12 @@ def test_codex_isolated_adapter_missing_approval_rejects_before_run(tmp_path) ->
     result = execute_lease(tmp_path, leased["lease"].id, owner="local_daemon:test:123")
 
     assert result.ok is False
-    assert result.decision == "codex_isolated_edit_blocked_policy"
+    assert result.decision == "execution_adapter_rejected"
+    assert result.security_decision is not None
+    assert result.security_decision.decision.value == "approval_required"
+    assert result.security_decision.missing_approvals == ["hosted_provider_codex"]
     assert result.run is None
-    assert "Missing valid hosted-provider Codex approval" in result.rejection_reasons[0]
+    assert "Missing required adapter approvals: hosted_provider_codex." in result.rejection_reasons
     assert store.list_runs() == []
     assert any(event.event_type == "execution_adapter_rejected" for event in store.list_daemon_events())
 
@@ -398,9 +429,12 @@ def test_repo_planning_adapter_missing_approval_rejects_before_run(tmp_path) -> 
     result = execute_lease(tmp_path, leased["lease"].id, owner="local_daemon:test:123")
 
     assert result.ok is False
-    assert result.decision == "repo_planning_blocked_policy"
+    assert result.decision == "execution_adapter_rejected"
+    assert result.security_decision is not None
+    assert result.security_decision.decision.value == "approval_required"
+    assert result.security_decision.missing_approvals == ["hosted_provider_codex"]
     assert result.run is None
-    assert "Missing valid hosted-provider Codex approval" in result.rejection_reasons[0]
+    assert "Missing required adapter approvals: hosted_provider_codex." in result.rejection_reasons
     assert store.list_runs() == []
     assert any(event.event_type == "execution_adapter_rejected" for event in store.list_daemon_events())
 
@@ -551,6 +585,39 @@ def test_chat_orchestrated_codex_flow_uses_registered_adapter_with_denied_apply_
         "codex_isolated_edit_completed_denied",
     ]
     assert (tmp_path / "app.py").read_bytes() == before
+
+
+def test_chat_apply_back_approve_applies_inspected_codex_diff(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    result = run_edit(tmp_path, FakeEditBackend(default_config().backends["codex_cli"]), "denied")
+    state = ChatSessionState(latest_run_id=result["run_id"])
+
+    applied = handle_chat_input("apply it", tmp_path, state)
+
+    assert applied["kind"] == "apply_back_applied"
+    assert applied["ok"] is True
+    assert applied["applied_files"] == ["app.py"]
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+    store = SQLiteStore(tmp_path)
+    assert store.get_run(result["run_id"]).status == "completed_applied"
+    events = store.list_events(result["run_id"])
+    assert any(event.event_type == "apply_back_decision" and event.payload["decision"] == "approved" for event in events)
+    assert any(event.event_type == "apply_back_applied" for event in events)
+
+
+def test_chat_apply_back_approve_fails_closed_when_active_file_changed(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    result = run_edit(tmp_path, FakeEditBackend(default_config().backends["codex_cli"]), "denied")
+    (tmp_path / "app.py").write_text("value = 9\n", encoding="utf-8")
+    state = ChatSessionState(latest_run_id=result["run_id"])
+
+    blocked = handle_chat_input("/apply-back approve", tmp_path, state)
+
+    assert blocked["kind"] == "apply_back_freshness_failed"
+    assert blocked["ok"] is False
+    assert "changed since isolation" in "\n".join(blocked["lines"])
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 9\n"
+    assert not any(event.event_type == "apply_back_applied" for event in SQLiteStore(tmp_path).list_events(result["run_id"]))
 
 
 def test_codex_isolated_adapter_rejects_requires_hosted_boundary_metadata(tmp_path) -> None:

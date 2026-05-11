@@ -2,7 +2,7 @@
 
 ## Current Phase
 
-The v1.6 repo-planning adapter pass is current. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, bounded read-only, repo-planning, and Codex isolated adapters, and the unified chat/TUI operator app.
+The v1.8 Local Agent App Readiness pass is current. The repository now has local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, bounded read-only, repo-planning, and Codex isolated adapters, the unified chat/TUI operator app, capability catalog, explicit local memory notes, and read-only orchestration progress.
 
 Historical milestone plans were removed after MVP cleanup. Keep this file as the current planning snapshot; use [agent_harness_master_plan.md](agent_harness_master_plan.md) only as a retained roadmap reference, not as blanket implementation approval.
 
@@ -61,6 +61,10 @@ The first v0.2 schema and registry foundations are in place:
 - Version bump to `1.5.0`.
 - v1.6 repo-planning adapter registers `repo_planning/repo_planning` behind the task, lease, daemon, run, artifact, and evidence flow while preserving Codex hosted-boundary approval and read-only sandbox execution.
 - Version bump to `1.6.0`.
+- v1.7 read-only operator TUI polish updates copy-only command-palette, right-panel, slash/help, and next-step guidance to reflect the registered adapter set without adding execution authority.
+- Version bump to `1.7.0`.
+- v1.8 Local Agent App Readiness adds a Harness-native capability catalog, explicit local memory notes, read-only orchestration progress, app/chat/TUI exposure for those surfaces, release docs, and packaging alignment without adding execution authority.
+- Version bump to `1.8.0`.
 
 The v0.2 components are declarative and read-only. The v0.3 queue components write only initialized harness persistence through the runtime. None of these components execute agents, preflight backends, run Docker from task commands, start schedulers, or schedule background work.
 
@@ -121,9 +125,19 @@ The staged execution layer is complete:
 - v1.5 Codex Isolated Adapter: `codex_isolated_edit/codex_code_edit` dispatch validates hosted-boundary approval before run creation, uses configured `codex_cli`, preserves deny-by-default apply-back, and records security-relevant applied/denied/no-change/failure decisions.
 - v1.6 Repo Planning Adapter: `repo_planning/repo_planning` dispatch validates hosted-boundary approval before run creation, uses configured `codex_cli` read-only sandbox execution, and fails closed on policy violation, unsafe backend metadata, missing approval, or duplicate execution.
 
+## Completed v1.7 Operator TUI Polish
+
+The v1.7 operator polish milestone keeps the unified app read-only outside explicit existing commands. It updates command-palette templates, right-panel adapter rows, slash/help guidance, and deterministic next-step recommendations to include `repo_planning/repo_planning` and generic registered dispatch while preserving copy-only TUI behavior and in-memory UI state only.
+
+## Completed v1.8 Local Agent App Readiness
+
+The v1.8 local app readiness milestone translates OpenClaw-style ideas into Harness-native local surfaces without broadening authority. Capability Catalog exposes registered adapters as read-only capabilities. Explicit Local Memory Notes stores operator-saved, scoped, redacted local records only. Orchestration Progress exposes objective/task/lease/run state through a stable read-only schema, chat aliases, and TUI right-panel summary. The release keeps the existing task, lease, approval, registered adapter, evidence, sandbox, and apply-back boundaries unchanged.
+
 ## Immediate Next Planning Target
 
-The current implementation target is release readiness for the unified Harness app described in [chat_cli_experience_plan.md](chat_cli_experience_plan.md). The chat layer sits above the existing control plane and registered execution dispatcher. It is an operator surface, not a separate execution authority.
+The current implementation target after v1.8 is separate decision-complete planning for any future external channel adapters, third-party skill/package lifecycle, MCP/A2A support, browser automation, generic shell execution, local daemon autonomy beyond bounded foreground loops, or broader workbench automation. Planning files do not authorize implementation by themselves.
+
+The first post-v1.8 future-gate artifact is [external_channel_adapters_decision_plan.md](external_channel_adapters_decision_plan.md). It keeps external channels deferred and defines the minimum safe decision surface required before any Slack, Discord, Telegram, email, calendar, Matrix, Signal, Teams, WhatsApp, web chat, or other channel code can be implemented.
 
 Current chat implementation status:
 
@@ -142,9 +156,9 @@ Current chat implementation status:
 
 Recommended decision options after release verification:
 
-- Package and publish the coherent `1.6.0` local release after regression and wheel smokes pass.
-- Next bounded execution adapter planning, only if policy, approval, sandbox, artifact, trace, idempotency, and recovery contracts are decision-complete.
-- Additional read-only TUI refinements, still with no command execution or persisted preferences.
+- Package and publish the coherent `1.8.0` local release after regression and wheel smokes pass.
+- External channel adapters, third-party skills, MCP/A2A, browser automation, generic shell, unmanaged autonomy, and new execution adapters only after separate decision-complete plans.
+- Additional local app refinements, still with no command execution or persisted preferences unless explicitly authorized.
 
 Do not add another execution adapter until a separate decision-complete plan authorizes it. `simple_code_edit`, Docker execution, shell access, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, and active repo writes outside the explicit Codex apply-back path remain unauthorized.
 

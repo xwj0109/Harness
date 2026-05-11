@@ -19,6 +19,7 @@ from harness.codex_runner import HostedBoundaryApprovalRequired
 from harness.events import append_jsonl
 from harness.isolation import ActiveRepoDirtyError, IsolationManager, inspect_isolated_diff
 from harness.memory.sqlite_store import SQLiteStore
+from harness.models import KillSwitchTargetKind
 from harness.security import sanitize_for_logging
 from harness.tools.patch import PatchValidationError, apply_planned_updates, plan_unified_diff
 
@@ -329,9 +330,22 @@ class CodexCodeEditRunner:
     ) -> tuple[ApplyBackDecision, FreshnessCheckResult, list[str], str | None]:
         summary = self._apply_back_summary(diff_result)
         decision = self.apply_back_approval_provider.decide(summary, diff_result.unified_diff, diff_artifact)
-        self._persist_apply_back_decision(run_id, decision)
         if not decision.approved:
+            self._persist_apply_back_decision(run_id, decision)
             return decision, FreshnessCheckResult(ok=False, active_pre_apply_status="", reason="Apply-back denied."), [], None
+        control_reason = self._active_repo_apply_back_disabled_reason()
+        if control_reason is not None:
+            blocked = ApplyBackDecision(decision="denied", reason=control_reason)
+            self._persist_apply_back_decision(run_id, blocked)
+            self.store.append_event(
+                run_id,
+                "warning",
+                "apply_back_control_disabled",
+                "Apply-back denied by active repo apply-back kill switch.",
+                {"reason": control_reason},
+            )
+            return blocked, FreshnessCheckResult(ok=False, active_pre_apply_status="", reason=control_reason), [], None
+        self._persist_apply_back_decision(run_id, decision)
         freshness = self._check_freshness(diff_result.allowed_changed_files, baseline_hashes, pre_isolation_status)
         if not freshness.ok:
             self.store.append_event(
@@ -373,6 +387,22 @@ class CodexCodeEditRunner:
             {"files": summary_obj.files, "active_post_apply_status": post_status},
         )
         return decision, freshness, summary_obj.files, None
+
+    def _active_repo_apply_back_disabled_reason(self) -> str | None:
+        try:
+            for control in self.store.active_execution_controls():
+                if (
+                    control.target_kind == KillSwitchTargetKind.ACTIVE_REPO_APPLY_BACK
+                    and control.target_id == "*"
+                ):
+                    return str(
+                        sanitize_for_logging(
+                            f"Execution control disabled active_repo_apply_back:*. {control.reason}"
+                        )
+                    )
+        except Exception as exc:
+            return str(sanitize_for_logging(f"Runtime control state unavailable: {exc}"))
+        return None
 
     def _persist_apply_back_decision(self, run_id: str, decision: ApplyBackDecision) -> None:
         self.store.append_event(

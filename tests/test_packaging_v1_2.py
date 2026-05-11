@@ -17,7 +17,7 @@ def test_pyproject_has_distribution_metadata_and_packaged_specs() -> None:
 
     project = pyproject["project"]
     assert project["name"] == "agent-harness"
-    assert project["version"] == "1.6.0"
+    assert project["version"] == "1.8.0"
     assert project["license"] == "MIT"
     assert project["requires-python"] == ">=3.11"
     assert project["scripts"]["harness"] == "harness.cli.main:app"
@@ -42,14 +42,17 @@ def test_wheel_includes_packaged_specs_and_console_entrypoint(tmp_path) -> None:
         assert "harness/builtin_specs/agents/quant/quant_research/group.yaml" in names
         assert "harness/builtin_specs/agents/quant/profiles/commodities_researcher.default.yaml" in names
         assert "harness/builtin_specs/workbenches/quant.yaml" in names
+        assert "agent_harness-1.8.0.data/data/share/agent-harness/SECURITY.md" in names
+        assert "agent_harness-1.8.0.data/data/share/agent-harness/docs/smoke_checklist.md" in names
+        assert "agent_harness-1.8.0.data/data/share/agent-harness/docs/command_catalog.md" in names
 
-        metadata = archive.read("agent_harness-1.6.0.dist-info/METADATA").decode("utf-8")
+        metadata = archive.read("agent_harness-1.8.0.dist-info/METADATA").decode("utf-8")
         assert "Name: agent-harness" in metadata
-        assert "Version: 1.6.0" in metadata
+        assert "Version: 1.8.0" in metadata
         assert "Classifier: Environment :: Console" in metadata
         assert "Requires-Dist: textual" in metadata
 
-        entrypoints = archive.read("agent_harness-1.6.0.dist-info/entry_points.txt").decode("utf-8")
+        entrypoints = archive.read("agent_harness-1.8.0.dist-info/entry_points.txt").decode("utf-8")
         assert "harness = harness.cli.main:app" in entrypoints
 
 
@@ -83,6 +86,21 @@ def test_installed_wheel_cli_loads_packaged_specs(tmp_path) -> None:
 
     project_dir = tmp_path / "operator-project"
     project_dir.mkdir()
+    integrity_result = subprocess.run(
+        [str(harness), "integrity", "check", "--project", str(project_dir), "--output", "json"],
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    integrity = json.loads(integrity_result.stdout)
+    assert integrity["schema_version"] == "harness.integrity_check_result/v1"
+    assert integrity["ok"] is True
+    assert {check["subject_kind"] for check in integrity["checks"]} >= {
+        "builtin_spec",
+        "adapter_descriptor",
+        "tui_static_asset",
+    }
+
     home_result = subprocess.run(
         [str(harness), "home", "--project", str(project_dir), "--output", "json"],
         text=True,
@@ -119,6 +137,10 @@ def _copy_project_source(tmp_path: Path) -> Path:
     source.mkdir()
     shutil.copy2(ROOT / "pyproject.toml", source / "pyproject.toml")
     shutil.copy2(ROOT / "README.md", source / "README.md")
+    shutil.copy2(ROOT / "SECURITY.md", source / "SECURITY.md")
+    (source / "docs").mkdir()
+    shutil.copy2(ROOT / "docs" / "smoke_checklist.md", source / "docs" / "smoke_checklist.md")
+    shutil.copy2(ROOT / "docs" / "command_catalog.md", source / "docs" / "command_catalog.md")
     shutil.copytree(
         ROOT / "src",
         source / "src",

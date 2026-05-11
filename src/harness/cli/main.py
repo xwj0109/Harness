@@ -34,6 +34,7 @@ from harness.backends.codex_cli import (
     CodexUnavailable,
 )
 from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAICompatibleBackend
+from harness.capabilities import build_capability_catalog, get_capability
 from harness.chat import chat_context, run_chat_loop
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
 from harness.codex_runner import (
@@ -46,10 +47,11 @@ from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecis
 from harness.daemon_adapters import execute_read_only_summary_lease
 from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
-from harness.evals import run_safety_smoke
+from harness.evals import run_safety_smoke, run_security_check, run_security_layer_audit
+from harness.integrity import run_integrity_check
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import TaskStatus
+from harness.models import KillSwitchTargetKind, MemoryScopeType, TaskStatus
 from harness.paths import resolve_project_root
 from harness.policy import (
     backend_descriptor_sha256,
@@ -59,8 +61,11 @@ from harness.policy import (
     resolve_task_effective_policy,
     resolve_workbench_effective_policy,
 )
+from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, DockerImageManager
+from harness.sandbox_profiles import build_sandbox_profile_catalog, get_sandbox_profile
+from harness.security_explanations import render_blocked_state
 from harness.spec_loader import (
     SpecBundleError,
     diff_builtin_to_custom_spec_registry,
@@ -87,8 +92,14 @@ specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previ
 policy_app = typer.Typer(help="Runtime effective policy evidence.")
 artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
 tools_app = typer.Typer(help="Harness tool capability descriptors.")
+capabilities_app = typer.Typer(help="Read-only Harness capability catalog.")
+sandbox_app = typer.Typer(help="Read-only sandbox profile descriptors.")
+controls_app = typer.Typer(help="Local runtime execution controls.")
+memory_app = typer.Typer(help="Explicit local memory records.")
 baseline_app = typer.Typer(help="Local run evidence baselines.")
 evals_app = typer.Typer(help="Local evidence-only eval suites.")
+security_app = typer.Typer(help="Local metadata-only security detections.")
+integrity_app = typer.Typer(help="Local package and evidence integrity checks.")
 traces_app = typer.Typer(help="Local run trace export.")
 daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
@@ -104,8 +115,14 @@ app.add_typer(specs_app, name="specs")
 app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(tools_app, name="tools")
+app.add_typer(capabilities_app, name="capabilities")
+app.add_typer(sandbox_app, name="sandbox")
+app.add_typer(controls_app, name="controls")
+app.add_typer(memory_app, name="memory")
 app.add_typer(baseline_app, name="baseline")
 app.add_typer(evals_app, name="evals")
+app.add_typer(security_app, name="security")
+app.add_typer(integrity_app, name="integrity")
 app.add_typer(traces_app, name="traces")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
@@ -1333,6 +1350,459 @@ def tools_inspect(
     typer.echo(f"Replay policy: {descriptor.replay_policy.value}")
 
 
+@capabilities_app.command("list")
+def capabilities_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    catalog = build_capability_catalog(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(catalog.model_dump(mode="json"))
+        return
+    _print_tsv(["capability_id", "task_types", "readiness", "approvals"])
+    for capability in catalog.capabilities:
+        _print_tsv_row(
+            [
+                capability.id,
+                ", ".join(capability.supported_task_types),
+                capability.readiness,
+                ", ".join(capability.required_approvals) if capability.required_approvals else "none",
+            ]
+        )
+
+
+@capabilities_app.command("inspect")
+def capabilities_inspect(
+    capability_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        capability = get_capability(project_root, capability_id)
+    except KeyError as exc:
+        _emit_capability_error(str(exc).strip("'"), project_root, output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = capability.model_dump(mode="json")
+        payload.update({"ok": True, "project_root": str(project_root)})
+        _emit_json(payload)
+        return
+    _print_section("Capability")
+    _print_kv("Capability id", capability.id)
+    _print_kv("Title", capability.title)
+    _print_kv("Adapter", capability.execution_adapter)
+    _print_kv("Readiness", capability.readiness)
+    for explanation in capability.blocked_state_explanations:
+        _print_kv("Blocked state", render_blocked_state(explanation))
+    _print_kv("Task types", ", ".join(capability.supported_task_types) if capability.supported_task_types else "none")
+    _print_kv(
+        "Required approvals",
+        ", ".join(capability.required_approvals) if capability.required_approvals else "none",
+    )
+    _print_section("Safety")
+    _print_kv("Side effects", capability.side_effect_summary)
+    if capability.sandbox_profile:
+        _print_kv("Sandbox profile", capability.sandbox_profile.get("id"))
+    _print_kv("Replay policy", capability.replay_policy.value)
+    for note in capability.safety_notes:
+        typer.echo(f"- {note}")
+    _print_section("Equivalent Commands")
+    for command in capability.equivalent_commands:
+        typer.echo(command)
+
+
+@controls_app.command("list")
+def controls_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    store.initialize()
+    controls = store.list_execution_controls()
+    breakers = store.list_adapter_breaker_states([descriptor.id for descriptor in list_execution_adapter_descriptors()])
+    payload = {
+        "schema_version": "harness.execution_controls/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "controls": [control.model_dump(mode="json") for control in controls],
+        "breakers": [breaker.model_dump(mode="json") for breaker in breakers],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["target_kind", "target_id", "disabled", "reason"])
+    for control in controls:
+        _print_tsv_row([control.target_kind.value, control.target_id, str(control.disabled), control.reason])
+
+
+@controls_app.command("disable")
+def controls_disable(
+    target_kind: Annotated[KillSwitchTargetKind, typer.Option("--target-kind", help="Control target kind.")],
+    target_id: Annotated[str, typer.Option("--target-id", help="Control target id, or * for global controls.")],
+    reason: Annotated[str, typer.Option("--reason", help="Reason for disabling this control.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        _validate_control_target(target_kind, target_id)
+    except ValueError as exc:
+        _emit_controls_error(str(exc), project_root, output)
+        raise typer.Exit(code=1) from exc
+    store = SQLiteStore(project_root)
+    store.initialize()
+    control = store.disable_execution_control(
+        target_kind,
+        target_id,
+        reason=reason,
+        actor=_daemon_owner(),
+    )
+    payload = {
+        "schema_version": "harness.execution_control/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "control": control.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Disabled {control.target_kind.value}:{control.target_id}")
+
+
+@controls_app.command("enable")
+def controls_enable(
+    target_kind: Annotated[KillSwitchTargetKind, typer.Option("--target-kind", help="Control target kind.")],
+    target_id: Annotated[str, typer.Option("--target-id", help="Control target id, or * for global controls.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        _validate_control_target(target_kind, target_id)
+    except ValueError as exc:
+        _emit_controls_error(str(exc), project_root, output)
+        raise typer.Exit(code=1) from exc
+    store = SQLiteStore(project_root)
+    store.initialize()
+    control = store.enable_execution_control(
+        target_kind,
+        target_id,
+        reason="Control enabled.",
+        actor=_daemon_owner(),
+    )
+    payload = {
+        "schema_version": "harness.execution_control/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "control": control.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Enabled {control.target_kind.value}:{control.target_id}")
+
+
+@controls_app.command("breaker-status")
+def controls_breaker_status(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    store.initialize()
+    breakers = store.list_adapter_breaker_states([descriptor.id for descriptor in list_execution_adapter_descriptors()])
+    payload = {
+        "schema_version": "harness.adapter_breakers/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "breakers": [breaker.model_dump(mode="json") for breaker in breakers],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["adapter_id", "status", "failures", "threshold"])
+    for breaker in breakers:
+        _print_tsv_row(
+            [breaker.adapter_id, breaker.status.value, str(breaker.failure_count), str(breaker.threshold)]
+        )
+
+
+@controls_app.command("breaker-reset")
+def controls_breaker_reset(
+    adapter_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Reason for resetting this breaker.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        _validate_adapter_id(adapter_id)
+    except ValueError as exc:
+        _emit_controls_error(str(exc), project_root, output)
+        raise typer.Exit(code=1) from exc
+    store = SQLiteStore(project_root)
+    store.initialize()
+    breaker = store.reset_adapter_breaker(adapter_id, reason=reason, actor=_daemon_owner())
+    payload = {
+        "schema_version": "harness.adapter_breaker/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "breaker": breaker.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Reset breaker {breaker.adapter_id}: {breaker.status.value}")
+
+
+def _validate_control_target(target_kind: KillSwitchTargetKind, target_id: str) -> None:
+    if target_kind in {
+        KillSwitchTargetKind.HOSTED_BOUNDARY,
+        KillSwitchTargetKind.DOCKER_EXECUTION,
+        KillSwitchTargetKind.ACTIVE_REPO_APPLY_BACK,
+    }:
+        if target_id != "*":
+            raise ValueError(f"{target_kind.value} controls require --target-id *")
+        return
+    if target_kind == KillSwitchTargetKind.ADAPTER:
+        _validate_adapter_id(target_id)
+    elif target_kind == KillSwitchTargetKind.TASK_TYPE:
+        known = {task_type for descriptor in list_execution_adapter_descriptors() for task_type in descriptor.supported_task_types}
+        if target_id not in known:
+            raise ValueError(f"Unknown registered task type: {target_id}")
+    elif target_kind == KillSwitchTargetKind.BACKEND and target_id != "codex_cli":
+        raise ValueError(f"Unknown registered backend target: {target_id}")
+
+
+def _validate_adapter_id(adapter_id: str) -> None:
+    known = {descriptor.id for descriptor in list_execution_adapter_descriptors()}
+    if adapter_id not in known:
+        raise ValueError(f"Unknown registered adapter: {adapter_id}")
+
+
+def _emit_controls_error(message: str, project_root: Path, output: OutputFormat) -> None:
+    payload = {
+        "schema_version": "harness.execution_controls/v1",
+        "ok": False,
+        "project_root": str(project_root),
+        "errors": [message],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+    else:
+        typer.echo(f"Error: {message}")
+
+
+@memory_app.command("save-note")
+def memory_save_note(
+    scope: Annotated[MemoryScopeType, typer.Option("--scope", help="Memory scope type.")],
+    summary: Annotated[str, typer.Option("--summary", help="Operator note summary.")],
+    scope_id: Annotated[str | None, typer.Option("--scope-id", help="Scope id for workbench, agent, or objective.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.initialize()
+        resolved_scope_id = _resolve_memory_scope_id(store, project_root, scope, scope_id)
+        record = store.save_memory_note(scope, resolved_scope_id, summary)
+    except (KeyError, ValueError) as exc:
+        _emit_memory_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.memory_record/v1", "ok": True, "memory": record.model_dump(mode="json")})
+        return
+    typer.echo(f"Saved memory {record.id}")
+    typer.echo(f"Scope: {record.scope_type.value}:{record.scope_id}")
+    typer.echo(f"Redaction: {record.redaction_state.value}")
+
+
+@memory_app.command("list")
+def memory_list(
+    scope: Annotated[MemoryScopeType | None, typer.Option("--scope", help="Filter by memory scope type.")] = None,
+    scope_id: Annotated[str | None, typer.Option("--scope-id", help="Filter by scope id.")] = None,
+    include_forgotten: Annotated[bool, typer.Option("--include-forgotten", help="Include forgotten memory records.")] = False,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        records = SQLiteStore(project_root).list_memory_records(
+            scope,
+            scope_id,
+            include_forgotten=include_forgotten,
+        )
+    except ValueError as exc:
+        _emit_memory_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.memory_records/v1",
+                "ok": True,
+                "project_root": str(project_root),
+                "memory": [record.model_dump(mode="json") for record in records],
+            }
+        )
+        return
+    if not records:
+        typer.echo("No memory records found.")
+        return
+    _print_tsv(["memory_id", "scope", "redaction", "summary"])
+    for record in records:
+        _print_tsv_row(
+            [
+                record.id,
+                f"{record.scope_type.value}:{record.scope_id}",
+                record.redaction_state.value,
+                record.summary,
+            ]
+        )
+
+
+@memory_app.command("inspect")
+def memory_inspect(
+    memory_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        record = SQLiteStore(project_root).get_memory_record(memory_id)
+    except KeyError as exc:
+        _emit_memory_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = record.model_dump(mode="json")
+        payload.update({"ok": True})
+        _emit_json(payload)
+        return
+    _print_section("Memory")
+    _print_kv("Memory id", record.id)
+    _print_kv("Scope", f"{record.scope_type.value}:{record.scope_id}")
+    _print_kv("Source", record.source_kind.value)
+    _print_kv("Redaction", record.redaction_state.value)
+    _print_kv("Summary", record.summary)
+    _print_section("Evidence")
+    _print_kv("SHA256", record.sha256)
+    _print_kv("Size bytes", record.size_bytes)
+
+
+@memory_app.command("forget")
+def memory_forget(
+    memory_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        record = SQLiteStore(project_root).forget_memory_record(memory_id)
+    except KeyError as exc:
+        _emit_memory_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.memory_record/v1", "ok": True, "memory": record.model_dump(mode="json")})
+        return
+    typer.echo(f"Forgot memory {record.id}")
+
+
+@app.command("progress")
+def progress(
+    objective: Annotated[str, typer.Option("--objective", help="Objective id to inspect.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        payload = build_orchestration_progress(project_root, objective)
+    except KeyError as exc:
+        _emit_progress_error(str(exc).strip("'"), project_root, objective, output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload.model_dump(mode="json"))
+        return
+    _print_section("Orchestration Progress")
+    _print_kv("Objective", f"{payload.objective_id} | {payload.objective_title}")
+    _print_kv("Mode", payload.mode.value)
+    _print_kv("Next action", payload.next_action or "none")
+    if payload.active_lease_ids:
+        _print_kv("Active leases", ", ".join(payload.active_lease_ids))
+    if payload.active_run_ids:
+        _print_kv("Active runs", ", ".join(payload.active_run_ids))
+    if payload.blocked_reasons:
+        _print_kv("Blocked reasons", "; ".join(payload.blocked_reasons))
+    if payload.untrusted_context_warnings:
+        _print_kv("Context warnings", ", ".join(payload.untrusted_context_warnings))
+    _print_section("Tasks")
+    if not payload.tasks:
+        typer.echo("No tasks for this objective.")
+        return
+    _print_tsv(["task_id", "status", "adapter", "task_type", "lease", "run", "next"])
+    for task in payload.tasks:
+        _print_tsv_row(
+            [
+                task.task_id,
+                task.status.value,
+                task.execution_adapter or "",
+                task.task_type or "",
+                task.lease_id or "",
+                task.run_id or "",
+                task.next_action or "",
+            ]
+        )
+
+
+@sandbox_app.command("profiles")
+def sandbox_profiles(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    catalog = build_sandbox_profile_catalog(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(catalog.model_dump(mode="json"))
+        return
+    _print_tsv(["profile_id", "tier", "network", "active_repo_write", "host_filesystem"])
+    for profile in catalog.profiles:
+        _print_tsv_row(
+            [
+                profile.id,
+                profile.tier.value,
+                profile.network.value,
+                profile.active_repo_write.value,
+                profile.host_filesystem.value,
+            ]
+        )
+
+
+@sandbox_app.command("inspect")
+def sandbox_inspect(
+    profile_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        profile = get_sandbox_profile(profile_id)
+    except KeyError as exc:
+        _emit_sandbox_profile_error(str(exc).strip("'"), project_root, output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = profile.model_dump(mode="json")
+        payload.update({"ok": True, "project_root": str(project_root)})
+        _emit_json(payload)
+        return
+    _print_section("Sandbox Profile")
+    _print_kv("Profile id", profile.id)
+    _print_kv("Tier", profile.tier.value)
+    _print_kv("Network", profile.network.value)
+    _print_kv("Active repo write", profile.active_repo_write.value)
+    _print_kv("Host filesystem", profile.host_filesystem.value)
+    _print_kv("Secret path policy", profile.secret_path_policy)
+
+
 @baseline_app.command("set")
 def baseline_set(
     run_id: str,
@@ -1387,20 +1857,100 @@ def evals_run(
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
+    if suite == "integrity":
+        result = run_integrity_check(project_root)
+        _emit_integrity_check_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "security-layer":
+        result = run_security_layer_audit(project_root)
+        _emit_security_layer_audit_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
     _require_initialized(project_root)
-    if suite != "safety-smoke":
+    if suite == "safety-smoke":
+        result = run_safety_smoke(project_root, load_config(project_root), SQLiteStore(project_root))
+        if output == OutputFormat.JSON:
+            _emit_json(result.model_dump(mode="json"))
+        else:
+            typer.echo(f"Suite: {result.suite}")
+            typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+            for check in result.checks:
+                typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "security":
+        result = run_security_check(project_root, SQLiteStore(project_root))
+        _emit_security_check_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    else:
         _emit_eval_error(f"Unsupported eval suite: {suite}", output)
         raise typer.Exit(code=1)
-    result = run_safety_smoke(project_root, load_config(project_root), SQLiteStore(project_root))
-    if output == OutputFormat.JSON:
-        _emit_json(result.model_dump(mode="json"))
-    else:
-        typer.echo(f"Suite: {result.suite}")
-        typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
-        for check in result.checks:
-            typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+
+
+@security_app.command("check")
+def security_check(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    result = run_security_check(project_root, SQLiteStore(project_root))
+    _emit_security_check_result(result, output)
     if not result.ok:
         raise typer.Exit(code=1)
+
+
+def _emit_security_check_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Suite: security")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    if not result.findings:
+        typer.echo("pass\tinfo\tsecurity\tNo security detections found.")
+    for finding in result.findings:
+        typer.echo(f"{finding.status.value}\t{finding.severity.value}\t{finding.check_id}\t{finding.message}")
+
+
+@security_app.command("audit")
+def security_audit(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = run_security_layer_audit(project_root)
+    _emit_security_layer_audit_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _emit_security_layer_audit_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Suite: security-layer")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    for check in result.checks:
+        typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+
+
+@integrity_app.command("check")
+def integrity_check(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = run_integrity_check(project_root)
+    _emit_integrity_check_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _emit_integrity_check_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Suite: integrity")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    for check in result.checks:
+        typer.echo(f"{check.status.value}\t{check.subject_kind.value}\t{check.subject_id}\t{check.message}")
 
 
 @traces_app.command("export")
@@ -1578,6 +2128,12 @@ def daemon_execute(
         return
     typer.echo("Registered-adapter dispatch")
     typer.echo(f"Decision: {result.decision}")
+    if result.security_decision is not None:
+        typer.echo(f"Security decision: {result.security_decision.decision.value}")
+    for explanation in result.blocked_state_explanations:
+        typer.echo(f"Blocked state: {render_blocked_state(explanation)}")
+    if result.untrusted_context_warnings:
+        typer.echo(f"Context warnings: {', '.join(result.untrusted_context_warnings)}")
     typer.echo(f"Adapter: {result.adapter_id or 'none'}")
     if result.task is not None:
         typer.echo(f"Task: {result.task.id}")
@@ -1646,6 +2202,13 @@ def daemon_inspect_lease(
     _print_kv("Read-only eligible", result.read_only_eligibility.get("eligible"))
     _print_kv("Registered adapter eligible", result.execution_eligibility.get("eligible"))
     _print_kv("Registered adapter", result.execution_eligibility.get("adapter_id") or "none")
+    if result.security_decision is not None:
+        _print_kv("Security decision", result.security_decision.decision.value)
+        _print_kv("Security reason", "; ".join(result.security_decision.reasons))
+    for explanation in result.blocked_state_explanations:
+        _print_kv("Blocked state", render_blocked_state(explanation))
+    if result.untrusted_context_warnings:
+        _print_kv("Context warnings", ", ".join(result.untrusted_context_warnings))
     _print_section("Recovery")
     _print_kv("Action", result.recovery_recommendation.get("action"))
 
@@ -2178,6 +2741,32 @@ def _validate_task_spec_refs(project_root: Path, workbench_id: str | None, agent
     return source_kind, source_path
 
 
+def _resolve_memory_scope_id(
+    store: SQLiteStore,
+    project_root: Path,
+    scope: MemoryScopeType,
+    scope_id: str | None,
+) -> str:
+    registry = builtin_spec_registry()
+    if scope == MemoryScopeType.PROJECT:
+        return scope_id or str(project_root)
+    if scope_id is None or not scope_id.strip():
+        raise ValueError(f"--scope-id is required for {scope.value} memory scope.")
+    if scope == MemoryScopeType.WORKBENCH:
+        registry.get_workbench(scope_id)
+        return scope_id
+    if scope == MemoryScopeType.AGENT:
+        try:
+            registry.get_agent(scope_id)
+        except KeyError:
+            store.get_project_agent(scope_id)
+        return scope_id
+    if scope == MemoryScopeType.OBJECTIVE:
+        store.get_objective(scope_id)
+        return scope_id
+    raise ValueError(f"Unsupported memory scope: {scope.value}")
+
+
 def _execution_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:
     if execution_adapter is None and task_type is None:
         return {}
@@ -2245,6 +2834,56 @@ def _emit_tool_error(message: str, output: OutputFormat) -> None:
         _emit_json({"schema_version": "harness.tool_capability/v1", "ok": False, "errors": [message]})
     else:
         typer.echo(f"Tool command failed: {message}")
+
+
+def _emit_capability_error(message: str, project_root: Path, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.capability_catalog/v1",
+                "ok": False,
+                "project_root": str(project_root),
+                "errors": [message],
+            }
+        )
+    else:
+        typer.echo(f"Capability command failed: {message}")
+
+
+def _emit_sandbox_profile_error(message: str, project_root: Path, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.sandbox_profile/v1",
+                "ok": False,
+                "project_root": str(project_root),
+                "errors": [message],
+            }
+        )
+    else:
+        typer.echo(f"Sandbox profile command failed: {message}")
+
+
+def _emit_memory_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.memory_record/v1", "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Memory command failed: {message}")
+
+
+def _emit_progress_error(message: str, project_root: Path, objective_id: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.orchestration_progress/v1",
+                "ok": False,
+                "project_root": str(project_root),
+                "objective_id": objective_id,
+                "errors": [message],
+            }
+        )
+    else:
+        typer.echo(f"Progress command failed: {message}")
 
 
 def _emit_compare_error(schema_version: str, message: str, output: OutputFormat) -> None:

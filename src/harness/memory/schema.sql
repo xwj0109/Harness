@@ -187,6 +187,44 @@ CREATE TABLE IF NOT EXISTS daemon_events (
   FOREIGN KEY(daemon_id) REFERENCES daemon_records(id)
 );
 
+CREATE TABLE IF NOT EXISTS memory_records (
+  id TEXT PRIMARY KEY,
+  scope_type TEXT NOT NULL,
+  scope_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL,
+  source_id TEXT,
+  source_artifact_id TEXT,
+  summary TEXT NOT NULL,
+  redaction_state TEXT NOT NULL,
+  sha256 TEXT NOT NULL,
+  size_bytes INTEGER NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  lineage_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS execution_controls (
+  id TEXT PRIMARY KEY,
+  target_kind TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  disabled INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL,
+  UNIQUE(target_kind, target_id)
+);
+
+CREATE TABLE IF NOT EXISTS execution_breaker_resets (
+  id TEXT PRIMARY KEY,
+  adapter_id TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created
   ON tasks(status, priority DESC, created_at ASC);
 
@@ -201,6 +239,12 @@ CREATE INDEX IF NOT EXISTS idx_task_dependencies_downstream
 
 CREATE INDEX IF NOT EXISTS idx_task_dependencies_upstream
   ON task_dependencies(upstream_task_id);
+
+CREATE INDEX IF NOT EXISTS idx_execution_controls_target
+  ON execution_controls(target_kind, target_id);
+
+CREATE INDEX IF NOT EXISTS idx_execution_breaker_resets_adapter
+  ON execution_breaker_resets(adapter_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_task_attempts_task
   ON task_attempts(task_id, attempt_number);
@@ -219,3 +263,9 @@ CREATE INDEX IF NOT EXISTS idx_daemon_records_status_heartbeat
 
 CREATE INDEX IF NOT EXISTS idx_daemon_events_daemon_created
   ON daemon_events(daemon_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_records_scope_created
+  ON memory_records(scope_type, scope_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_records_redaction_updated
+  ON memory_records(redaction_state, updated_at DESC);

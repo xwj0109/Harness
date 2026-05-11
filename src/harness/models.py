@@ -89,6 +89,15 @@ class TaskLeaseStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class OrchestrationProgressMode(str, Enum):
+    IDLE = "idle"
+    READY = "ready"
+    LEASED = "leased"
+    DISPATCHING = "dispatching"
+    BLOCKED = "blocked"
+    TERMINAL = "terminal"
+
+
 class DaemonStatus(str, Enum):
     RUNNING = "running"
     STOPPED = "stopped"
@@ -114,6 +123,129 @@ class ToolReplayPolicy(str, Enum):
     IDEMPOTENT_WITH_KEY = "idempotent_with_key"
     REQUIRES_FRESH_APPROVAL = "requires_fresh_approval"
     NOT_REPLAYABLE = "not_replayable"
+
+
+class SecurityDecisionStatus(str, Enum):
+    ALLOW = "allow"
+    DENY = "deny"
+    APPROVAL_REQUIRED = "approval_required"
+
+
+class BlockedStateCode(str, Enum):
+    MISSING_APPROVAL = "missing_approval"
+    DISABLED_ADAPTER = "disabled_adapter"
+    UNSAFE_METADATA = "unsafe_metadata"
+    UNKNOWN_ADAPTER = "unknown_adapter"
+    SANDBOX_PROFILE_MISMATCH = "sandbox_profile_mismatch"
+    BREAKER_OPEN = "breaker_open"
+    FORBIDDEN_PATH_OR_SECRET_LIKE_CONTENT = "forbidden_path_or_secret_like_content"
+    BLOCKED_BY_POLICY = "blocked_by_policy"
+
+
+class SecurityFindingSeverity(str, Enum):
+    INFO = "info"
+    WARNING = "warning"
+    HIGH = "high"
+
+
+class SecurityFindingStatus(str, Enum):
+    PASS = "pass"
+    FAIL = "fail"
+
+
+class KillSwitchTargetKind(str, Enum):
+    ADAPTER = "adapter"
+    TASK_TYPE = "task_type"
+    BACKEND = "backend"
+    HOSTED_BOUNDARY = "hosted_boundary"
+    DOCKER_EXECUTION = "docker_execution"
+    ACTIVE_REPO_APPLY_BACK = "active_repo_apply_back"
+
+
+class BreakerStatus(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+
+
+class IntegritySubjectKind(str, Enum):
+    BUILTIN_SPEC = "builtin_spec"
+    ADAPTER_DESCRIPTOR = "adapter_descriptor"
+    SECURITY_DOC = "security_doc"
+    ARTIFACT = "artifact"
+    TRACE_EXPORT = "trace_export"
+    TUI_STATIC_ASSET = "tui_static_asset"
+
+
+class IntegrityCheckStatus(str, Enum):
+    PASS = "pass"
+    FAIL = "fail"
+
+
+class ContextTrustLevel(str, Enum):
+    TRUSTED_OPERATOR = "trusted_operator"
+    UNTRUSTED_REPO = "untrusted_repo"
+    UNTRUSTED_TOOL_OUTPUT = "untrusted_tool_output"
+    GENERATED = "generated"
+    ARTIFACT = "artifact"
+    MEMORY = "memory"
+
+
+class ContextSourceKind(str, Enum):
+    USER_PROMPT = "user_prompt"
+    REPO_FILE = "repo_file"
+    TOOL_OUTPUT = "tool_output"
+    ARTIFACT = "artifact"
+    GENERATED_PLAN = "generated_plan"
+    MEMORY_RECORD = "memory_record"
+    TASK_METADATA = "task_metadata"
+    RUN_GOAL = "run_goal"
+
+
+class SandboxTier(str, Enum):
+    NONE = "none"
+    READ_ONLY = "read_only"
+    ISOLATED_WORKSPACE = "isolated_workspace"
+    DOCKER_SANDBOX = "docker_sandbox"
+    FUTURE_STRONGER_ISOLATION = "future_stronger_isolation"
+
+
+class SandboxNetworkPolicy(str, Enum):
+    FORBIDDEN = "forbidden"
+    APPROVAL_REQUIRED = "approval_required"
+    ALLOWED = "allowed"
+
+
+class SandboxActiveRepoWritePolicy(str, Enum):
+    FORBIDDEN = "forbidden"
+    APPROVAL_REQUIRED = "approval_required"
+
+
+class SandboxHostFilesystemPolicy(str, Enum):
+    FORBIDDEN = "forbidden"
+    SANITIZED_COPY = "sanitized_copy"
+    ISOLATED_WORKSPACE = "isolated_workspace"
+
+
+class MemoryScopeType(str, Enum):
+    PROJECT = "project"
+    WORKBENCH = "workbench"
+    AGENT = "agent"
+    OBJECTIVE = "objective"
+
+
+class MemorySourceKind(str, Enum):
+    OPERATOR_NOTE = "operator_note"
+    ARTIFACT = "artifact"
+    RUN = "run"
+    TASK = "task"
+    OBJECTIVE = "objective"
+
+
+class MemoryRedactionState(str, Enum):
+    NOT_REQUIRED = "not_required"
+    REDACTED = "redacted"
+    BLOCKED = "blocked"
+    FORGOTTEN = "forgotten"
 
 
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
@@ -217,9 +349,194 @@ class ExecutionAdapterDescriptor(BaseModel):
     required_approvals: list[str] = Field(default_factory=list)
     backend_requirements: list[str] = Field(default_factory=list)
     sandbox_requirements: list[str] = Field(default_factory=list)
+    sandbox_profile_id: str | None = None
     side_effect_summary: str
     replay_policy: ToolReplayPolicy
     safety_notes: list[str] = Field(default_factory=list)
+
+
+class CapabilityRecord(BaseModel):
+    schema_version: str = "harness.capability/v1"
+    id: str
+    title: str
+    description: str
+    execution_adapter: str
+    supported_task_types: list[str] = Field(default_factory=list)
+    required_approvals: list[str] = Field(default_factory=list)
+    backend_requirements: list[str] = Field(default_factory=list)
+    sandbox_requirements: list[str] = Field(default_factory=list)
+    sandbox_profile: dict[str, Any] | None = None
+    side_effect_summary: str
+    replay_policy: ToolReplayPolicy
+    readiness: str
+    readiness_reasons: list[str] = Field(default_factory=list)
+    blocked_state_explanations: list["BlockedStateExplanation"] = Field(default_factory=list)
+    safety_notes: list[str] = Field(default_factory=list)
+    equivalent_commands: list[str] = Field(default_factory=list)
+
+
+class CapabilityCatalog(BaseModel):
+    schema_version: str = "harness.capability_catalog/v1"
+    ok: bool = True
+    project_root: Path
+    capabilities: list[CapabilityRecord] = Field(default_factory=list)
+
+
+class SandboxProfileDescriptor(BaseModel):
+    schema_version: str = "harness.sandbox_profile/v1"
+    id: str
+    tier: SandboxTier
+    network: SandboxNetworkPolicy
+    active_repo_write: SandboxActiveRepoWritePolicy
+    host_filesystem: SandboxHostFilesystemPolicy
+    resource_limits: dict[str, Any] = Field(default_factory=dict)
+    forbidden_mounts: list[str] = Field(default_factory=list)
+    secret_path_policy: str
+    notes: list[str] = Field(default_factory=list)
+
+
+class SandboxProfileCatalog(BaseModel):
+    schema_version: str = "harness.sandbox_profiles/v1"
+    ok: bool = True
+    project_root: Path
+    profiles: list[SandboxProfileDescriptor] = Field(default_factory=list)
+
+
+class KillSwitchRecord(BaseModel):
+    schema_version: str = "harness.kill_switch/v1"
+    id: str
+    target_kind: KillSwitchTargetKind
+    target_id: str
+    disabled: bool
+    reason: str
+    actor: str
+    created_at: datetime
+    updated_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AdapterBreakerState(BaseModel):
+    schema_version: str = "harness.adapter_breaker/v1"
+    adapter_id: str
+    status: BreakerStatus
+    failure_count: int
+    threshold: int
+    window_seconds: int
+    opened_at: datetime | None = None
+    last_reset_at: datetime | None = None
+    reasons: list[str] = Field(default_factory=list)
+
+
+class MemoryRecord(BaseModel):
+    schema_version: str = "harness.memory_record/v1"
+    id: str
+    scope_type: MemoryScopeType
+    scope_id: str
+    source_kind: MemorySourceKind
+    source_id: str | None = None
+    source_artifact_id: str | None = None
+    summary: str
+    redaction_state: MemoryRedactionState
+    sha256: str
+    size_bytes: int
+    created_at: datetime
+    updated_at: datetime
+    lineage: dict[str, Any] = Field(default_factory=dict)
+
+
+class ContextProvenanceRecord(BaseModel):
+    schema_version: str = "harness.context_provenance/v1"
+    id: str
+    source_kind: ContextSourceKind
+    trust_level: ContextTrustLevel
+    label: str
+    source_id: str | None = None
+    artifact_id: str | None = None
+    memory_id: str | None = None
+    path: Path | None = None
+    sha256: str | None = None
+    redaction_state: str | None = None
+    lineage: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class BlockedStateExplanation(BaseModel):
+    schema_version: str = "harness.blocked_state/v1"
+    code: BlockedStateCode
+    message: str
+    details: list[str] = Field(default_factory=list)
+    inspect_command: str | None = None
+
+
+class IntegrityCheckRecord(BaseModel):
+    schema_version: str = "harness.integrity_check/v1"
+    id: str
+    subject_kind: IntegritySubjectKind
+    subject_id: str
+    path: Path | None = None
+    sha256: str | None = None
+    expected_sha256: str | None = None
+    status: IntegrityCheckStatus
+    message: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class IntegrityCheckResult(BaseModel):
+    schema_version: str = "harness.integrity_check_result/v1"
+    ok: bool
+    project_root: Path
+    checks: list[IntegrityCheckRecord] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+
+
+class ArtifactProvenanceRecord(BaseModel):
+    schema_version: str = "harness.artifact_provenance/v1"
+    id: str
+    artifact_id: str
+    run_id: str
+    producer: str | None = None
+    source_kind: str
+    source_id: str | None = None
+    input_sha256: str | None = None
+    output_sha256: str | None = None
+    redaction_state: str = "unknown"
+    lineage: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class OrchestrationProgressTask(BaseModel):
+    schema_version: str = "harness.orchestration_progress_task/v1"
+    task_id: str
+    title: str
+    status: TaskStatus
+    execution_adapter: str | None = None
+    task_type: str | None = None
+    attempt_id: str | None = None
+    lease_id: str | None = None
+    run_id: str | None = None
+    terminal_decision: str | None = None
+    blocked_reasons: list[str] = Field(default_factory=list)
+    blocked_state_explanations: list[BlockedStateExplanation] = Field(default_factory=list)
+    next_action: str | None = None
+
+
+class OrchestrationProgress(BaseModel):
+    schema_version: str = "harness.orchestration_progress/v1"
+    ok: bool = True
+    project_root: Path
+    objective_id: str
+    objective_title: str
+    objective_status: ObjectiveStatus
+    selected_orchestrator: str | None = None
+    mode: OrchestrationProgressMode
+    tasks: list[OrchestrationProgressTask] = Field(default_factory=list)
+    active_lease_ids: list[str] = Field(default_factory=list)
+    active_run_ids: list[str] = Field(default_factory=list)
+    blocked_reasons: list[str] = Field(default_factory=list)
+    untrusted_context_warnings: list[str] = Field(default_factory=list)
+    next_action: str | None = None
+    equivalent_commands: list[str] = Field(default_factory=list)
 
 
 class RunRecord(BaseModel):
@@ -436,6 +753,7 @@ class ArtifactRecord(BaseModel):
     redaction_state: str = "unknown"
     evidence_status: str = "unknown"
     metadata: dict[str, Any] = Field(default_factory=dict)
+    provenance: ArtifactProvenanceRecord | None = None
 
 
 class ManifestArtifact(BaseModel):
@@ -451,6 +769,7 @@ class ManifestArtifact(BaseModel):
     redaction_state: str = "unknown"
     evidence_status: str = "unknown"
     metadata: dict[str, Any] = Field(default_factory=dict)
+    provenance: ArtifactProvenanceRecord | None = None
 
 
 class RunManifest(BaseModel):
@@ -474,6 +793,32 @@ class RunManifest(BaseModel):
     backend_descriptor_sha256: str | None = None
     sandbox_profile: dict[str, Any] | None = None
     validation_results: dict[str, Any] | None = None
+    context_provenance: list[ContextProvenanceRecord] = Field(default_factory=list)
+    untrusted_context_warnings: list[str] = Field(default_factory=list)
+
+
+class SecurityDecision(BaseModel):
+    schema_version: str = "harness.security_decision/v1"
+    id: str
+    created_at: datetime
+    subject_kind: str
+    subject_id: str
+    resource_kind: str
+    resource_id: str
+    action: str
+    decision: SecurityDecisionStatus
+    policy_sha256: str | None = None
+    required_approvals: list[str] = Field(default_factory=list)
+    satisfied_approvals: list[str] = Field(default_factory=list)
+    missing_approvals: list[str] = Field(default_factory=list)
+    adapter_id: str | None = None
+    task_type: str | None = None
+    data_boundary: DataBoundary | None = None
+    side_effect_level: ToolSideEffectLevel | None = None
+    sandbox_profile_id: str | None = None
+    replay_policy: ToolReplayPolicy | None = None
+    reason_code: str
+    reasons: list[str] = Field(default_factory=list)
 
 
 class DaemonDryRunResult(BaseModel):
@@ -516,6 +861,10 @@ class DaemonExecuteResult(BaseModel):
     manifest: RunManifest | None = None
     policy_sha256: str | None = None
     approval_id: str | None = None
+    security_decision: SecurityDecision | None = None
+    context_provenance: list[ContextProvenanceRecord] = Field(default_factory=list)
+    untrusted_context_warnings: list[str] = Field(default_factory=list)
+    blocked_state_explanations: list[BlockedStateExplanation] = Field(default_factory=list)
     rejection_reasons: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
     adapter_result: dict[str, Any] = Field(default_factory=dict)
@@ -533,6 +882,10 @@ class DaemonLeaseInspection(BaseModel):
     dry_run_eligibility: dict[str, Any] = Field(default_factory=dict)
     read_only_eligibility: dict[str, Any] = Field(default_factory=dict)
     execution_eligibility: dict[str, Any] = Field(default_factory=dict)
+    security_decision: SecurityDecision | None = None
+    context_provenance: list[ContextProvenanceRecord] = Field(default_factory=list)
+    untrusted_context_warnings: list[str] = Field(default_factory=list)
+    blocked_state_explanations: list[BlockedStateExplanation] = Field(default_factory=list)
     recovery_recommendation: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -567,6 +920,50 @@ class SafetySmokeResult(BaseModel):
     ok: bool
     suite: str = "safety-smoke"
     checks: list[SafetySmokeCheck] = Field(default_factory=list)
+
+
+class SecurityFinding(BaseModel):
+    schema_version: str = "harness.security_finding/v1"
+    id: str
+    check_id: str
+    status: SecurityFindingStatus
+    severity: SecurityFindingSeverity
+    message: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    run_id: str | None = None
+    task_id: str | None = None
+    attempt_id: str | None = None
+    lease_id: str | None = None
+    adapter_id: str | None = None
+    security_decision_id: str | None = None
+    policy_sha256: str | None = None
+    approval_id: str | None = None
+    sandbox_profile_id: str | None = None
+    created_at: datetime = Field(default_factory=utc_now)
+
+
+class SecurityCheckResult(BaseModel):
+    schema_version: str = "harness.security_check/v1"
+    ok: bool
+    project_root: Path
+    findings: list[SecurityFinding] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
+
+
+class SecurityLayerAuditCheck(BaseModel):
+    schema_version: str = "harness.security_layer_audit_check/v1"
+    id: str
+    status: str
+    message: str
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class SecurityLayerAuditResult(BaseModel):
+    schema_version: str = "harness.security_layer_audit/v1"
+    ok: bool
+    project_root: Path
+    checks: list[SecurityLayerAuditCheck] = Field(default_factory=list)
+    summary: dict[str, int] = Field(default_factory=dict)
 
 
 class TraceSpan(BaseModel):

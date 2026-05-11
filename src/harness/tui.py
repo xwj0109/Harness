@@ -12,7 +12,7 @@ COMMAND_PALETTE_GROUPS = [
     {"id": "built_in_specs", "title": "Built-In Specs"},
     {"id": "objectives_tasks", "title": "Objectives And Tasks"},
     {"id": "daemon_control", "title": "Daemon Control Plane"},
-    {"id": "read_only_adapter", "title": "Authorized Read-Only Adapter"},
+    {"id": "registered_adapters", "title": "Registered Adapters"},
     {"id": "runtime_evidence", "title": "Runtime Evidence"},
     {"id": "packaging_smoke", "title": "Packaging Smoke"},
 ]
@@ -118,6 +118,15 @@ COMMAND_PALETTE_ENTRIES = [
         "safety_note": "Queue metadata only; does not execute when manually run.",
     },
     {
+        "id": "objectives_tasks.add_repo_planning_task",
+        "group_id": "objectives_tasks",
+        "title": "Add repo planning task",
+        "command": "harness tasks add --title \"Plan repo change\" --execution-adapter repo_planning --task-type repo_planning --project . --output json",
+        "description": "Create a manual task record for the registered repo-planning adapter.",
+        "mutates_when_run": True,
+        "safety_note": "Queue metadata only; repo planning still requires lease, approval, and registered dispatch.",
+    },
+    {
         "id": "objectives_tasks.list_tasks",
         "group_id": "objectives_tasks",
         "title": "List tasks",
@@ -154,13 +163,22 @@ COMMAND_PALETTE_ENTRIES = [
         "safety_note": "Read-only lease inspection.",
     },
     {
-        "id": "read_only_adapter.execute",
-        "group_id": "read_only_adapter",
+        "id": "registered_adapters.execute_read_only",
+        "group_id": "registered_adapters",
         "title": "Execute authorized read-only adapter",
         "command": "harness daemon execute-read-only task_lease_abc123 --project . --output json",
         "description": "Bind an existing active lease to the read-only repo summary adapter.",
         "mutates_when_run": True,
-        "safety_note": "Authorized bounded adapter only when manually run.",
+        "safety_note": "Compatibility command for the bounded read-only adapter when manually run.",
+    },
+    {
+        "id": "registered_adapters.execute",
+        "group_id": "registered_adapters",
+        "title": "Dispatch registered adapter",
+        "command": "harness daemon execute task_lease_abc123 --project . --output json",
+        "description": "Dispatch one already-leased task through its registered adapter.",
+        "mutates_when_run": True,
+        "safety_note": "Registered adapter dispatch only; no adapter, unknown adapter, or unsafe metadata fails closed.",
     },
     {
         "id": "runtime_evidence.runs",
@@ -232,7 +250,7 @@ TUI_VIEW_SECTIONS = [
             "command_palette_built_in_specs",
             "command_palette_objectives_tasks",
             "command_palette_daemon_control",
-            "command_palette_read_only_adapter",
+            "command_palette_registered_adapters",
             "command_palette_runtime_evidence",
             "command_palette_packaging_smoke",
             "command_palette_selected",
@@ -274,11 +292,13 @@ SLASH_COMMAND_ALIASES = {
     "specs": "built_in_specs.list",
     "spec": "built_in_specs.preview_agent",
     "task": "objectives_tasks.add_task",
+    "plan-task": "objectives_tasks.add_repo_planning_task",
     "tasks": "objectives_tasks.list_tasks",
     "graph": "objectives_tasks.graph",
     "lease": "daemon_control.run_once",
     "inspect-lease": "daemon_control.inspect_lease",
-    "execute-read-only": "read_only_adapter.execute",
+    "execute-read-only": "registered_adapters.execute_read_only",
+    "execute": "registered_adapters.execute",
     "runs": "runtime_evidence.runs",
     "policy": "runtime_evidence.policy",
     "artifacts": "runtime_evidence.artifacts",
@@ -593,6 +613,11 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
             "rows": _right_panel_adapter_rows(dashboard),
         },
         {
+            "id": "progress",
+            "title": "Progress",
+            "rows": _right_panel_progress_rows(dashboard),
+        },
+        {
             "id": "next",
             "title": "Next",
             "rows": _right_panel_next_rows(dashboard),
@@ -654,20 +679,76 @@ def _right_panel_recent_rows(dashboard: dict) -> list[str]:
 
 
 def _right_panel_adapter_rows(dashboard: dict) -> list[str]:
-    adapters = [adapter["id"] for adapter in dashboard.get("registered_adapters", [])]
+    capabilities = dashboard.get("capabilities", {}).get("capabilities", [])
+    if capabilities:
+        rows = []
+        for capability in capabilities[:6]:
+            task_types = ", ".join(capability.get("supported_task_types", [])) or "no task types"
+            readiness = capability.get("readiness") or "unknown"
+            blocked = capability.get("blocked_state_explanations") or []
+            blocked_label = f" | {blocked[0].get('code')}" if blocked else ""
+            rows.append(f"{capability['id']} -> {task_types} | {readiness}{blocked_label}")
+        return rows
+    adapters = dashboard.get("registered_adapters", [])
     if not adapters:
         return ["No registered adapters."]
-    return [", ".join(adapters[:4])]
+    rows = []
+    for adapter in adapters[:6]:
+        task_types = ", ".join(adapter.get("supported_task_types", [])) or "no task types"
+        rows.append(f"{adapter['id']} -> {task_types}")
+    return rows
+
+
+def _right_panel_progress_rows(dashboard: dict) -> list[str]:
+    progress = dashboard.get("progress") or {}
+    objective_id = progress.get("objective_id")
+    if not objective_id:
+        return ["No objective selected."]
+    rows = [
+        f"{progress.get('mode') or 'idle'} | {objective_id}",
+    ]
+    if progress.get("active_lease_ids"):
+        rows.append(f"Lease: {progress['active_lease_ids'][0]}")
+    if progress.get("active_run_ids"):
+        rows.append(f"Run: {progress['active_run_ids'][0]}")
+    for task in progress.get("tasks", [])[:3]:
+        label = f"{task.get('status') or 'unknown'} | {task.get('title') or task.get('task_id')}"
+        blocked = task.get("blocked_state_explanations") or []
+        if blocked:
+            label += f" | {blocked[0].get('code')}"
+        if task.get("lease_id"):
+            label += f" | {task['lease_id']}"
+        rows.append(label)
+    if progress.get("next_action"):
+        rows.append(f"Next: {progress['next_action']}")
+    return rows
 
 
 def _right_panel_next_rows(dashboard: dict) -> list[str]:
     if not dashboard.get("initialized"):
         return ["/init", "Then try: summarize this repo"]
     if dashboard.get("active_leases"):
-        return ["/run", "/leases"]
+        lease_id = dashboard["active_leases"][0]["id"]
+        return [
+            f"harness daemon inspect-lease {lease_id} --project . --output json",
+            f"harness daemon execute {lease_id} --project . --output json",
+        ]
     if dashboard["task_status_counts"].get("ready", 0):
+        ready_repo_planning = any(
+            task.get("status") == "ready" and task.get("execution_adapter") == "repo_planning"
+            for task in dashboard.get("tasks", [])
+        )
+        if ready_repo_planning:
+            return [
+                "harness daemon run-once --project . --output json",
+                "then dispatch with: harness daemon execute <lease_id> --project . --output json",
+            ]
         return ["lease the next task", "run the registered adapter"]
-    return ["summarize this repo", "/tasks /runs /adapters"]
+    return [
+        "summarize this repo",
+        "create dry run task",
+        'harness tasks add --title "Plan repo change" --execution-adapter repo_planning --task-type repo_planning --project . --output json',
+    ]
 
 
 def _right_panel_command_rows(palette: dict, query: str, *, mode: str) -> list[str]:

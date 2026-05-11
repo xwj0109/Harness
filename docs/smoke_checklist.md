@@ -33,14 +33,14 @@ python3 -m venv --system-site-packages /tmp/harness-install
 Expected packaging properties:
 
 - The installed wheel exposes the `harness` console script.
-- Package metadata reports version `1.6.0`.
+- Package metadata reports version `1.8.0`.
 - Packaged built-in YAML specs under `harness/builtin_specs/` are available after wheel install.
 - `harness --output json`, `harness home`, and `harness quickstart agent` remain non-mutating in the temporary project.
 - `harness doctor --release --output json` reports release-readiness metadata without backend/provider preflight.
 - Textual is a normal dependency for the installed app. `harness --output json` is a non-interactive probe and must not launch the terminal UI.
 - The packaging smoke does not preflight backends, call providers, run Docker, create tasks, acquire leases, create runs, execute adapters, expose secrets, or use hosted/paid fallback.
 
-## Verify v1.6 Registered Adapter Path
+## Verify v1.8 Local Agent App Readiness Path
 
 This smoke path exercises the declarative agent lifecycle, project-local import, manual queue metadata, daemon lease inspection, and the bounded read-only adapter. Replace `task_lease_...` with the lease id returned by `daemon run-once`.
 
@@ -73,17 +73,47 @@ harness daemon inspect-lease "$LEASE_ID" --project . --output json
 harness daemon execute-read-only "$LEASE_ID" --project . --output json
 ```
 
-Expected v1.6 safety properties:
+Expected v1.8 safety properties:
 
 - Agent and task lifecycle commands are declarative/control-plane operations only.
 - `daemon run-once` leases work but does not execute it.
 - `daemon execute-read-only` uses only the configured Codex CLI subscription route in read-only sandbox mode and requires hosted-boundary approval for `read_only_repo_summary`.
 - The MVP read-only path does not authorize Codex execution from the queue, Docker-from-queue, generic shell, hosted fallback, paid fallback, OpenAI API usage, MCP/A2A, browser/email/calendar tools, broker actions, live trading, order placement, active repo writes, external messaging, application submission, or autonomous workflows.
 - The repo planning adapter is available only through exact `repo_planning/repo_planning` metadata, an active lease, a valid hosted-boundary Codex approval, and Codex read-only sandbox execution through the registered dispatcher.
+- TUI command-palette and right-panel guidance surfaces are copy-only/passive and do not execute commands or call providers.
+- Capability catalog, memory, and progress surfaces are local operator context only and do not grant new execution authority.
+
+## Verify v1.8 Capability, Memory, And Progress Surfaces
+
+```bash
+harness capabilities list --project . --output json
+harness capabilities inspect dry_run --project . --output json
+harness memory save-note --scope project --summary "v1.8 smoke note" --project . --output json
+harness memory list --project . --output json
+harness memory inspect "$MEMORY_ID" --project . --output json
+harness memory forget "$MEMORY_ID" --project . --output json
+harness objectives add --title "v1.8 progress smoke" --project . --output json
+harness tasks add --title "v1.8 progress dry run" \
+  --objective "$OBJECTIVE_ID" \
+  --execution-adapter dry_run \
+  --task-type phase_1a_test \
+  --project . \
+  --output json
+harness progress --objective "$OBJECTIVE_ID" --project . --output json
+```
+
+Expected v1.8 local app properties:
+
+- `capabilities list` returns `harness.capability_catalog/v1`, includes registered adapters such as `dry_run`, `read_only_summary`, `repo_planning`, and `codex_isolated_edit`, and does not preflight backends or execute adapters.
+- `memory save-note/list/inspect/forget` returns `harness.memory_record/v1` or `harness.memory_records/v1`, stores only explicit local notes, redacts secret-looking content before persistence, and does not alter policy, approvals, or adapter eligibility.
+- `progress --objective` returns `harness.orchestration_progress/v1`, reports ready/leased/blocked/terminal state, and does not create leases, runs, artifacts, or adapter dispatch.
+- `harness --project . --output json` continues to return `harness.chat/v1` with `registered_adapters`, `capabilities`, runtime controls, memory summary, and progress summary when initialized.
+- Chat aliases `/capabilities`, `/memory`, `/remember`, `/forget`, `/progress`, “show capabilities”, “show memory”, and “where are we” remain deterministic local renderers.
+- The TUI right panel displays capability and progress rows passively; app startup and dashboard refresh do not call Codex, local model endpoints, Docker, shell, network, providers, or adapter execution.
 
 ## Verify Operator Cockpit
 
-Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.6 registered adapter smoke path when checking inspect text output.
+Replace `TASK_ID`, `LEASE_ID`, and `ARTIFACT_ID` with ids produced by the v1.8 registered adapter smoke path when checking inspect text output.
 
 ```bash
 harness --project . --output json
@@ -109,7 +139,7 @@ Expected operator cockpit safety properties:
 - Bare `harness` is the single primary app surface. It combines passive dashboard context with the chat/orchestrator prompt in one Textual terminal app. `harness --plain` is a line-oriented fallback for tests/dev use, not a separate product surface.
 - `harness home` is read-only and does not initialize projects, import agents, create tasks, create runs, create artifacts, acquire leases, mutate daemon state, or execute adapters.
 - `harness --output json` is read-only and returns `harness.chat/v1` context without launching a prompt, preflighting backends, calling providers, touching Docker, or initializing `.harness/`.
-- The unified app and `--plain` fallback keep session state in memory only. `/help`, `/init`, `/mode`, `/home`, `/dashboard`, `/orchestrators`, `/use`, `/agents`, `/tasks`, `/adapters`, and `/quit` should work without traceback on an uninitialized project. `/init` is the explicit in-app setup path; `harness --output json`, dashboard refresh, and passive slash commands must not initialize. Task creation, orchestrated graph creation, lease acquisition, and registered-adapter dispatch require explicit confirmation and use the normal objective, task, daemon run-once, and daemon execute paths.
+- The unified app and `--plain` fallback keep session state in memory only. `/help`, `/init`, `/mode`, `/home`, `/dashboard`, `/orchestrators`, `/use`, `/agents`, `/tasks`, `/capabilities`, `/memory`, `/progress`, `/adapters`, and `/quit` should work without traceback on an uninitialized project. `/init` is the explicit in-app setup path; `harness --output json`, dashboard refresh, and passive slash commands must not initialize. Task creation, orchestrated graph creation, lease acquisition, and registered-adapter dispatch require explicit confirmation and use the normal objective, task, daemon run-once, and daemon execute paths.
 - In normal mode, chat drafts before confirmation. In `--codex-like` or `/mode codex-like`, one explicit confirmation may create the approved task/objective graph and run it in the foreground through registered adapters. Missing hosted-boundary approval should be offered as an explicit in-app approval step; apply-back remains separate and denied by default.
 - Chat-first orchestration should draft the full objective/task graph before creation. The foreground `/run` path may drive only the approved graph through `daemon run-once` and `daemon execute`; it must stop on blocked dependencies, rejection, missing hosted approval, operator `/stop`, or terminal graph completion.
 - The dashboard side renders a light-theme chat-style interface, project state, summary counts, imported agents, task details, active lease details, daemon event summaries, recent runs, safety reminders, local in-memory search over loaded dashboard/command metadata, in-memory section collapse, palette-only search focus, and a copy-only command palette without initializing projects, importing agents, creating tasks, creating runs, creating artifacts, acquiring leases, mutating daemon state, executing adapters, crawling files, or searching artifact contents.
@@ -354,10 +384,20 @@ Expected safety properties for the v0.3.5 evidence commands and v0.4 daemon cont
 - `daemon execute-dry-run` is explicit v0.4.5 contract evidence only: it may bind one active lease to one local `phase_1a_test` run and metadata-only artifacts, but it must not call backends, run Docker, execute shell commands, access the network, mutate active repo files, or use hosted/paid fallback.
 - `daemon execute-read-only` is explicit read-only adapter execution only: it may bind one active lease to one `read_only_repo_summary` run through the configured `codex_cli` subscription backend in read-only sandbox mode after hosted-boundary approval.
 - `daemon execute` is registered-adapter dispatch only: no adapter means no execution, unknown adapter fails closed, and adapter descriptors are documentation and validation metadata rather than permission grants.
-- `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, read-only eligibility, generic execution eligibility, and recovery recommendation without creating runs or artifacts.
+- `daemon inspect-lease` is read-only and may report linked task, attempt, run, manifest, dry-run eligibility, read-only eligibility, generic execution eligibility, typed `security_decision`, and recovery recommendation without creating runs or artifacts.
+- `daemon inspect-lease --output json` and generic `daemon execute --output json` include sanitized `security_decision` evidence before registered-adapter execution is allowed, denied, or paused for approval.
+- `harness controls list`, `harness controls disable`, `harness controls enable`, `harness controls breaker-status`, and `harness controls breaker-reset` expose local runtime kill switches and adapter breakers without calling providers, touching Docker, or creating runs/tasks/artifacts.
+- Disabled controls and open breakers appear as `security_decision.reason_code` values such as `control_disabled` or `breaker_open`, and capability/chat surfaces mark affected adapters unavailable rather than granting new authority.
+- Run manifests and trace export include sanitized `context_provenance` and `untrusted_context_warnings` for prompts, task metadata, artifacts, generated text, and memory records without embedding artifact contents.
+- Memory records are redacted when needed and marked non-authoritative for permissions, policy, approvals, hosted-boundary execution, Docker/network access, shell/tool grants, and active repo apply-back.
+- `harness evals run --suite security --output json` and `harness security check --output json` expose sanitized metadata-only local detections without creating records, calling providers, touching Docker, or reading artifact bodies.
+- `harness evals run --suite integrity --output json` and `harness integrity check --output json` expose local package/evidence integrity for built-in specs, adapter descriptors, security docs, static TUI assets, and artifact provenance without initializing projects, creating runtime records, calling providers, touching Docker, or reading forbidden paths.
+- `harness evals run --suite security-layer --output json` and `harness security audit --output json` pass for the local-first completion scope and remain read-only. On uninitialized projects they report package/static checks plus skipped runtime checks without creating `.harness/`.
+- Blocked-state smoke should verify the same stable code appears in `daemon inspect-lease --output json`, text `daemon inspect-lease`, `daemon execute --output json`, `capabilities inspect`, chat “why is this blocked?”, and TUI/operator context for cases such as missing approval, disabled adapter, unsafe metadata, unknown adapter, breaker open, and forbidden path or secret-like content.
 - `daemon recover` may reconcile existing dry-run or read-only evidence but must not create a second run for a linked attempt.
 - Registered dispatch does not authorize Docker-from-queue, shell execution, hosted fallback, paid fallback, OpenAI API usage, active repo writes without apply-back approval, MCP/A2A, browser/email/calendar tools, generic task execution, or unmanaged daemon loops.
 - Output is schema-versioned and does not include backend settings, `api_key`, `OPENAI_API_KEY`, `base_url`, environment variables, or artifact file contents.
+- Artifact records use explicit redaction states: clean evidence is `not_required`, secret-like text is represented by a redacted derived artifact with lineage metadata, and secret-like artifact paths are rejected.
 - `harness compare "$RUN_ID" "$RUN_ID"` and baseline comparison against the same run should report no drift.
 
 ## Build Local Docker Test Image

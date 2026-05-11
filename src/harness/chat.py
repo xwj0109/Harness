@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
@@ -7,14 +9,18 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from harness.approvals import ApprovalStore
+from harness.capabilities import build_capability_catalog
 from harness.config import HARNESS_DIR, write_default_config
 from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import ArtifactRecord, RunRecord, TaskLease, TaskRecord
 from harness.operator_context import build_operator_context, render_operator_context_lines
 from harness.paths import resolve_project_root
+from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.security import sanitize_for_logging
+from harness.security_explanations import explanations_from_reasons
+from harness.tools.patch import apply_planned_updates, plan_unified_diff
 
 
 CHAT_SCHEMA_VERSION = "harness.chat/v1"
@@ -157,6 +163,9 @@ def chat_context(project_root: Path) -> dict[str, Any]:
         "branch": context.get("branch"),
         "summary": summary,
         "registered_adapters": context["registered_adapters"],
+        "capabilities": context["capabilities"],
+        "runtime_controls": context.get("runtime_controls"),
+        "context_warnings": context.get("memory", {}).get("warnings", []),
         "dashboard": context,
         "safety_boundaries": [
             "chat_is_operator_surface_not_authority",
@@ -253,6 +262,20 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "mode_codex_like"
     elif normalized in {"normal mode", "draft mode"}:
         intent = "mode_normal"
+    elif normalized in {
+        "show capabilities",
+        "capabilities",
+        "list capabilities",
+        "what can harness do here",
+        "what can harness do here?",
+        "which actions need approval",
+        "which actions need approval?",
+    }:
+        intent = "show_capabilities"
+    elif normalized in {"show memory", "memory", "list memory"}:
+        intent = "show_memory"
+    elif normalized in {"show progress", "show orchestration progress", "where are we", "progress"}:
+        intent = "show_progress"
     elif normalized in {"show tasks", "tasks", "list tasks"}:
         intent = "show_tasks"
     elif normalized in {"show latest run", "latest run", "show runs", "runs"}:
@@ -261,6 +284,8 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "execute_adapter"
     elif "adapter" in normalized:
         intent = "show_adapters"
+    elif normalized in {"why is this blocked", "why is this blocked?", "explain blocked", "security blockers"}:
+        intent = "show_blocked"
     elif "blocked" in normalized:
         intent = "show_blocked"
     elif (
@@ -292,6 +317,18 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "inspect_lease"
     elif normalized in {"that diff", "show diff", "show that diff"}:
         intent = "show_diff"
+    elif normalized in {
+        "apply it",
+        "apply the diff",
+        "apply changes",
+        "apply the changes",
+        "approve the diff",
+        "approve apply back",
+        "approve apply-back",
+    }:
+        intent = "approve_apply_back"
+    elif normalized in {"deny apply back", "deny apply-back", "deny the diff", "do not apply it"}:
+        intent = "deny_apply_back"
     elif "apply-back" in normalized or "apply back" in normalized:
         intent = "apply_back_review"
     else:
@@ -318,7 +355,12 @@ def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict
                 "/tasks - list latest tasks",
                 "/runs - list latest runs",
                 "/leases - list active leases",
-                "/adapters - list registered adapters",
+                "/capabilities - list Harness capability catalog entries",
+                "/adapters - list registered adapters including repo_planning",
+                "/memory - list explicit local memory records",
+                "/remember <text> - save a project-scoped operator memory note",
+                "/forget <memory_id> - forget a memory record",
+                "/progress [objective_id] - show read-only orchestration progress",
                 "/task <id> - show task details",
                 "/run <id> - show run manifest summary",
                 "/artifact <id> - show artifact metadata",
@@ -351,8 +393,17 @@ def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict
         return _runs_response(project_root, state)
     if command == "leases":
         return _leases_response(project_root, state)
+    if command == "capabilities":
+        return _capabilities_response(project_root)
     if command == "adapters":
         return _adapters_response(project_root)
+    if command == "memory":
+        return _memory_response(project_root)
+    if command == "remember":
+        note = raw.partition(" ")[2].strip()
+        return _remember_response(project_root, note)
+    if command == "forget":
+        return _forget_memory_response(project_root, arg)
     if command == "task":
         return _task_detail_response(project_root, _resolve_task_ref(arg, state))
     if command == "run":
@@ -380,7 +431,7 @@ def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict
         choice = arg if arg in {"approve", "deny", "keep"} else None
         return _apply_back_review_response(project_root, state, choice=choice)
     if command == "progress":
-        return _response("progress", "Progress", state.progress or ["No progress events in this chat session."])
+        return _orchestration_progress_response(project_root, arg or state.latest_objective_id, state)
     if command == "reset":
         state.reset()
         return _response("reset", "Session Reset", ["Session-local references were cleared."], ok=True)
@@ -401,6 +452,12 @@ def _handle_intent(raw: str, project_root: Path, state: ChatSessionState) -> dic
         return _runs_response(project_root, state)
     if intent == "show_adapters":
         return _adapters_response(project_root)
+    if intent == "show_capabilities":
+        return _capabilities_response(project_root)
+    if intent == "show_memory":
+        return _memory_response(project_root)
+    if intent == "show_progress":
+        return _orchestration_progress_response(project_root, state.latest_objective_id, state)
     if intent == "show_blocked":
         return _blocked_response(project_root)
     if intent == "recommend_next":
@@ -425,6 +482,10 @@ def _handle_intent(raw: str, project_root: Path, state: ChatSessionState) -> dic
         return _artifact_response(project_root, state.latest_diff_artifact)
     if intent == "apply_back_review":
         return _apply_back_review_response(project_root, state)
+    if intent == "approve_apply_back":
+        return _apply_back_review_response(project_root, state, choice="approve")
+    if intent == "deny_apply_back":
+        return _apply_back_review_response(project_root, state, choice="deny")
     return _deterministic_chat_guidance(raw, project_root, state)
 
 
@@ -432,7 +493,7 @@ def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessio
     lines = [
         "I can inspect local Harness state and prepare explicit actions.",
         "I do not call Codex, Docker, shell, providers, or model backends directly from chat.",
-        "Try: 'summarize this repo', 'fix this bug', 'show adapters', 'what should I do next?', or /help.",
+        "Try: 'summarize this repo', 'fix this bug', 'show capabilities', 'what should I do next?', or /help.",
     ]
     if state.pending_draft or state.pending_orchestration or state.pending_execute_lease_id or state.pending_hosted_approval:
         lines.append("There is a pending action. Type yes or /confirm to continue, or no to cancel.")
@@ -446,7 +507,7 @@ def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessio
         extra={
             "input": raw,
             "mode": "codex-like" if state.codex_like_mode else "normal",
-            "equivalent_commands": ["/help", "/home", "/adapters"],
+            "equivalent_commands": ["/help", "/home", "/capabilities", "/adapters"],
         },
     )
 
@@ -893,16 +954,182 @@ def _adapters_response(project_root: Path) -> dict[str, Any]:
     )
 
 
+def _capabilities_response(project_root: Path) -> dict[str, Any]:
+    catalog = build_capability_catalog(project_root)
+    lines = [
+        (
+            f"{capability.id}: task_types={','.join(capability.supported_task_types) or 'none'} "
+            f"readiness={capability.readiness} approvals="
+            f"{','.join(capability.required_approvals) if capability.required_approvals else 'none'}"
+        )
+        for capability in catalog.capabilities
+    ]
+    return _response(
+        "capabilities",
+        "Capability Catalog",
+        lines or ["No capabilities registered."],
+        ok=True,
+        extra={"capability_catalog": catalog.model_dump(mode="json")},
+    )
+
+
+def _memory_response(project_root: Path) -> dict[str, Any]:
+    if not _is_initialized(project_root):
+        return _uninitialized_response(project_root)
+    records = _require_store(project_root).list_memory_records()[:10]
+    lines = ["No memory records found."] if not records else [
+        f"{record.id} [{record.scope_type.value}:{record.scope_id}] {record.summary}"
+        for record in records
+    ]
+    return _response("memory", "Memory", lines, ok=True, extra={"memory": [record.model_dump(mode="json") for record in records]})
+
+
+def _remember_response(project_root: Path, note: str) -> dict[str, Any]:
+    if not _is_initialized(project_root):
+        return _uninitialized_response(project_root)
+    store = _require_store(project_root)
+    try:
+        store.initialize()
+        record = store.save_memory_note("project", str(resolve_project_root(project_root)), note)
+    except ValueError as exc:
+        return _response("memory_error", "Memory Error", [str(exc)], ok=False)
+    return _response(
+        "memory_saved",
+        "Memory Saved",
+        [
+            f"Memory: {record.id}",
+            f"Scope: {record.scope_type.value}:{record.scope_id}",
+            f"Redaction: {record.redaction_state.value}",
+        ],
+        ok=True,
+        extra={"memory": record.model_dump(mode="json")},
+    )
+
+
+def _forget_memory_response(project_root: Path, memory_id: str | None) -> dict[str, Any]:
+    if not _is_initialized(project_root):
+        return _uninitialized_response(project_root)
+    if not memory_id:
+        return _response("memory_error", "Memory Error", ["Provide a memory id to forget."], ok=False)
+    try:
+        record = _require_store(project_root).forget_memory_record(memory_id)
+    except KeyError as exc:
+        return _response("memory_error", "Memory Error", [str(exc).strip("'")], ok=False)
+    return _response(
+        "memory_forgotten",
+        "Memory Forgotten",
+        [f"Memory: {record.id}", f"Redaction: {record.redaction_state.value}"],
+        ok=True,
+        extra={"memory": record.model_dump(mode="json")},
+    )
+
+
+def _orchestration_progress_response(
+    project_root: Path,
+    objective_id: str | None,
+    state: ChatSessionState,
+) -> dict[str, Any]:
+    if objective_id is None:
+        return _response(
+            "progress",
+            "Progress",
+            state.progress or ["No objective is selected and no progress events exist in this chat session."],
+            ok=True,
+            extra={"progress": state.progress, "objective_id": None},
+        )
+    try:
+        progress = build_orchestration_progress(project_root, objective_id)
+    except KeyError as exc:
+        message = str(exc).strip("'")
+        return _response(
+            "progress_error",
+            "Progress Error",
+            [message],
+            ok=False,
+            extra={
+                "progress": {
+                    "schema_version": "harness.orchestration_progress/v1",
+                    "ok": False,
+                    "objective_id": objective_id,
+                    "errors": [message],
+                }
+            },
+        )
+    lines = [
+        f"Objective: {progress.objective_id} | {progress.objective_title}",
+        f"Mode: {progress.mode.value}",
+        f"Next: {progress.next_action or 'none'}",
+    ]
+    if progress.active_lease_ids:
+        lines.append(f"Active lease: {progress.active_lease_ids[0]}")
+    if progress.active_run_ids:
+        lines.append(f"Active run: {progress.active_run_ids[0]}")
+    for task in progress.tasks[:6]:
+        detail = f"{task.task_id}: {task.status.value} | {task.execution_adapter or 'no_adapter'}"
+        if task.lease_id:
+            detail += f" | lease={task.lease_id}"
+        if task.run_id:
+            detail += f" | run={task.run_id}"
+        if task.blocked_reasons:
+            detail += f" | blocked={'; '.join(task.blocked_reasons[:2])}"
+        lines.append(detail)
+    return _response(
+        "progress",
+        "Progress",
+        lines,
+        ok=True,
+        extra={"progress": progress.model_dump(mode="json")},
+    )
+
+
 def _blocked_response(project_root: Path) -> dict[str, Any]:
     if not _is_initialized(project_root):
         return _uninitialized_response(project_root)
     store = _require_store(project_root)
     tasks = [task for task in store.list_tasks() if task.status.value in {"blocked", "waiting_approval"}]
     lines = ["No blocked or waiting-approval tasks."] if not tasks else [
-        f"{task.id} [{task.status.value}] {task.title}"
+        _blocked_task_line(task)
         for task in tasks
     ]
-    return _response("blocked", "Blocked Tasks", lines, ok=True, extra={"tasks": [task.model_dump(mode="json") for task in tasks]})
+    explanations = {
+        task.id: [
+            explanation.model_dump(mode="json")
+            for explanation in explanations_from_reasons(
+                [
+                    *task.required_approvals,
+                    *(
+                        ["task is waiting for approval"]
+                        if task.status.value == "waiting_approval"
+                        else []
+                    ),
+                    *(
+                        ["task is blocked"]
+                        if task.status.value == "blocked"
+                        else []
+                    ),
+                ],
+                inspect_command=f"harness tasks inspect {task.id} --project {project_root} --output json",
+            )
+        ]
+        for task in tasks
+    }
+    return _response(
+        "blocked",
+        "Blocked Tasks",
+        lines,
+        ok=True,
+        extra={"tasks": [task.model_dump(mode="json") for task in tasks], "blocked_state_explanations": explanations},
+    )
+
+
+def _blocked_task_line(task) -> str:
+    reasons = []
+    if task.required_approvals:
+        reasons.append("missing_approval")
+    elif task.status.value == "blocked":
+        reasons.append("blocked_by_policy")
+    suffix = f" | {', '.join(reasons)}" if reasons else ""
+    return f"{task.id} [{task.status.value}] {task.title}{suffix}"
 
 
 def _task_detail_response(project_root: Path, task_id: str | None) -> dict[str, Any]:
@@ -1186,12 +1413,21 @@ def _recommend_next_response(project_root: Path, state: ChatSessionState) -> dic
         state.latest_task_id = lease.task_id
     elif ready:
         task = ready[0]
-        lines = [
-            f"Lease the next ready task: {task.id} [{task.title}]",
-            f"Equivalent command: harness daemon run-once --project {resolve_project_root(project_root)}",
-            "Chat shortcut: lease the next task",
-        ]
-        rec_id = "lease_ready_task"
+        if task.metadata.get("execution_adapter") == "repo_planning":
+            lines = [
+                f"Lease the ready repo-planning task: {task.id} [{task.title}]",
+                f"Equivalent command: harness daemon run-once --project {resolve_project_root(project_root)} --output json",
+                "Then dispatch the leased task with: harness daemon execute <lease_id> --project . --output json",
+                "Repo planning still requires hosted-boundary approval before run creation.",
+            ]
+            rec_id = "lease_repo_planning_task"
+        else:
+            lines = [
+                f"Lease the next ready task: {task.id} [{task.title}]",
+                f"Equivalent command: harness daemon run-once --project {resolve_project_root(project_root)}",
+                "Chat shortcut: lease the next task",
+            ]
+            rec_id = "lease_ready_task"
     elif blocked:
         task = blocked[0]
         lines = [
@@ -1213,8 +1449,8 @@ def _recommend_next_response(project_root: Path, state: ChatSessionState) -> dic
         lines = [
             "Create a bounded task through chat.",
             "For repository context: say 'summarize this repo'.",
-            "For an isolated coding attempt: say 'fix this bug with Codex'.",
             "For metadata-only evidence: say 'create dry run task'.",
+            'For repo planning: harness tasks add --title "Plan repo change" --execution-adapter repo_planning --task-type repo_planning --project . --output json',
         ]
         rec_id = "create_bounded_task"
     return _response(
@@ -1450,19 +1686,30 @@ def _apply_back_review_response(
         artifacts = store.list_artifacts(state.latest_run_id)
     except KeyError as exc:
         return _response("run_missing", "Run Not Found", [str(exc).strip("'")], ok=False)
-    interesting = [artifact for artifact in artifacts if artifact.kind in {"isolated_unified_diff", "isolated_diff_stat", "final_report"}]
+    interesting = [
+        artifact
+        for artifact in artifacts
+        if artifact.kind in {"baseline_manifest", "isolated_unified_diff", "isolated_diff_stat", "final_report"}
+    ]
     lines = [
         "Apply-back review uses existing inspected diff artifacts only.",
         "Hosted-boundary approval is not apply-back approval.",
         "This chat path does not parse or apply patches from chat text.",
     ]
     if choice == "deny":
+        store.append_event(
+            state.latest_run_id,
+            "info",
+            "apply_back_decision",
+            "Apply-back was denied from chat review.",
+            {"decision": "denied", "reason": "Denied from Harness chat."},
+        )
+        store.write_run_manifest(state.latest_run_id)
         lines.append("Apply-back denied from chat review; active repository mutation was not requested.")
     elif choice == "keep":
         lines.append("Isolation retained for operator inspection; active repository mutation was not requested.")
     elif choice == "approve":
-        lines.append("Apply-back approval was not performed because chat can only use an existing explicit apply-back approval provider path.")
-        lines.append("No active repository mutation was requested by chat.")
+        return _approve_apply_back_response(project_root, store, state.latest_run_id, interesting)
     lines.extend(f"{artifact.kind}: {artifact.path}" for artifact in interesting)
     return _response(
         "apply_back_review",
@@ -1471,6 +1718,265 @@ def _apply_back_review_response(
         ok=choice != "approve",
         extra={"artifacts": [artifact.model_dump(mode="json") for artifact in interesting]},
     )
+
+
+def _approve_apply_back_response(
+    project_root: Path,
+    store: SQLiteStore,
+    run_id: str,
+    artifacts: list[ArtifactRecord],
+) -> dict[str, Any]:
+    diff_artifact = _artifact_by_kind(artifacts, "isolated_unified_diff")
+    baseline_artifact = _artifact_by_kind(artifacts, "baseline_manifest")
+    inspection = _latest_event_payload(store, run_id, "isolated_diff_inspected")
+    if diff_artifact is None or baseline_artifact is None:
+        return _response(
+            "apply_back_missing_artifacts",
+            "Apply-Back Blocked",
+            ["Missing isolated diff or baseline manifest artifact for this run."],
+            ok=False,
+            extra={"run_id": run_id},
+        )
+    if diff_artifact.redaction_state == "redacted":
+        return _response(
+            "apply_back_redacted_diff",
+            "Apply-Back Blocked",
+            ["The isolated diff artifact was redacted, so it cannot be used as an apply-back source."],
+            ok=False,
+            extra={"run_id": run_id, "diff_artifact": diff_artifact.model_dump(mode="json")},
+        )
+    if _latest_event_payload(store, run_id, "apply_back_applied") is not None:
+        return _response(
+            "apply_back_already_applied",
+            "Apply-Back Already Applied",
+            ["This run already has an apply_back_applied event. Refusing duplicate active repo mutation."],
+            ok=False,
+            extra={"run_id": run_id},
+        )
+    violations = list((inspection or {}).get("violations") or [])
+    allowed_files = list((inspection or {}).get("allowed_changed_files") or [])
+    if violations:
+        return _response(
+            "apply_back_policy_violation",
+            "Apply-Back Blocked",
+            ["The inspected isolated diff has policy violations.", f"Violations: {violations}"],
+            ok=False,
+            extra={"run_id": run_id, "violations": violations},
+        )
+    if not allowed_files:
+        return _response(
+            "apply_back_no_changes",
+            "No Apply-Back Changes",
+            ["The inspected isolated diff has no allowed file changes to apply."],
+            ok=False,
+            extra={"run_id": run_id},
+        )
+    control_reason = _active_repo_apply_back_disabled_reason(store)
+    if control_reason is not None:
+        store.append_event(
+            run_id,
+            "warning",
+            "apply_back_control_disabled",
+            "Apply-back denied by active repo apply-back kill switch.",
+            {"reason": control_reason},
+        )
+        store.append_event(
+            run_id,
+            "info",
+            "apply_back_decision",
+            "Apply-back approval was blocked by runtime control.",
+            {"decision": "denied", "reason": control_reason},
+        )
+        store.write_run_manifest(run_id)
+        return _response(
+            "apply_back_control_disabled",
+            "Apply-Back Blocked",
+            [control_reason],
+            ok=False,
+            extra={"run_id": run_id},
+        )
+    try:
+        baseline = _load_baseline_manifest(baseline_artifact.path)
+        pre_status = str((inspection or {}).get("active_pre_isolation_git_status") or "")
+        if not pre_status:
+            pre_status = _active_pre_isolation_status(store, run_id)
+        freshness = _check_apply_back_freshness(project_root, allowed_files, baseline["hashes"], pre_status)
+        store.append_event(
+            run_id,
+            "info",
+            "apply_back_decision",
+            "Apply-back was approved from chat review.",
+            {"decision": "approved", "reason": "Approved from Harness chat."},
+        )
+        if not freshness["ok"]:
+            store.append_event(
+                run_id,
+                "warning",
+                "apply_back_freshness_failed",
+                "Apply-back failed closed because active project changed since isolation.",
+                freshness,
+            )
+            store.write_run_manifest(run_id)
+            return _response(
+                "apply_back_freshness_failed",
+                "Apply-Back Freshness Failed",
+                [
+                    freshness["reason"] or "Freshness check failed.",
+                    f"Target hash checks: {freshness['target_hash_checks']}",
+                ],
+                ok=False,
+                extra={"run_id": run_id, "freshness": freshness},
+            )
+        patch = diff_artifact.path.read_text(encoding="utf-8")
+        summary, updates = plan_unified_diff(patch, project_root, baseline["excluded_patterns"])
+        apply_planned_updates(updates)
+    except Exception as exc:
+        reason = str(sanitize_for_logging(str(exc)))
+        store.append_event(
+            run_id,
+            "error",
+            "apply_back_validation_or_apply_failed",
+            "Apply-back failed validation or atomic application.",
+            {"reason": reason},
+        )
+        store.write_run_manifest(run_id)
+        return _response(
+            "apply_back_failed",
+            "Apply-Back Failed",
+            [reason],
+            ok=False,
+            extra={"run_id": run_id},
+        )
+    post_status = _git_status_porcelain(project_root)
+    store.append_event(
+        run_id,
+        "info",
+        "apply_back_applied",
+        "Approved isolated diff was applied to the active project from chat.",
+        {"files": summary.files, "active_post_apply_status": post_status},
+    )
+    store.update_run_status(run_id, "completed_applied")
+    store.write_run_manifest(run_id)
+    return _response(
+        "apply_back_applied",
+        "Apply-Back Applied",
+        [
+            f"Run: {run_id}",
+            f"Applied files: {', '.join(summary.files)}",
+            f"Added lines: {summary.added_lines}",
+            f"Removed lines: {summary.removed_lines}",
+            "Active repo mutation used the stored inspected diff artifact only.",
+        ],
+        ok=True,
+        extra={
+            "run_id": run_id,
+            "applied_files": summary.files,
+            "added_lines": summary.added_lines,
+            "removed_lines": summary.removed_lines,
+            "diff_artifact": diff_artifact.model_dump(mode="json"),
+        },
+    )
+
+
+def _artifact_by_kind(artifacts: list[ArtifactRecord], kind: str) -> ArtifactRecord | None:
+    for artifact in reversed(artifacts):
+        if artifact.kind == kind:
+            return artifact
+    return None
+
+
+def _latest_event_payload(store: SQLiteStore, run_id: str, event_type: str) -> dict[str, Any] | None:
+    for event in reversed(store.list_events(run_id)):
+        if event.event_type == event_type:
+            return event.payload
+    return None
+
+
+def _active_pre_isolation_status(store: SQLiteStore, run_id: str) -> str:
+    payload = _latest_event_payload(store, run_id, "isolation_created") or {}
+    return str(payload.get("active_pre_isolation_git_status") or "")
+
+
+def _active_repo_apply_back_disabled_reason(store: SQLiteStore) -> str | None:
+    try:
+        for control in store.active_execution_controls():
+            if control.target_kind.value == "active_repo_apply_back" and control.target_id == "*":
+                return str(
+                    sanitize_for_logging(
+                        f"Execution control disabled active_repo_apply_back:*. {control.reason}"
+                    )
+                )
+    except Exception as exc:
+        return str(sanitize_for_logging(f"Runtime control state unavailable: {exc}"))
+    return None
+
+
+def _load_baseline_manifest(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    hashes = {
+        str(entry["path"]): str(entry["sha256"])
+        for entry in payload.get("entries", [])
+        if isinstance(entry, dict) and "path" in entry and "sha256" in entry
+    }
+    return {
+        "hashes": hashes,
+        "excluded_patterns": [str(item) for item in payload.get("excluded_patterns", [])],
+    }
+
+
+def _check_apply_back_freshness(
+    project_root: Path,
+    target_files: list[str],
+    baseline_hashes: dict[str, str],
+    pre_isolation_status: str,
+) -> dict[str, Any]:
+    active_status = _git_status_porcelain(project_root)
+    checks: list[dict[str, str | bool]] = []
+    ok = True
+    reason = None
+    if active_status != pre_isolation_status:
+        ok = False
+        reason = "Active git status changed since isolation was created."
+    for relative_path in target_files:
+        expected = baseline_hashes.get(relative_path, "")
+        path = project_root / relative_path
+        exists = path.exists() and path.is_file() and not path.is_symlink()
+        actual = _sha256_path(path) if exists else ""
+        matches = bool(exists and expected and actual == expected)
+        checks.append(
+            {
+                "path": relative_path,
+                "expected_sha256": expected,
+                "actual_sha256": actual,
+                "matches": matches,
+            }
+        )
+        if not matches:
+            ok = False
+            reason = reason or f"Target file changed since isolation was created: {relative_path}"
+    return {
+        "ok": ok,
+        "reason": reason,
+        "active_pre_apply_status": active_status,
+        "target_hash_checks": checks,
+    }
+
+
+def _git_status_porcelain(project_root: Path) -> str:
+    result = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=project_root,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        return f"GIT_STATUS_UNAVAILABLE: {(result.stderr or result.stdout).strip()}"
+    return result.stdout
+
+
+def _sha256_path(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _plan_response(state: ChatSessionState) -> dict[str, Any]:

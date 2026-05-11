@@ -5,11 +5,14 @@ import subprocess
 from pathlib import Path
 
 from harness import __version__
+from harness.capabilities import build_capability_catalog
 from harness.config import HARNESS_DIR
 from harness.execution import list_execution_adapter_descriptors
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import TaskStatus
 from harness.paths import resolve_project_root
+from harness.progress import build_orchestration_progress
+from harness.security import sanitize_for_logging
 
 
 OPERATOR_CONTEXT_SCHEMA_VERSION = "harness.operator_context/v1"
@@ -18,6 +21,7 @@ OPERATOR_CONTEXT_SCHEMA_VERSION = "harness.operator_context/v1"
 def build_operator_context(project_root: Path) -> dict:
     project_root = resolve_project_root(project_root)
     initialized = _is_initialized(project_root)
+    capability_catalog = build_capability_catalog(project_root).model_dump(mode="json")
     dashboard = {
         "schema_version": OPERATOR_CONTEXT_SCHEMA_VERSION,
         "ok": True,
@@ -43,10 +47,32 @@ def build_operator_context(project_root: Path) -> dict:
             "latest_events": [],
         },
         "recent_runs": [],
+        "memory": {
+            "schema_version": "harness.memory_summary/v1",
+            "total": 0,
+            "recent": [],
+        },
+        "progress": {
+            "schema_version": "harness.orchestration_progress_summary/v1",
+            "objective_id": None,
+            "objective_title": None,
+            "mode": "idle",
+            "next_action": None,
+            "active_lease_ids": [],
+            "active_run_ids": [],
+            "blocked_reasons": [],
+            "tasks": [],
+        },
         "registered_adapters": [
             descriptor.model_dump(mode="json")
             for descriptor in list_execution_adapter_descriptors()
         ],
+        "capabilities": capability_catalog,
+        "runtime_controls": {
+            "schema_version": "harness.execution_controls_summary/v1",
+            "controls": [],
+            "breakers": [],
+        },
         "command_suggestions": [
             f"harness home --project {project_root}",
             f"harness chat --project {project_root}",
@@ -95,7 +121,12 @@ def build_operator_context(project_root: Path) -> dict:
         tasks = store.list_tasks()
         leases = store.list_task_leases()
         runs = store.list_runs()[:5]
+        memory_records = store.list_memory_records()[:5]
         daemon_status = store.daemon_status()
+        controls = store.list_execution_controls()
+        breakers = store.list_adapter_breaker_states(
+            [descriptor.id for descriptor in list_execution_adapter_descriptors()]
+        )
     except sqlite3.Error as exc:
         dashboard["initialized"] = False
         dashboard["state_error"] = {
@@ -123,6 +154,11 @@ def build_operator_context(project_root: Path) -> dict:
         "active_daemons": len(daemon_status.active_daemons),
         "recent_runs": len(runs),
     }
+    dashboard["runtime_controls"] = {
+        "schema_version": "harness.execution_controls_summary/v1",
+        "controls": [control.model_dump(mode="json") for control in controls],
+        "breakers": [breaker.model_dump(mode="json") for breaker in breakers],
+    }
     dashboard["task_status_counts"] = task_status_counts
     dashboard["agents"] = [
         {
@@ -137,14 +173,14 @@ def build_operator_context(project_root: Path) -> dict:
     dashboard["tasks"] = [
         {
             "id": task.id,
-            "title": task.title,
+            "title": sanitize_for_logging(task.title),
             "status": task.status.value,
             "priority": task.priority,
             "objective_id": task.objective_id,
             "agent_id": task.agent_id,
             "workbench_id": task.workbench_id,
-            "execution_adapter": task.metadata.get("execution_adapter"),
-            "task_type": task.metadata.get("task_type"),
+            "execution_adapter": sanitize_for_logging(task.metadata.get("execution_adapter")),
+            "task_type": sanitize_for_logging(task.metadata.get("task_type")),
         }
         for task in tasks[:10]
     ]
@@ -164,11 +200,62 @@ def build_operator_context(project_root: Path) -> dict:
             "id": run.id,
             "status": run.status,
             "task_type": run.task_type,
-            "goal": run.goal,
+            "goal": sanitize_for_logging(run.goal),
             "created_at": run.created_at.isoformat(),
         }
         for run in runs
     ]
+    dashboard["memory"] = {
+        "schema_version": "harness.memory_summary/v1",
+        "total": len(store.list_memory_records()),
+        "warnings": ["memory_not_authority"] if memory_records else [],
+        "recent": [
+            {
+                "id": record.id,
+                "scope_type": record.scope_type.value,
+                "scope_id": record.scope_id,
+                "summary": sanitize_for_logging(record.summary),
+                "redaction_state": record.redaction_state.value,
+                "lineage": sanitize_for_logging(record.lineage),
+                "created_at": record.created_at.isoformat(),
+            }
+            for record in memory_records
+        ],
+    }
+    objective_for_progress = _objective_for_progress(objectives, tasks)
+    if objective_for_progress is not None:
+        try:
+            progress = build_orchestration_progress(project_root, objective_for_progress.id)
+            dashboard["progress"] = {
+                "schema_version": "harness.orchestration_progress_summary/v1",
+                "objective_id": progress.objective_id,
+                "objective_title": progress.objective_title,
+                "mode": progress.mode.value,
+                "next_action": progress.next_action,
+                "active_lease_ids": progress.active_lease_ids,
+                "active_run_ids": progress.active_run_ids,
+                "blocked_reasons": progress.blocked_reasons[:5],
+                "tasks": [
+                    {
+                        "task_id": task.task_id,
+                        "title": task.title,
+                        "status": task.status.value,
+                        "execution_adapter": task.execution_adapter,
+                        "task_type": task.task_type,
+                        "lease_id": task.lease_id,
+                        "run_id": task.run_id,
+                        "blocked_reasons": task.blocked_reasons[:3],
+                        "blocked_state_explanations": [
+                            explanation.model_dump(mode="json")
+                            for explanation in task.blocked_state_explanations[:3]
+                        ],
+                        "next_action": task.next_action,
+                    }
+                    for task in progress.tasks[:5]
+                ],
+            }
+        except (KeyError, sqlite3.Error):
+            pass
     dashboard["daemon"] = {
         "active_daemons": len(daemon_status.active_daemons),
         "paused_tasks": len(daemon_status.paused_tasks),
@@ -177,7 +264,7 @@ def build_operator_context(project_root: Path) -> dict:
                 "id": event.id,
                 "daemon_id": event.daemon_id,
                 "event_type": event.event_type,
-                "message": event.message,
+                "message": sanitize_for_logging(event.message),
                 "created_at": event.created_at.isoformat(),
             }
             for event in daemon_status.latest_events[:5]
@@ -185,11 +272,37 @@ def build_operator_context(project_root: Path) -> dict:
     }
     dashboard["guidance"] = []
     if task_status_counts.get("ready", 0) > 0 and not active_leases:
+        ready_repo_planning = next(
+            (
+                task
+                for task in tasks
+                if task.status.value == "ready" and task.metadata.get("execution_adapter") == "repo_planning"
+            ),
+            None,
+        )
+        if ready_repo_planning is not None:
+            dashboard["guidance"].append(
+                {
+                    "id": "lease_repo_planning_task",
+                    "command": f"harness daemon run-once --project {project_root}",
+                    "description": "Lease the ready repo-planning task, then dispatch the resulting lease through registered daemon execute.",
+                }
+            )
+        else:
+            dashboard["guidance"].append(
+                {
+                    "id": "lease_ready_task",
+                    "command": f"harness daemon run-once --project {project_root}",
+                    "description": "Lease the highest-priority eligible task without executing it.",
+                }
+            )
+    if active_leases:
+        lease = active_leases[0]
         dashboard["guidance"].append(
             {
-                "id": "lease_ready_task",
-                "command": f"harness daemon run-once --project {project_root}",
-                "description": "Lease the highest-priority eligible task without executing it.",
+                "id": "dispatch_active_lease",
+                "command": f"harness daemon execute {lease.id} --project {project_root}",
+                "description": "Dispatch the active lease through its registered adapter after inspection.",
             }
         )
     if not agents:
@@ -203,6 +316,27 @@ def build_operator_context(project_root: Path) -> dict:
             }
         )
     return dashboard
+
+
+def _objective_for_progress(objectives: list, tasks: list) -> object | None:
+    if not objectives:
+        return None
+    non_terminal_objective_ids = {
+        task.objective_id
+        for task in tasks
+        if task.objective_id is not None
+        and task.status
+        not in {
+            TaskStatus.SUCCEEDED,
+            TaskStatus.FAILED,
+            TaskStatus.CANCELLED,
+            TaskStatus.SKIPPED,
+        }
+    }
+    for objective in objectives:
+        if objective.id in non_terminal_objective_ids:
+            return objective
+    return objectives[0]
 
 
 def build_tui_dashboard(project_root: Path) -> dict:
@@ -226,6 +360,9 @@ def build_tui_dashboard(project_root: Path) -> dict:
 def render_operator_context_lines(context: dict, *, active_orchestrator: str | None = None) -> list[str]:
     summary = context["summary"]
     adapters = ", ".join(adapter["id"] for adapter in context.get("registered_adapters", []))
+    capabilities = ", ".join(
+        capability["id"] for capability in context.get("capabilities", {}).get("capabilities", [])
+    )
     lines = [
         f"Project: {context['project_root']}",
         f"Branch: {context.get('branch') or 'unknown'}",
@@ -235,6 +372,7 @@ def render_operator_context_lines(context: dict, *, active_orchestrator: str | N
         f"tasks={summary['tasks_total']} objectives={summary['objectives']} "
         f"active_leases={summary['active_leases']} recent_runs={summary['recent_runs']}",
         f"Adapters: {adapters or 'none'}",
+        f"Capabilities: {capabilities or 'none'}",
     ]
     if context.get("state_error"):
         lines.append(f"State error: {context['state_error']['type']}: {context['state_error']['message']}")

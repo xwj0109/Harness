@@ -193,6 +193,29 @@ def test_cli_chat_json_reports_context_without_backend_preflight(tmp_path, monke
     assert not (tmp_path / ".harness").exists()
 
 
+def test_cli_chat_json_context_sanitizes_task_and_memory_secrets(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+        metadata={"secret": "Bearer abcdefghijklmnop"},
+    )
+    store.save_memory_note(
+        scope_type="project",
+        scope_id="default",
+        summary="password: correcthorsebatterystaple",
+    )
+
+    result = runner.invoke(app, ["--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    serialized = result.output
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in serialized
+    assert "abcdefghijklmnop" not in serialized
+    assert "correcthorsebatterystaple" not in serialized
+    assert "[REDACTED_SECRET]" in serialized
+
+
 def test_chat_slash_commands_and_plain_text_guidance_without_backend(tmp_path, monkeypatch) -> None:
     def fail_backend(*args, **kwargs):
         raise AssertionError("chat guidance must not construct a backend")
@@ -268,6 +291,8 @@ def test_chat_read_only_intent_routing() -> None:
     assert route_chat_intent("show tasks")["intent"] == "show_tasks"
     assert route_chat_intent("what adapters are available?")["intent"] == "show_adapters"
     assert route_chat_intent("what is blocked?")["intent"] == "show_blocked"
+    assert route_chat_intent("why is this blocked?")["intent"] == "show_blocked"
+    assert route_chat_intent("security blockers")["intent"] == "show_blocked"
     assert route_chat_intent("what should I do next?")["intent"] == "recommend_next"
     assert route_chat_intent("what is the current project state?")["intent"] == "show_status"
     assert route_chat_intent("summarize this repo")["intent"] == "draft_read_only_summary"
@@ -287,6 +312,26 @@ def test_chat_next_recommendation_uses_local_state(tmp_path) -> None:
     assert response["recommendation"]["id"] == "lease_ready_task"
     assert task.id in "\n".join(response["lines"])
     assert "harness daemon run-once" in "\n".join(response["lines"])
+
+
+def test_chat_next_recommendation_surfaces_repo_planning_and_adapters(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Plan repo change",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    state = ChatSessionState()
+
+    recommendation = handle_chat_input("what should I do next?", tmp_path, state)
+    adapters = handle_chat_input("/adapters", tmp_path, state)
+
+    assert recommendation["kind"] == "next_recommendation"
+    assert recommendation["recommendation"]["id"] == "lease_repo_planning_task"
+    assert task.id in "\n".join(recommendation["lines"])
+    assert "harness daemon execute <lease_id> --project . --output json" in "\n".join(recommendation["lines"])
+    assert adapters["kind"] == "adapters"
+    assert "repo_planning: task_types=repo_planning" in "\n".join(adapters["lines"])
 
 
 def test_cli_tui_json_probe_does_not_launch_or_mutate(tmp_path, monkeypatch) -> None:
@@ -509,6 +554,7 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
         "daemon",
         "runs",
         "commands",
+        "guidance",
         "safety",
     ]
     assert any("tui_agent" in line for line in panes[1]["lines"])
@@ -613,7 +659,7 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     assert [pane["id"] for pane in agent_filtered["panes"]] == ["agents"]
     assert agent_filtered["panes"][0]["match_count"] == 1
     assert [pane["id"] for pane in task_filtered["panes"]] == ["tasks"]
-    assert [pane["id"] for pane in lease_filtered["panes"]] == ["leases"]
+    assert [pane["id"] for pane in lease_filtered["panes"]] == ["leases", "guidance"]
     assert [pane["id"] for pane in run_filtered["panes"]] == ["runs"]
     assert "daemon" in [pane["id"] for pane in daemon_filtered["panes"]]
     assert [pane["id"] for pane in command_filtered["panes"]] == ["commands"]
@@ -650,7 +696,7 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
         "built_in_specs",
         "objectives_tasks",
         "daemon_control",
-        "read_only_adapter",
+        "registered_adapters",
         "runtime_evidence",
         "packaging_smoke",
     ]
@@ -661,13 +707,17 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     all_entries = filter_command_palette(palette, "")
     daemon_entries = filter_command_palette(palette, "daemon")
     read_only_entries = filter_command_palette(palette, "execute-read-only")
+    planning_entries = filter_command_palette(palette, "repo_planning")
+    adapter_entries = filter_command_palette(palette, "adapter")
     packaging_entries = filter_command_palette(palette, "wheel")
     missing_entries = filter_command_palette(palette, "does-not-exist")
 
     assert all_entries["schema_version"] == "harness.tui_command_palette_filter/v1"
     assert all_entries["total_matches"] == len(palette["entries"])
     assert any(entry["id"] == "daemon_control.run_once" for entry in daemon_entries["entries"])
-    assert [entry["id"] for entry in read_only_entries["entries"]] == ["read_only_adapter.execute"]
+    assert [entry["id"] for entry in read_only_entries["entries"]] == ["registered_adapters.execute_read_only"]
+    assert any(entry["id"] == "objectives_tasks.add_repo_planning_task" for entry in planning_entries["entries"])
+    assert any(entry["id"] == "registered_adapters.execute" for entry in adapter_entries["entries"])
     assert [entry["id"] for entry in packaging_entries["entries"]] == ["packaging_smoke.wheel"]
     assert missing_entries["entries"] == []
     assert missing_entries["groups"] == []
@@ -690,14 +740,14 @@ def test_tui_command_palette_panes_show_copy_only_command_details() -> None:
     assert render_palette_status(read_only_entries) == "Palette search: execute-read-only | Commands: 1 | Groups: 1"
     assert [pane["id"] for pane in panes] == [
         "command_palette",
-        "command_palette_read_only_adapter",
+        "command_palette_registered_adapters",
         "command_palette_selected",
     ]
     assert "Copy-only command templates." in panes[0]["lines"]
-    assert any("read_only_adapter.execute" in line for line in panes[1]["lines"])
+    assert any("registered_adapters.execute_read_only" in line for line in panes[1]["lines"])
     selected_lines = "\n".join(panes[2]["lines"])
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in selected_lines
-    assert "Authorized bounded adapter only when manually run." in selected_lines
+    assert "Compatibility command for the bounded read-only adapter when manually run." in selected_lines
     assert "No matching command template." in missing_panes[-1]["lines"]
 
     serialized = json.dumps({"panes": panes, "missing": missing_panes})
@@ -853,6 +903,7 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
         "queue",
         "recent",
         "adapters",
+        "progress",
         "next",
     ]
     assert model["active_section_id"] == "project"
@@ -866,6 +917,28 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
     assert "no_openai_api_usage" not in rendered
     assert render_right_panel_status(model) == "Context | project | ready"
     assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_right_panel_surfaces_repo_planning_adapter_and_guidance(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="Plan repo change",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+
+    model = build_right_panel_model(dashboard, {"palette": palette}, "repo_planning", "dashboard")
+    rendered = render_right_panel(model)
+
+    assert "repo_planning -> repo_planning" in rendered
+    assert "harness daemon run-once --project . --output json" in render_right_panel(
+        build_right_panel_model(dashboard, {"palette": palette}, "", "dashboard")
+    )
+    assert "harness daemon execute <lease_id> --project . --output json" in render_right_panel(
+        build_right_panel_model(dashboard, {"palette": palette}, "", "dashboard")
+    )
 
 
 def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
@@ -1048,6 +1121,8 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
         "lease",
         "inspect-lease",
         "execute-read-only",
+        "execute",
+        "plan-task",
         "runs",
         "policy",
         "artifacts",
@@ -1106,7 +1181,7 @@ def test_tui_chat_slash_command_responses_are_templates_only() -> None:
     rendered = render_chat_message(command_response["messages"][0])
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in rendered
     assert "Mutates when run manually: True" in rendered
-    assert "Authorized bounded adapter only when manually run." in rendered
+    assert "Compatibility command for the bounded read-only adapter when manually run." in rendered
     assert plain_response["kind"] == "plain_text_unsupported"
     assert unknown_response["kind"] == "unknown"
 
@@ -1583,6 +1658,10 @@ def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, mo
         app,
         ["evals", "run", "--suite", "safety-smoke", "--project", str(tmp_path), "--output", "json"],
     )
+    security_layer = runner.invoke(
+        app,
+        ["evals", "run", "--suite", "security-layer", "--project", str(tmp_path), "--output", "json"],
+    )
     trace = runner.invoke(
         app,
         ["traces", "export", run.id, "--format", "otel-json", "--project", str(tmp_path), "--output", "json"],
@@ -1598,6 +1677,10 @@ def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, mo
         "artifact_evidence",
         "task_queue_non_execution",
     }
+    assert security_layer.exit_code == 0, security_layer.output
+    security_layer_payload = json.loads(security_layer.output)
+    assert security_layer_payload["schema_version"] == "harness.security_layer_audit/v1"
+    assert security_layer_payload["ok"] is True
 
     assert trace.exit_code == 0, trace.output
     trace_payload = json.loads(trace.output)
@@ -1612,7 +1695,7 @@ def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, mo
     assert "Trace:" in trace_text.output
     assert "Spans:" in trace_text.output
 
-    serialized = json.dumps(eval_payload) + json.dumps(trace_payload)
+    serialized = json.dumps(eval_payload) + json.dumps(trace_payload) + json.dumps(security_layer_payload)
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
@@ -2633,6 +2716,13 @@ def test_cli_daemon_execute_dry_run_links_run_without_backends_or_docker(tmp_pat
     assert payload["manifest"]["task_id"] == payload["task"]["id"]
     assert payload["manifest"]["backend_descriptor"] is None
     assert payload["manifest"]["backend_descriptor_sha256"] is None
+    assert payload["manifest"]["context_provenance"]
+    assert {record["source_kind"] for record in payload["manifest"]["context_provenance"]} >= {
+        "run_goal",
+        "task_metadata",
+        "artifact",
+    }
+    assert "artifact_content_not_authority" in payload["manifest"]["untrusted_context_warnings"]
     assert {artifact["kind"] for artifact in payload["manifest"]["artifacts"]} >= {
         "events",
         "transcript",
@@ -2692,9 +2782,203 @@ def test_cli_daemon_execute_dispatches_dry_run_through_registered_adapter(tmp_pa
     assert payload["ok"] is True
     assert payload["adapter_id"] == "dry_run"
     assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["security_decision"]["schema_version"] == "harness.security_decision/v1"
+    assert payload["security_decision"]["decision"] == "allow"
+    assert payload["security_decision"]["adapter_id"] == "dry_run"
+    assert payload["security_decision"]["task_type"] == "phase_1a_test"
+    assert payload["security_decision"]["sandbox_profile_id"] == "none"
+    assert payload["manifest"]["sandbox_profile"]["id"] == "none"
+    assert payload["context_provenance"] == payload["manifest"]["context_provenance"]
+    assert "artifact_content_not_authority" in payload["untrusted_context_warnings"]
     assert payload["task"]["status"] == "succeeded"
     assert payload["attempt"]["run_id"] == payload["run"]["id"]
     assert payload["adapter_result"]["schema_version"] == "harness.daemon_execute_dry_run/v1"
+
+
+def test_cli_controls_disable_adapter_blocks_generic_execute_without_run(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    disabled = runner.invoke(
+        app,
+        [
+            "controls",
+            "disable",
+            "--target-kind",
+            "adapter",
+            "--target-id",
+            "dry_run",
+            "--reason",
+            "operator blocked OPENAI_API_KEY=secret",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert disabled.exit_code == 0, disabled.output
+    disabled_payload = json.loads(disabled.output)
+    assert disabled_payload["control"]["disabled"] is True
+    assert "OPENAI_API_KEY=secret" not in disabled.output
+
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        title="Generic dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    inspected = runner.invoke(
+        app,
+        ["daemon", "inspect-lease", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["security_decision"]["decision"] == "deny"
+    assert inspected_payload["security_decision"]["reason_code"] == "control_disabled"
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["run"] is None
+    assert payload["security_decision"]["decision"] == "deny"
+    assert payload["security_decision"]["reason_code"] == "control_disabled"
+    assert "OPENAI_API_KEY=secret" not in result.output
+    assert store.list_runs() == []
+    assert store.list_daemon_events()[0].metadata["reason_code"] == "control_disabled"
+
+
+def test_cli_controls_task_type_backend_and_breaker_are_json_inspectable(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task_type_disabled = runner.invoke(
+        app,
+        [
+            "controls",
+            "disable",
+            "--target-kind",
+            "task_type",
+            "--target-id",
+            "phase_1a_test",
+            "--reason",
+            "pause dry-run task type",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    backend_disabled = runner.invoke(
+        app,
+        [
+            "controls",
+            "disable",
+            "--target-kind",
+            "backend",
+            "--target-id",
+            "codex_cli",
+            "--reason",
+            "pause Codex backend",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    listed = runner.invoke(app, ["controls", "list", "--project", str(tmp_path), "--output", "json"])
+    invalid = runner.invoke(
+        app,
+        [
+            "controls",
+            "disable",
+            "--target-kind",
+            "adapter",
+            "--target-id",
+            "missing",
+            "--reason",
+            "nope",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert task_type_disabled.exit_code == 0, task_type_disabled.output
+    assert backend_disabled.exit_code == 0, backend_disabled.output
+    assert listed.exit_code == 0, listed.output
+    payload = json.loads(listed.output)
+    assert payload["schema_version"] == "harness.execution_controls/v1"
+    assert {(item["target_kind"], item["target_id"]) for item in payload["controls"]} >= {
+        ("task_type", "phase_1a_test"),
+        ("backend", "codex_cli"),
+    }
+    assert invalid.exit_code == 1
+    invalid_payload = json.loads(invalid.output)
+    assert invalid_payload["schema_version"] == "harness.execution_controls/v1"
+    assert invalid_payload["ok"] is False
+    assert invalid_payload["errors"] == ["Unknown registered adapter: missing"]
+
+
+def test_cli_controls_breaker_opens_and_reset_closes_for_adapter(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    daemon = store.ensure_daemon(owner="test")
+    for index in range(3):
+        store.record_daemon_event(
+            daemon.id,
+            event_type="execution_adapter_rejected",
+            message="Adapter execution failed.",
+            metadata={
+                "adapter_id": "dry_run",
+                "reason_code": "adapter_execution_failed",
+                "error": f"failure {index}",
+            },
+        )
+
+    status = runner.invoke(app, ["controls", "breaker-status", "--project", str(tmp_path), "--output", "json"])
+    assert status.exit_code == 0, status.output
+    payload = json.loads(status.output)
+    dry_run = next(item for item in payload["breakers"] if item["adapter_id"] == "dry_run")
+    assert dry_run["status"] == "open"
+    assert dry_run["failure_count"] == 3
+
+    store.create_task(
+        title="Generic dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    rejected = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert rejected.exit_code == 1
+    rejected_payload = json.loads(rejected.output)
+    assert rejected_payload["security_decision"]["reason_code"] == "breaker_open"
+    assert rejected_payload["blocked_state_explanations"][0]["code"] == "breaker_open"
+    assert store.list_runs() == []
+
+    reset = runner.invoke(
+        app,
+        [
+            "controls",
+            "breaker-reset",
+            "dry_run",
+            "--reason",
+            "operator reviewed",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert reset.exit_code == 0, reset.output
+    reset_payload = json.loads(reset.output)
+    assert reset_payload["breaker"]["status"] == "closed"
 
 
 def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> None:
@@ -2718,12 +3002,98 @@ def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> Non
     assert payload["ok"] is False
     assert payload["decision"] == "execution_adapter_rejected"
     assert payload["adapter_id"] == "unknown_adapter"
+    assert payload["security_decision"]["decision"] == "deny"
+    assert payload["security_decision"]["reason_code"] == "unknown_adapter"
+    assert payload["blocked_state_explanations"][0]["code"] == "unknown_adapter"
     assert payload["run"] is None
     assert payload["rejection_reasons"] == ["Unknown execution adapter: unknown_adapter."]
     assert store.list_runs() == []
     event = store.list_daemon_events()[0]
     assert event.event_type == "execution_adapter_rejected"
     assert event.metadata["reason_code"] == "unknown_adapter"
+
+
+def test_cli_daemon_execute_rejects_unsafe_metadata_with_security_decision(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Unsafe generic dispatch",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "execution_adapter": "dry_run",
+                        "task_type": "phase_1a_test",
+                        "requires_external_network": True,
+                    },
+                    sort_keys=True,
+                ),
+                task.id,
+            ),
+        )
+
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["run"] is None
+    assert payload["security_decision"]["decision"] == "deny"
+    assert payload["security_decision"]["reason_code"] == "unsafe_metadata"
+    assert payload["blocked_state_explanations"][0]["code"] == "unsafe_metadata"
+    assert payload["security_decision"]["reasons"] == [
+        "Execution rejected by task metadata: requires_external_network."
+    ]
+    assert store.list_runs() == []
+
+
+def test_cli_daemon_execute_reports_approval_required_security_decision(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Approval required",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET required_approvals_json = ?, approval_state = ? WHERE id = ?",
+            (json.dumps(["human_operator"]), "required", task.id),
+        )
+
+    inspected = runner.invoke(
+        app,
+        ["daemon", "inspect-lease", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    assert inspected.exit_code == 0, inspected.output
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["security_decision"]["decision"] == "approval_required"
+    assert inspected_payload["security_decision"]["sandbox_profile_id"] == "none"
+    assert inspected_payload["security_decision"]["missing_approvals"] == ["human_operator"]
+    assert inspected_payload["blocked_state_explanations"][0]["code"] == "missing_approval"
+
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["run"] is None
+    assert payload["security_decision"]["decision"] == "approval_required"
+    assert payload["security_decision"]["missing_approvals"] == ["human_operator"]
+    assert payload["blocked_state_explanations"][0]["code"] == "missing_approval"
+    assert store.list_runs() == []
 
 
 def test_cli_tasks_add_accepts_repo_planning_execution_metadata(tmp_path) -> None:
@@ -2971,7 +3341,11 @@ def test_chat_codex_missing_hosted_approval_rejects_before_run(tmp_path, monkeyp
     assert draft["draft"]["tasks"][0]["execution_adapter"] == "codex_isolated_edit"
     assert rejected["ok"] is False
     assert rejected["kind"] == "orchestration_result"
-    assert rejected["orchestration"]["results"][0]["decision"] == "codex_isolated_edit_blocked_policy"
+    assert rejected["orchestration"]["results"][0]["decision"] == "execution_adapter_rejected"
+    assert rejected["orchestration"]["results"][0]["security_decision"]["decision"] == "approval_required"
+    assert rejected["orchestration"]["results"][0]["security_decision"]["missing_approvals"] == [
+        "hosted_provider_codex"
+    ]
     assert rejected["orchestration"]["results"][0]["run"] is None
     assert state.pending_hosted_approval is True
     assert "Hosted-boundary approval is not apply-back approval." in rendered
@@ -3403,6 +3777,9 @@ def test_cli_daemon_inspect_lease_before_and_after_dry_run_is_read_only(tmp_path
     before_payload = json.loads(before.output)
     assert before_payload["schema_version"] == "harness.daemon_lease/v1"
     assert before_payload["dry_run_eligibility"]["eligible"] is True
+    assert before_payload["security_decision"]["decision"] == "allow"
+    assert before_payload["security_decision"]["adapter_id"] == "dry_run"
+    assert before_payload["security_decision"]["sandbox_profile_id"] == "none"
     assert before_payload["run"] is None
     assert len(store.list_runs()) == 0
 
@@ -3420,7 +3797,9 @@ def test_cli_daemon_inspect_lease_before_and_after_dry_run_is_read_only(tmp_path
     assert after_payload["attempt"]["status"] == "succeeded"
     assert after_payload["run"]["id"] == json.loads(executed.output)["run"]["id"]
     assert after_payload["manifest"]["schema_version"] == "harness.manifest/v1.1"
+    assert after_payload["manifest"]["sandbox_profile"]["id"] == "none"
     assert after_payload["dry_run_eligibility"]["eligible"] is False
+    assert after_payload["security_decision"]["decision"] == "deny"
 
     missing = runner.invoke(
         app,
@@ -3714,7 +4093,7 @@ def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, mo
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.doctor/v1"
     assert payload["mode"] == "release"
-    assert payload["version"] == "1.6.0"
+    assert payload["version"] == "1.8.0"
     checks = {check["id"]: check for check in payload["checks"]}
     assert checks["codex_cli_metadata"]["details"]["preflight_performed"] is False
     assert checks["docker_metadata"]["details"]["version_check_performed"] is False

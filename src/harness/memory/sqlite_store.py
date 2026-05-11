@@ -16,6 +16,11 @@ from harness.models import (
     BackendDescriptor,
     BackendKind,
     BackendMetadata,
+    AdapterBreakerState,
+    BreakerStatus,
+    ContextProvenanceRecord,
+    ContextSourceKind,
+    ContextTrustLevel,
     DaemonDryRunResult,
     DaemonEvent,
     DaemonLeaseInspection,
@@ -26,8 +31,14 @@ from harness.models import (
     DaemonTickResult,
     EventRecord,
     ManifestArtifact,
+    MemoryRecord,
+    MemoryRedactionState,
+    MemoryScopeType,
+    MemorySourceKind,
     ObjectiveRecord,
     ObjectiveStatus,
+    KillSwitchRecord,
+    KillSwitchTargetKind,
     ProjectAgentRecord,
     RunBaselineRecord,
     RunCompareResult,
@@ -54,7 +65,9 @@ from harness.policy import (
     resolve_run_effective_policy,
     resolve_task_effective_policy,
 )
-from harness.security import sanitize_for_logging
+from harness.sandbox_profiles import sandbox_profile_dict
+from harness.security import SecretBlockedError, is_secret_path, redact_secret_text, sanitize_for_logging, scan_text_for_secrets
+from harness.security_explanations import explanations_from_eligibility, explanations_from_security_decision
 
 LEGACY_TASK_STATUS_VALUES = {
     "queued": TaskStatus.READY,
@@ -75,6 +88,8 @@ DRY_RUN_EXECUTION_ADAPTER = "dry_run"
 DRY_RUN_TASK_TYPE = "phase_1a_test"
 READ_ONLY_EXECUTION_ADAPTER = "read_only_summary"
 READ_ONLY_TASK_TYPE = "read_only_repo_summary"
+ADAPTER_BREAKER_THRESHOLD = 3
+ADAPTER_BREAKER_WINDOW_SECONDS = 15 * 60
 DAEMON_POLICY_FORBIDDEN_METADATA_KEYS = {
     "daemon_policy_forbidden",
     "requires_active_repo_write",
@@ -162,6 +177,62 @@ def validate_task_transition(from_status: str | TaskStatus, to_status: str | Tas
         return
     if next_status not in ALLOWED_TASK_TRANSITIONS[current]:
         raise ValueError(f"Invalid task transition: {current.value} -> {next_status.value}")
+
+
+def _execution_control_id(target_kind: KillSwitchTargetKind, target_id: str) -> str:
+    digest = hashlib.sha256(f"{target_kind.value}:{target_id}".encode("utf-8")).hexdigest()[:16]
+    return f"control_{digest}"
+
+
+def _event_counts_for_adapter_breaker(event: DaemonEvent, adapter_id: str) -> bool:
+    metadata = event.metadata
+    if metadata.get("adapter_id") != adapter_id:
+        return False
+    if event.event_type == "execution_adapter_rejected":
+        return metadata.get("reason_code") == "adapter_execution_failed"
+    decision = str(metadata.get("decision") or "")
+    return decision.endswith("_failed")
+
+
+def _authority_claim_codes(text: str) -> list[str]:
+    lowered = text.lower()
+    checks = {
+        "approval_claim": ("approve", "approval", "authorized", "permission"),
+        "hosted_boundary_claim": ("hosted", "codex", "provider"),
+        "active_repo_write_claim": ("active repo", "apply-back", "apply back", "write access"),
+        "docker_network_shell_claim": ("docker", "network", "shell", "tool"),
+        "policy_override_claim": ("override policy", "weaken policy", "ignore policy", "bypass"),
+    }
+    return [
+        code
+        for code, needles in checks.items()
+        if any(needle in lowered for needle in needles)
+    ]
+
+
+def _provenance_id(kind: str, value: str) -> str:
+    digest = hashlib.sha256(f"{kind}:{value}".encode("utf-8")).hexdigest()[:16]
+    return f"ctx_{digest}"
+
+
+def _context_warnings(records: list[ContextProvenanceRecord]) -> list[str]:
+    warnings: list[str] = []
+    for record in records:
+        for warning in record.warnings:
+            if warning not in warnings:
+                warnings.append(warning)
+    return warnings
+
+
+def _artifact_context_classification(kind: str) -> tuple[ContextSourceKind, ContextTrustLevel, list[str]]:
+    normalized = kind.lower()
+    if normalized in {"codex_final_message", "final_report"}:
+        return ContextSourceKind.GENERATED_PLAN, ContextTrustLevel.GENERATED, ["generated_text_not_authority"]
+    if "isolated" in normalized or "diff" in normalized or "baseline_manifest" in normalized:
+        return ContextSourceKind.REPO_FILE, ContextTrustLevel.UNTRUSTED_REPO, ["untrusted_repo_context"]
+    if "event" in normalized or "transcript" in normalized or "test" in normalized or "pytest" in normalized:
+        return ContextSourceKind.TOOL_OUTPUT, ContextTrustLevel.UNTRUSTED_TOOL_OUTPUT, ["artifact_content_not_authority"]
+    return ContextSourceKind.ARTIFACT, ContextTrustLevel.ARTIFACT, ["artifact_content_not_authority"]
 
 
 class SQLiteStore:
@@ -252,6 +323,206 @@ class SQLiteStore:
             """
         )
 
+    def disable_execution_control(
+        self,
+        target_kind: KillSwitchTargetKind | str,
+        target_id: str,
+        *,
+        reason: str,
+        actor: str = DEFAULT_TASK_LEASE_OWNER,
+        metadata: dict[str, Any] | None = None,
+    ) -> KillSwitchRecord:
+        return self._set_execution_control(
+            target_kind,
+            target_id,
+            disabled=True,
+            reason=reason,
+            actor=actor,
+            metadata=metadata or {},
+        )
+
+    def enable_execution_control(
+        self,
+        target_kind: KillSwitchTargetKind | str,
+        target_id: str,
+        *,
+        reason: str = "Control enabled.",
+        actor: str = DEFAULT_TASK_LEASE_OWNER,
+        metadata: dict[str, Any] | None = None,
+    ) -> KillSwitchRecord:
+        return self._set_execution_control(
+            target_kind,
+            target_id,
+            disabled=False,
+            reason=reason,
+            actor=actor,
+            metadata=metadata or {},
+        )
+
+    def _set_execution_control(
+        self,
+        target_kind: KillSwitchTargetKind | str,
+        target_id: str,
+        *,
+        disabled: bool,
+        reason: str,
+        actor: str,
+        metadata: dict[str, Any],
+    ) -> KillSwitchRecord:
+        kind = KillSwitchTargetKind(target_kind.value if isinstance(target_kind, KillSwitchTargetKind) else target_kind)
+        normalized_target = str(target_id or "*")
+        timestamp = now_iso()
+        control_id = _execution_control_id(kind, normalized_target)
+        with self.connect() as conn:
+            existing = conn.execute(
+                "SELECT created_at FROM execution_controls WHERE target_kind = ? AND target_id = ?",
+                (kind.value, normalized_target),
+            ).fetchone()
+            created_at = existing["created_at"] if existing is not None else timestamp
+            conn.execute(
+                """
+                INSERT INTO execution_controls (
+                  id, target_kind, target_id, disabled, reason, actor, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(target_kind, target_id) DO UPDATE SET
+                  disabled = excluded.disabled,
+                  reason = excluded.reason,
+                  actor = excluded.actor,
+                  updated_at = excluded.updated_at,
+                  metadata_json = excluded.metadata_json
+                """,
+                (
+                    control_id,
+                    kind.value,
+                    normalized_target,
+                    1 if disabled else 0,
+                    str(sanitize_for_logging(reason)),
+                    str(sanitize_for_logging(actor)),
+                    created_at,
+                    timestamp,
+                    json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+                ),
+            )
+        return self.get_execution_control(kind, normalized_target)
+
+    def get_execution_control(
+        self,
+        target_kind: KillSwitchTargetKind | str,
+        target_id: str,
+    ) -> KillSwitchRecord:
+        kind = KillSwitchTargetKind(target_kind.value if isinstance(target_kind, KillSwitchTargetKind) else target_kind)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM execution_controls WHERE target_kind = ? AND target_id = ?",
+                (kind.value, str(target_id or "*")),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Execution control not found: {kind.value}:{target_id}")
+        return self._row_to_kill_switch(row)
+
+    def list_execution_controls(self) -> list[KillSwitchRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM execution_controls ORDER BY target_kind ASC, target_id ASC"
+            ).fetchall()
+        return [self._row_to_kill_switch(row) for row in rows]
+
+    def active_execution_controls(self) -> list[KillSwitchRecord]:
+        return [control for control in self.list_execution_controls() if control.disabled]
+
+    def reset_adapter_breaker(
+        self,
+        adapter_id: str,
+        *,
+        reason: str,
+        actor: str = DEFAULT_TASK_LEASE_OWNER,
+        metadata: dict[str, Any] | None = None,
+    ) -> AdapterBreakerState:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO execution_breaker_resets (
+                  id, adapter_id, reason, actor, created_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"breaker_reset_{uuid.uuid4().hex[:12]}",
+                    str(adapter_id),
+                    str(sanitize_for_logging(reason)),
+                    str(sanitize_for_logging(actor)),
+                    timestamp,
+                    json.dumps(sanitize_for_logging(metadata or {}), sort_keys=True, default=str),
+                ),
+            )
+        return self.adapter_breaker_state(adapter_id)
+
+    def adapter_breaker_state(
+        self,
+        adapter_id: str,
+        *,
+        threshold: int = ADAPTER_BREAKER_THRESHOLD,
+        window_seconds: int = ADAPTER_BREAKER_WINDOW_SECONDS,
+    ) -> AdapterBreakerState:
+        adapter = str(adapter_id)
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=window_seconds)
+        last_reset = self._latest_breaker_reset_at(adapter)
+        effective_cutoff = max(cutoff, last_reset) if last_reset is not None else cutoff
+        failures: list[DaemonEvent] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM daemon_events
+                WHERE created_at >= ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (effective_cutoff.isoformat(),),
+            ).fetchall()
+        for row in rows:
+            event = self._row_to_daemon_event(row)
+            if _event_counts_for_adapter_breaker(event, adapter):
+                failures.append(event)
+        opened_at = failures[threshold - 1].created_at if len(failures) >= threshold else None
+        reasons = [
+            str(sanitize_for_logging(event.metadata.get("error") or event.metadata.get("reason_code") or event.message))
+            for event in failures[-threshold:]
+        ]
+        return AdapterBreakerState(
+            adapter_id=adapter,
+            status=BreakerStatus.OPEN if len(failures) >= threshold else BreakerStatus.CLOSED,
+            failure_count=len(failures),
+            threshold=threshold,
+            window_seconds=window_seconds,
+            opened_at=opened_at,
+            last_reset_at=last_reset,
+            reasons=reasons if len(failures) >= threshold else [],
+        )
+
+    def list_adapter_breaker_states(
+        self,
+        adapter_ids: list[str],
+        *,
+        threshold: int = ADAPTER_BREAKER_THRESHOLD,
+        window_seconds: int = ADAPTER_BREAKER_WINDOW_SECONDS,
+    ) -> list[AdapterBreakerState]:
+        return [
+            self.adapter_breaker_state(adapter_id, threshold=threshold, window_seconds=window_seconds)
+            for adapter_id in adapter_ids
+        ]
+
+    def _latest_breaker_reset_at(self, adapter_id: str) -> datetime | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_at FROM execution_breaker_resets
+                WHERE adapter_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (adapter_id,),
+            ).fetchone()
+        return parse_dt(row["created_at"]) if row is not None else None
+
     def connect(self) -> sqlite3.Connection:
         self.harness_dir.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path)
@@ -285,7 +556,7 @@ class SQLiteStore:
                 """,
                 (
                     run_id,
-                    goal,
+                    sanitize_for_logging(goal) if goal is not None else None,
                     task_type,
                     status,
                     str(self.project_root),
@@ -376,8 +647,8 @@ class SQLiteStore:
                 """,
                 (
                     objective_id,
-                    title,
-                    description,
+                    str(sanitize_for_logging(title)),
+                    str(sanitize_for_logging(description)),
                     ObjectiveStatus.ACTIVE.value,
                     str(self.project_root),
                     timestamp,
@@ -555,8 +826,8 @@ class SQLiteStore:
                 """,
                 (
                     task_id,
-                    title,
-                    description,
+                    str(sanitize_for_logging(title)),
+                    str(sanitize_for_logging(description)),
                     initial_status.value,
                     str(self.project_root),
                     timestamp,
@@ -644,6 +915,142 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Task not found: {task_id}")
         return self._row_to_task(row)
+
+    def save_memory_note(
+        self,
+        scope_type: str | MemoryScopeType,
+        scope_id: str,
+        summary: str,
+    ) -> MemoryRecord:
+        scope = MemoryScopeType(scope_type.value if isinstance(scope_type, MemoryScopeType) else scope_type)
+        trimmed = summary.strip()
+        if not trimmed:
+            raise ValueError("Memory note summary cannot be empty.")
+        findings = scan_text_for_secrets(trimmed)
+        stored_summary = redact_secret_text(trimmed) if findings else trimmed
+        redaction_state = MemoryRedactionState.REDACTED if findings else MemoryRedactionState.NOT_REQUIRED
+        encoded = stored_summary.encode("utf-8")
+        memory_id = f"mem_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        lineage = {
+            "source": "operator_note",
+            "secret_findings": [finding.to_dict() for finding in findings],
+            "permission_granting": False,
+            "policy_authority": False,
+            "approval_authority": False,
+            "redaction_state": redaction_state.value,
+            "authority_claims_stripped": _authority_claim_codes(trimmed),
+        }
+        record = MemoryRecord(
+            id=memory_id,
+            scope_type=scope,
+            scope_id=scope_id,
+            source_kind=MemorySourceKind.OPERATOR_NOTE,
+            source_id=memory_id,
+            source_artifact_id=None,
+            summary=stored_summary,
+            redaction_state=redaction_state,
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            size_bytes=len(encoded),
+            created_at=parse_dt(timestamp),
+            updated_at=parse_dt(timestamp),
+            lineage=sanitize_for_logging(lineage),
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_records (
+                  id, scope_type, scope_id, source_kind, source_id, source_artifact_id,
+                  summary, redaction_state, sha256, size_bytes, created_at, updated_at, lineage_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.scope_type.value,
+                    record.scope_id,
+                    record.source_kind.value,
+                    record.source_id,
+                    record.source_artifact_id,
+                    record.summary,
+                    record.redaction_state.value,
+                    record.sha256,
+                    record.size_bytes,
+                    timestamp,
+                    timestamp,
+                    json.dumps(record.lineage, sort_keys=True, default=str),
+                ),
+            )
+        return record
+
+    def list_memory_records(
+        self,
+        scope_type: str | MemoryScopeType | None = None,
+        scope_id: str | None = None,
+        *,
+        include_forgotten: bool = False,
+    ) -> list[MemoryRecord]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if scope_type is not None:
+            scope = MemoryScopeType(scope_type.value if isinstance(scope_type, MemoryScopeType) else scope_type)
+            filters.append("scope_type = ?")
+            params.append(scope.value)
+        if scope_id is not None:
+            filters.append("scope_id = ?")
+            params.append(scope_id)
+        if not include_forgotten:
+            filters.append("redaction_state != ?")
+            params.append(MemoryRedactionState.FORGOTTEN.value)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        try:
+            with self.connect() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM memory_records
+                    {where}
+                    ORDER BY created_at DESC, id DESC
+                    """,
+                    params,
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table: memory_records" in str(exc):
+                return []
+            raise
+        return [self._row_to_memory_record(row) for row in rows]
+
+    def get_memory_record(self, memory_id: str) -> MemoryRecord:
+        try:
+            with self.connect() as conn:
+                row = conn.execute("SELECT * FROM memory_records WHERE id = ?", (memory_id,)).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table: memory_records" in str(exc):
+                raise KeyError(f"Memory record not found: {memory_id}") from exc
+            raise
+        if row is None:
+            raise KeyError(f"Memory record not found: {memory_id}")
+        return self._row_to_memory_record(row)
+
+    def forget_memory_record(self, memory_id: str) -> MemoryRecord:
+        current = self.get_memory_record(memory_id)
+        timestamp = now_iso()
+        lineage = dict(current.lineage)
+        lineage["forgotten_at"] = timestamp
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE memory_records
+                SET summary = ?, redaction_state = ?, updated_at = ?, lineage_json = ?
+                WHERE id = ?
+                """,
+                (
+                    "[FORGOTTEN]",
+                    MemoryRedactionState.FORGOTTEN.value,
+                    timestamp,
+                    json.dumps(sanitize_for_logging(lineage), sort_keys=True, default=str),
+                    memory_id,
+                ),
+            )
+        return self.get_memory_record(memory_id)
 
     def update_task_status(
         self,
@@ -1562,7 +1969,7 @@ class SQLiteStore:
             raise ValueError(f"Read-only execution rejected by task metadata: {', '.join(forbidden)}")
 
     def inspect_task_lease(self, lease_id: str) -> DaemonLeaseInspection:
-        from harness.execution import inspect_execution_eligibility
+        from harness.execution import evaluate_registered_adapter_security_decision, inspect_execution_eligibility
 
         lease = self.get_task_lease(lease_id)
         task: TaskRecord | None = None
@@ -1585,6 +1992,27 @@ class SQLiteStore:
             except KeyError:
                 run = None
                 manifest = None
+        context_provenance = self.build_context_provenance(task=task, run_id=run.id if run is not None else None)
+        execution_eligibility = inspect_execution_eligibility(self.project_root, lease, task, attempt)
+        security_decision = evaluate_registered_adapter_security_decision(
+            self.project_root,
+            lease,
+            task,
+            attempt,
+            owner=lease.owner,
+        )
+        blocked_state_explanations = [
+            *explanations_from_eligibility(
+                execution_eligibility,
+                lease_id=lease.id,
+                project_root=str(self.project_root),
+            ),
+            *explanations_from_security_decision(
+                security_decision,
+                lease_id=lease.id,
+                project_root=str(self.project_root),
+            ),
+        ]
         return DaemonLeaseInspection(
             project_root=self.project_root,
             lease=lease,
@@ -1594,7 +2022,11 @@ class SQLiteStore:
             manifest=manifest,
             dry_run_eligibility=self._dry_run_eligibility_for_inspection(lease, task, attempt),
             read_only_eligibility=self._read_only_eligibility_for_inspection(lease, task, attempt),
-            execution_eligibility=inspect_execution_eligibility(self.project_root, lease, task, attempt),
+            execution_eligibility=execution_eligibility,
+            security_decision=security_decision,
+            context_provenance=context_provenance,
+            untrusted_context_warnings=_context_warnings(context_provenance),
+            blocked_state_explanations=blocked_state_explanations,
             recovery_recommendation=self._lease_recovery_recommendation(lease, task, attempt, run),
         )
 
@@ -2640,13 +3072,30 @@ class SQLiteStore:
         producer: str | None = None,
         redaction_state: str = "unknown",
     ) -> ArtifactRecord:
+        from harness.integrity import artifact_provenance_from_metadata, with_artifact_provenance_metadata
+
         self.get_run(run_id)
         if not path.exists():
             raise FileNotFoundError(f"Artifact path not found: {path}")
+        path, redaction_state, metadata = self._prepare_artifact_registration(
+            run_id=run_id,
+            path=path,
+            metadata=metadata or {},
+            redaction_state=redaction_state,
+        )
         artifact_id = f"art_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
-        metadata = metadata or {}
         sha256, size_bytes = self._artifact_file_evidence(path)
+        metadata = with_artifact_provenance_metadata(
+            artifact_id=artifact_id,
+            run_id=run_id,
+            kind=kind,
+            producer=producer,
+            sha256=sha256,
+            redaction_state=redaction_state,
+            metadata=metadata,
+            created_at=timestamp,
+        )
         with self.connect() as conn:
             conn.execute(
                 """
@@ -2683,9 +3132,53 @@ class SQLiteStore:
             redaction_state=redaction_state,
             evidence_status="verified",
             metadata=metadata,
+            provenance=artifact_provenance_from_metadata(
+                artifact_id=artifact_id,
+                run_id=run_id,
+                kind=kind,
+                producer=producer,
+                sha256=sha256,
+                redaction_state=redaction_state,
+                metadata=metadata,
+                created_at=parse_dt(timestamp),
+            ),
         )
         self.write_run_manifest(run_id)
         return record
+
+    def _prepare_artifact_registration(
+        self,
+        *,
+        run_id: str,
+        path: Path,
+        metadata: dict[str, Any],
+        redaction_state: str,
+    ) -> tuple[Path, str, dict[str, Any]]:
+        if is_secret_path(path):
+            raise SecretBlockedError(f"Blocked secret-like artifact path: {path.name}")
+        metadata = dict(sanitize_for_logging(metadata))
+        if redaction_state != "unknown":
+            return path, redaction_state, metadata
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            return path, "not_required", metadata
+        findings = scan_text_for_secrets(text)
+        if not findings:
+            return path, "not_required", metadata
+        source_sha256, source_size = self._artifact_file_evidence(path)
+        redacted_path = _redacted_artifact_path(path)
+        redacted_path.write_text(redact_secret_text(text), encoding="utf-8")
+        metadata["redaction_lineage"] = sanitize_for_logging(
+            {
+                "source_path": str(path),
+                "source_sha256": source_sha256,
+                "source_size_bytes": source_size,
+                "findings": [finding.to_dict() for finding in findings],
+                "derived_path": str(redacted_path),
+            }
+        )
+        return redacted_path, "redacted", metadata
 
     def get_artifact(self, artifact_id: str) -> ArtifactRecord:
         with self.connect() as conn:
@@ -2794,6 +3287,98 @@ class SQLiteStore:
         )
         return path
 
+    def build_context_provenance(
+        self,
+        *,
+        run_id: str | None = None,
+        task: TaskRecord | None = None,
+    ) -> list[ContextProvenanceRecord]:
+        records: list[ContextProvenanceRecord] = []
+        run: RunRecord | None = None
+        if run_id is not None:
+            try:
+                run = self.get_run(run_id)
+            except KeyError:
+                run = None
+        if task is None and run is not None and run.task_id is not None:
+            try:
+                task = self.get_task(run.task_id)
+            except KeyError:
+                task = None
+        if run is not None and run.goal:
+            records.append(
+                ContextProvenanceRecord(
+                    id=_provenance_id("run_goal", run.id),
+                    source_kind=ContextSourceKind.RUN_GOAL,
+                    trust_level=ContextTrustLevel.TRUSTED_OPERATOR,
+                    label=str(sanitize_for_logging("Run goal")),
+                    source_id=run.id,
+                    sha256=hashlib.sha256(str(sanitize_for_logging(run.goal)).encode("utf-8")).hexdigest(),
+                    redaction_state="not_required",
+                    lineage={"authority": "operator_request", "permission_granting": False},
+                )
+            )
+        if task is not None:
+            task_text = f"{task.title}\n{task.description}".strip()
+            records.append(
+                ContextProvenanceRecord(
+                    id=_provenance_id("task_metadata", task.id),
+                    source_kind=ContextSourceKind.TASK_METADATA,
+                    trust_level=ContextTrustLevel.TRUSTED_OPERATOR,
+                    label=str(sanitize_for_logging(f"Task metadata for {task.id}")),
+                    source_id=task.id,
+                    sha256=hashlib.sha256(str(sanitize_for_logging(task_text)).encode("utf-8")).hexdigest()
+                    if task_text
+                    else None,
+                    redaction_state="not_required",
+                    lineage={"authority": "task_record", "permission_granting": False},
+                )
+            )
+        if run is not None:
+            for artifact in self.list_artifacts(run.id):
+                source_kind, trust_level, warnings = _artifact_context_classification(artifact.kind)
+                records.append(
+                    ContextProvenanceRecord(
+                        id=_provenance_id("artifact", artifact.id),
+                        source_kind=source_kind,
+                        trust_level=trust_level,
+                        label=str(sanitize_for_logging(f"Artifact {artifact.kind}")),
+                        source_id=run.id,
+                        artifact_id=artifact.id,
+                        path=artifact.path,
+                        sha256=artifact.sha256,
+                        redaction_state=artifact.redaction_state,
+                        lineage={
+                            "kind": artifact.kind,
+                            "producer": artifact.producer,
+                            "evidence_status": self._artifact_evidence_status(artifact),
+                            "permission_granting": False,
+                        },
+                        warnings=warnings,
+                    )
+                )
+        for memory in self.list_memory_records()[:5]:
+            records.append(
+                ContextProvenanceRecord(
+                    id=_provenance_id("memory", memory.id),
+                    source_kind=ContextSourceKind.MEMORY_RECORD,
+                    trust_level=ContextTrustLevel.MEMORY,
+                    label=str(sanitize_for_logging(f"Memory {memory.scope_type.value}:{memory.scope_id}")),
+                    source_id=memory.source_id,
+                    memory_id=memory.id,
+                    sha256=memory.sha256,
+                    redaction_state=memory.redaction_state.value,
+                    lineage={
+                        **sanitize_for_logging(memory.lineage),
+                        "permission_granting": False,
+                        "policy_authority": False,
+                        "approval_authority": False,
+                    },
+                    warnings=["memory_not_authority"],
+                )
+            )
+        return records
+
     def build_run_manifest(self, run_id: str) -> RunManifest:
         run = self.get_run(run_id)
         backend_descriptor = self._latest_backend_descriptor(run_id)
@@ -2811,9 +3396,11 @@ class SQLiteStore:
                 redaction_state=artifact.redaction_state,
                 evidence_status=self._artifact_evidence_status(artifact),
                 metadata=artifact.metadata,
+                provenance=artifact.provenance,
             )
             for artifact in self.list_artifacts(run_id)
         ]
+        context_provenance = self.build_context_provenance(run_id=run_id)
         return RunManifest(
             run_id=run.id,
             goal=run.goal,
@@ -2831,9 +3418,14 @@ class SQLiteStore:
             effective_policy=effective_policy,
             effective_policy_sha256=effective_policy_sha256(effective_policy),
             backend_descriptor_sha256=backend_descriptor_sha256(backend_descriptor),
+            sandbox_profile=sandbox_profile_dict(_sandbox_profile_id_for_run(run.task_type)),
+            context_provenance=context_provenance,
+            untrusted_context_warnings=_context_warnings(context_provenance),
         )
 
     def build_run_evidence_snapshot(self, run_id: str) -> dict[str, Any]:
+        from harness.integrity import adapter_descriptor_evidence
+
         manifest = self.build_run_manifest(run_id).model_dump(mode="json")
         return sanitize_for_logging(
             {
@@ -2842,6 +3434,7 @@ class SQLiteStore:
                 "effective_policy_sha256": manifest.get("effective_policy_sha256"),
                 "backend_descriptor_sha256": manifest.get("backend_descriptor_sha256"),
                 "sandbox_profile": manifest.get("sandbox_profile"),
+                "adapter_descriptors": adapter_descriptor_evidence(),
                 "approvals": {
                     "approval_id": manifest.get("approval_id"),
                     "required_approvals": (
@@ -2865,6 +3458,7 @@ class SQLiteStore:
                         "redaction_state": artifact.get("redaction_state"),
                         "evidence_status": artifact.get("evidence_status"),
                         "metadata": artifact.get("metadata", {}),
+                        "provenance": artifact.get("provenance"),
                     }
                     for artifact in sorted(
                         manifest.get("artifacts", []),
@@ -3005,6 +3599,9 @@ class SQLiteStore:
         )
 
     def _row_to_artifact(self, row: sqlite3.Row) -> ArtifactRecord:
+        from harness.integrity import artifact_provenance_from_metadata
+
+        metadata = json.loads(row["metadata_json"])
         return ArtifactRecord(
             schema_version=row["schema_version"] or "harness.artifact/v1",
             id=row["id"],
@@ -3017,7 +3614,17 @@ class SQLiteStore:
             producer=row["producer"],
             redaction_state=row["redaction_state"] or "unknown",
             evidence_status=row["evidence_status"] or "unknown",
-            metadata=json.loads(row["metadata_json"]),
+            metadata=metadata,
+            provenance=artifact_provenance_from_metadata(
+                artifact_id=row["id"],
+                run_id=row["run_id"],
+                kind=row["kind"],
+                producer=row["producer"],
+                sha256=row["sha256"],
+                redaction_state=row["redaction_state"] or "unknown",
+                metadata=metadata,
+                created_at=parse_dt(row["created_at"]),
+            ),
         )
 
     def _row_to_run_baseline(self, row: sqlite3.Row) -> RunBaselineRecord:
@@ -3027,6 +3634,23 @@ class SQLiteStore:
             created_at=parse_dt(row["created_at"]),
             evidence_sha256=row["evidence_sha256"],
             snapshot=json.loads(row["snapshot_json"]),
+        )
+
+    def _row_to_memory_record(self, row: sqlite3.Row) -> MemoryRecord:
+        return MemoryRecord(
+            id=row["id"],
+            scope_type=MemoryScopeType(row["scope_type"]),
+            scope_id=row["scope_id"],
+            source_kind=MemorySourceKind(row["source_kind"]),
+            source_id=row["source_id"],
+            source_artifact_id=row["source_artifact_id"],
+            summary=row["summary"],
+            redaction_state=MemoryRedactionState(row["redaction_state"]),
+            sha256=row["sha256"],
+            size_bytes=row["size_bytes"],
+            created_at=parse_dt(row["created_at"]),
+            updated_at=parse_dt(row["updated_at"]),
+            lineage=json.loads(row["lineage_json"]),
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:
@@ -3174,6 +3798,19 @@ class SQLiteStore:
             metadata=json.loads(row["metadata_json"]),
         )
 
+    def _row_to_kill_switch(self, row: sqlite3.Row) -> KillSwitchRecord:
+        return KillSwitchRecord(
+            id=row["id"],
+            target_kind=KillSwitchTargetKind(row["target_kind"]),
+            target_id=row["target_id"],
+            disabled=bool(row["disabled"]),
+            reason=row["reason"],
+            actor=row["actor"],
+            created_at=parse_dt(row["created_at"]),
+            updated_at=parse_dt(row["updated_at"]),
+            metadata=json.loads(row["metadata_json"]),
+        )
+
     def _row_to_objective(self, row: sqlite3.Row) -> ObjectiveRecord:
         return ObjectiveRecord(
             id=row["id"],
@@ -3199,3 +3836,31 @@ class SQLiteStore:
             created_at=parse_dt(row["created_at"]),
             metadata=json.loads(row["metadata_json"]),
         )
+
+
+def _sandbox_profile_id_for_run(task_type: str | None) -> str | None:
+    mapping = {
+        DRY_RUN_TASK_TYPE: "none",
+        READ_ONLY_TASK_TYPE: "read_only_codex",
+        "repo_planning": "read_only_codex",
+        "codex_code_edit": "isolated_workspace_codex",
+        "docker_run_tests": "docker_test_sandbox",
+    }
+    return mapping.get(task_type or "")
+
+
+def _redacted_artifact_path(path: Path) -> Path:
+    suffix = "".join(path.suffixes)
+    if suffix:
+        base = path.name[: -len(suffix)]
+        candidate = path.with_name(f"{base}.redacted{suffix}")
+    else:
+        candidate = path.with_name(f"{path.name}.redacted")
+    counter = 2
+    while candidate.exists():
+        if suffix:
+            candidate = path.with_name(f"{base}.redacted_{counter}{suffix}")
+        else:
+            candidate = path.with_name(f"{path.name}.redacted_{counter}")
+        counter += 1
+    return candidate

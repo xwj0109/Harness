@@ -62,6 +62,22 @@ def test_secret_scanner_redacts_values() -> None:
     assert "[REDACTED]" in findings[0].preview
 
 
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "Authorization: Bearer abcdefghijklmnop",
+        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+        "AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF",
+        "password: correcthorsebatterystaple",
+        "-----BEGIN PRIVATE KEY-----",
+    ],
+)
+def test_secret_scanner_covers_common_secret_shapes(secret) -> None:
+    findings = scan_text_for_secrets(secret)
+    assert findings
+    assert secret[-8:] not in findings[0].preview
+
+
 def test_sanitize_for_logging_removes_secret_values() -> None:
     secret = "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz"
     sanitized = sanitize_for_logging({"line": secret, "nested": [secret]})

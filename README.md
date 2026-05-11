@@ -2,7 +2,7 @@
 
 Local-first custom agent harness.
 
-The v1.6 release includes local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, a unified chat/TUI operator app, and bounded registered adapters:
+The v1.8 release is **Local Agent App Readiness**: local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, a unified chat/TUI operator app, bounded registered adapters, read-only operator TUI polish, and OpenClaw-style local app surfaces without broadening execution authority:
 
 - CLI scaffolding.
 - `.harness/` project state.
@@ -27,8 +27,12 @@ The v1.6 release includes local infrastructure, declarative agent structure, man
 - Explicit `codex_isolated_edit/codex_code_edit` adapter with hosted-boundary approval and isolated apply-back review.
 - Explicit `repo_planning/repo_planning` adapter with hosted-boundary approval and Codex read-only sandbox planning.
 - Unified `harness` app with passive dashboard context, deterministic chat actions, in-memory transcript/progress, and `--plain` fallback.
+- TUI command-palette and right-panel guidance that reflects the registered adapter set without executing commands.
+- Read-only Capability Catalog over registered adapters through `harness capabilities list|inspect`.
+- Explicit local memory notes through `harness memory save-note|list|inspect|forget`, with scoped records and redaction state.
+- Read-only orchestration progress through `harness progress --objective <id>` and matching chat/TUI progress renderers.
 
-Paid API execution, hosted fallback, generic shell execution, autonomous workflows, MCP/A2A, browser/email/calendar integrations, broker actions, live trading, order placement, and active repo write automation remain outside the v1 MVP scope.
+OpenAI API usage, paid API fallback, hosted fallback, generic shell execution, autonomous workflows, MCP/A2A, browser/email/calendar integrations, external channels, third-party marketplace execution, broker actions, live trading, order placement, and active repo write automation remain outside the v1 MVP scope.
 
 Spec and agent lifecycle surfaces are inspection/control-plane commands. They do not execute agents, preflight backends, create runs, schedule work, or authorize tools. Bounded execution happens only through active leases and registered adapters. Chat is an operator surface over those same control-plane operations; it does not call Codex, Docker, shell, providers, or model backends directly.
 

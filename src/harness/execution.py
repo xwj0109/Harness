@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -27,7 +29,11 @@ from harness.models import (
     DaemonExecuteResult,
     ExecutionLocation,
     ExecutionAdapterDescriptor,
+    BreakerStatus,
+    KillSwitchTargetKind,
     RunManifest,
+    SecurityDecision,
+    SecurityDecisionStatus,
     TaskAttempt,
     TaskLease,
     TaskLeaseStatus,
@@ -36,7 +42,13 @@ from harness.models import (
     ToolReplayPolicy,
 )
 from harness.policy import effective_policy_sha256, resolve_task_effective_policy
+from harness.sandbox_profiles import (
+    ISOLATED_WORKSPACE_CODEX_SANDBOX_PROFILE,
+    NONE_SANDBOX_PROFILE,
+    READ_ONLY_CODEX_SANDBOX_PROFILE,
+)
 from harness.security import sanitize_for_logging
+from harness.security_explanations import explanations_from_reasons, explanations_from_security_decision
 
 
 EXECUTION_ADAPTER_REJECTED = "execution_adapter_rejected"
@@ -87,6 +99,7 @@ class DryRunExecutionAdapter:
         required_approvals=[],
         backend_requirements=[],
         sandbox_requirements=[],
+        sandbox_profile_id=NONE_SANDBOX_PROFILE,
         side_effect_summary="Writes harness run/task/lease/artifact evidence only.",
         replay_policy=ToolReplayPolicy.IDEMPOTENT_WITH_KEY,
         safety_notes=[
@@ -143,6 +156,7 @@ class ReadOnlySummaryExecutionAdapter:
             "allow_network=false",
         ],
         sandbox_requirements=["Codex CLI --cd support", "Codex CLI read-only sandbox support"],
+        sandbox_profile_id=READ_ONLY_CODEX_SANDBOX_PROFILE,
         side_effect_summary="Writes harness run/task/lease/artifact evidence and runs Codex CLI in read-only sandbox mode.",
         replay_policy=ToolReplayPolicy.REQUIRES_FRESH_APPROVAL,
         safety_notes=[
@@ -200,6 +214,7 @@ class CodexIsolatedEditExecutionAdapter:
             "allow_network=false",
         ],
         sandbox_requirements=["Codex CLI --cd support", "Codex CLI workspace-write sandbox support"],
+        sandbox_profile_id=ISOLATED_WORKSPACE_CODEX_SANDBOX_PROFILE,
         side_effect_summary="Writes harness evidence and isolated workspace files; active repo mutation only after separate apply-back approval.",
         replay_policy=ToolReplayPolicy.REQUIRES_FRESH_APPROVAL,
         safety_notes=[
@@ -430,6 +445,7 @@ class RepoPlanningExecutionAdapter:
             "allow_network=false",
         ],
         sandbox_requirements=["Codex CLI --cd support", "Codex CLI read-only sandbox support"],
+        sandbox_profile_id=READ_ONLY_CODEX_SANDBOX_PROFILE,
         side_effect_summary="Writes harness run/task/lease/artifact evidence and runs Codex CLI in read-only sandbox mode.",
         replay_policy=ToolReplayPolicy.REQUIRES_FRESH_APPROVAL,
         safety_notes=[
@@ -691,6 +707,98 @@ def inspect_execution_eligibility(
     return adapter.inspect_eligibility(project_root, lease, task, attempt)
 
 
+def evaluate_registered_adapter_security_decision(
+    project_root: Path,
+    lease: TaskLease,
+    task: TaskRecord | None,
+    attempt: TaskAttempt | None,
+    owner: str = DEFAULT_TASK_LEASE_OWNER,
+) -> SecurityDecision:
+    eligibility = inspect_execution_eligibility(project_root, lease, task, attempt)
+    adapter_id = eligibility.get("adapter_id")
+    adapters = builtin_execution_adapters()
+    descriptor = adapters[str(adapter_id)].descriptor if isinstance(adapter_id, str) and adapter_id in adapters else None
+    policy = resolve_task_effective_policy(task) if task is not None else None
+    policy_sha = effective_policy_sha256(policy) if policy is not None else None
+    task_type = task.metadata.get("task_type") if task is not None else None
+    task_type_value = str(task_type) if isinstance(task_type, str) else None
+    required_approvals = list(dict.fromkeys([str(item) for item in eligibility.get("descriptor_required_approvals", [])]))
+    if policy is not None:
+        for approval in policy.required_approvals:
+            if approval not in required_approvals:
+                required_approvals.append(approval)
+    task_required = [str(item) for item in task.required_approvals] if task is not None else []
+    descriptor_missing = _missing_descriptor_approvals(project_root, descriptor, task_type_value)
+    missing_approvals = sorted(set(task_required + descriptor_missing))
+    if eligibility.get("reason_code") == "unresolved_task_approvals":
+        missing_approvals = sorted(set(missing_approvals + required_approvals))
+    satisfied_approvals = sorted(set(required_approvals) - set(missing_approvals))
+    reason_code = str(eligibility.get("reason_code") or "adapter_ineligible")
+    reasons = [str(sanitize_for_logging(str(item))) for item in eligibility.get("rejection_reasons", [])]
+    if eligibility.get("eligible"):
+        decision = SecurityDecisionStatus.ALLOW
+        reason_code = "allow"
+        reasons = [str(sanitize_for_logging(str(eligibility.get("reason") or "Registered adapter execution is allowed.")))]
+    if reason_code == "unresolved_task_approvals" or missing_approvals:
+        decision = SecurityDecisionStatus.APPROVAL_REQUIRED
+        reason_code = "missing_required_approval" if reason_code == "allow" else reason_code
+        if not reasons or eligibility.get("eligible"):
+            reasons = ["Task has unresolved required approvals."]
+        if descriptor_missing:
+            reasons = [*reasons, f"Missing required adapter approvals: {', '.join(descriptor_missing)}."]
+    elif not eligibility.get("eligible"):
+        decision = SecurityDecisionStatus.DENY
+        if not reasons:
+            reasons = [str(sanitize_for_logging(str(eligibility.get("reason") or "Registered adapter execution is denied.")))]
+    control_denial = _runtime_control_denial(project_root, descriptor, task_type_value, decision)
+    if control_denial is not None:
+        decision = SecurityDecisionStatus.DENY
+        reason_code = control_denial["reason_code"]
+        reasons = control_denial["reasons"]
+    resource_id = lease.id
+    payload = {
+        "subject_kind": "daemon_owner",
+        "subject_id": owner,
+        "resource_kind": "task_lease",
+        "resource_id": resource_id,
+        "action": "registered_adapter_execute",
+        "adapter_id": adapter_id,
+        "task_id": task.id if task is not None else lease.task_id,
+        "attempt_id": attempt.id if attempt is not None else lease.attempt_id,
+        "task_type": task_type_value,
+        "policy_sha256": policy_sha,
+        "decision": decision.value,
+        "reason_code": reason_code,
+        "required_approvals": required_approvals,
+        "missing_approvals": missing_approvals,
+    }
+    decision_id = "secdec_" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
+    return SecurityDecision(
+        id=decision_id,
+        created_at=lease.acquired_at,
+        subject_kind="daemon_owner",
+        subject_id=owner,
+        resource_kind="task_lease",
+        resource_id=resource_id,
+        action="registered_adapter_execute",
+        decision=decision,
+        policy_sha256=policy_sha,
+        required_approvals=required_approvals,
+        satisfied_approvals=satisfied_approvals,
+        missing_approvals=missing_approvals,
+        adapter_id=str(adapter_id) if adapter_id is not None else None,
+        task_type=task_type_value,
+        data_boundary=None,
+        side_effect_level=None,
+        sandbox_profile_id=descriptor.sandbox_profile_id if descriptor is not None else None,
+        replay_policy=descriptor.replay_policy if descriptor is not None else None,
+        reason_code=reason_code,
+        reasons=reasons,
+    )
+
+
 def execute_lease(
     project_root: Path,
     lease_id: str,
@@ -699,11 +807,13 @@ def execute_lease(
     store = SQLiteStore(project_root)
     lease, task, attempt = _load_lease_context(store, lease_id)
     eligibility = inspect_execution_eligibility(project_root, lease, task, attempt)
+    security_decision = evaluate_registered_adapter_security_decision(project_root, lease, task, attempt, owner=owner)
     adapter_id = eligibility.get("adapter_id")
-    if not eligibility.get("eligible"):
-        reason_code = str(eligibility.get("reason_code") or "adapter_ineligible")
-        rejection_reasons = [str(item) for item in eligibility.get("rejection_reasons", [])]
+    if security_decision.decision != SecurityDecisionStatus.ALLOW:
+        reason_code = security_decision.reason_code
+        rejection_reasons = list(security_decision.reasons)
         decision = EXECUTION_DUPLICATE_REJECTED if reason_code == "duplicate_run" else EXECUTION_ADAPTER_REJECTED
+        context_provenance = store.build_context_provenance(task=task)
         _record_adapter_rejection(
             store,
             lease=lease,
@@ -712,6 +822,8 @@ def execute_lease(
             adapter_id=adapter_id,
             reason_code=reason_code,
             rejection_reasons=rejection_reasons,
+            security_decision_id=security_decision.id,
+            policy_sha256=security_decision.policy_sha256,
         )
         return DaemonExecuteResult(
             ok=False,
@@ -722,11 +834,31 @@ def execute_lease(
             attempt=attempt,
             lease=lease,
             policy_sha256=eligibility.get("policy_sha256"),
+            security_decision=security_decision,
+            context_provenance=context_provenance,
+            untrusted_context_warnings=_dedupe_context_warnings(context_provenance),
+            blocked_state_explanations=explanations_from_security_decision(
+                security_decision,
+                lease_id=lease.id,
+                project_root=str(store.project_root),
+            ),
             rejection_reasons=rejection_reasons,
         )
     adapter = builtin_execution_adapters()[str(adapter_id)]
     try:
-        return adapter.execute(project_root, lease_id, owner=owner)
+        result = adapter.execute(project_root, lease_id, owner=owner)
+        result.security_decision = security_decision
+        if result.manifest is not None:
+            result.context_provenance = list(result.manifest.context_provenance)
+            result.untrusted_context_warnings = list(result.manifest.untrusted_context_warnings)
+        else:
+            result.context_provenance = store.build_context_provenance(task=task)
+            result.untrusted_context_warnings = _dedupe_context_warnings(result.context_provenance)
+        result.blocked_state_explanations = explanations_from_reasons(
+            list(result.rejection_reasons) + list(result.errors),
+            inspect_command=f"harness daemon inspect-lease {lease_id} --project {project_root} --output json",
+        )
+        return result
     except (KeyError, ValueError, LocalEndpointUnavailable, CodexUnavailable, CodexSandboxUnavailable) as exc:
         sanitized = str(sanitize_for_logging(str(exc)))
         refreshed_lease = store.get_task_lease(lease.id)
@@ -741,6 +873,10 @@ def execute_lease(
             except KeyError:
                 run = None
                 manifest = None
+        context_provenance = store.build_context_provenance(
+            task=refreshed_task,
+            run_id=run.id if run is not None else None,
+        )
         _record_adapter_rejection(
             store,
             lease=refreshed_lease,
@@ -749,6 +885,8 @@ def execute_lease(
             adapter_id=adapter_id,
             reason_code="adapter_execution_failed",
             rejection_reasons=[sanitized],
+            security_decision_id=security_decision.id,
+            policy_sha256=security_decision.policy_sha256,
         )
         return DaemonExecuteResult(
             ok=False,
@@ -761,6 +899,13 @@ def execute_lease(
             run=run,
             manifest=manifest,
             policy_sha256=eligibility.get("policy_sha256"),
+            security_decision=security_decision,
+            context_provenance=context_provenance,
+            untrusted_context_warnings=_dedupe_context_warnings(context_provenance),
+            blocked_state_explanations=explanations_from_reasons(
+                [sanitized],
+                inspect_command=f"harness daemon inspect-lease {lease_id} --project {store.project_root} --output json",
+            ),
             rejection_reasons=[sanitized],
             errors=[sanitized],
         )
@@ -771,6 +916,117 @@ def _load_lease_context(store: SQLiteStore, lease_id: str) -> tuple[TaskLease, T
     task = _safe_get_task(store, lease.task_id)
     attempt = _safe_get_attempt(store, lease.attempt_id)
     return lease, task, attempt
+
+
+def _dedupe_context_warnings(records: list[Any]) -> list[str]:
+    warnings: list[str] = []
+    for record in records:
+        for warning in getattr(record, "warnings", []):
+            if warning not in warnings:
+                warnings.append(warning)
+    return warnings
+
+
+def _missing_descriptor_approvals(
+    project_root: Path,
+    descriptor: ExecutionAdapterDescriptor | None,
+    task_type: str | None,
+) -> list[str]:
+    if descriptor is None or task_type is None:
+        return []
+    missing: list[str] = []
+    for approval in descriptor.required_approvals:
+        if approval == "hosted_provider_codex":
+            found = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", task_type)
+            if found is None:
+                missing.append(approval)
+        else:
+            missing.append(approval)
+    return missing
+
+
+def _runtime_control_denial(
+    project_root: Path,
+    descriptor: ExecutionAdapterDescriptor | None,
+    task_type: str | None,
+    decision: SecurityDecisionStatus,
+) -> dict[str, Any] | None:
+    if descriptor is None:
+        return None
+    try:
+        store = SQLiteStore(project_root)
+        controls = store.active_execution_controls()
+        for control in controls:
+            if _control_matches_descriptor(control.target_kind, control.target_id, descriptor, task_type):
+                return {
+                    "reason_code": "control_disabled",
+                    "reasons": [
+                        str(
+                            sanitize_for_logging(
+                                f"Execution control disabled {control.target_kind.value}:{control.target_id}. {control.reason}"
+                            )
+                        )
+                    ],
+                }
+        if decision == SecurityDecisionStatus.ALLOW:
+            breaker = store.adapter_breaker_state(descriptor.id)
+            if breaker.status == BreakerStatus.OPEN:
+                return {
+                    "reason_code": "breaker_open",
+                    "reasons": [
+                        str(
+                            sanitize_for_logging(
+                                f"Adapter breaker is open for {descriptor.id}: "
+                                f"{breaker.failure_count}/{breaker.threshold} failures in {breaker.window_seconds} seconds."
+                            )
+                        )
+                    ],
+                }
+    except Exception as exc:
+        if _descriptor_is_high_risk(descriptor, task_type):
+            return {
+                "reason_code": "control_state_unavailable",
+                "reasons": [str(sanitize_for_logging(f"Runtime control state unavailable: {exc}"))],
+            }
+    return None
+
+
+def _control_matches_descriptor(
+    target_kind: KillSwitchTargetKind,
+    target_id: str,
+    descriptor: ExecutionAdapterDescriptor,
+    task_type: str | None,
+) -> bool:
+    target = target_id or "*"
+    if target_kind == KillSwitchTargetKind.ADAPTER:
+        return target in {"*", descriptor.id}
+    if target_kind == KillSwitchTargetKind.TASK_TYPE:
+        return target == "*" or target == task_type or target in descriptor.supported_task_types
+    if target_kind == KillSwitchTargetKind.BACKEND:
+        return target in {"*", "codex_cli"} and _descriptor_uses_codex_backend(descriptor)
+    if target_kind == KillSwitchTargetKind.HOSTED_BOUNDARY:
+        return target == "*" and _descriptor_crosses_hosted_boundary(descriptor)
+    if target_kind == KillSwitchTargetKind.DOCKER_EXECUTION:
+        return target == "*" and (task_type == "docker_run_tests" or "docker" in descriptor.id)
+    return False
+
+
+def _descriptor_uses_codex_backend(descriptor: ExecutionAdapterDescriptor) -> bool:
+    return any("codex_cli" in requirement for requirement in descriptor.backend_requirements)
+
+
+def _descriptor_crosses_hosted_boundary(descriptor: ExecutionAdapterDescriptor) -> bool:
+    return "hosted_provider_codex" in descriptor.required_approvals or any(
+        "data_boundary=hosted_provider" in requirement for requirement in descriptor.backend_requirements
+    )
+
+
+def _descriptor_is_high_risk(descriptor: ExecutionAdapterDescriptor, task_type: str | None) -> bool:
+    return (
+        _descriptor_crosses_hosted_boundary(descriptor)
+        or task_type == "docker_run_tests"
+        or "docker" in descriptor.id
+    )
 
 
 def _safe_get_task(store: SQLiteStore, task_id: str | None) -> TaskRecord | None:
@@ -990,6 +1246,8 @@ def _record_adapter_rejection(
     adapter_id: str | None,
     reason_code: str,
     rejection_reasons: list[str],
+    security_decision_id: str | None = None,
+    policy_sha256: str | None = None,
 ) -> None:
     daemon = store.ensure_daemon(owner=lease.owner)
     store.record_daemon_event(
@@ -1004,6 +1262,8 @@ def _record_adapter_rejection(
                 "adapter_id": adapter_id,
                 "reason_code": reason_code,
                 "rejection_reasons": rejection_reasons,
+                "security_decision_id": security_decision_id,
+                "policy_sha256": policy_sha256,
             }
         ),
     )
