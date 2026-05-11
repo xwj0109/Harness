@@ -295,7 +295,9 @@ def test_chat_read_only_intent_routing() -> None:
     assert route_chat_intent("security blockers")["intent"] == "show_blocked"
     assert route_chat_intent("what should I do next?")["intent"] == "recommend_next"
     assert route_chat_intent("what is the current project state?")["intent"] == "show_status"
-    assert route_chat_intent("summarize this repo")["intent"] == "draft_read_only_summary"
+    assert route_chat_intent("summarize this repo")["intent"] == "repo_summary"
+    assert route_chat_intent("plan how to improve the CLI")["intent"] == "repo_planning"
+    assert route_chat_intent("fix the failing test with codex")["intent"] == "coding_fix"
     assert route_chat_intent("initialize this project")["intent"] == "init_project"
 
 
@@ -3224,8 +3226,11 @@ def test_chat_task_draft_confirm_and_decline_flows(tmp_path) -> None:
 
     codex_draft = handle_chat_input("fix this bug with Codex", tmp_path, state)
     assert codex_draft["kind"] == "orchestration_draft"
-    assert codex_draft["draft"]["tasks"][0]["execution_adapter"] == "codex_isolated_edit"
-    assert "Hosted-boundary approval is not apply-back approval." in codex_draft["draft"]["safety_notes"]
+    assert [task["execution_adapter"] for task in codex_draft["draft"]["tasks"]] == [
+        "repo_planning",
+        "codex_isolated_edit",
+    ]
+    assert "Apply-back is not automatic and remains denied by default." in codex_draft["draft"]["safety_notes"]
 
 
 def test_chat_dry_run_end_to_end_dispatch_flow(tmp_path) -> None:
@@ -3338,7 +3343,7 @@ def test_chat_codex_missing_hosted_approval_rejects_before_run(tmp_path, monkeyp
     rendered = "\n".join(rejected["lines"])
     assert draft["kind"] == "orchestration_draft"
     assert draft["draft"]["orchestrator_id"] == "coding_orchestrator"
-    assert draft["draft"]["tasks"][0]["execution_adapter"] == "codex_isolated_edit"
+    assert [task["execution_adapter"] for task in draft["draft"]["tasks"]] == ["repo_planning", "codex_isolated_edit"]
     assert rejected["ok"] is False
     assert rejected["kind"] == "orchestration_result"
     assert rejected["orchestration"]["results"][0]["decision"] == "execution_adapter_rejected"

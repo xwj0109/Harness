@@ -26,7 +26,7 @@ The v1.8 release is **Local Agent App Readiness**: local infrastructure, declara
 - Explicit `read_only_summary/read_only_repo_summary` lease adapter.
 - Explicit `codex_isolated_edit/codex_code_edit` adapter with hosted-boundary approval and isolated apply-back review.
 - Explicit `repo_planning/repo_planning` adapter with hosted-boundary approval and Codex read-only sandbox planning.
-- Unified `harness` app with passive dashboard context, deterministic chat actions, in-memory transcript/progress, and `--plain` fallback.
+- Unified `harness` app with passive dashboard context, deterministic chat actions, first-class summary/planning/coding-fix templates, in-memory transcript/progress, and `--plain` fallback.
 - TUI command-palette and right-panel guidance that reflects the registered adapter set without executing commands.
 - Read-only Capability Catalog over registered adapters through `harness capabilities list|inspect`.
 - Explicit local memory notes through `harness memory save-note|list|inspect|forget`, with scoped records and redaction state.
@@ -36,17 +36,25 @@ OpenAI API usage, paid API fallback, hosted fallback, generic shell execution, a
 
 Spec and agent lifecycle surfaces are inspection/control-plane commands. They do not execute agents, preflight backends, create runs, schedule work, or authorize tools. Bounded execution happens only through active leases and registered adapters. Chat is an operator surface over those same control-plane operations; it does not call Codex, Docker, shell, providers, or model backends directly.
 
+The primary operator loop is:
+
+```bash
+harness --project .
+harness --project . --plain --codex-like
+```
+
+Inside the prompt, requests such as `summarize this repo`, `plan how to improve the CLI`, `fix the failing test with codex`, `show progress`, `show capabilities`, `show recent runs`, `review the last result`, `continue`, and `stop` route to explicit Harness actions. Chat first shows the interpreted intent, proposed action, equivalent CLI commands, safety boundary, required approvals, and confirmation prompt. Confirmed work still goes through objective/task records, daemon run-once leases, registered adapter dispatch, artifacts/events/manifests/progress, and an evidence summary with next inspection commands.
+
 ## Repository Layout
 
 ```text
 .
 ├── README.md
-├── AGENTS.md
 ├── SECURITY.md
 ├── docs/
 │   ├── operator_guide.md
-│   ├── smoke_checklist.md
-│   └── plans/
+│   ├── command_catalog.md
+│   └── smoke_checklist.md
 ├── src/
 │   └── harness/
 ├── tests/
@@ -94,9 +102,4 @@ The wheel must include packaged built-in YAML specs under `harness/builtin_specs
 
 ## Planning Docs
 
-Repo-local planning references are tracked in:
-
-- [docs/plans/agent_harness_master_plan.md](docs/plans/agent_harness_master_plan.md)
-- [docs/plans/next_steps.md](docs/plans/next_steps.md)
-
-Completed milestone plans were removed after the first MVP cleanup. Current operator behavior is documented in the operator docs above.
+The repo-local planning files have been retired. Current operator behavior is documented in the operator docs above.

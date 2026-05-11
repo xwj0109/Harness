@@ -21,6 +21,7 @@ from harness.registry import builtin_spec_registry
 from harness.security import sanitize_for_logging
 from harness.security_explanations import explanations_from_reasons
 from harness.tools.patch import apply_planned_updates, plan_unified_diff
+from harness.workflow_templates import WorkflowTemplate, template_for_intent
 
 
 CHAT_SCHEMA_VERSION = "harness.chat/v1"
@@ -40,6 +41,8 @@ class OrchestratedTaskDraft:
     description: str
     agent_id: str
     workbench_id: str
+    execution_adapter: str = CODEX_ORCHESTRATION_ADAPTER
+    task_type: str = CODEX_ORCHESTRATION_TASK_TYPE
     depends_on_indexes: list[int] = field(default_factory=list)
     priority: int = 0
 
@@ -51,8 +54,8 @@ class OrchestratedTaskDraft:
             "workbench_id": self.workbench_id,
             "depends_on_indexes": self.depends_on_indexes,
             "priority": self.priority,
-            "execution_adapter": CODEX_ORCHESTRATION_ADAPTER,
-            "task_type": CODEX_ORCHESTRATION_TASK_TYPE,
+            "execution_adapter": self.execution_adapter,
+            "task_type": self.task_type,
         }
 
 
@@ -63,9 +66,12 @@ class OrchestratedRunDraft:
     orchestrator_id: str
     workbench_id: str
     tasks: list[OrchestratedTaskDraft]
+    interpreted_intent: str = "codex_isolated_edit"
+    proposed_action: str = "Create a visible objective/task graph and run it through registered adapters."
     required_approvals: list[str] = field(default_factory=lambda: ["hosted_provider_codex"])
     safety_notes: list[str] = field(default_factory=list)
     equivalent_commands: list[str] = field(default_factory=list)
+    confirm_prompt: str = "Type yes, /confirm, or /run to create the objective and run this graph in the foreground."
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -74,10 +80,13 @@ class OrchestratedRunDraft:
             "objective_description": self.objective_description,
             "orchestrator_id": self.orchestrator_id,
             "workbench_id": self.workbench_id,
+            "interpreted_intent": self.interpreted_intent,
+            "proposed_action": self.proposed_action,
             "tasks": [task.to_payload() for task in self.tasks],
             "required_approvals": self.required_approvals,
             "safety_notes": self.safety_notes,
             "equivalent_commands": self.equivalent_commands,
+            "confirm_prompt": self.confirm_prompt,
         }
 
 
@@ -87,6 +96,8 @@ class ChatDraftTask:
     description: str
     execution_adapter: str
     task_type: str
+    interpreted_intent: str = "task"
+    proposed_action: str = "Create one Harness task from this draft."
     agent_id: str | None = None
     workbench_id: str | None = None
     required_approvals: list[str] = field(default_factory=list)
@@ -103,6 +114,8 @@ class ChatDraftTask:
             "description": self.description,
             "execution_adapter": self.execution_adapter,
             "task_type": self.task_type,
+            "interpreted_intent": self.interpreted_intent,
+            "proposed_action": self.proposed_action,
             "agent_id": self.agent_id,
             "workbench_id": self.workbench_id,
             "required_approvals": self.required_approvals,
@@ -278,8 +291,10 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "show_progress"
     elif normalized in {"show tasks", "tasks", "list tasks"}:
         intent = "show_tasks"
-    elif normalized in {"show latest run", "latest run", "show runs", "runs"}:
-        intent = "show_latest_run"
+    elif normalized in {"show latest run", "latest run", "show runs", "runs", "show recent runs", "recent runs"}:
+        intent = "show_runs"
+    elif normalized in {"review the last result", "review last result", "show last result", "last result"}:
+        intent = "show_last_result"
     elif "run" in normalized and ("adapter" in normalized or "registered" in normalized):
         intent = "execute_adapter"
     elif "adapter" in normalized:
@@ -295,22 +310,28 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "recommend_next"
     elif "current project state" in normalized or normalized in {"status", "home"}:
         intent = "show_status"
+    elif normalized in {"continue", "continue workflow", "keep going", "run next"}:
+        intent = "continue_workflow"
+    elif normalized in {"stop", "stop workflow", "stop work"}:
+        intent = "stop_workflow"
     elif "dry run" in normalized:
         intent = "draft_dry_run"
     elif "read only summary" in normalized or "summary" in normalized or "summarize" in normalized or "inspect this repo" in normalized:
-        intent = "draft_read_only_summary"
+        intent = "repo_summary"
+    elif normalized.startswith("plan ") or " repo planning" in normalized or "implementation plan" in normalized:
+        intent = "repo_planning"
     elif (
-        "orchestrate" in normalized
-        or "multi agent" in normalized
-        or "fix" in normalized
+        "fix" in normalized
         or "bug" in normalized
         or "failing test" in normalized
         or "implement" in normalized
         or "build" in normalized
+        or "codex" in normalized
+        or "isolated edit" in normalized
     ):
+        intent = "coding_fix"
+    elif "orchestrate" in normalized or "multi agent" in normalized:
         intent = "draft_orchestration"
-    elif "codex" in normalized or "isolated edit" in normalized:
-        intent = "draft_codex"
     elif "lease" in normalized and "next" in normalized:
         intent = "lease_next"
     elif "inspect" in normalized and "lease" in normalized:
@@ -448,8 +469,10 @@ def _handle_intent(raw: str, project_root: Path, state: ChatSessionState) -> dic
         return _mode_response("normal", state)
     if intent == "show_tasks":
         return _tasks_response(project_root)
-    if intent == "show_latest_run":
+    if intent == "show_runs":
         return _runs_response(project_root, state)
+    if intent == "show_last_result":
+        return _last_result_response(project_root, state)
     if intent == "show_adapters":
         return _adapters_response(project_root)
     if intent == "show_capabilities":
@@ -464,12 +487,25 @@ def _handle_intent(raw: str, project_root: Path, state: ChatSessionState) -> dic
         return _recommend_next_response(project_root, state)
     if intent == "show_status":
         return _status_response(project_root, state)
+    if intent == "continue_workflow":
+        return _continue_response(project_root, state)
+    if intent == "stop_workflow":
+        state.stop_requested = True
+        return _response("stop_requested", "Stop Requested", ["Foreground orchestration will stop at the next boundary."], ok=True)
+    if intent == "repo_summary":
+        return _draft_response(project_root, state, _draft_from_template(template_for_intent("repo_summary", raw, project_root)))
+    if intent == "repo_planning":
+        return _draft_response(project_root, state, _draft_from_template(template_for_intent("repo_planning", raw, project_root)))
+    if intent == "coding_fix":
+        return _orchestration_draft_response(
+            project_root,
+            state,
+            _orchestration_from_template(template_for_intent("coding_fix", raw, project_root), state),
+        )
     if intent == "draft_orchestration":
         return _orchestration_draft_response(project_root, state, _draft_orchestration(project_root, state, raw))
     if intent == "draft_dry_run":
         return _draft_response(project_root, state, _draft_dry_run(project_root))
-    if intent == "draft_read_only_summary":
-        return _draft_response(project_root, state, _draft_read_only(project_root, raw))
     if intent == "draft_codex":
         return _draft_response(project_root, state, _draft_codex(project_root, raw))
     if intent == "lease_next":
@@ -577,14 +613,14 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
         ApprovalStore(project_root).add(
             backend="codex_cli",
             data_boundary="hosted_provider",
-            task_types=["codex_code_edit", "read_only_repo_summary"],
+            task_types=["codex_code_edit", "read_only_repo_summary", "repo_planning"],
             duration_days=1,
             reason="Created from explicit harness chat confirmation.",
         )
         state.pending_hosted_approval = False
         lines = [
             "Created a one-day Codex hosted-boundary approval profile.",
-            "It permits scoped Codex execution for read-only summaries and isolated edits.",
+            "It permits scoped Codex execution for read-only summaries, repo planning, and isolated edits.",
             "It is not apply-back approval.",
         ]
         if state.latest_lease_id:
@@ -620,7 +656,7 @@ def _create_task_from_draft(project_root: Path, state: ChatSessionState, draft: 
         priority=1000 if state.codex_like_mode else 0,
         workbench_id=draft.workbench_id,
         agent_id=draft.agent_id,
-        required_approvals=draft.required_approvals,
+        required_approvals=[],
         metadata=draft.metadata(),
     )
     state.latest_task_id = task.id
@@ -702,11 +738,14 @@ def _draft_response(project_root: Path, state: ChatSessionState, draft: ChatDraf
         "task_draft",
         "Task Draft",
         [
+            f"Interpreted intent: {draft.interpreted_intent}",
+            f"Proposed action: {draft.proposed_action}",
             f"Title: {draft.title}",
             f"Adapter: {draft.execution_adapter}",
             f"Task type: {draft.task_type}",
+            f"Required approvals: {draft.required_approvals or ['none']}",
             f"Mutates when confirmed: {draft.mutates_when_confirmed}",
-            "Safety:",
+            "Safety boundary:",
             *[f"- {note}" for note in draft.safety_notes],
             "Equivalent command:",
             draft.equivalent_command,
@@ -726,6 +765,7 @@ def _orchestration_draft_response(
     state.pending_orchestration = draft
     task_lines = [
         f"{idx + 1}. {task.agent_id}: {task.title}"
+        + f" adapter={task.execution_adapter} task_type={task.task_type}"
         + (f" depends_on={','.join(str(i + 1) for i in task.depends_on_indexes)}" if task.depends_on_indexes else "")
         for idx, task in enumerate(draft.tasks)
     ]
@@ -733,16 +773,19 @@ def _orchestration_draft_response(
         "orchestration_draft",
         "Orchestration Draft",
         [
+            f"Interpreted intent: {draft.interpreted_intent}",
+            f"Proposed action: {draft.proposed_action}",
             f"Objective: {draft.objective_title}",
             f"Orchestrator: {draft.orchestrator_id}",
             f"Workbench: {draft.workbench_id}",
             "Tasks:",
             *task_lines,
-            "Execution: codex_isolated_edit / codex_code_edit for every task.",
             f"Required approvals: {draft.required_approvals}",
-            "Safety:",
+            "Safety boundary:",
             *[f"- {note}" for note in draft.safety_notes],
-            "Type yes, /confirm, or /run to create the objective and run this graph in the foreground.",
+            "Equivalent commands:",
+            *draft.equivalent_commands,
+            draft.confirm_prompt,
             "Type no to cancel.",
         ],
         ok=True,
@@ -798,6 +841,11 @@ def _draft_read_only(project_root: Path, prompt: str) -> ChatDraftTask:
         description=f"Read-only summary requested from chat: {sanitize_for_logging(prompt)}",
         execution_adapter="read_only_summary",
         task_type="read_only_repo_summary",
+        interpreted_intent="repo_summary",
+        proposed_action="Create one read-only repository summary task.",
+        agent_id="repo_inspector",
+        workbench_id="coding",
+        required_approvals=["hosted_provider_codex"],
         safety_notes=[
             "Read-only summary uses Codex CLI subscription via ChatGPT auth through the registered dispatcher.",
             "Hosted-boundary approval is required before scoped context is sent to Codex.",
@@ -814,6 +862,11 @@ def _draft_codex(project_root: Path, prompt: str) -> ChatDraftTask:
         description=f"Codex isolated edit requested from chat: {sanitize_for_logging(prompt)}",
         execution_adapter="codex_isolated_edit",
         task_type="codex_code_edit",
+        interpreted_intent="codex_isolated_edit",
+        proposed_action="Create one Codex isolated edit task.",
+        agent_id="code_editor",
+        workbench_id="coding",
+        required_approvals=["hosted_provider_codex"],
         safety_notes=[
             "Codex requires hosted-boundary approval before run creation.",
             "Hosted-boundary approval is not apply-back approval.",
@@ -821,6 +874,57 @@ def _draft_codex(project_root: Path, prompt: str) -> ChatDraftTask:
             "Apply-back remains denied by default unless a separate inspected-diff approval path approves it.",
         ],
         equivalent_command=f'harness tasks add --title "Chat Codex isolated edit" --execution-adapter codex_isolated_edit --task-type codex_code_edit --project {project_root} --output json',
+    )
+
+
+def _draft_from_template(template: WorkflowTemplate) -> ChatDraftTask:
+    if len(template.tasks) != 1:
+        raise ValueError(f"Single-task draft requires one task, got {len(template.tasks)}")
+    task = template.tasks[0]
+    return ChatDraftTask(
+        title=task.title,
+        description=task.description,
+        execution_adapter=task.execution_adapter,
+        task_type=task.task_type,
+        interpreted_intent=template.interpreted_intent,
+        proposed_action=template.proposed_action,
+        agent_id=task.agent_id,
+        workbench_id=task.workbench_id,
+        required_approvals=template.required_approvals,
+        safety_notes=template.safety_boundary,
+        equivalent_command=template.equivalent_commands[0] if template.equivalent_commands else "",
+        mutates_when_confirmed=True,
+    )
+
+
+def _orchestration_from_template(template: WorkflowTemplate, state: ChatSessionState) -> OrchestratedRunDraft:
+    tasks = [
+        OrchestratedTaskDraft(
+            title=task.title,
+            description=task.description,
+            agent_id=task.agent_id or "repo_inspector",
+            workbench_id=task.workbench_id or "coding",
+            execution_adapter=task.execution_adapter,
+            task_type=task.task_type,
+            depends_on_indexes=list(task.depends_on_indexes),
+            priority=task.priority,
+        )
+        for task in template.tasks
+    ]
+    orchestrator_id = _active_orchestrator_id(state)
+    workbench_id = tasks[0].workbench_id if tasks else _workbench_for_orchestrator(orchestrator_id)
+    return OrchestratedRunDraft(
+        objective_title=template.objective_title,
+        objective_description=template.objective_description,
+        orchestrator_id=orchestrator_id,
+        workbench_id=workbench_id,
+        tasks=tasks,
+        interpreted_intent=template.interpreted_intent,
+        proposed_action=template.proposed_action,
+        required_approvals=template.required_approvals,
+        safety_notes=template.safety_boundary,
+        equivalent_commands=template.equivalent_commands,
+        confirm_prompt=template.confirm_prompt,
     )
 
 
@@ -924,6 +1028,62 @@ def _runs_response(project_root: Path, state: ChatSessionState) -> dict[str, Any
         for run in runs
     ]
     return _response("runs", "Runs", lines, ok=True, extra={"runs": [run.model_dump(mode="json") for run in runs]})
+
+
+def _last_result_response(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+    if not _is_initialized(project_root):
+        return _uninitialized_response(project_root)
+    store = _require_store(project_root)
+    run_id = state.latest_run_id
+    if run_id is None:
+        runs = store.list_runs()
+        run_id = runs[0].id if runs else None
+    if run_id is None:
+        return _response("last_result_missing", "Last Result", ["No run evidence exists yet."], ok=False)
+    try:
+        run = store.get_run(run_id)
+        manifest = store.build_run_manifest(run_id)
+    except KeyError as exc:
+        return _response("run_missing", "Run Not Found", [str(exc).strip("'")], ok=False)
+    state.latest_run_id = run.id
+    if manifest.task_id:
+        state.latest_task_id = manifest.task_id
+    lines = [
+        f"Task: {manifest.task_id or 'none'}",
+        f"Status: {run.status}",
+        f"Adapter: {_adapter_from_manifest_task(store, manifest.task_id) or 'none'}",
+        f"Run: {run.id}",
+    ]
+    if manifest.artifacts:
+        lines.append("Artifacts:")
+        for artifact in manifest.artifacts[:6]:
+            lines.append(f"- {artifact.kind}: {artifact.path}")
+    lines.extend(
+        [
+            "Next:",
+            f"harness show {run.id} --project {project_root} --output json",
+            f"harness artifacts list {run.id} --project {project_root}",
+        ]
+    )
+    if manifest.objective_id:
+        lines.append(f"harness progress --objective {manifest.objective_id} --project {project_root} --output json")
+    return _response(
+        "last_result",
+        "Last Result",
+        lines,
+        ok=True,
+        extra={"run": run.model_dump(mode="json"), "manifest": manifest.model_dump(mode="json")},
+    )
+
+
+def _adapter_from_manifest_task(store: SQLiteStore, task_id: str | None) -> str | None:
+    if not task_id:
+        return None
+    try:
+        task = store.get_task(task_id)
+    except KeyError:
+        return None
+    return str(task.metadata.get("execution_adapter") or "") or None
 
 
 def _leases_response(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
@@ -1332,19 +1492,21 @@ def _execute_response(project_root: Path, lease_id: str, state: ChatSessionState
                 state.latest_diff_artifact = artifact.id or state.latest_diff_artifact
     state.progress.append(f"adapter decision: {result.decision}")
     if (
-        result.adapter_id in {"codex_isolated_edit", "read_only_summary"}
-        and result.decision in {"execution_adapter_rejected", "codex_isolated_edit_blocked_policy"}
+        result.adapter_id in {"codex_isolated_edit", "read_only_summary", "repo_planning"}
+        and result.decision in {"execution_adapter_rejected", "codex_isolated_edit_blocked_policy", "repo_planning_blocked_policy"}
         and _needs_hosted_approval(result.rejection_reasons + result.errors)
     ):
         state.pending_hosted_approval = True
     lines = [
-        f"Decision: {result.decision}",
+        f"Task: {_status_label_for_result(result)}",
         f"Adapter: {result.adapter_id or 'none'}",
-        f"Task: {result.task.id if result.task else 'none'}",
+        f"Lease: {result.lease.id if result.lease else 'none'}",
         f"Run: {result.run.id if result.run else 'none'}",
+        f"Decision: {result.decision}",
         f"Rejection reasons: {result.rejection_reasons}",
         f"Errors: {result.errors}",
     ]
+    lines.extend(_evidence_next_lines(project_root, result))
     lines.extend(_recovery_lines_for_execution(result))
     lines.extend(_summary_lines_from_result(project_root, result.adapter_result))
     if state.pending_hosted_approval:
@@ -1363,6 +1525,27 @@ def _execute_response(project_root: Path, lease_id: str, state: ChatSessionState
         ok=result.ok,
         extra={"result": result.model_dump(mode="json")},
     )
+
+
+def _continue_response(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+    if state.pending_orchestration is not None or state.pending_draft is not None or state.pending_execute_lease_id is not None:
+        return _confirm_pending(project_root, state)
+    if state.pending_hosted_approval:
+        return _response(
+            "continue_needs_confirmation",
+            "Confirmation Required",
+            [
+                "A hosted-boundary approval is pending from the last blocked Codex dispatch.",
+                "Type yes or /confirm to create it, or no to cancel.",
+                "Hosted-boundary approval is not apply-back approval.",
+            ],
+            ok=True,
+        )
+    if state.latest_objective_id is not None:
+        return _run_orchestration_loop(project_root, state, state.latest_objective_id)
+    if state.latest_lease_id is not None:
+        return _prepare_execute_response(project_root, state.latest_lease_id, state)
+    return _recommend_next_response(project_root, state)
 
 
 def _recommend_next_response(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
@@ -1501,10 +1684,11 @@ def _create_and_run_orchestration(
             spec_source_kind="builtin",
             depends_on=depends_on,
             metadata={
-                "execution_adapter": CODEX_ORCHESTRATION_ADAPTER,
-                "task_type": CODEX_ORCHESTRATION_TASK_TYPE,
+                "execution_adapter": task_draft.execution_adapter,
+                "task_type": task_draft.task_type,
                 "chat_orchestrated": True,
                 "orchestrator_id": draft.orchestrator_id,
+                "workflow_intent": draft.interpreted_intent,
             },
         )
         created_tasks.append(task)
@@ -1539,10 +1723,16 @@ def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objecti
             if tick.pause_reasons:
                 lines.append(f"Pause reasons: {tick.pause_reasons}")
             break
-        if tick.selected_task is None or tick.selected_task.objective_id != objective_id:
+        selected_task = tick.selected_task
+        if selected_task is None:
+            try:
+                selected_task = store.get_task(tick.lease.task_id)
+            except KeyError:
+                selected_task = None
+        if selected_task is None or selected_task.objective_id != objective_id:
             lines.append("Lease did not belong to this orchestration objective; stopping without dispatch.")
             break
-        state.latest_task_id = tick.selected_task.id
+        state.latest_task_id = selected_task.id
         state.latest_lease_id = tick.lease.id
         state.progress.append(f"orchestration lease acquired: {tick.lease.id}")
         result = execute_lease(project_root, tick.lease.id, owner=ORCHESTRATION_OWNER)
@@ -1563,15 +1753,17 @@ def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objecti
         state.progress.append(f"orchestration adapter decision: {result.decision}")
         lines.extend(
             [
-                f"Task: {result.task.id if result.task else tick.selected_task.id}",
+                f"Task: {result.task.id if result.task else selected_task.id} [{_status_label_for_result(result)}]",
                 f"Lease: {tick.lease.id}",
                 f"Adapter: {result.adapter_id or 'none'}",
                 f"Decision: {result.decision}",
                 f"Run: {result.run.id if result.run else 'none'}",
             ]
         )
+        lines.extend(_evidence_next_lines(project_root, result))
         if result.rejection_reasons:
             lines.append(f"Rejection reasons: {result.rejection_reasons}")
+        lines.extend(_recovery_lines_for_execution(result))
         lines.extend(_summary_lines_from_result(project_root, result.adapter_result))
         if _needs_hosted_approval(result.rejection_reasons + result.errors):
             state.pending_hosted_approval = True
@@ -1602,6 +1794,49 @@ def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objecti
         ok=not any(not item.get("ok", False) for item in results),
         extra={"orchestration": state.latest_orchestration},
     )
+
+
+def _status_label_for_result(result: Any) -> str:
+    task = getattr(result, "task", None)
+    if task is not None:
+        status = getattr(getattr(task, "status", None), "value", None) or getattr(task, "status", None)
+        if status:
+            return str(status)
+    if getattr(result, "ok", False):
+        return "succeeded"
+    decision = str(getattr(result, "decision", ""))
+    reasons = getattr(result, "rejection_reasons", []) or getattr(result, "errors", []) or []
+    if "approval" in " ".join(str(reason) for reason in reasons).casefold():
+        return "waiting approval"
+    if "blocked" in decision or "rejected" in decision:
+        return "blocked"
+    return "failed"
+
+
+def _evidence_next_lines(project_root: Path, result: Any) -> list[str]:
+    run = getattr(result, "run", None)
+    task = getattr(result, "task", None)
+    lease = getattr(result, "lease", None)
+    manifest = getattr(result, "manifest", None)
+    lines: list[str] = []
+    artifacts = list(getattr(manifest, "artifacts", []) or [])
+    if artifacts:
+        lines.append("Artifacts:")
+        for artifact in artifacts[:6]:
+            label = getattr(artifact, "kind", "artifact")
+            path = getattr(artifact, "path", "")
+            lines.append(f"- {label}: {path}")
+    lines.append("Next:")
+    if run is not None:
+        lines.append(f"harness show {run.id} --project {project_root} --output json")
+        lines.append(f"harness artifacts list {run.id} --project {project_root}")
+    elif lease is not None:
+        lines.append(f"harness daemon inspect-lease {lease.id} --project {project_root} --output json")
+    if task is not None and getattr(task, "objective_id", None):
+        lines.append(f"harness progress --objective {task.objective_id} --project {project_root} --output json")
+    if getattr(result, "adapter_id", None) == "codex_isolated_edit" and run is not None:
+        lines.append("Apply-back state: not approved by this run; inspect artifacts before any separate apply-back approval.")
+    return lines
 
 
 def _summary_lines_from_result(project_root: Path, adapter_result: dict[str, Any]) -> list[str]:
@@ -1643,7 +1878,7 @@ def _recovery_lines_for_rejection(reasons: list[Any], *, decision: str = "") -> 
     if "hosted" in joined and "approval" in joined:
         return [
             "Recovery: add an explicit Codex hosted-boundary approval, then rerun the active lease.",
-            "Command: harness approvals add --backend codex_cli --data-boundary hosted_provider --task-types codex_code_edit --duration-days 1 --project .",
+            "Command: harness approvals add --backend codex_cli --data-boundary hosted_provider --task-types codex_code_edit,read_only_repo_summary,repo_planning --duration-days 1 --project .",
         ]
     if "requires active lease" in joined or "released" in joined or "duplicate" in decision:
         return [

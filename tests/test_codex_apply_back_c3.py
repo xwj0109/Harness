@@ -65,6 +65,7 @@ class FakeEditBackend(CodexCliBackend):
             capabilities=BackendCapabilities(
                 supports_exec=True,
                 supports_cd=True,
+                supports_read_only_sandbox=True,
                 supports_workspace_write_sandbox=True,
                 supports_ask_for_approval=True,
                 supports_json_events=True,
@@ -87,6 +88,18 @@ class FakeEditBackend(CodexCliBackend):
             ),
             self.preflight().capabilities,
             NETWORK_NOT_ENFORCEABLE,
+        )
+
+    def run_read_only(self, project_root, prompt, final_message_path):
+        if final_message_path:
+            final_message_path.write_text("implementation plan", encoding="utf-8")
+        return CodexRunResult(
+            ["codex", "exec", "--cd", str(project_root), "--sandbox", "read-only"],
+            "",
+            "",
+            0,
+            [],
+            "implementation plan",
         )
 
 
@@ -564,7 +577,7 @@ def test_chat_orchestrated_codex_flow_uses_registered_adapter_with_denied_apply_
     ApprovalStore(tmp_path).add(
         backend="codex_cli",
         data_boundary="hosted_provider",
-        task_types=["codex_code_edit"],
+        task_types=["repo_planning", "codex_code_edit"],
         duration_days=1,
     )
     monkeypatch.setattr("harness.execution.CodexCliBackend", FakeEditBackend)
@@ -577,11 +590,9 @@ def test_chat_orchestrated_codex_flow_uses_registered_adapter_with_denied_apply_
     assert result["kind"] == "orchestration_result"
     assert result["ok"] is True
     assert len(store.list_objectives()) == 1
-    assert len(store.list_tasks(objective_id=state.latest_objective_id)) == 4
+    assert len(store.list_tasks(objective_id=state.latest_objective_id)) == 2
     assert [item["decision"] for item in result["orchestration"]["results"]] == [
-        "codex_isolated_edit_completed_denied",
-        "codex_isolated_edit_completed_denied",
-        "codex_isolated_edit_completed_denied",
+        "repo_planning_completed",
         "codex_isolated_edit_completed_denied",
     ]
     assert (tmp_path / "app.py").read_bytes() == before
