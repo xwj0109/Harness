@@ -277,7 +277,7 @@ TUI_NAVIGATION_HINTS = [
 ]
 
 TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
-RIGHT_PANEL_SECTION_IDS = ("project", "now", "queue", "recent", "adapters", "next", "commands")
+RIGHT_PANEL_SECTION_IDS = ("assistant", "action", "project", "now", "queue", "recent", "adapters", "progress", "next", "commands")
 
 SLASH_COMMAND_ALIASES = {
     "help": "orientation.quickstart_agent",
@@ -583,6 +583,16 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
     branch = dashboard.get("branch") or "unknown"
     sections = [
         {
+            "id": "assistant",
+            "title": "Assistant",
+            "rows": _right_panel_assistant_rows(dashboard, state),
+        },
+        {
+            "id": "action",
+            "title": "Action",
+            "rows": _right_panel_action_rows(state),
+        },
+        {
             "id": "project",
             "title": "Project",
             "rows": [
@@ -624,6 +634,47 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
         },
     ]
     return sections
+
+
+def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
+    chat_cfg = dashboard.get("chat") or {}
+    rows = [
+        f"Model: {chat_cfg.get('default_model_profile') or state.get('model_profile') or 'codex_cli'}",
+        f"Mode: {state.get('chat_mode') or chat_cfg.get('mode') or 'normal'}",
+        "Read tools: autonomous",
+        "Side effects: action contracts",
+    ]
+    latest_response = state.get("latest_response") or {}
+    tool_results = latest_response.get("tool_results") or []
+    if tool_results:
+        rows.append("Tools: " + ", ".join(str(item.get("tool")) for item in tool_results[:4]))
+    manifest = latest_response.get("context_manifest") or {}
+    blocks = manifest.get("blocks") or []
+    if blocks:
+        rows.append("Context: " + ", ".join(str(block.get("kind")) for block in blocks[:4]))
+    return rows
+
+
+def _right_panel_action_rows(state: dict) -> list[str]:
+    contract = state.get("pending_action_contract")
+    if contract:
+        return [
+            f"Pending: {contract.get('summary')}",
+            f"Tool: {contract.get('tool')}",
+            f"Risk: {contract.get('risk')}",
+            "Confirm: yes or /confirm",
+            "Cancel: no",
+        ]
+    latest = []
+    if state.get("latest_task_id"):
+        latest.append(f"Task: {state['latest_task_id']}")
+    if state.get("latest_lease_id"):
+        latest.append(f"Lease: {state['latest_lease_id']}")
+    if state.get("latest_run_id"):
+        latest.append(f"Run: {state['latest_run_id']}")
+    if latest:
+        return latest
+    return ["No pending action.", "Ask naturally or request an action."]
 
 
 def _right_panel_now_rows(dashboard: dict) -> list[str]:
@@ -1318,6 +1369,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             super().__init__()
             self._messages = [dict(message) for message in initial_messages]
             self._chat_state = ChatSessionState(codex_like_mode=codex_like)
+            self._latest_response: dict = {}
             self._focus_mode = "dashboard"
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
@@ -1369,6 +1421,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 return
             self._messages.append({"role": "user", "title": request, "lines": []})
             response = handle_chat_input(request, project_root, self._chat_state)
+            self._latest_response = dict(response)
             self._messages.append(_chat_response_to_tui_message(response))
             event.input.value = ""
             self._render_chat()
@@ -1431,6 +1484,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "collapsed_section_ids": self._collapsed_section_ids,
                     "active_orchestrator": self._chat_state.selected_orchestrator_id or "coding_orchestrator",
                     "chat_mode": "codex-like" if self._chat_state.codex_like_mode else "normal",
+                    "pending_action_contract": self._chat_state.pending_action_contract.to_payload()
+                    if self._chat_state.pending_action_contract
+                    else None,
+                    "latest_task_id": self._chat_state.latest_task_id,
+                    "latest_lease_id": self._chat_state.latest_lease_id,
+                    "latest_run_id": self._chat_state.latest_run_id,
+                    "latest_response": self._latest_response,
                 },
                 prompt.value,
                 focus_mode=self._focus_mode,
@@ -1468,8 +1528,29 @@ def run_read_only_tui(project_root: Path) -> None:
 
 
 def _chat_response_to_tui_message(response: dict) -> dict:
+    lines = list(response.get("lines", []))
+    if response.get("tool_results"):
+        lines.append("Tool calls:")
+        for item in response["tool_results"]:
+            status = "ok" if item.get("ok") else item.get("error_type") or "failed"
+            lines.append(f"- {item.get('tool')}: {status}")
+    if response.get("contract"):
+        contract = response["contract"]
+        lines.extend(
+            [
+                "Action contract:",
+                f"- Tool: {contract.get('tool')}",
+                f"- Risk: {contract.get('risk')}",
+                f"- Confirmations: {', '.join(contract.get('required_confirmations') or []) or 'none'}",
+            ]
+        )
+    if response.get("context_manifest"):
+        blocks = response["context_manifest"].get("blocks") or []
+        if blocks:
+            lines.append("Context:")
+            lines.append("- " + ", ".join(str(block.get("kind")) for block in blocks[:6]))
     return {
         "role": "assistant",
         "title": response.get("title") or response.get("kind") or "Harness",
-        "lines": response.get("lines", []),
+        "lines": lines,
     }

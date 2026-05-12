@@ -52,6 +52,14 @@ class SandboxConfig(BaseModel):
     install_project_no_build_isolation: bool = True
 
 
+class ChatConfig(BaseModel):
+    default_model_profile: str = "codex_cli"
+    mode: str = "subscription"
+    stream: bool = True
+    allow_hosted_chat: bool = False
+    allow_codex_subscription_chat: bool = True
+
+
 class HarnessConfig(BaseModel):
     project_name: str = "agent-harness-project"
     context_excludes: list[str] = Field(default_factory=lambda: list(DEFAULT_CONTEXT_EXCLUDES))
@@ -63,6 +71,7 @@ class HarnessConfig(BaseModel):
         "base_url is localhost, 127.0.0.1, or an explicitly approved local/LAN endpoint."
     )
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    chat: ChatConfig = Field(default_factory=ChatConfig)
     backends: dict[str, BackendConfig]
 
 
@@ -89,6 +98,7 @@ def default_backend_configs() -> dict[str, BackendConfig]:
                 "model": "gpt-5.5",
                 "model_reasoning_effort": "low",
                 "timeout_seconds": 900,
+                "skip_git_repo_check": True,
                 "use_subscription_credits": True,
             },
         ),

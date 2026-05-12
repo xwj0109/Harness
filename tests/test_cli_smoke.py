@@ -216,20 +216,26 @@ def test_cli_chat_json_context_sanitizes_task_and_memory_secrets(tmp_path) -> No
     assert "[REDACTED_SECRET]" in serialized
 
 
-def test_chat_slash_commands_and_plain_text_guidance_without_backend(tmp_path, monkeypatch) -> None:
+def test_chat_slash_commands_and_plain_text_model_unavailable_without_mutation(tmp_path, monkeypatch) -> None:
     def fail_backend(*args, **kwargs):
         raise AssertionError("chat guidance must not construct a backend")
 
+    def unavailable_chat_model(*args, **kwargs):
+        from harness.backends.local_openai import LocalEndpointUnavailable
+
+        raise LocalEndpointUnavailable("test chat backend unavailable")
+
     monkeypatch.setattr("harness.cli.main.CodexCliBackend", fail_backend)
+    monkeypatch.setattr("harness.chat.build_default_chat_model", unavailable_chat_model)
     help_response = handle_chat_input("/help", tmp_path, ChatSessionState())
     plain_response = handle_chat_input("hello model", tmp_path, ChatSessionState())
 
     assert help_response["schema_version"] == "harness.chat_response/v1"
     assert help_response["ok"] is True
     assert "/tasks" in "\n".join(help_response["lines"])
-    assert plain_response["ok"] is True
-    assert plain_response["kind"] == "deterministic_guidance"
-    assert "I do not call Codex, Docker, shell, providers, or model backends directly from chat." in plain_response["lines"]
+    assert plain_response["ok"] is False
+    assert plain_response["kind"] == "chat_model_unavailable"
+    assert "does not fall back to paid hosted chat automatically" in "\n".join(plain_response["lines"])
     assert not (tmp_path / ".harness").exists()
 
 
@@ -900,6 +906,8 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
 
     assert model["schema_version"] == "harness.tui_right_panel/v1"
     assert [section["id"] for section in model["sections"]] == [
+        "assistant",
+        "action",
         "project",
         "now",
         "queue",
@@ -908,8 +916,12 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
         "progress",
         "next",
     ]
-    assert model["active_section_id"] == "project"
+    assert model["active_section_id"] == "assistant"
     assert model["summary"]["initialized"] is False
+    assert "Assistant" in rendered
+    assert "Model: codex_cli" in rendered
+    assert "Side effects: action contracts" in rendered
+    assert "No pending action." in rendered
     assert "/init" in rendered
     assert "summarize this repo" in rendered
     assert "State:" not in rendered
@@ -917,7 +929,7 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
     assert "IDs:" not in rendered
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" not in rendered
     assert "no_openai_api_usage" not in rendered
-    assert render_right_panel_status(model) == "Context | project | ready"
+    assert render_right_panel_status(model) == "Context | assistant | ready"
     assert not (tmp_path / ".harness").exists()
 
 
@@ -941,6 +953,47 @@ def test_tui_right_panel_surfaces_repo_planning_adapter_and_guidance(tmp_path) -
     assert "harness daemon execute <lease_id> --project . --output json" in render_right_panel(
         build_right_panel_model(dashboard, {"palette": palette}, "", "dashboard")
     )
+
+
+def test_tui_right_panel_surfaces_assistant_context_and_pending_action(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+
+    model = build_right_panel_model(
+        dashboard,
+        {
+            "palette": palette,
+            "active_section_index": 1,
+            "collapsed_section_ids": set(),
+            "chat_mode": "normal",
+            "pending_action_contract": {
+                "summary": "Create Harness objective: improve chat",
+                "tool": "create_objective",
+                "risk": "control_plane_write",
+            },
+            "latest_response": {
+                "tool_results": [{"tool": "read_file", "ok": True}],
+                "context_manifest": {
+                    "blocks": [
+                        {"kind": "harness_state"},
+                        {"kind": "repo_tree"},
+                    ]
+                },
+            },
+        },
+        "",
+        "dashboard",
+    )
+    rendered = render_right_panel(model)
+
+    assert model["active_section_id"] == "action"
+    assert "Tools: read_file" in rendered
+    assert "Context: harness_state, repo_tree" in rendered
+    assert "Pending: Create Harness objective: improve chat" in rendered
+    assert "Tool: create_objective" in rendered
+    assert "Risk: control_plane_write" in rendered
+    assert "Confirm: yes or /confirm" in rendered
+    assert not (tmp_path / ".harness").exists()
 
 
 def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:

@@ -2,15 +2,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import sqlite3
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TextIO
 
+from harness.action_proposals import ActionContract, contract_from_tool_request
 from harness.approvals import ApprovalStore
+from harness.backends.local_openai import LocalEndpointUnavailable
 from harness.capabilities import build_capability_catalog
-from harness.config import HARNESS_DIR, write_default_config
+from harness.chat_model import ChatContext, ChatMessage, ChatModel, build_default_chat_model
+from harness.chat_tools import (
+    ChatToolRequest,
+    chat_tool_specs_payload,
+    default_chat_tool_context,
+    parse_tool_request,
+    run_chat_tool,
+)
+from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
+from harness.context_pack import pack_chat_context
 from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import ArtifactRecord, RunRecord, TaskLease, TaskRecord
@@ -20,6 +32,7 @@ from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.security import sanitize_for_logging
 from harness.security_explanations import explanations_from_reasons
+from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tools.patch import apply_planned_updates, plan_unified_diff
 from harness.workflow_templates import WorkflowTemplate, template_for_intent
 
@@ -33,6 +46,7 @@ CODEX_ORCHESTRATION_ADAPTER = "codex_isolated_edit"
 CODEX_ORCHESTRATION_TASK_TYPE = "codex_code_edit"
 DEFAULT_ORCHESTRATOR_ID = "coding_orchestrator"
 ORCHESTRATION_OWNER = "chat_orchestrator"
+MAX_CHAT_TOOL_CALLS = 3
 
 
 @dataclass
@@ -135,6 +149,7 @@ class ChatSessionState:
     pending_draft: ChatDraftTask | None = None
     pending_orchestration: OrchestratedRunDraft | None = None
     pending_execute_lease_id: str | None = None
+    pending_action_contract: ActionContract | None = None
     pending_hosted_approval: bool = False
     selected_orchestrator_id: str | None = None
     latest_objective_id: str | None = None
@@ -153,6 +168,7 @@ class ChatSessionState:
         self.pending_draft = None
         self.pending_orchestration = None
         self.pending_execute_lease_id = None
+        self.pending_action_contract = None
         self.pending_hosted_approval = False
         self.selected_orchestrator_id = None
         self.latest_objective_id = None
@@ -166,6 +182,10 @@ class ChatSessionState:
 def chat_context(project_root: Path) -> dict[str, Any]:
     project_root = resolve_project_root(project_root)
     context = build_operator_context(project_root)
+    try:
+        cfg = load_config(project_root)
+    except FileNotFoundError:
+        cfg = default_config()
     summary = dict(context["summary"])
     summary.setdefault("runs_total", summary.get("recent_runs", 0))
     return {
@@ -178,6 +198,13 @@ def chat_context(project_root: Path) -> dict[str, Any]:
         "registered_adapters": context["registered_adapters"],
         "capabilities": context["capabilities"],
         "runtime_controls": context.get("runtime_controls"),
+        "chat": {
+            "default_model_profile": cfg.chat.default_model_profile,
+            "mode": cfg.chat.mode,
+            "allow_hosted_chat": cfg.chat.allow_hosted_chat,
+            "allow_codex_subscription_chat": cfg.chat.allow_codex_subscription_chat,
+            "hosted_fallback": False,
+        },
         "context_warnings": context.get("memory", {}).get("warnings", []),
         "dashboard": context,
         "safety_boundaries": [
@@ -195,11 +222,12 @@ def handle_chat_input(
     text: str,
     project_root: Path,
     state: ChatSessionState | None = None,
+    chat_model: ChatModel | None = None,
 ) -> dict[str, Any]:
     state = state or ChatSessionState()
     project_root = resolve_project_root(project_root)
     raw = text.strip()
-    response = _dispatch_chat_input(raw, project_root, state)
+    response = _dispatch_chat_input(raw, project_root, state, chat_model=chat_model)
     if response.get("kind") != "reset":
         state.transcript.append({"role": "user", "content": str(sanitize_for_logging(raw))})
         state.transcript.append(
@@ -212,7 +240,13 @@ def handle_chat_input(
     return response
 
 
-def _dispatch_chat_input(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+def _dispatch_chat_input(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    chat_model: ChatModel | None = None,
+) -> dict[str, Any]:
     if not raw:
         return _response("empty", "No input", ["Type /help for available commands."])
     if raw in {"/quit", "quit", "exit"}:
@@ -223,11 +257,12 @@ def _dispatch_chat_input(raw: str, project_root: Path, state: ChatSessionState) 
         state.pending_draft = None
         state.pending_orchestration = None
         state.pending_execute_lease_id = None
+        state.pending_action_contract = None
         state.pending_hosted_approval = False
         return _response("declined", "Declined", ["No action was taken."], ok=True)
     if raw.startswith("/"):
-        return _handle_slash(raw, project_root, state)
-    return _handle_intent(raw, project_root, state)
+        return _handle_slash(raw, project_root, state, chat_model=chat_model)
+    return _handle_intent(raw, project_root, state, chat_model=chat_model)
 
 
 def render_chat_response(response: dict[str, Any]) -> str:
@@ -357,10 +392,17 @@ def route_chat_intent(text: str) -> dict[str, Any]:
     return {"schema_version": CHAT_INTENT_SCHEMA_VERSION, "ok": True, "input": text, "intent": intent}
 
 
-def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+def _handle_slash(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    chat_model: ChatModel | None = None,
+) -> dict[str, Any]:
     parts = raw.split()
     command = parts[0][1:]
     arg = parts[1] if len(parts) > 1 else None
+    tail = raw.partition(" ")[2].strip()
     if command == "help":
         return _response(
             "help",
@@ -387,7 +429,12 @@ def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict
                 "/artifact <id> - show artifact metadata",
                 "/lease [id] - inspect a lease",
                 "/execute [lease_id] - prepare registered adapter dispatch",
-                "/plan - show pending/latest orchestration plan",
+                "/plan [request] - ask the assistant for a plan or show pending/latest orchestration plan",
+                "/act <request> - let the assistant inspect and propose Harness-backed action contracts",
+                "/diff - show latest isolated diff artifact or git diff",
+                "/test [command] - propose a sandboxed test run through an action contract",
+                "/apply [approve|deny|keep] - review/apply inspected isolated changes",
+                "/revert - prepare a Harness revert action contract for pending isolated state",
                 "/run - run pending orchestration or prepare latest lease dispatch",
                 "/stop - stop the foreground orchestration loop",
                 "/apply-back [deny|approve|keep] - review inspected Codex diff artifacts",
@@ -444,7 +491,61 @@ def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict
     if command == "execute":
         return _prepare_execute_response(project_root, arg or state.latest_lease_id, state)
     if command == "plan":
+        if tail:
+            return _model_chat_response(
+                "Plan this Harness-backed change. Inspect read-only context as needed and propose an action "
+                f"contract only if the next step needs side effects:\n{tail}",
+                project_root,
+                state,
+                chat_model=chat_model,
+                mode_override="plan",
+            )
         return _plan_response(state)
+    if command == "act":
+        if not tail:
+            return _response(
+                "act_needs_request",
+                "Act Mode",
+                [
+                    "Usage: /act <request>",
+                    "I will inspect with read-only tools and propose Harness action contracts for side effects.",
+                ],
+                ok=False,
+            )
+        return _model_chat_response(
+            "Act on this request through Harness. Use read-only tools autonomously first when useful. "
+            "For side effects, request a Harness action contract instead of claiming completion:\n"
+            f"{tail}",
+            project_root,
+            state,
+            chat_model=chat_model,
+            mode_override="act",
+        )
+    if command == "diff":
+        return _artifact_response(project_root, state.latest_diff_artifact) if state.latest_diff_artifact else _diff_response(project_root)
+    if command == "test":
+        return _action_contract_response(
+            project_root,
+            state,
+            ChatToolRequest(
+                type="harness.tool_request/v1",
+                tool="run_tests",
+                arguments={"suggested_command": tail or "pytest -q", "scope": "chat"},
+            ),
+        )
+    if command == "apply":
+        choice = arg if arg in {"approve", "deny", "keep"} else None
+        return _apply_back_review_response(project_root, state, choice=choice)
+    if command == "revert":
+        return _action_contract_response(
+            project_root,
+            state,
+            ChatToolRequest(
+                type="harness.tool_request/v1",
+                tool="revert_pending_change",
+                arguments={"goal": tail or "revert pending isolated/apply-back state"},
+            ),
+        )
     if command == "stop":
         state.stop_requested = True
         return _response("stop_requested", "Stop Requested", ["Foreground orchestration will stop at the next boundary."], ok=True)
@@ -459,7 +560,13 @@ def _handle_slash(raw: str, project_root: Path, state: ChatSessionState) -> dict
     return _response("unknown", "Unknown Command", [f"No chat command matched {raw}.", "Type /help."])
 
 
-def _handle_intent(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+def _handle_intent(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    chat_model: ChatModel | None = None,
+) -> dict[str, Any]:
     intent = route_chat_intent(raw)["intent"]
     if intent == "init_project":
         return _init_response(project_root, state)
@@ -522,7 +629,7 @@ def _handle_intent(raw: str, project_root: Path, state: ChatSessionState) -> dic
         return _apply_back_review_response(project_root, state, choice="approve")
     if intent == "deny_apply_back":
         return _apply_back_review_response(project_root, state, choice="deny")
-    return _deterministic_chat_guidance(raw, project_root, state)
+    return _model_chat_response(raw, project_root, state, chat_model=chat_model)
 
 
 def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any]:
@@ -531,7 +638,13 @@ def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessio
         "I do not call Codex, Docker, shell, providers, or model backends directly from chat.",
         "Try: 'summarize this repo', 'fix this bug', 'show capabilities', 'what should I do next?', or /help.",
     ]
-    if state.pending_draft or state.pending_orchestration or state.pending_execute_lease_id or state.pending_hosted_approval:
+    if (
+        state.pending_draft
+        or state.pending_orchestration
+        or state.pending_execute_lease_id
+        or state.pending_action_contract
+        or state.pending_hosted_approval
+    ):
         lines.append("There is a pending action. Type yes or /confirm to continue, or no to cancel.")
     if not _is_initialized(project_root):
         lines.append("This project is not initialized. Type /init to create local Harness records.")
@@ -546,6 +659,571 @@ def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessio
             "equivalent_commands": ["/help", "/home", "/capabilities", "/adapters"],
         },
     )
+
+
+def _model_chat_response(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    chat_model: ChatModel | None = None,
+    mode_override: str | None = None,
+) -> dict[str, Any]:
+    context_payload = chat_context(project_root)
+    context_manifest = pack_chat_context(project_root)
+    chat_ctx = ChatContext(
+        project_root=str(project_root),
+        model_profile=context_payload["chat"]["default_model_profile"],
+        mode=mode_override or ("codex-like" if state.codex_like_mode else "normal"),
+        context_blocks=[block.to_payload() for block in context_manifest.blocks],
+        safety_boundaries=list(context_payload["safety_boundaries"]),
+    )
+    messages = _model_messages(raw, state, chat_ctx)
+    tool_results: list[dict[str, Any]] = []
+    try:
+        model = chat_model or build_default_chat_model(project_root)
+        model_response = model.complete(messages, chat_ctx)
+        for _index in range(MAX_CHAT_TOOL_CALLS):
+            tool_request = parse_tool_request(model_response.content)
+            if tool_request is None:
+                break
+            tool_result = run_chat_tool(tool_request, default_chat_tool_context(project_root))
+            if tool_result.error_type == "action_contract_required":
+                return _action_contract_response(project_root, state, tool_request)
+            tool_results.append(
+                {
+                    "tool": tool_result.tool,
+                    "ok": tool_result.ok,
+                    "error_type": tool_result.error_type,
+                }
+            )
+            messages.append(ChatMessage(role="assistant", content=model_response.content))
+            messages.append(ChatMessage(role="user", content=f"Harness tool result:\n{tool_result.to_message()}"))
+            model_response = model.complete(messages, chat_ctx)
+    except LocalEndpointUnavailable as exc:
+        return _local_model_unavailable_response(project_root, exc)
+    content = str(sanitize_for_logging(model_response.content)).strip()
+    if not content:
+        content = "The local chat model returned an empty response."
+    fallback_request = _fallback_action_request_for_user_intent(raw)
+    if fallback_request is not None and _model_missed_side_effect_request(content):
+        return _action_contract_response(project_root, state, fallback_request)
+    return _response(
+        "llm_chat",
+        "Assistant",
+        content.splitlines(),
+        ok=True,
+        extra={
+            "model_profile": chat_ctx.model_profile,
+            "mode": chat_ctx.mode,
+            "hosted_fallback": False,
+            "context_manifest": {
+                "blocks": [
+                    {
+                        "kind": block.kind,
+                        "title": block.title,
+                        "source": block.source,
+                        "token_estimate": block.token_estimate,
+                        "truncated": block.truncated,
+                    }
+                    for block in context_manifest.blocks
+                ],
+                "blocked_paths": context_manifest.blocked_paths,
+                "warnings": context_manifest.warnings,
+            },
+            "tool_results": tool_results,
+            "action_proposals": model_response.action_proposals,
+        },
+    )
+
+
+def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> list[ChatMessage]:
+    messages = [
+        ChatMessage(
+            role="system",
+            content=(
+                "You are the Harness terminal coding and research assistant. "
+                "The user speaks in intentions. Answer naturally and use the provided Harness context. "
+                "You are not limited to read-only conversation. Read-only tools run automatically inside the chat "
+                "loop. Side-effecting tools are also available, but Harness converts them into validated action "
+                "contracts and asks the user for confirmation before execution. Do not claim to mutate files, run "
+                "tests, apply patches, or create records directly; request the appropriate Harness tool instead. "
+                "When a tool is needed, respond with exactly one JSON object of type harness.tool_request/v1 using "
+                "one of the listed tools. After Harness returns a read-only tool result, answer the user normally. "
+                "If the user asks to edit, create, delete, test, apply, approve, orchestrate, or otherwise do work, "
+                "emit the gated tool request rather than saying chat is read-only."
+            ),
+        )
+    ]
+    if context.mode == "act":
+        messages.append(
+            ChatMessage(
+                role="system",
+                content=(
+                    "Act mode is enabled. You may run a bounded read-only tool loop to inspect context. "
+                    "Any side-effecting step must be emitted as a harness.tool_request/v1 for a gated Harness "
+                    "action contract. Do not say edits, tests, or apply-back are complete until Harness returns evidence."
+                ),
+            )
+        )
+    elif context.mode == "plan":
+        messages.append(
+            ChatMessage(
+                role="system",
+                content=(
+                    "Plan mode is enabled. Produce a concrete implementation plan grounded in Harness context. "
+                    "If the plan should become work, emit a gated Harness action request rather than relying on "
+                    "deterministic intent routing."
+                ),
+            )
+        )
+    messages.append(
+        ChatMessage(
+            role="system",
+            content="Available Harness chat tools. Tools with risk=read can run in the chat loop; other tools become action contracts:\n"
+            + json.dumps(chat_tool_specs_payload(), sort_keys=True, default=str),
+        )
+    )
+    if context.context_blocks:
+        context_text = "\n\n".join(f"{block['title']}:\n{block['content']}" for block in context.context_blocks)
+        messages.append(ChatMessage(role="system", content=f"Current Harness context:\n{context_text}"))
+    for item in state.transcript[-12:]:
+        role = item.get("role")
+        if role == "user":
+            messages.append(ChatMessage(role="user", content=str(item.get("content", ""))))
+        elif role == "assistant":
+            lines = item.get("lines", [])
+            if isinstance(lines, list):
+                messages.append(ChatMessage(role="assistant", content="\n".join(str(line) for line in lines)))
+    messages.append(ChatMessage(role="user", content=raw))
+    return messages
+
+
+def _local_model_unavailable_response(project_root: Path, exc: Exception) -> dict[str, Any]:
+    return _response(
+        "chat_model_unavailable",
+        "Chat Model Unavailable",
+        [
+            "The configured chat model is unavailable.",
+            str(exc),
+            "Fix the configured chat backend, then retry. Harness does not fall back to paid hosted chat automatically.",
+        ],
+        ok=False,
+        extra={
+            "project_root": str(project_root),
+            "model_profile": "configured_chat_model",
+            "hosted_fallback": False,
+        },
+    )
+
+
+def _fallback_action_request_for_user_intent(raw: str) -> ChatToolRequest | None:
+    normalized = _normalize(raw)
+    if not normalized:
+        return None
+    if _looks_like_test_request(normalized):
+        return ChatToolRequest(
+            type="harness.tool_request/v1",
+            tool="run_tests",
+            arguments={"suggested_command": _test_command_from_user_text(raw), "scope": "chat"},
+        )
+    if _looks_like_apply_request(normalized):
+        return ChatToolRequest(type="harness.tool_request/v1", tool="apply_back", arguments={"goal": raw})
+    if _looks_like_repo_mutation_request(normalized):
+        return ChatToolRequest(type="harness.tool_request/v1", tool="edit_isolated", arguments={"goal": raw})
+    return None
+
+
+def _looks_like_repo_mutation_request(normalized: str) -> bool:
+    mutation_verbs = {
+        "add",
+        "apply",
+        "build",
+        "change",
+        "create",
+        "delete",
+        "edit",
+        "fix",
+        "implement",
+        "modify",
+        "patch",
+        "remove",
+        "rename",
+        "update",
+        "write",
+    }
+    words = set(normalized.split())
+    if not words.intersection(mutation_verbs):
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            " file",
+            " repo",
+            " repository",
+            " code",
+            " test",
+            " bug",
+            " failing",
+            " implementation",
+            " feature",
+            " docs",
+            " readme",
+        )
+    )
+
+
+def _looks_like_test_request(normalized: str) -> bool:
+    return normalized in {"test", "run tests", "run the tests"} or (
+        "test" in normalized and any(verb in normalized.split() for verb in {"run", "execute", "start"})
+    )
+
+
+def _looks_like_apply_request(normalized: str) -> bool:
+    return normalized in {"apply it", "apply the diff", "apply changes", "apply the changes"} or "apply back" in normalized
+
+
+def _test_command_from_user_text(raw: str) -> str:
+    stripped = raw.strip()
+    if stripped.startswith("pytest"):
+        return stripped
+    return "pytest -q"
+
+
+def _model_missed_side_effect_request(content: str) -> bool:
+    normalized = _normalize(content)
+    if not normalized:
+        return True
+    refusal_markers = (
+        "read only",
+        "read-only",
+        "can't",
+        "cannot",
+        "can not",
+        "i need",
+        "need one detail",
+        "would propose",
+        "i'd propose",
+        "should be confirmed",
+    )
+    return any(marker in normalized for marker in refusal_markers)
+
+
+def _diff_response(project_root: Path) -> dict[str, Any]:
+    try:
+        diff_stat = subprocess.run(
+            ["git", "-C", str(project_root), "diff", "--stat"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        diff_patch = subprocess.run(
+            ["git", "-C", str(project_root), "diff", "--", "."],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _response("diff_unavailable", "Diff Unavailable", [str(exc)], ok=False)
+    stat = str(sanitize_for_logging(diff_stat.stdout.strip()))
+    patch = str(sanitize_for_logging(diff_patch.stdout.strip()))
+    if not stat and not patch:
+        return _response("diff", "Diff", ["No current git diff and no latest isolated diff artifact is selected."], ok=True)
+    lines = []
+    if stat:
+        lines.extend(["Git diff stat:", *stat.splitlines()])
+    if patch:
+        preview = patch[:6000]
+        if len(patch) > len(preview):
+            preview += "\n[diff truncated]"
+        lines.extend(["Git diff:", *preview.splitlines()])
+    return _response("diff", "Diff", lines, ok=True)
+
+
+def _action_contract_response(project_root: Path, state: ChatSessionState, tool_request: Any) -> dict[str, Any]:
+    try:
+        contract = contract_from_tool_request(tool_request, project_root=project_root)
+    except ValueError as exc:
+        return _response(
+            "action_contract_rejected",
+            "Action Contract Rejected",
+            [str(exc)],
+            ok=False,
+        )
+    state.pending_action_contract = contract
+    lines = [
+        "I can do that through a Harness action contract.",
+        f"Action: {contract.summary}",
+        f"Tool: {contract.tool}",
+        f"Risk: {contract.risk}",
+        f"Required confirmations: {', '.join(contract.required_confirmations) or 'none'}",
+        f"Required approvals: {', '.join(contract.required_approvals) or 'none'}",
+        "Execution plan:",
+    ]
+    lines.extend(f"- {step}" for step in contract.execution_plan)
+    lines.append("Type yes or /confirm to approve this contract, or no to cancel.")
+    if not _is_initialized(project_root):
+        lines.append("This project must be initialized before confirmed actions can create Harness records.")
+    return _response(
+        "action_contract",
+        "Action Contract",
+        lines,
+        ok=True,
+        extra={"contract": contract.to_payload()},
+    )
+
+
+def _execute_action_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    approval_lines = _ensure_contract_required_approvals(project_root, contract)
+    if contract.tool == "create_objective":
+        response = _confirm_create_objective_contract(project_root, state, contract)
+    elif contract.tool == "create_task":
+        response = _confirm_create_task_contract(project_root, state, contract)
+    elif contract.tool == "create_task_graph":
+        response = _confirm_create_task_graph_contract(project_root, state, contract)
+    elif contract.tool == "remember":
+        response = _confirm_remember_contract(project_root, contract)
+    elif contract.tool == "edit_isolated":
+        response = _confirm_edit_isolated_contract(project_root, state, contract)
+    elif contract.tool == "dispatch_registered_adapter":
+        response = _confirm_dispatch_contract(project_root, state, contract)
+    elif contract.tool == "run_tests":
+        response = _confirm_run_tests_contract(project_root, state, contract)
+    elif contract.tool == "apply_back":
+        response = _apply_back_review_response(project_root, state, choice="approve")
+    elif contract.tool == "deny_apply_back":
+        response = _apply_back_review_response(project_root, state, choice="deny")
+    else:
+        response = _response(
+            "action_contract_confirmed_not_executed",
+            "Action Contract Confirmed",
+            [
+                f"Confirmed contract: {contract.id}",
+                f"Tool: {contract.tool}",
+                "This side-effecting tool is validated, but execution is not wired in this slice yet.",
+                "Next implementation step: route this contract through the corresponding Harness control-plane executor.",
+            ],
+            ok=False,
+            extra={"contract": contract.to_payload()},
+        )
+    if approval_lines:
+        response["lines"] = [*approval_lines, *response.get("lines", [])]
+        response["auto_approvals"] = approval_lines
+    return response
+
+
+def _ensure_contract_required_approvals(project_root: Path, contract: ActionContract) -> list[str]:
+    if "hosted_provider_codex" not in contract.required_approvals:
+        return []
+    task_types = _hosted_codex_task_types_for_contract(contract)
+    approvals = ApprovalStore(project_root)
+    missing = [
+        task_type
+        for task_type in task_types
+        if approvals.find_valid("codex_cli", "hosted_provider", task_type) is None
+    ]
+    if not missing:
+        return []
+    approvals.add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=task_types,
+        duration_days=1,
+        reason=f"Created from confirmed Harness action contract {contract.id}.",
+    )
+    return [
+        "Prepared required hosted-provider Codex approval for this confirmed action contract.",
+        "This permits scoped Codex planning/edit execution only; apply-back still requires a separate approval.",
+    ]
+
+
+def _hosted_codex_task_types_for_contract(contract: ActionContract) -> list[str]:
+    task_types = {"codex_code_edit", "repo_planning"}
+    if contract.tool == "dispatch_registered_adapter":
+        task_type = contract.normalized_arguments.get("task_type")
+        if isinstance(task_type, str) and task_type:
+            task_types.add(task_type)
+    if contract.tool == "create_task_graph":
+        for task in contract.normalized_arguments.get("tasks") or []:
+            if isinstance(task, dict) and isinstance(task.get("task_type"), str):
+                task_types.add(task["task_type"])
+    return sorted(task_types)
+
+
+def _confirm_create_objective_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    store = _require_store(project_root)
+    args = contract.normalized_arguments
+    objective = store.create_objective(
+        title=str(args["title"]),
+        description=str(args.get("description") or ""),
+        workbench_id=args.get("workbench_id"),
+        metadata={"created_from": "chat_action_contract", "contract_id": contract.id, "tool": contract.tool},
+    )
+    state.latest_objective_id = objective.id
+    return _response(
+        "action_contract_executed",
+        "Objective Created",
+        [f"Objective: {objective.id}", f"Title: {objective.title}", "Next: say what tasks should be added, or ask me to plan the task graph."],
+        ok=True,
+        extra={"contract": contract.to_payload(), "objective": objective.model_dump(mode="json")},
+    )
+
+
+def _confirm_create_task_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    store = _require_store(project_root)
+    args = contract.normalized_arguments
+    task = store.create_task(
+        title=str(args["title"]),
+        description=str(args.get("description") or ""),
+        objective_id=args.get("objective_id"),
+        workbench_id=args.get("workbench_id"),
+        agent_id=args.get("agent_id"),
+        metadata={"execution_adapter": args["execution_adapter"], "task_type": args["task_type"], "created_from": "chat_action_contract", "contract_id": contract.id},
+    )
+    state.latest_task_id = task.id
+    return _response(
+        "action_contract_executed",
+        "Task Created",
+        [f"Task: {task.id}", f"Adapter: {args['execution_adapter']}", f"Task type: {args['task_type']}", "Next: say 'lease the next task' or ask me to continue."],
+        ok=True,
+        extra={"contract": contract.to_payload(), "task": task.model_dump(mode="json")},
+    )
+
+
+def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    store = _require_store(project_root)
+    args = contract.normalized_arguments
+    objective = store.create_objective(
+        title=str(args["goal"]),
+        description=str(args["goal"]),
+        workbench_id=args.get("workbench_id"),
+        metadata={"created_from": "chat_action_contract", "contract_id": contract.id, "tool": contract.tool},
+    )
+    created_tasks = []
+    raw_tasks = [task for task in args.get("tasks") or [] if isinstance(task, dict)]
+    for raw_task in raw_tasks:
+        if not isinstance(raw_task, dict):
+            continue
+        depends_on = []
+        for index in raw_task.get("depends_on_indexes") or []:
+            if isinstance(index, int) and 0 <= index < len(created_tasks):
+                depends_on.append(created_tasks[index].id)
+        task_contract = contract_from_tool_request(
+            ChatToolRequest(
+                type="harness.tool_request/v1",
+                tool="create_task",
+                arguments={**raw_task, "objective_id": objective.id},
+            ),
+            project_root=project_root,
+        )
+        task_args = task_contract.normalized_arguments
+        created_tasks.append(
+            store.create_task(
+                title=str(task_args["title"]),
+                description=str(task_args.get("description") or ""),
+                objective_id=objective.id,
+                workbench_id=task_args.get("workbench_id"),
+                agent_id=task_args.get("agent_id"),
+                priority=int(raw_task.get("priority") or 0),
+                depends_on=depends_on,
+                required_approvals=(args.get("template") or {}).get("required_approvals") or [],
+                metadata={"execution_adapter": task_args["execution_adapter"], "task_type": task_args["task_type"], "created_from": "chat_action_contract", "contract_id": contract.id},
+            )
+        )
+    state.latest_objective_id = objective.id
+    if created_tasks:
+        state.latest_task_id = created_tasks[-1].id
+    return _response(
+        "action_contract_executed",
+        "Task Graph Created",
+        [f"Objective: {objective.id}", f"Tasks: {len(created_tasks)}", "Next: ask me to inspect progress or continue execution."],
+        ok=True,
+        extra={"contract": contract.to_payload(), "objective": objective.model_dump(mode="json"), "tasks": [task.model_dump(mode="json") for task in created_tasks]},
+    )
+
+
+def _confirm_remember_contract(project_root: Path, contract: ActionContract) -> dict[str, Any]:
+    note = str(contract.normalized_arguments.get("summary") or contract.normalized_arguments.get("goal") or "").strip()
+    if not note:
+        return _response("action_contract_invalid", "Missing Memory Note", ["The remember contract did not include a summary."], ok=False)
+    response = _remember_response(project_root, note)
+    response["contract"] = contract.to_payload()
+    return response
+
+
+def _confirm_edit_isolated_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    goal = str(contract.normalized_arguments.get("goal") or contract.normalized_arguments.get("summary") or contract.summary)
+    template = template_for_intent("coding_fix", goal, project_root)
+    draft = _orchestration_from_template(template, state)
+    draft.objective_title = str(contract.normalized_arguments.get("title") or draft.objective_title)
+    draft.objective_description = goal
+    response = _create_and_run_orchestration(project_root, state, draft)
+    response["contract"] = contract.to_payload()
+    return response
+
+
+def _confirm_dispatch_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    lease_id = contract.normalized_arguments.get("lease_id") or contract.normalized_arguments.get("id") or state.latest_lease_id
+    if not lease_id:
+        return _response(
+            "action_contract_missing_lease",
+            "Missing Lease",
+            ["The dispatch contract needs a lease_id or an existing latest lease."],
+            ok=False,
+            extra={"contract": contract.to_payload()},
+        )
+    response = _execute_response(project_root, str(lease_id), state)
+    response["contract"] = contract.to_payload()
+    return response
+
+
+class _ChatConfirmedTestApprovalProvider:
+    def decide(self, details: str) -> RunTestsDecision:
+        return RunTestsDecision(decision="approved", reason="Approved by explicit chat action contract confirmation.")
+
+
+def _confirm_run_tests_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
+    command = _test_command_from_contract(contract)
+    if not command:
+        return _response(
+            "action_contract_invalid",
+            "Missing Test Command",
+            ["The run_tests contract needs suggested_command or command arguments."],
+            ok=False,
+            extra={"contract": contract.to_payload()},
+        )
+    store = _require_store(project_root)
+    runner = DockerTestRunner(project_root, load_config(project_root), store, _ChatConfirmedTestApprovalProvider())
+    result = runner.run(command)
+    state.latest_run_id = str(result.get("run_id") or state.latest_run_id)
+    state.progress.append(f"tests run: {state.latest_run_id} status={result.get('status')}")
+    return _response(
+        "action_contract_executed",
+        "Tests Run",
+        [
+            f"Run: {result.get('run_id')}",
+            f"Status: {result.get('status')}",
+            f"Approval decision: {result.get('approval_decision')}",
+            f"Artifacts: {result.get('artifacts')}",
+        ],
+        ok=result.get("status") in {"tests_passed", "tests_failed", "tests_timed_out", "execution_denied"},
+        extra={"contract": contract.to_payload(), "test_result": result},
+    )
+
+
+def _test_command_from_contract(contract: ActionContract) -> list[str]:
+    args = contract.normalized_arguments
+    command = args.get("command")
+    if isinstance(command, list):
+        return [str(part) for part in command]
+    if isinstance(command, str):
+        return shlex.split(command)
+    suggested = args.get("suggested_command")
+    if isinstance(suggested, str):
+        return shlex.split(suggested)
+    return []
 
 
 def _init_response(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
@@ -607,6 +1285,12 @@ def _mode_response(mode: str | None, state: ChatSessionState) -> dict[str, Any]:
 
 
 def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+    if state.pending_action_contract is not None:
+        if not _is_initialized(project_root):
+            return _uninitialized_response(project_root)
+        contract = state.pending_action_contract
+        state.pending_action_contract = None
+        return _execute_action_contract(project_root, state, contract)
     if state.pending_hosted_approval:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)

@@ -18,6 +18,7 @@ Usage: codex exec [OPTIONS] [PROMPT]
   --sandbox <SANDBOX_MODE> [possible values: read-only, workspace-write, danger-full-access]
   --output-last-message <FILE>
   --output-schema <FILE>
+  --skip-git-repo-check
 """
 
 
@@ -49,6 +50,7 @@ def test_codex_capability_detection_from_help(monkeypatch) -> None:
     assert capabilities.supports_output_last_message
     assert capabilities.supports_output_schema
     assert capabilities.supports_login_status
+    assert capabilities.supports_skip_git_repo_check
 
 
 def test_codex_command_construction_uses_detected_capabilities(monkeypatch, tmp_path) -> None:
@@ -74,6 +76,7 @@ def test_codex_command_construction_uses_detected_capabilities(monkeypatch, tmp_
     assert ["-c", 'model_reasoning_effort="low"'] in [
         command[index : index + 2] for index, value in enumerate(command[:-1]) if value == "-c"
     ]
+    assert "--skip-git-repo-check" in command
     assert ["--sandbox", "read-only"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
     assert "--output-last-message" in command
     assert "plan" == command[-1]
@@ -103,7 +106,24 @@ def test_codex_edit_command_uses_model_and_low_reasoning(monkeypatch, tmp_path) 
     assert ["-c", 'model_reasoning_effort="low"'] in [
         command[index : index + 2] for index, value in enumerate(command[:-1]) if value == "-c"
     ]
+    assert "--skip-git-repo-check" in command
     assert ["--sandbox", "workspace-write"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
+
+
+def test_codex_skip_git_repo_check_is_capability_gated(monkeypatch, tmp_path) -> None:
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=EXEC_HELP.replace("  --skip-git-repo-check\n", ""))
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    command = CodexCliBackend(codex_config()).build_read_only_command(tmp_path, "plan", None)
+
+    assert "--skip-git-repo-check" not in command
 
 
 def test_codex_rejects_invalid_reasoning_effort_before_execution(monkeypatch, tmp_path) -> None:

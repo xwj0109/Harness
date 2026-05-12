@@ -285,6 +285,7 @@ class BackendCapabilities(BaseModel):
     supports_network_control: bool = False
     supports_full_auto: bool = False
     supports_full_auto_workspace_write_on_request: bool = False
+    supports_skip_git_repo_check: bool = False
 
 
 class BackendStatus(BaseModel):

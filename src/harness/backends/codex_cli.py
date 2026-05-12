@@ -83,6 +83,7 @@ class CodexCliBackend:
             supports_network_control=_detect_network_control(exec_help.stdout),
             supports_full_auto="--full-auto" in exec_help.stdout,
             supports_full_auto_workspace_write_on_request=_full_auto_documents_workspace_write_on_request(exec_help.stdout),
+            supports_skip_git_repo_check="--skip-git-repo-check" in exec_help.stdout,
         )
 
     def preflight(self) -> BackendStatus:
@@ -137,6 +138,8 @@ class CodexCliBackend:
         if model and capabilities.supports_model_arg:
             command.extend(["--model", str(model)])
         command.extend(self._reasoning_effort_args())
+        if self._should_skip_git_repo_check(capabilities):
+            command.append("--skip-git-repo-check")
         command.extend(["--sandbox", "read-only"])
         if final_message_path and capabilities.supports_output_last_message:
             command.extend(["--output-last-message", str(final_message_path)])
@@ -197,6 +200,8 @@ class CodexCliBackend:
         if model and capabilities.supports_model_arg:
             command.extend(["--model", str(model)])
         command.extend(self._reasoning_effort_args())
+        if self._should_skip_git_repo_check(capabilities):
+            command.append("--skip-git-repo-check")
         if capabilities.supports_json_events:
             command.append("--json")
         if final_message_path and capabilities.supports_output_last_message:
@@ -213,6 +218,9 @@ class CodexCliBackend:
         self.config.settings["last_codex_internal_command_approval_enforceable"] = internal_approval_enforceable
         self.config.settings["last_apply_back_approval_required"] = True
         return command, capabilities, network_status
+
+    def _should_skip_git_repo_check(self, capabilities: BackendCapabilities) -> bool:
+        return bool(self.config.settings.get("skip_git_repo_check", True)) and capabilities.supports_skip_git_repo_check
 
     def run_read_only(self, project_root: Path, prompt: str, final_message_path: Path | None) -> CodexRunResult:
         command = self.build_read_only_command(project_root, prompt, final_message_path)
