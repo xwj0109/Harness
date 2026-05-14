@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS runs (
   allow_network INTEGER,
   approval_id TEXT,
   task_id TEXT,
-  objective_id TEXT
+  objective_id TEXT,
+  session_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS events (
   event_type TEXT NOT NULL,
   message TEXT NOT NULL,
   payload_json TEXT NOT NULL,
+  session_id TEXT,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
 
@@ -41,6 +43,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   redaction_state TEXT,
   evidence_status TEXT,
   metadata_json TEXT NOT NULL,
+  session_id TEXT,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
 
@@ -74,6 +77,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   required_approvals_json TEXT,
   approval_state TEXT,
   run_id TEXT,
+  session_id TEXT,
   metadata_json TEXT NOT NULL
 );
 
@@ -98,6 +102,23 @@ CREATE TABLE IF NOT EXISTS objectives (
   updated_at TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 0,
   workbench_id TEXT,
+  session_id TEXT,
+  metadata_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  project_path TEXT NOT NULL,
+  objective_id TEXT,
+  active_task_id TEXT,
+  active_run_id TEXT,
+  workbench_id TEXT,
+  agent_id TEXT,
+  mode TEXT,
+  intent TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
   metadata_json TEXT NOT NULL
 );
 
@@ -257,6 +278,9 @@ CREATE INDEX IF NOT EXISTS idx_task_transitions_task_created
 
 CREATE INDEX IF NOT EXISTS idx_run_baselines_run
   ON run_baselines(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_status_updated
+  ON sessions(status, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_daemon_records_status_heartbeat
   ON daemon_records(status, heartbeat_at DESC);

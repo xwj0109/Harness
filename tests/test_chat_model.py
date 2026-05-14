@@ -175,13 +175,17 @@ def test_mutation_request_falls_back_to_action_contract_when_model_only_refuses(
 
 
 def test_test_request_falls_back_to_run_tests_contract_when_model_only_refuses(tmp_path) -> None:
+    from typer.testing import CliRunner
+
+    from harness.cli.main import app
+
+    assert CliRunner().invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     model = FakeChatModel("I cannot run tests directly from read-only chat.")
     state = ChatSessionState()
 
     response = handle_chat_input("run the tests", tmp_path, state, chat_model=model)
 
-    assert response["kind"] == "action_contract"
-    assert response["contract"]["tool"] == "run_tests"
-    assert response["contract"]["normalized_arguments"]["suggested_command"] == "pytest -q"
-    assert state.pending_action_contract is not None
-    assert not (tmp_path / ".harness").exists()
+    assert response["kind"] == "managed_action_approval_required"
+    assert response["route"]["intent"] == "run_tests"
+    assert response["decision"]["status"] == "approval_required"
+    assert state.pending_action_contract is None

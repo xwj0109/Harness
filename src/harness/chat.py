@@ -10,7 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, TextIO
 
+from harness.action_executors import execute_managed_action
+from harness.action_policy import decide_managed_action
 from harness.action_proposals import ActionContract, contract_from_tool_request
+from harness.action_router import ManagedActionDecisionStatus, ManagedActionResult, route_managed_action
 from harness.approvals import ApprovalStore
 from harness.autonomy import (
     AutonomyDecision,
@@ -808,6 +811,9 @@ def _handle_intent(
     chat_model: ChatModel | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    managed_action_response = _maybe_run_managed_action(raw, project_root, state)
+    if managed_action_response is not None:
+        return managed_action_response
     intent = route_chat_intent(raw)["intent"]
     if intent == "init_project":
         return _init_response(project_root, state)
@@ -899,6 +905,70 @@ def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessio
             "mode": "codex-like" if state.codex_like_mode else "normal",
             "equivalent_commands": ["/help", "/home", "/capabilities", "/adapters"],
         },
+    )
+
+
+def _maybe_run_managed_action(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+) -> dict[str, Any] | None:
+    route = route_managed_action(raw, project_root)
+    decision = decide_managed_action(route, project_root)
+    if decision.status == ManagedActionDecisionStatus.UNSUPPORTED:
+        return None
+    if not _is_initialized(project_root):
+        return _uninitialized_response(project_root)
+    if decision.status == ManagedActionDecisionStatus.DENIED:
+        return _response(
+            "managed_action_denied",
+            "Action Denied",
+            decision.reasons,
+            ok=False,
+            extra={"route": route.model_dump(mode="json"), "decision": decision.model_dump(mode="json")},
+        )
+    if decision.status == ManagedActionDecisionStatus.APPROVAL_REQUIRED:
+        return _response(
+            "managed_action_approval_required",
+            "Approval Required",
+            [
+                "Approval required before Harness can run this action.",
+                *decision.reasons,
+            ],
+            ok=False,
+            extra={"route": route.model_dump(mode="json"), "decision": decision.model_dump(mode="json")},
+        )
+    store = _require_store(project_root)
+    try:
+        result = execute_managed_action(project_root, route, decision, store)
+    except ValueError as exc:
+        return _response(
+            "managed_action_failed",
+            "Action Failed",
+            [str(exc)],
+            ok=False,
+            extra={"route": route.model_dump(mode="json"), "decision": decision.model_dump(mode="json")},
+        )
+    state.latest_run_id = result.run_id
+    state.progress.append(f"managed action: {route.intent} run={result.run_id}")
+    return _managed_action_response(result)
+
+
+def _managed_action_response(result: ManagedActionResult) -> dict[str, Any]:
+    manifest_path = result.manifest_path or (result.report_path.parent / "manifest.json" if result.report_path else None)
+    lines = [result.message]
+    if result.run_id:
+        lines.append(f"Run: {result.run_id}")
+    if result.report_path:
+        lines.append(f"Report: {result.report_path}")
+    if manifest_path:
+        lines.append(f"Manifest: {manifest_path}")
+    return _response(
+        "self_managed_local_action",
+        "Done",
+        lines,
+        ok=result.ok,
+        extra=result.model_dump(mode="json"),
     )
 
 
@@ -1283,7 +1353,8 @@ def _action_contract_response(project_root: Path, state: ChatSessionState, tool_
             )
     state.pending_action_contract = contract
     lines = [
-        "I can do that through a Harness action contract.",
+        "Ready to manage this through Harness.",
+        "Next: type yes or /confirm to approve this contract, or no to cancel.",
         f"Action: {contract.summary}",
         f"Tool: {contract.tool}",
         f"Risk: {contract.risk}",
@@ -1292,7 +1363,6 @@ def _action_contract_response(project_root: Path, state: ChatSessionState, tool_
         "Execution plan:",
     ]
     lines.extend(f"- {step}" for step in contract.execution_plan)
-    lines.append("Type yes or /confirm to approve this contract, or no to cancel.")
     if not _is_initialized(project_root):
         lines.append("This project must be initialized before confirmed actions can create Harness records.")
     return _response(

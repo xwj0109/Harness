@@ -68,6 +68,14 @@ class TaskStatus(str, Enum):
         return None
 
 
+class SessionStatus(str, Enum):
+    ACTIVE = "active"
+    WAITING_APPROVAL = "waiting_approval"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 class ObjectiveStatus(str, Enum):
     CREATED = "created"
     ACTIVE = "active"
@@ -567,6 +575,24 @@ class RunRecord(BaseModel):
     approval_id: str | None = None
     task_id: str | None = None
     objective_id: str | None = None
+    session_id: str | None = None
+
+
+class SessionSpec(BaseModel):
+    schema_version: str = "harness.session/v1"
+    id: str
+    project_path: Path
+    objective_id: str | None = None
+    active_task_id: str | None = None
+    active_run_id: str | None = None
+    workbench_id: str | None = None
+    agent_id: str | None = None
+    mode: RunMode | None = None
+    intent: str | None = None
+    status: SessionStatus
+    created_at: datetime
+    updated_at: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TaskRecord(BaseModel):
@@ -588,6 +614,7 @@ class TaskRecord(BaseModel):
     required_approvals: list[str] = Field(default_factory=list)
     approval_state: str | None = None
     run_id: str | None = None
+    session_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -613,6 +640,7 @@ class ObjectiveRecord(BaseModel):
     updated_at: datetime
     priority: int = 0
     workbench_id: str | None = None
+    session_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -748,6 +776,7 @@ class EventRecord(BaseModel):
     level: str
     event_type: str
     message: str
+    session_id: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -755,6 +784,7 @@ class ArtifactRecord(BaseModel):
     schema_version: str = "harness.artifact/v1"
     id: str
     run_id: str
+    session_id: str | None = None
     kind: str
     path: Path
     created_at: datetime

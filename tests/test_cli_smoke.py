@@ -1133,6 +1133,38 @@ def test_tui_right_panel_surfaces_assistant_context_and_pending_action(tmp_path)
     assert not (tmp_path / ".harness").exists()
 
 
+def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirmation(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+
+    model = build_right_panel_model(
+        dashboard,
+        {
+            "palette": palette,
+            "active_section_index": 1,
+            "collapsed_section_ids": set(),
+            "chat_mode": "normal",
+            "latest_response": {
+                "kind": "self_managed_local_action",
+                "ok": True,
+                "run_id": "run_managed123",
+                "report_path": str(tmp_path / ".harness" / "runs" / "run_managed123" / "final_report.md"),
+            },
+        },
+        "",
+        "dashboard",
+    )
+    rendered = render_right_panel(model)
+
+    assert model["active_section_id"] == "action"
+    assert "Latest action" in rendered
+    assert "Status: succeeded" in rendered
+    assert "Run: run_managed123" in rendered
+    assert "Report: final_report.md" in rendered
+    assert "Confirm: yes or /confirm" not in rendered
+    assert not (tmp_path / ".harness").exists()
+
+
 def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
     dashboard = build_tui_dashboard(tmp_path)
     palette = build_command_palette()

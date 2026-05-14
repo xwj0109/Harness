@@ -665,6 +665,18 @@ def _right_panel_action_rows(state: dict) -> list[str]:
             "Confirm: yes or /confirm",
             "Cancel: no",
         ]
+    latest_response = state.get("latest_response") or {}
+    if latest_response.get("kind") == "self_managed_local_action":
+        report_path = latest_response.get("report_path")
+        if not report_path and isinstance(latest_response.get("extra"), dict):
+            report_path = latest_response["extra"].get("report_path")
+        rows = ["Latest action", f"Status: {'succeeded' if latest_response.get('ok') else 'failed'}"]
+        run_id = latest_response.get("run_id") or latest_response.get("extra", {}).get("run_id")
+        if run_id:
+            rows.append(f"Run: {run_id}")
+        if report_path:
+            rows.append(f"Report: {Path(str(report_path)).name}")
+        return rows
     latest = []
     if state.get("latest_task_id"):
         latest.append(f"Task: {state['latest_task_id']}")
@@ -1476,7 +1488,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._messages.append(_chat_response_to_tui_message(response))
             self._request_in_flight = False
             prompt = self.query_one("#prompt", Input)
-            prompt.placeholder = "Ask Harness or type /help"
+            if self._chat_state.pending_action_contract is not None:
+                prompt.placeholder = "Type yes to confirm, no to cancel, or ask a follow-up"
+            else:
+                prompt.placeholder = "Ask Harness or type /help"
             self._render_chat()
             self._render_current_view()
             if response.get("kind") == "quit":
@@ -1561,6 +1576,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         def _render_chat(self) -> None:
             transcript = "\n\n".join(render_chat_message(message) for message in self._messages)
             self.query_one("#chat-content", Static).update(transcript)
+            self.call_after_refresh(lambda: self.query_one("#chat", VerticalScroll).scroll_end(animate=False))
 
         def _render_view(self, view: dict) -> None:
             self._clamp_section_cursor(view)
@@ -1582,6 +1598,12 @@ def run_read_only_tui(project_root: Path) -> None:
 
 def _chat_response_to_tui_message(response: dict) -> dict:
     lines = list(response.get("lines", []))
+    if response.get("kind") == "self_managed_local_action":
+        return {
+            "role": "assistant",
+            "title": response.get("title") or "Done",
+            "lines": lines,
+        }
     if response.get("tool_results"):
         lines.append("Tool calls:")
         for item in response["tool_results"]:

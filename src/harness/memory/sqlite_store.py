@@ -44,6 +44,8 @@ from harness.models import (
     RunCompareResult,
     RunManifest,
     RunRecord,
+    SessionSpec,
+    SessionStatus,
     TaskAttempt,
     TaskDependency,
     TaskDependencyType,
@@ -255,16 +257,21 @@ class SQLiteStore:
             self._ensure_column(conn, "runs", "approval_id", "TEXT")
             self._ensure_column(conn, "runs", "task_id", "TEXT")
             self._ensure_column(conn, "runs", "objective_id", "TEXT")
+            self._ensure_column(conn, "runs", "session_id", "TEXT")
+            self._ensure_column(conn, "events", "session_id", "TEXT")
             self._ensure_column(conn, "artifacts", "schema_version", "TEXT")
             self._ensure_column(conn, "artifacts", "sha256", "TEXT")
             self._ensure_column(conn, "artifacts", "size_bytes", "INTEGER")
             self._ensure_column(conn, "artifacts", "producer", "TEXT")
             self._ensure_column(conn, "artifacts", "redaction_state", "TEXT")
             self._ensure_column(conn, "artifacts", "evidence_status", "TEXT")
+            self._ensure_column(conn, "artifacts", "session_id", "TEXT")
             self._ensure_column(conn, "tasks", "objective_id", "TEXT")
             self._ensure_column(conn, "tasks", "idempotency_key", "TEXT")
             self._ensure_column(conn, "tasks", "required_approvals_json", "TEXT")
             self._ensure_column(conn, "tasks", "approval_state", "TEXT")
+            self._ensure_column(conn, "tasks", "session_id", "TEXT")
+            self._ensure_column(conn, "objectives", "session_id", "TEXT")
             self._migrate_task_rows(conn)
             self._migrate_artifact_rows(conn)
 
@@ -322,6 +329,152 @@ class SQLiteStore:
             WHERE evidence_status IS NULL OR evidence_status = ''
             """
         )
+
+    def create_session(
+        self,
+        *,
+        objective_id: str | None = None,
+        active_task_id: str | None = None,
+        active_run_id: str | None = None,
+        workbench_id: str | None = None,
+        agent_id: str | None = None,
+        mode: str | None = None,
+        intent: str | None = None,
+        status: SessionStatus = SessionStatus.ACTIVE,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionSpec:
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        metadata = sanitize_for_logging(metadata or {})
+        with self.connect() as conn:
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
+            if active_task_id is not None:
+                self._require_task(conn, active_task_id)
+            if active_run_id is not None:
+                self._require_run(conn, active_run_id)
+            conn.execute(
+                """
+                INSERT INTO sessions (
+                  id, project_path, objective_id, active_task_id, active_run_id,
+                  workbench_id, agent_id, mode, intent, status, created_at, updated_at,
+                  metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    str(self.project_root),
+                    objective_id,
+                    active_task_id,
+                    active_run_id,
+                    workbench_id,
+                    agent_id,
+                    mode,
+                    intent,
+                    status.value,
+                    timestamp,
+                    timestamp,
+                    json.dumps(metadata, sort_keys=True, default=str),
+                ),
+            )
+        (self.harness_dir / "sessions" / session_id).mkdir(parents=True, exist_ok=True)
+        (self.harness_dir / "sessions" / session_id / "transcript.jsonl").touch(exist_ok=True)
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> SessionSpec:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+        return self._row_to_session(row)
+
+    def list_sessions(self, status: str | None = None) -> list[SessionSpec]:
+        with self.connect() as conn:
+            if status is None:
+                rows = conn.execute("SELECT * FROM sessions ORDER BY updated_at DESC").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM sessions WHERE status = ? ORDER BY updated_at DESC",
+                    (SessionStatus(status).value,),
+                ).fetchall()
+        return [self._row_to_session(row) for row in rows]
+
+    def update_session(
+        self,
+        session_id: str,
+        *,
+        objective_id: str | None = None,
+        active_task_id: str | None = None,
+        active_run_id: str | None = None,
+        workbench_id: str | None = None,
+        agent_id: str | None = None,
+        mode: str | None = None,
+        intent: str | None = None,
+        status: SessionStatus | str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionSpec:
+        current = self.get_session(session_id)
+        values = {
+            "objective_id": current.objective_id if objective_id is None else objective_id,
+            "active_task_id": current.active_task_id if active_task_id is None else active_task_id,
+            "active_run_id": current.active_run_id if active_run_id is None else active_run_id,
+            "workbench_id": current.workbench_id if workbench_id is None else workbench_id,
+            "agent_id": current.agent_id if agent_id is None else agent_id,
+            "mode": current.mode.value if current.mode is not None else None,
+            "intent": current.intent if intent is None else intent,
+            "status": current.status.value if status is None else SessionStatus(status).value,
+            "metadata": current.metadata if metadata is None else sanitize_for_logging(metadata),
+        }
+        if mode is not None:
+            values["mode"] = mode
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET objective_id = ?, active_task_id = ?, active_run_id = ?, workbench_id = ?,
+                    agent_id = ?, mode = ?, intent = ?, status = ?, updated_at = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    values["objective_id"],
+                    values["active_task_id"],
+                    values["active_run_id"],
+                    values["workbench_id"],
+                    values["agent_id"],
+                    values["mode"],
+                    values["intent"],
+                    values["status"],
+                    timestamp,
+                    json.dumps(values["metadata"], sort_keys=True, default=str),
+                    session_id,
+                ),
+            )
+        return self.get_session(session_id)
+
+    def attach_session_to_objective(self, session_id: str, objective_id: str) -> SessionSpec:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            self._require_objective(conn, objective_id)
+            conn.execute("UPDATE objectives SET session_id = ? WHERE id = ?", (session_id, objective_id))
+        return self.update_session(session_id, objective_id=objective_id)
+
+    def attach_session_to_task(self, session_id: str, task_id: str) -> SessionSpec:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            self._require_task(conn, task_id)
+            conn.execute("UPDATE tasks SET session_id = ? WHERE id = ?", (session_id, task_id))
+        return self.update_session(session_id, active_task_id=task_id)
+
+    def attach_session_to_run(self, session_id: str, run_id: str) -> SessionSpec:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            self._require_run(conn, run_id)
+            conn.execute("UPDATE runs SET session_id = ? WHERE id = ?", (session_id, run_id))
+            conn.execute("UPDATE events SET session_id = ? WHERE run_id = ?", (session_id, run_id))
+            conn.execute("UPDATE artifacts SET session_id = ? WHERE run_id = ?", (session_id, run_id))
+        self.write_run_manifest(run_id)
+        return self.update_session(session_id, active_run_id=run_id)
 
     def disable_execution_control(
         self,
@@ -538,6 +691,7 @@ class SQLiteStore:
         approval_id: str | None = None,
         task_id: str | None = None,
         objective_id: str | None = None,
+        session_id: str | None = None,
     ) -> RunRecord:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
@@ -546,13 +700,17 @@ class SQLiteStore:
                 self._require_task(conn, task_id)
             if objective_id is not None:
                 self._require_objective(conn, objective_id)
+            if session_id is not None:
+                row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if row is None:
+                    raise KeyError(f"Session not found: {session_id}")
             conn.execute(
                 """
                 INSERT INTO runs (
                   id, goal, task_type, status, project_root, created_at, updated_at,
                   backend_name, backend_kind, billing_mode, execution_location,
-                  data_boundary, allow_network, approval_id, task_id, objective_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  data_boundary, allow_network, approval_id, task_id, objective_id, session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -571,12 +729,15 @@ class SQLiteStore:
                     approval_id,
                     task_id,
                     objective_id,
+                    session_id,
                 ),
             )
         self.initialize_run_artifacts(run_id)
         if backend:
             self.persist_backend_snapshot(run_id, backend)
         self.write_run_manifest(run_id)
+        if session_id is not None:
+            self.update_session(session_id, active_run_id=run_id)
         return self.get_run(run_id)
 
     def initialize_run_artifacts(self, run_id: str) -> dict[str, Path]:
@@ -633,6 +794,7 @@ class SQLiteStore:
         priority: int = 0,
         workbench_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> ObjectiveRecord:
         objective_id = f"obj_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
@@ -642,8 +804,8 @@ class SQLiteStore:
                 """
                 INSERT INTO objectives (
                   id, title, description, status, project_root, created_at, updated_at,
-                  priority, workbench_id, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  priority, workbench_id, metadata_json, session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     objective_id,
@@ -656,8 +818,11 @@ class SQLiteStore:
                     priority,
                     workbench_id,
                     json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+                    session_id,
                 ),
             )
+        if session_id is not None:
+            self.update_session(session_id, objective_id=objective_id)
         return self.get_objective(objective_id)
 
     def list_objectives(self) -> list[ObjectiveRecord]:
@@ -796,6 +961,7 @@ class SQLiteStore:
         required_approvals: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         idempotency_key: str | None = None,
+        session_id: str | None = None,
     ) -> TaskRecord:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         idempotency_key = idempotency_key or f"task_idem_{uuid.uuid4().hex[:16]}"
@@ -809,6 +975,10 @@ class SQLiteStore:
                 return self._row_to_task(existing)
             if objective_id is not None:
                 self._require_objective(conn, objective_id)
+            if session_id is not None:
+                row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+                if row is None:
+                    raise KeyError(f"Session not found: {session_id}")
             for dependency_id in depends_on:
                 self._require_task(conn, dependency_id)
             dependencies_satisfied = self._dependency_ids_completed(conn, depends_on)
@@ -825,8 +995,8 @@ class SQLiteStore:
                   id, title, description, status, project_root, created_at, updated_at,
                   priority, objective_id, workbench_id, agent_id, spec_source_kind, spec_source_path,
                   depends_on_json, run_id, metadata_json, idempotency_key,
-                  required_approvals_json, approval_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  required_approvals_json, approval_state, session_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -848,6 +1018,7 @@ class SQLiteStore:
                     idempotency_key,
                     json.dumps(sanitize_for_logging(required_approvals), sort_keys=True, default=str),
                     "required" if required_approvals else None,
+                    session_id,
                 ),
             )
             for dependency_id in depends_on:
@@ -869,6 +1040,8 @@ class SQLiteStore:
                 metadata={},
                 created_at=timestamp,
             )
+        if session_id is not None:
+            self.update_session(session_id, active_task_id=task_id)
         return self.get_task(task_id)
 
     def list_tasks(self, status: str | None = None, objective_id: str | None = None) -> list[TaskRecord]:
@@ -3100,6 +3273,11 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Objective not found: {objective_id}")
 
+    def _require_run(self, conn: sqlite3.Connection, run_id: str) -> None:
+        row = conn.execute("SELECT id FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Run not found: {run_id}")
+
     def list_task_transitions(self, task_id: str) -> list[TaskTransitionRecord]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -3150,18 +3328,21 @@ class SQLiteStore:
         event_type: str,
         message: str,
         payload: dict[str, Any] | None = None,
+        session_id: str | None = None,
     ) -> EventRecord:
         event_id = f"evt_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         payload = sanitize_for_logging(payload or {})
         payload_json = json.dumps(payload, sort_keys=True, default=str)
+        run = self.get_run(run_id)
+        session_id = session_id if session_id is not None else run.session_id
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO events (id, run_id, created_at, level, event_type, message, payload_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO events (id, run_id, created_at, level, event_type, message, payload_json, session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (event_id, run_id, timestamp, level, event_type, message, payload_json),
+                (event_id, run_id, timestamp, level, event_type, message, payload_json, session_id),
             )
         record = EventRecord(
             id=event_id,
@@ -3170,6 +3351,7 @@ class SQLiteStore:
             level=level,
             event_type=event_type,
             message=message,
+            session_id=session_id,
             payload=payload,
         )
         append_jsonl(self.runs_dir / run_id / "events.jsonl", record.model_dump(mode="json"))
@@ -3188,6 +3370,7 @@ class SQLiteStore:
                 level=row["level"],
                 event_type=row["event_type"],
                 message=row["message"],
+                session_id=row["session_id"] if "session_id" in row.keys() else None,
                 payload=json.loads(row["payload_json"]),
             )
             for row in rows
@@ -3201,10 +3384,12 @@ class SQLiteStore:
         metadata: dict[str, Any] | None = None,
         producer: str | None = None,
         redaction_state: str = "unknown",
+        session_id: str | None = None,
     ) -> ArtifactRecord:
         from harness.integrity import artifact_provenance_from_metadata, with_artifact_provenance_metadata
 
-        self.get_run(run_id)
+        run = self.get_run(run_id)
+        session_id = session_id if session_id is not None else run.session_id
         if not path.exists():
             raise FileNotFoundError(f"Artifact path not found: {path}")
         path, redaction_state, metadata = self._prepare_artifact_registration(
@@ -3231,9 +3416,9 @@ class SQLiteStore:
                 """
                 INSERT INTO artifacts (
                   id, run_id, kind, path, created_at, schema_version, sha256,
-                  size_bytes, producer, redaction_state, evidence_status, metadata_json
+                  size_bytes, producer, redaction_state, evidence_status, metadata_json, session_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact_id,
@@ -3248,11 +3433,13 @@ class SQLiteStore:
                     redaction_state,
                     "verified",
                     json.dumps(metadata, sort_keys=True, default=str),
+                    session_id,
                 ),
             )
         record = ArtifactRecord(
             id=artifact_id,
             run_id=run_id,
+            session_id=session_id,
             kind=kind,
             path=path,
             created_at=parse_dt(timestamp),
@@ -3744,6 +3931,7 @@ class SQLiteStore:
             schema_version=row["schema_version"] or "harness.artifact/v1",
             id=row["id"],
             run_id=row["run_id"],
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
             kind=row["kind"],
             path=Path(row["path"]),
             created_at=parse_dt(row["created_at"]),
@@ -3809,6 +3997,24 @@ class SQLiteStore:
             approval_id=row["approval_id"] if "approval_id" in row.keys() else None,
             task_id=row["task_id"] if "task_id" in row.keys() else None,
             objective_id=row["objective_id"] if "objective_id" in row.keys() else None,
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
+        )
+
+    def _row_to_session(self, row: sqlite3.Row) -> SessionSpec:
+        return SessionSpec(
+            id=row["id"],
+            project_path=Path(row["project_path"]),
+            objective_id=row["objective_id"],
+            active_task_id=row["active_task_id"],
+            active_run_id=row["active_run_id"],
+            workbench_id=row["workbench_id"],
+            agent_id=row["agent_id"],
+            mode=row["mode"],
+            intent=row["intent"],
+            status=SessionStatus(row["status"]),
+            created_at=parse_dt(row["created_at"]),
+            updated_at=parse_dt(row["updated_at"]),
+            metadata=json.loads(row["metadata_json"]),
         )
 
     def _row_to_task(self, row: sqlite3.Row) -> TaskRecord:
@@ -3845,6 +4051,7 @@ class SQLiteStore:
             else [],
             approval_state=row["approval_state"] if "approval_state" in row.keys() else None,
             run_id=row["run_id"],
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
             metadata=json.loads(row["metadata_json"]),
         )
 
@@ -3960,6 +4167,7 @@ class SQLiteStore:
             updated_at=parse_dt(row["updated_at"]),
             priority=row["priority"],
             workbench_id=row["workbench_id"],
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
             metadata=json.loads(row["metadata_json"]),
         )
 

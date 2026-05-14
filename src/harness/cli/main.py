@@ -17,6 +17,9 @@ import click
 import typer
 from typer.core import TyperGroup
 
+from harness.action_executors import execute_managed_action
+from harness.action_policy import decide_managed_action
+from harness.action_router import ManagedActionDecisionStatus, route_managed_action
 from harness.agent_authoring import (
     AgentBundleError,
     load_agent_bundle,
@@ -53,9 +56,10 @@ from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.evals import run_safety_smoke, run_security_check, run_security_layer_audit
 from harness.integrity import run_integrity_check
+from harness.intent_router import IntentRoute, route_instruction
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import KillSwitchTargetKind, MemoryScopeType, MemorySourceKind, TaskStatus
+from harness.models import KillSwitchTargetKind, MemoryScopeType, MemorySourceKind, SessionStatus, TaskStatus
 from harness.objective_runner import run_next_active_objective_autonomously, run_objective_autonomously
 from harness.paths import resolve_project_root
 from harness.policy import (
@@ -71,6 +75,13 @@ from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, DockerImageManager
 from harness.sandbox_profiles import build_sandbox_profile_catalog, get_sandbox_profile
 from harness.security_explanations import render_blocked_state
+from harness.session_events import (
+    SessionEventKind,
+    append_session_event,
+    read_session_events,
+    render_session_event,
+    session_transcript_path,
+)
 from harness.spec_loader import (
     SpecBundleError,
     diff_builtin_to_custom_spec_registry,
@@ -108,6 +119,8 @@ specs_app = typer.Typer(help="Read-only built-in v0.2 spec inspection.", invoke_
 specs_preview_app = typer.Typer(help="Read-only effective v0.2 spec policy previews.")
 policy_app = typer.Typer(help="Runtime effective policy evidence.")
 artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
+sessions_app = typer.Typer(help="Interactive session records.")
+actions_app = typer.Typer(help="Self-managed local action routing and execution.")
 tools_app = typer.Typer(help="Harness tool capability descriptors.")
 capabilities_app = typer.Typer(help="Read-only Harness capability catalog.")
 sandbox_app = typer.Typer(help="Read-only sandbox profile descriptors.")
@@ -133,6 +146,8 @@ app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
 app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
+app.add_typer(sessions_app, name="sessions")
+app.add_typer(actions_app, name="actions")
 app.add_typer(tools_app, name="tools")
 app.add_typer(capabilities_app, name="capabilities")
 app.add_typer(sandbox_app, name="sandbox")
@@ -290,6 +305,17 @@ def chat(
         _emit_json(chat_context(project_root))
         return
     autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
+    if (project_root / HARNESS_DIR / "harness.sqlite").exists():
+        store = SQLiteStore(project_root)
+        store.initialize()
+        session = store.create_session(metadata={"entrypoint": "chat"})
+        append_session_event(
+            project_root,
+            session_id=session.id,
+            event_type=SessionEventKind.SESSION_STARTED,
+            message="Chat session started",
+            payload={"entrypoint": "harness chat"},
+        )
     if not plain:
         if codex_like:
             _run_unified_app(project_root, codex_like=True)
@@ -1420,6 +1446,271 @@ def _resolve_policy_explain(project_root: Path, subject_kind: str, subject_id: s
     }
 
 
+@app.command("route")
+def route(
+    instruction: Annotated[str, typer.Argument(help="Natural-language instruction to route.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Inspect the deterministic product route for an instruction."""
+
+    resolve_project_root(project)
+    resolved = route_instruction(instruction)
+    payload = {
+        "schema_version": "harness.route/v1",
+        "ok": resolved.intent != "unsupported",
+        "route": resolved.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Intent: {resolved.intent}")
+    typer.echo(f"Confidence: {resolved.confidence}")
+    typer.echo(f"Workbench: {resolved.workbench_id}")
+    typer.echo(f"Agent: {resolved.agent_id}")
+    typer.echo(f"Mode: {resolved.mode.value}")
+    typer.echo(f"Task type: {resolved.task_type}")
+    typer.echo(f"Backend: {resolved.default_backend}")
+    typer.echo(
+        "Approvals: "
+        f"{', '.join(resolved.required_approvals) if resolved.required_approvals else 'none'}"
+    )
+    typer.echo(
+        "Expected outputs: "
+        f"{', '.join(resolved.expected_outputs) if resolved.expected_outputs else 'none'}"
+    )
+
+
+@sessions_app.command("list")
+def sessions_list(
+    status: Annotated[SessionStatus | None, typer.Option("--status", help="Filter by session status.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    sessions = SQLiteStore(project_root).list_sessions(status.value if status is not None else None)
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.sessions/v1",
+                "ok": True,
+                "sessions": [session.model_dump(mode="json") for session in sessions],
+            }
+        )
+        return
+    if not sessions:
+        typer.echo("No sessions found.")
+        return
+    _print_tsv(["session_id", "status", "intent", "run", "task", "updated_at"])
+    for session in sessions:
+        _print_tsv_row(
+            [
+                session.id,
+                session.status.value,
+                session.intent or "none",
+                session.active_run_id or "none",
+                session.active_task_id or "none",
+                session.updated_at.isoformat(),
+            ]
+        )
+
+
+@sessions_app.command("inspect")
+def sessions_inspect(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    transcript = session_transcript_path(project_root, session.id)
+    events = read_session_events(project_root, session.id)
+    payload = {
+        "schema_version": "harness.session/v1",
+        "ok": True,
+        "session": session.model_dump(mode="json"),
+        "transcript_path": str(transcript),
+        "event_count": len(events),
+        "next_actions": _session_next_actions(session),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_section("Session")
+    _print_kv("Session id", session.id)
+    _print_kv("Status", session.status.value)
+    _print_kv("Intent", session.intent or "none")
+    _print_kv("Objective", session.objective_id or "none")
+    _print_kv("Task", session.active_task_id or "none")
+    _print_kv("Run", session.active_run_id or "none")
+    _print_kv("Transcript", transcript)
+    _print_section("Next")
+    for action in payload["next_actions"]:
+        typer.echo(action)
+
+
+@app.command("resume")
+def resume(session_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        session = SQLiteStore(project_root).get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    events = read_session_events(project_root, session.id)
+    payload = {
+        "schema_version": "harness.session_resume/v1",
+        "ok": True,
+        "session": session.model_dump(mode="json"),
+        "events": [event.model_dump(mode="json") for event in events],
+        "next_actions": _session_next_actions(session),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Resumed session {session.id}")
+    for event in events[-20:]:
+        typer.echo(render_session_event(event))
+    typer.echo("Next:")
+    for action in payload["next_actions"]:
+        typer.echo(f"  {action}")
+
+
+@actions_app.command("route")
+def actions_route(
+    instruction: Annotated[str, typer.Argument(help="Natural-language local action instruction.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    route = route_managed_action(instruction, project_root)
+    decision = decide_managed_action(route, project_root)
+    payload = {
+        "schema_version": "harness.managed_action_route_preview/v1",
+        "ok": decision.status != ManagedActionDecisionStatus.DENIED,
+        "project_root": str(project_root),
+        "instruction": instruction,
+        "route": route.model_dump(mode="json"),
+        "decision": decision.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_section("Managed Action Route")
+    _print_kv("Intent", route.intent)
+    _print_kv("Confidence", route.confidence)
+    _print_kv("Risk", route.risk.value)
+    _print_kv("Executor", route.executor)
+    _print_kv("Decision", decision.status.value)
+    if decision.reasons:
+        _print_section("Reasons")
+        for reason in decision.reasons:
+            typer.echo(reason)
+
+
+@actions_app.command("run")
+def actions_run(
+    instruction: Annotated[str, typer.Argument(help="Natural-language local action instruction.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    route = route_managed_action(instruction, project_root)
+    decision = decide_managed_action(route, project_root)
+    if decision.status != ManagedActionDecisionStatus.AUTO_ALLOWED:
+        payload = {
+            "schema_version": "harness.managed_action_run/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "instruction": instruction,
+            "route": route.model_dump(mode="json"),
+            "decision": decision.model_dump(mode="json"),
+            "result": None,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            raise typer.Exit(code=1)
+        typer.echo(f"Action not executed: {decision.status.value}")
+        for reason in decision.reasons:
+            typer.echo(reason)
+        raise typer.Exit(code=1)
+    try:
+        result = execute_managed_action(project_root, route, decision, store)
+    except ValueError as exc:
+        payload = {
+            "schema_version": "harness.managed_action_run/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "instruction": instruction,
+            "route": route.model_dump(mode="json"),
+            "decision": decision.model_dump(mode="json"),
+            "errors": [str(exc)],
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            return
+        typer.echo(str(exc))
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.managed_action_run/v1",
+        "ok": result.ok,
+        "project_root": str(project_root),
+        "instruction": instruction,
+        "route": route.model_dump(mode="json"),
+        "decision": decision.model_dump(mode="json"),
+        "result": result.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(result.message)
+    if result.run_id:
+        typer.echo(f"Run: {result.run_id}")
+    if result.report_path:
+        typer.echo(f"Report: {result.report_path}")
+    if result.manifest_path:
+        typer.echo(f"Manifest: {result.manifest_path}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@actions_app.command("report")
+def actions_report(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        run = store.get_run(run_id)
+    except KeyError as exc:
+        _emit_managed_action_error("harness.managed_action_report/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    report_path = store.runs_dir / run.id / "final_report.md"
+    if not report_path.exists() or not report_path.read_text(encoding="utf-8").strip():
+        _emit_managed_action_error("harness.managed_action_report/v1", f"Managed action report not found: {run_id}", output)
+        raise typer.Exit(code=1)
+    payload = {
+        "schema_version": "harness.managed_action_report/v1",
+        "ok": True,
+        "run_id": run.id,
+        "path": str(report_path),
+        "content": report_path.read_text(encoding="utf-8"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(payload["content"])
+
+
 @artifacts_app.command("list")
 def artifacts_list(
     run_id: str,
@@ -1488,6 +1779,153 @@ def artifacts_inspect(
     _print_kv("SHA256", artifact.sha256 or "none")
     _print_kv("Size bytes", artifact.size_bytes if artifact.size_bytes is not None else "unknown")
     _print_kv("Path", artifact.path)
+
+
+@artifacts_app.command("open")
+def artifacts_open(
+    run_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        artifacts = store.verify_artifacts(run_id)
+    except KeyError as exc:
+        _emit_artifact_error("harness.artifacts_open/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    run_dir = project_root / HARNESS_DIR / "runs" / run_id
+    payload = {
+        "schema_version": "harness.artifacts_open/v1",
+        "ok": True,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "artifacts": [artifact.model_dump(mode="json") for artifact in artifacts],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Run artifacts: {run_dir}")
+    for artifact in artifacts:
+        typer.echo(f"{artifact.kind}: {artifact.path}")
+
+
+@app.command("report")
+def report(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        report_path = _ensure_product_report(store, run_id)
+    except KeyError as exc:
+        _emit_artifact_error("harness.report/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.report/v1",
+        "ok": True,
+        "run_id": run_id,
+        "path": str(report_path),
+        "content": report_path.read_text(encoding="utf-8"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(payload["content"])
+
+
+@app.command("diff")
+def diff(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        diff_artifact = _find_artifact_by_kind(store, run_id, {"isolated_diff", "diff", "patch", "diff.patch"})
+    except KeyError as exc:
+        _emit_artifact_error("harness.diff/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if diff_artifact is None:
+        payload = {"schema_version": "harness.diff/v1", "ok": False, "run_id": run_id, "error": "No diff artifact found."}
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            return
+        typer.echo("No diff artifact found for this run.")
+        raise typer.Exit(code=1)
+    content = diff_artifact.path.read_text(encoding="utf-8")
+    payload = {
+        "schema_version": "harness.diff/v1",
+        "ok": True,
+        "run_id": run_id,
+        "artifact": diff_artifact.model_dump(mode="json"),
+        "content": content,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(content)
+
+
+@app.command("reject")
+def reject(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        payload = _record_apply_decision(project_root, run_id, "rejected")
+    except KeyError as exc:
+        _emit_artifact_error("harness.apply_decision/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Rejected apply-back for {run_id}")
+    typer.echo(f"Decision artifact: {payload['artifact']['path']}")
+
+
+@app.command("apply")
+def apply(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        payload = _record_apply_decision(project_root, run_id, "apply_requested", ok=False)
+    except KeyError as exc:
+        _emit_artifact_error("harness.apply_decision/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload["error"] = (
+        "Direct product-spine apply is not enabled yet; use the existing codex_code_edit apply-back "
+        "approval path or inspect the diff artifact first."
+    )
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(payload["error"])
+    typer.echo(f"Decision artifact: {payload['artifact']['path']}")
+    raise typer.Exit(code=1)
+
+
+@app.command("undo")
+def undo(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        store = SQLiteStore(project_root)
+        store.get_run(run_id)
+    except KeyError as exc:
+        _emit_artifact_error("harness.undo/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    undo_path = project_root / HARNESS_DIR / "runs" / run_id / "undo.json"
+    payload = {
+        "schema_version": "harness.undo/v1",
+        "ok": False,
+        "run_id": run_id,
+        "error": "Undo metadata is not available for this run.",
+        "undo_path": str(undo_path),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(payload["error"])
+    typer.echo("Manual recovery: inspect the run report, manifest, and diff artifact.")
+    raise typer.Exit(code=1)
 
 
 @tools_app.command("list")
@@ -2547,7 +2985,7 @@ def backends_preflight(project: ProjectOption = Path("."), output: OutputOption 
 @app.command()
 def run(
     goal: str,
-    task_type: Annotated[str, typer.Option("--task-type", help="Task type route.")] = "codex_direct_agent",
+    task_type: Annotated[str, typer.Option("--task-type", help="Task type route. Use auto for product routing.")] = "auto",
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
     approve_hosted_boundary: Annotated[
@@ -2577,6 +3015,11 @@ def run(
     _require_initialized(project_root)
     cfg = load_config(project_root)
     store = SQLiteStore(project_root)
+    if task_type == "auto":
+        if route_instruction(goal).intent != "unsupported":
+            result = _run_product_session(goal, project_root, output=output)
+            raise typer.Exit(code=0 if result.get("ok") or result.get("status") == "waiting_approval" else 1)
+        task_type = "codex_direct_agent"
     if task_type == "codex_direct_agent":
         result = _run_codex_direct_agent_cli(
             goal,
@@ -2915,6 +3358,313 @@ def dev_create_run(
 def _require_initialized(project_root: Path) -> None:
     if not (project_root / HARNESS_DIR / "harness.sqlite").exists():
         raise typer.BadParameter(f"Project is not initialized. Run 'harness init --project {project_root}'.")
+    SQLiteStore(project_root).initialize()
+
+
+def _run_product_session(goal: str, project_root: Path, *, output: OutputFormat) -> dict:
+    store = SQLiteStore(project_root)
+    route = route_instruction(goal)
+    session = store.create_session(
+        workbench_id=route.workbench_id,
+        agent_id=route.agent_id,
+        mode=route.mode.value,
+        intent=route.intent,
+        metadata={"instruction": goal, "route": route.model_dump(mode="json")},
+    )
+    append_session_event(
+        project_root,
+        session_id=session.id,
+        event_type=SessionEventKind.SESSION_STARTED,
+        message="Session started",
+        payload={"instruction": goal},
+    )
+    route_event = append_session_event(
+        project_root,
+        session_id=session.id,
+        event_type=SessionEventKind.INTENT_ROUTED,
+        message=f"Routed as {route.intent}",
+        payload=route.model_dump(mode="json"),
+    )
+    if route.intent == "unsupported":
+        session = store.update_session(session.id, status=SessionStatus.FAILED)
+        event = append_session_event(
+            project_root,
+            session_id=session.id,
+            event_type=SessionEventKind.SESSION_FAILED,
+            message="No safe automatic route matched this instruction",
+            level="warning",
+            payload={"instruction": goal},
+        )
+        result = _product_session_payload(project_root, session.id, route, [route_event, event], ok=False)
+        _emit_product_session_result(result, output)
+        return result
+
+    objective = store.create_objective(
+        title=f"Session {route.intent}",
+        description=f"Session-requested workflow: {goal}",
+        priority=1000,
+        workbench_id=route.workbench_id,
+        metadata={"intent": route.intent},
+        session_id=session.id,
+    )
+    task = store.create_task(
+        title=f"Session task: {route.intent}",
+        description=goal,
+        priority=1000,
+        objective_id=objective.id,
+        workbench_id=route.workbench_id,
+        agent_id=route.agent_id,
+        metadata={"execution_adapter": route.execution_adapter, "task_type": route.task_type, "intent": route.intent},
+        required_approvals=["hosted_provider_codex"] if "hosted_provider_codex" in route.required_approvals else [],
+        session_id=session.id,
+    )
+    store.attach_session_to_objective(session.id, objective.id)
+    store.attach_session_to_task(session.id, task.id)
+
+    approval = None
+    if "hosted_provider_codex" in route.required_approvals:
+        approval = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", route.task_type)
+    if "hosted_provider_codex" in route.required_approvals and approval is None:
+        session = store.update_session(
+            session.id,
+            status=SessionStatus.WAITING_APPROVAL,
+            objective_id=objective.id,
+            active_task_id=task.id,
+        )
+        event = append_session_event(
+            project_root,
+            session_id=session.id,
+            objective_id=objective.id,
+            task_id=task.id,
+            event_type=SessionEventKind.APPROVAL_REQUIRED,
+            message="Hosted-boundary approval is required before execution",
+            level="warning",
+            payload={
+                "backend": "codex_cli",
+                "data_boundary": "hosted_provider",
+                "task_type": route.task_type,
+                "command": (
+                    "harness approvals add --backend codex_cli --data-boundary hosted_provider "
+                    f"--task-type {route.task_type}"
+                ),
+            },
+        )
+        result = _product_session_payload(project_root, session.id, route, [route_event, event], ok=True)
+        _emit_product_session_result(result, output)
+        return result
+
+    run = store.create_run(
+        goal=goal,
+        task_type=route.task_type,
+        status="created",
+        task_id=task.id,
+        objective_id=objective.id,
+        approval_id=approval.id if approval is not None else None,
+        session_id=session.id,
+    )
+    store.attach_session_to_run(session.id, run.id)
+    report_path = _write_product_report(store, run.id, instruction=goal, route=route, status="created")
+    artifact = store.register_artifact(run.id, "final_report", report_path, producer="product_session")
+    event = append_session_event(
+        project_root,
+        session_id=session.id,
+        objective_id=objective.id,
+        task_id=task.id,
+        run_id=run.id,
+        event_type=SessionEventKind.REPORT_READY,
+        message="Report ready",
+        payload={"report": str(report_path), "artifact_id": artifact.id},
+    )
+    session = store.update_session(session.id, status=SessionStatus.COMPLETED, active_run_id=run.id)
+    complete_event = append_session_event(
+        project_root,
+        session_id=session.id,
+        objective_id=objective.id,
+        task_id=task.id,
+        run_id=run.id,
+        event_type=SessionEventKind.SESSION_COMPLETED,
+        message="Session completed",
+        payload={"run_id": run.id},
+    )
+    result = _product_session_payload(project_root, session.id, route, [route_event, event, complete_event], ok=True)
+    _emit_product_session_result(result, output)
+    return result
+
+
+def _product_session_payload(project_root: Path, session_id: str, route: IntentRoute, events: list, *, ok: bool) -> dict:
+    store = SQLiteStore(project_root)
+    session = store.get_session(session_id)
+    artifacts = []
+    if session.active_run_id:
+        artifacts = [artifact.model_dump(mode="json") for artifact in store.verify_artifacts(session.active_run_id)]
+    return {
+        "schema_version": "harness.product_session/v1",
+        "ok": ok,
+        "status": session.status.value,
+        "session": session.model_dump(mode="json"),
+        "route": route.model_dump(mode="json"),
+        "transcript_path": str(session_transcript_path(project_root, session.id)),
+        "events": [event.model_dump(mode="json") for event in events],
+        "artifacts": artifacts,
+        "next_actions": _session_next_actions(session),
+    }
+
+
+def _emit_product_session_result(result: dict, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    for event in result["events"]:
+        typer.echo(render_session_event(event))
+    typer.echo(f"Session: {result['session']['id']}")
+    typer.echo(f"Status: {result['status']}")
+    typer.echo("Next:")
+    for action in result["next_actions"]:
+        typer.echo(f"  {action}")
+
+
+def _session_next_actions(session) -> list[str]:
+    if session.status == SessionStatus.WAITING_APPROVAL:
+        return [
+            "approve hosted boundary with harness approvals add",
+            f"resume with harness resume {session.id}",
+            f"inspect with harness sessions inspect {session.id}",
+        ]
+    actions = [f"inspect with harness sessions inspect {session.id}"]
+    if session.active_run_id:
+        actions.extend(
+            [
+                f"report with harness report {session.active_run_id}",
+                f"artifacts with harness artifacts open {session.active_run_id}",
+                f"diff with harness diff {session.active_run_id}",
+            ]
+        )
+    return actions
+
+
+def _write_product_report(
+    store: SQLiteStore,
+    run_id: str,
+    *,
+    instruction: str,
+    route: IntentRoute | None,
+    status: str,
+) -> Path:
+    run = store.get_run(run_id)
+    report_path = store.runs_dir / run_id / "final_report.md"
+    route_name = route.intent if route is not None else (run.task_type or "unknown")
+    mode = route.mode.value if route is not None else "unknown"
+    expected_outputs = route.expected_outputs if route is not None else []
+    report_path.write_text(
+        "\n".join(
+            [
+                "# Harness Run Report",
+                "",
+                "## Summary",
+                f"- Instruction: {instruction}",
+                f"- Intent: {route_name}",
+                f"- Route: {mode}",
+                f"- Status: {status}",
+                "",
+                "## Work Performed",
+                "- Read: see transcript and run events",
+                "- Edited: see diff artifact when present",
+                "- Tested: see test_result.json when present",
+                "- Reviewed: see policy and manifest evidence",
+                "",
+                "## Policy And Approvals",
+                f"- Hosted boundary: {run.approval_id or 'not approved'}",
+                "- Isolation: required for edit routes",
+                "- Path policy: see manifest",
+                "- Secret scan: see artifact redaction state",
+                "- Apply-back: separate explicit decision",
+                "",
+                "## Artifacts",
+                "- Transcript: session transcript when run is session-linked",
+                "- Patch: diff artifact when present",
+                "- Test result: test_result.json when present",
+                "- Manifest: manifest.json",
+                f"- Expected outputs: {', '.join(expected_outputs) if expected_outputs else 'none'}",
+                "",
+                "## Next Actions",
+                f"- apply: harness apply {run_id}",
+                f"- reject: harness reject {run_id}",
+                f"- retry: harness run \"{instruction}\"",
+                f"- inspect: harness artifacts open {run_id}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def _ensure_product_report(store: SQLiteStore, run_id: str) -> Path:
+    run = store.get_run(run_id)
+    report_path = store.runs_dir / run_id / "final_report.md"
+    if report_path.exists() and report_path.read_text(encoding="utf-8").strip():
+        return report_path
+    return _write_product_report(
+        store,
+        run_id,
+        instruction=run.goal or "",
+        route=None,
+        status=run.status,
+    )
+
+
+def _find_artifact_by_kind(store: SQLiteStore, run_id: str, kinds: set[str]):
+    artifacts = store.verify_artifacts(run_id)
+    normalized = {kind.lower() for kind in kinds}
+    for artifact in artifacts:
+        if artifact.kind.lower() in normalized or artifact.path.name.lower() in normalized:
+            return artifact
+    return None
+
+
+def _record_apply_decision(project_root: Path, run_id: str, decision: str, *, ok: bool = True) -> dict:
+    store = SQLiteStore(project_root)
+    run = store.get_run(run_id)
+    run_dir = project_root / HARNESS_DIR / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    decision_path = run_dir / "apply_back.json"
+    payload = {
+        "schema_version": "harness.apply_back_decision/v1",
+        "ok": ok,
+        "run_id": run_id,
+        "decision": decision,
+        "session_id": run.session_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    decision_path.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+    artifact = store.register_artifact(run_id, "apply_back", decision_path, producer="product_session")
+    store.append_event(run_id, "info", "apply_back_decision", f"Apply-back decision: {decision}", payload)
+    if run.session_id:
+        append_session_event(
+            project_root,
+            session_id=run.session_id,
+            run_id=run_id,
+            event_type=SessionEventKind.APPLY_DECIDED,
+            message=f"Apply-back decision: {decision}",
+            payload={"artifact_id": artifact.id, "decision": decision},
+        )
+    payload["artifact"] = artifact.model_dump(mode="json")
+    return payload
+
+
+def _emit_session_error(message: str, output: OutputFormat) -> None:
+    payload = {"schema_version": "harness.session_error/v1", "ok": False, "error": message}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+    else:
+        typer.echo(message)
+
+
+def _emit_managed_action_error(schema_version: str, message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": schema_version, "ok": False, "errors": [message]})
+    else:
+        typer.echo(message)
 
 
 def _split_csv(value: str | None) -> list[str]:
