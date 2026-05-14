@@ -28,6 +28,7 @@ class ChatContext:
 @dataclass(frozen=True)
 class ChatDelta:
     content: str
+    kind: str = "content"
 
 
 @dataclass(frozen=True)
@@ -50,7 +51,7 @@ class LocalOpenAIChatModel:
     backend: LocalOpenAICompatibleBackend
 
     def stream(self, messages: list[ChatMessage], context: ChatContext) -> Iterator[ChatDelta]:
-        yield ChatDelta(content=self.complete(messages, context).content)
+        yield ChatDelta(content=self.complete(messages, context).content, kind="content")
 
     def complete(self, messages: list[ChatMessage], context: ChatContext) -> ChatResponse:
         payload = [{"role": message.role, "content": message.content} for message in messages]
@@ -63,7 +64,29 @@ class CodexCliChatModel:
     project_root: Path
 
     def stream(self, messages: list[ChatMessage], context: ChatContext) -> Iterator[ChatDelta]:
-        yield ChatDelta(content=self.complete(messages, context).content)
+        prompt = _codex_chat_prompt(messages, context)
+        try:
+            with tempfile.TemporaryDirectory(prefix="harness-codex-chat-") as tmp:
+                final_message_path = Path(tmp) / "final_message.md"
+                result = None
+                for event in self.backend.stream_read_only(self.project_root, prompt, final_message_path):
+                    if event["type"] == "completed":
+                        result = event["result"]
+                        continue
+                    event_text = _codex_stream_event_text(event.get("event") or {})
+                    if event_text:
+                        yield ChatDelta(content=event_text, kind="reasoning")
+                if result is None:
+                    raise LocalEndpointUnavailable("Codex CLI stream ended without a completion event.")
+        except Exception as exc:
+            if isinstance(exc, LocalEndpointUnavailable):
+                raise
+            raise LocalEndpointUnavailable(f"Codex CLI subscription chat is unavailable. Details: {exc}") from exc
+        if result.exit_status != 0:
+            message = (result.stderr or result.stdout or "Codex CLI returned a non-zero exit status.").strip()
+            raise LocalEndpointUnavailable(f"Codex CLI subscription chat failed. Details: {message}")
+        content = result.final_message or _last_assistant_message(result.json_events) or result.stdout
+        yield ChatDelta(content=content.strip(), kind="content")
 
     def complete(self, messages: list[ChatMessage], context: ChatContext) -> ChatResponse:
         prompt = _codex_chat_prompt(messages, context)
@@ -121,4 +144,51 @@ def _last_assistant_message(events: list[dict[str, Any]]) -> str | None:
         message = event.get("message") or event.get("content") or event.get("text")
         if isinstance(message, str) and message.strip():
             return message
+    return None
+
+
+def _codex_stream_event_text(event: dict[str, Any]) -> str | None:
+    event_type = str(event.get("type") or event.get("event") or "").replace("_", " ").replace(".", " ")
+    lower_type = event_type.casefold()
+    if not event:
+        return None
+    if "reason" in lower_type or _nested_type_contains(event, "reason"):
+        text = _first_nested_text(event, keys={"summary", "text", "content", "message"})
+        if text:
+            return f"Reasoning: {text}"
+        return f"Reasoning: {event_type or 'model reasoning'}"
+    if "tool" in lower_type or _nested_type_contains(event, "tool"):
+        text = _first_nested_text(event, keys={"name", "tool", "command", "message"})
+        return f"Tool: {text or event_type or 'tool event'}"
+    if "turn" in lower_type or "step" in lower_type:
+        return event_type.capitalize()
+    return None
+
+
+def _nested_type_contains(value: Any, needle: str) -> bool:
+    if isinstance(value, dict):
+        item_type = str(value.get("type") or value.get("kind") or "").casefold()
+        if needle in item_type:
+            return True
+        return any(_nested_type_contains(item, needle) for item in value.values())
+    if isinstance(value, list):
+        return any(_nested_type_contains(item, needle) for item in value)
+    return False
+
+
+def _first_nested_text(value: Any, *, keys: set[str]) -> str | None:
+    if isinstance(value, dict):
+        for key in keys:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                return " ".join(item.strip().split())
+        for item in value.values():
+            found = _first_nested_text(item, keys=keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_nested_text(item, keys=keys)
+            if found:
+                return found
     return None

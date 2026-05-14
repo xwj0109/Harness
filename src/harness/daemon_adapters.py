@@ -43,7 +43,14 @@ def execute_read_only_summary_lease(
     if backend_config.metadata.allow_network:
         _record_read_only_rejection(store, lease, attempt, task, "unsafe_backend", ["Read-only execution requires backend allow_network=false"])
         raise ValueError("Read-only execution requires backend allow_network=false")
-    approval = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", "read_only_repo_summary")
+    approval = ApprovalStore(project_root).find_valid(
+        "codex_cli",
+        "hosted_provider",
+        "read_only_repo_summary",
+        adapter_id="read_only_summary",
+        workbench_id=task.workbench_id,
+        objective_id=task.objective_id,
+    )
     if approval is None:
         _record_read_only_rejection(
             store,

@@ -95,6 +95,8 @@ def _normalize_arguments(tool: str, arguments: dict[str, Any], *, project_root: 
         adapter = _optional_string_arg(safe_args, "execution_adapter") or "dry_run"
         task_type = _optional_string_arg(safe_args, "task_type") or _default_task_type(adapter)
         _validate_adapter_task_type(adapter, task_type)
+        metadata = safe_args.get("metadata") if isinstance(safe_args.get("metadata"), dict) else {}
+        _validate_adapter_task_metadata(adapter, metadata)
         return {
             "title": _string_arg(safe_args, "title") or _string_arg(safe_args, "goal") or "Chat-created task",
             "description": _string_arg(safe_args, "description") or _string_arg(safe_args, "goal") or "",
@@ -103,6 +105,7 @@ def _normalize_arguments(tool: str, arguments: dict[str, Any], *, project_root: 
             "agent_id": _optional_string_arg(safe_args, "agent_id"),
             "execution_adapter": adapter,
             "task_type": task_type,
+            "metadata": metadata,
         }
     if tool == "create_task_graph":
         goal = _string_arg(safe_args, "goal") or _string_arg(safe_args, "title") or "Chat-created objective"
@@ -119,7 +122,16 @@ def _normalize_arguments(tool: str, arguments: dict[str, Any], *, project_root: 
                 "template": template.to_payload(),
                 "tasks": [task.to_payload() for task in template.tasks],
             }
-        return {"goal": goal, "workbench_id": _optional_string_arg(safe_args, "workbench_id"), "tasks": list(safe_args.get("tasks") or [])}
+        raw_tasks = list(safe_args.get("tasks") or [])
+        for raw_task in raw_tasks:
+            if not isinstance(raw_task, dict):
+                continue
+            adapter = _optional_string_arg(raw_task, "execution_adapter") or "dry_run"
+            task_type = _optional_string_arg(raw_task, "task_type") or _default_task_type(adapter)
+            _validate_adapter_task_type(adapter, task_type)
+            metadata = raw_task.get("metadata") if isinstance(raw_task.get("metadata"), dict) else {}
+            _validate_adapter_task_metadata(adapter, metadata)
+        return {"goal": goal, "workbench_id": _optional_string_arg(safe_args, "workbench_id"), "tasks": raw_tasks}
     if tool in {"edit_isolated", "run_tests", "dispatch_registered_adapter", "apply_back", "deny_apply_back", "revert_pending_change", "request_approval", "remember", "forget_memory"}:
         normalized = dict(safe_args)
         if "goal" not in normalized and "summary" in normalized:
@@ -215,6 +227,18 @@ def _validate_adapter_task_type(adapter: str, task_type: str) -> None:
             raise ValueError(f"Task type {task_type} is not supported by adapter {adapter}")
         return
     raise ValueError(f"Unknown execution adapter: {adapter}")
+
+
+def _validate_adapter_task_metadata(adapter: str, metadata: dict[str, Any]) -> None:
+    if not metadata:
+        return
+    for descriptor in list_execution_adapter_descriptors():
+        if descriptor.id != adapter:
+            continue
+        rejected = sorted(key for key in descriptor.rejected_task_metadata if metadata.get(key))
+        if rejected:
+            raise ValueError(f"Task metadata is rejected by adapter {adapter}: {', '.join(rejected)}")
+        return
 
 
 def _string_arg(arguments: dict[str, Any], key: str) -> str:

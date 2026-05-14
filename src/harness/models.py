@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -231,6 +231,7 @@ class MemoryScopeType(str, Enum):
     WORKBENCH = "workbench"
     AGENT = "agent"
     OBJECTIVE = "objective"
+    TASK = "task"
 
 
 class MemorySourceKind(str, Enum):
@@ -239,6 +240,10 @@ class MemorySourceKind(str, Enum):
     RUN = "run"
     TASK = "task"
     OBJECTIVE = "objective"
+    ARTIFACT_SUMMARY = "artifact_summary"
+    OBJECTIVE_STATE = "objective_state"
+    RUN_REVIEW = "run_review"
+    FAILED_ATTEMPT_SUMMARY = "failed_attempt_summary"
 
 
 class MemoryRedactionState(str, Enum):
@@ -354,6 +359,11 @@ class ExecutionAdapterDescriptor(BaseModel):
     side_effect_summary: str
     replay_policy: ToolReplayPolicy
     safety_notes: list[str] = Field(default_factory=list)
+    autonomy_default: Literal["auto_allowed", "approval_required", "forbidden"] = "approval_required"
+    max_autonomous_retries: int = 0
+    required_autonomy_scopes: list[str] = Field(default_factory=list)
+    output_contracts: list[str] = Field(default_factory=list)
+    terminal_evidence_required: list[str] = Field(default_factory=list)
 
 
 class CapabilityRecord(BaseModel):
@@ -794,6 +804,9 @@ class RunManifest(BaseModel):
     backend_descriptor_sha256: str | None = None
     sandbox_profile: dict[str, Any] | None = None
     validation_results: dict[str, Any] | None = None
+    autonomy_decision_id: str | None = None
+    autonomous_approval_id: str | None = None
+    autonomous_outcome_id: str | None = None
     context_provenance: list[ContextProvenanceRecord] = Field(default_factory=list)
     untrusted_context_warnings: list[str] = Field(default_factory=list)
 

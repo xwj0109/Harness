@@ -1,7 +1,9 @@
 import json
 import asyncio
 import sqlite3
+import subprocess
 import tomllib
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -107,6 +109,133 @@ def test_cli_home_text_output_is_sectioned_and_non_mutating(tmp_path) -> None:
     assert "harness init --project" in result.output
     assert "\nSafety\n" in result.output
     assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_autonomy_policy_inspect_json_is_read_only(tmp_path) -> None:
+    result = runner.invoke(
+        app,
+        ["autonomy", "policy", "inspect", "--project", str(tmp_path), "--profile", "safe-local", "--output", "json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.autonomy_policy_inspect/v1"
+    assert payload["ok"] is True
+    assert payload["policy"]["id"] == "safe-local"
+    assert "daemon-safe" in payload["available_profiles"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_plain_autonomous_auto_executes_allowed_action_contract(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FakeChatModel:
+        def complete(self, _messages, _context):
+            from harness.chat_model import ChatResponse
+
+            return ChatResponse(
+                content='{"type":"harness.tool_request/v1","tool":"create_objective","arguments":{"title":"CLI autonomous objective"}}'
+            )
+
+    monkeypatch.setattr("harness.chat.build_default_chat_model", lambda _project_root: FakeChatModel())
+
+    result = runner.invoke(app, ["--project", str(tmp_path), "--plain", "--autonomous"], input="create objective\n/quit\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Autonomy: safe-local" in result.output
+    assert "Autonomy profile safe-local auto-approved this action contract." in result.output
+    assert "Objective Created" in result.output
+    objectives = SQLiteStore(tmp_path).list_objectives()
+    assert [objective.title for objective in objectives] == ["CLI autonomous objective"]
+    assert (tmp_path / ".harness" / "autonomy" / "approvals.jsonl").exists()
+
+
+def test_cli_act_runs_read_only_loop_with_json_evidence(tmp_path, monkeypatch) -> None:
+    (tmp_path / "README.md").write_text("# CLI Act\n", encoding="utf-8")
+
+    class FakeChatModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, _messages, _context):
+            from harness.chat_model import ChatResponse
+
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(
+                    content='{"type":"harness.tool_request/v1","tool":"read_file","arguments":{"path":"README.md"}}'
+                )
+            return ChatResponse(content="Evidence from README: CLI Act.")
+
+    monkeypatch.setattr("harness.chat.build_default_chat_model", lambda _project_root: FakeChatModel())
+
+    result = runner.invoke(
+        app,
+        ["act", "summarize this repo", "--project", str(tmp_path), "--autonomy", "safe-local", "--output", "json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.autonomous_read_loop/v1"
+    assert payload["ok"] is True
+    assert payload["stop_reason"] == "final_answer"
+    assert payload["tool_results"] == [{"tool": "read_file", "ok": True, "error_type": None}]
+    assert Path(payload["evidence_path"]).exists()
+
+
+def test_cli_act_can_create_and_run_local_task_graph(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FakeChatModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(self, _messages, _context):
+            from harness.chat_model import ChatResponse
+
+            self.calls += 1
+            if self.calls == 1:
+                return ChatResponse(
+                    content=json.dumps(
+                        {
+                            "type": "harness.tool_request/v1",
+                            "tool": "create_task_graph",
+                            "arguments": {
+                                "goal": "CLI act graph",
+                                "tasks": [
+                                    {
+                                        "title": "CLI act dry run",
+                                        "execution_adapter": "dry_run",
+                                        "task_type": "phase_1a_test",
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+            return ChatResponse(content="Created and ran the local task graph.")
+
+    monkeypatch.setattr("harness.chat.build_default_chat_model", lambda _project_root: FakeChatModel())
+
+    result = runner.invoke(
+        app,
+        ["act", "create and run a local graph", "--project", str(tmp_path), "--autonomy", "safe-local", "--output", "json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.autonomous_read_loop/v1"
+    assert payload["ok"] is True
+    assert [item["tool"] for item in payload["tool_results"]] == [
+        "create_task_graph",
+        "create_task_graph",
+        "objectives.run",
+    ]
+    assert payload["tool_results"][1]["kind"] == "action_contract_executed"
+    assert payload["tool_results"][2]["stop_reason"] == "objective_succeeded"
+    store = SQLiteStore(tmp_path)
+    assert [task.status.value for task in store.list_tasks()] == ["succeeded"]
+    assert len(store.list_runs()) == 1
 
 
 def test_cli_root_launches_unified_app(tmp_path, monkeypatch) -> None:
@@ -249,11 +378,19 @@ def test_cli_chat_interactive_smoke_exits_without_mutation(tmp_path) -> None:
     assert not (tmp_path / ".harness").exists()
 
 
-def test_cli_chat_plain_text_replies_with_deterministic_guidance(tmp_path) -> None:
+def test_cli_chat_plain_text_replies_with_model_answer_without_mutation(tmp_path, monkeypatch) -> None:
+    class FakeChatModel:
+        def complete(self, _messages, _context):
+            from harness.chat_model import ChatResponse
+
+            return ChatResponse(content="I can inspect local Harness state and prepare explicit actions.")
+
+    monkeypatch.setattr("harness.chat.build_default_chat_model", lambda _project_root: FakeChatModel())
+
     result = runner.invoke(app, ["--project", str(tmp_path), "--plain"], input="hello\n/quit\n")
 
     assert result.exit_code == 0, result.output
-    assert "Harness: Harness Guidance" in result.output
+    assert "Harness: Assistant" in result.output
     assert "I can inspect local Harness state and prepare explicit actions." in result.output
     assert "Intent Routing Disabled" not in result.output
     assert not (tmp_path / ".harness").exists()
@@ -3282,7 +3419,13 @@ def test_chat_task_draft_confirm_and_decline_flows(tmp_path) -> None:
     assert [task["execution_adapter"] for task in codex_draft["draft"]["tasks"]] == [
         "repo_planning",
         "codex_isolated_edit",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+        "dry_run",
     ]
+    assert codex_draft["draft"]["tasks"][3]["agent_id"] == "implementation_reviewer"
+    assert codex_draft["draft"]["tasks"][4]["agent_id"] == "security_reviewer"
     assert "Apply-back is not automatic and remains denied by default." in codex_draft["draft"]["safety_notes"]
 
 
@@ -3396,7 +3539,16 @@ def test_chat_codex_missing_hosted_approval_rejects_before_run(tmp_path, monkeyp
     rendered = "\n".join(rejected["lines"])
     assert draft["kind"] == "orchestration_draft"
     assert draft["draft"]["orchestrator_id"] == "coding_orchestrator"
-    assert [task["execution_adapter"] for task in draft["draft"]["tasks"]] == ["repo_planning", "codex_isolated_edit"]
+    assert [task["execution_adapter"] for task in draft["draft"]["tasks"]] == [
+        "repo_planning",
+        "codex_isolated_edit",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+    ]
+    assert draft["draft"]["tasks"][3]["agent_id"] == "implementation_reviewer"
+    assert draft["draft"]["tasks"][4]["agent_id"] == "security_reviewer"
     assert rejected["ok"] is False
     assert rejected["kind"] == "orchestration_result"
     assert rejected["orchestration"]["results"][0]["decision"] == "execution_adapter_rejected"
@@ -4298,7 +4450,8 @@ def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path)
         "statistical_validity_reviewer",
     }
     quant_groups = {"quant_research", "quant_development", "trading_analysis", "review"}
-    assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | quant_agents) <= set(
+    coding_reviewers = {"implementation_reviewer", "security_reviewer", "factuality_reviewer"}
+    assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | coding_reviewers | quant_agents) <= set(
         payload["agents"]
     )
     assert {"coding", "quant", "personal"} <= set(payload["workbenches"])
@@ -4332,7 +4485,15 @@ def test_cli_specs_workbench_supports_json_output() -> None:
     assert payload["schema_version"] == "harness.workbench_spec/v1"
     assert payload["workbench"]["id"] == "coding"
     assert payload["workbench"]["default_model_profile"] == "codex_supervised"
-    assert {"coding_orchestrator", "repo_inspector", "code_editor", "test_runner"} <= set(payload["workbench"]["allowed_agents"])
+    assert {
+        "coding_orchestrator",
+        "repo_inspector",
+        "code_editor",
+        "test_runner",
+        "implementation_reviewer",
+        "security_reviewer",
+        "factuality_reviewer",
+    } <= set(payload["workbench"]["allowed_agents"])
 
 
 def test_cli_specs_quant_workbench_exposes_v0_6_declarative_agents_without_runtime_leaks(tmp_path) -> None:
@@ -4421,7 +4582,10 @@ def test_cli_specs_default_outputs_remain_text() -> None:
     assert workbench.exit_code == 0
     assert not workbench.output.lstrip().startswith("{")
     assert "Workbench: coding" in workbench.output
-    assert "Allowed agents: coding_orchestrator, repo_inspector, code_editor, test_runner" in workbench.output
+    assert (
+        "Allowed agents: coding_orchestrator, repo_inspector, code_editor, test_runner, "
+        "implementation_reviewer, security_reviewer, factuality_reviewer"
+    ) in workbench.output
 
 
 def test_cli_specs_missing_ids_fail_without_creating_harness_dir(tmp_path) -> None:
@@ -4999,6 +5163,104 @@ def test_cli_repo_planning_uses_valid_approval_profile(tmp_path, monkeypatch) ->
 
 def test_existing_read_only_route_uses_codex_subscription(tmp_path, monkeypatch) -> None:
     test_cli_run_read_only_repo_summary_with_mocked_codex_backend(tmp_path, monkeypatch)
+
+
+def test_cli_bare_prompt_runs_codex_direct_agent(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True, capture_output=True)
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(available=True, metadata=self.config.metadata, capabilities=self.config.capabilities)
+
+        def run_direct_agent(self, project_root, prompt, final_message_path, *, model=None, reasoning_effort=None):
+            assert prompt == "change value"
+            assert model == "gpt-test"
+            assert reasoning_effort == "medium"
+            (Path(project_root) / "app.py").write_text("value = 2\n", encoding="utf-8")
+            final_message_path.write_text("Changed the value.", encoding="utf-8")
+            self.config.settings["last_codex_approval_mode"] = "on-request via --ask-for-approval"
+            self.config.settings["last_codex_sandbox_mode"] = "workspace-write"
+            self.config.settings["last_apply_back_approval_required"] = False
+            return (
+                CodexRunResult(
+                    command=["codex", "exec", "--cd", str(project_root), "--sandbox", "workspace-write", prompt],
+                    stdout='{"type":"done","message":"Changed"}\n',
+                    stderr="",
+                    exit_status=0,
+                    json_events=[{"type": "done", "message": "Changed"}],
+                    final_message="Changed the value.",
+                ),
+                self.config.capabilities,
+                "network not enforceable in fake",
+            )
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    result = runner.invoke(
+        app,
+        [
+            "change value",
+            "--project",
+            str(tmp_path),
+            "--model",
+            "gpt-test",
+            "--reasoning-effort",
+            "medium",
+            "--no-stream",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Codex foreground agent" in result.output
+    assert "Changed files: app.py" in result.output
+    assert "Changed the value." in result.output
+    assert "value = 2" in (tmp_path / "app.py").read_text(encoding="utf-8")
+    run_id = result.output.split("Created run ", 1)[1].splitlines()[0]
+    report = tmp_path / ".harness" / "runs" / run_id / "final_report.md"
+    report_text = report.read_text(encoding="utf-8")
+    assert "Direct workspace edits: true" in report_text
+    assert "Apply-back approval required: False" in report_text
+
+
+def test_cli_run_defaults_to_codex_direct_agent_json(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True, capture_output=True)
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(available=True, metadata=self.config.metadata, capabilities=self.config.capabilities)
+
+        def run_direct_agent(self, project_root, prompt, final_message_path, *, model=None, reasoning_effort=None):
+            (Path(project_root) / "app.py").write_text("value = 3\n", encoding="utf-8")
+            final_message_path.write_text("Changed through run.", encoding="utf-8")
+            self.config.settings["last_codex_approval_mode"] = "on-request via --ask-for-approval"
+            self.config.settings["last_codex_sandbox_mode"] = "workspace-write"
+            self.config.settings["last_apply_back_approval_required"] = False
+            return (
+                CodexRunResult(["codex", "exec", prompt], "", "", 0, [], "Changed through run."),
+                self.config.capabilities,
+                "",
+            )
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    result = runner.invoke(app, ["run", "change value", "--project", str(tmp_path), "--output", "json", "--no-stream"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.codex_direct_agent/v1"
+    assert payload["status"] == "completed"
+    assert payload["changed_files"] == ["app.py"]
+    assert "value = 3" in (tmp_path / "app.py").read_text(encoding="utf-8")
 
 
 def test_cli_simple_code_edit_routes_to_local_backend_only(tmp_path, monkeypatch) -> None:

@@ -1373,6 +1373,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._focus_mode = "dashboard"
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
+            self._request_in_flight = False
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
@@ -1417,13 +1418,65 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if event.input.id != "prompt":
                 return
             request = event.value.strip()
-            if not request:
+            if not request or self._request_in_flight:
                 return
             self._messages.append({"role": "user", "title": request, "lines": []})
-            response = handle_chat_input(request, project_root, self._chat_state)
-            self._latest_response = dict(response)
-            self._messages.append(_chat_response_to_tui_message(response))
+            stream_index = len(self._messages)
+            self._messages.append({"role": "assistant", "title": "Assistant", "lines": ["Starting model turn..."]})
             event.input.value = ""
+            event.input.placeholder = "Model is responding..."
+            self._request_in_flight = True
+            self._render_chat()
+            self._render_current_view()
+            self.run_worker(lambda: self._run_chat_request(request, stream_index), thread=True)
+
+        def _run_chat_request(self, request: str, stream_index: int) -> None:
+            def progress(update: dict) -> None:
+                self.call_from_thread(self._append_stream_update, stream_index, update)
+
+            try:
+                response = handle_chat_input(request, project_root, self._chat_state, progress_callback=progress)
+            except Exception as exc:
+                response = {
+                    "ok": False,
+                    "kind": "chat_error",
+                    "title": "Chat Error",
+                    "lines": [str(exc)],
+                }
+            self.call_from_thread(self._finish_chat_request, stream_index, response)
+
+        def _append_stream_update(self, stream_index: int, update: dict) -> None:
+            if stream_index >= len(self._messages):
+                return
+            message = self._messages[stream_index]
+            lines = list(message.get("lines") or [])
+            content = str(update.get("content") or "").strip()
+            if not content:
+                return
+            if lines == ["Starting model turn..."]:
+                lines = []
+            kind = str(update.get("kind") or "content")
+            for line in content.splitlines():
+                clean = line.strip()
+                if not clean:
+                    continue
+                if kind == "content":
+                    lines.append(clean)
+                elif not lines or lines[-1] != clean:
+                    lines.append(clean)
+            message["title"] = "Assistant Streaming"
+            message["lines"] = lines[-80:]
+            self._render_chat()
+
+        def _finish_chat_request(self, stream_index: int, response: dict) -> None:
+            self._latest_response = dict(response)
+            if stream_index < len(self._messages):
+                self._messages[stream_index] = _chat_response_to_tui_message(response)
+            else:
+                self._messages.append(_chat_response_to_tui_message(response))
+            self._request_in_flight = False
+            prompt = self.query_one("#prompt", Input)
+            prompt.placeholder = "Ask Harness or type /help"
             self._render_chat()
             self._render_current_view()
             if response.get("kind") == "quit":

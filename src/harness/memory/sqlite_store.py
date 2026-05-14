@@ -795,14 +795,18 @@ class SQLiteStore:
         depends_on: list[str] | None = None,
         required_approvals: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> TaskRecord:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
-        idempotency_key = f"task_idem_{uuid.uuid4().hex[:16]}"
+        idempotency_key = idempotency_key or f"task_idem_{uuid.uuid4().hex[:16]}"
         timestamp = now_iso()
         depends_on = depends_on or []
         required_approvals = required_approvals or []
         metadata = metadata or {}
         with self.connect() as conn:
+            existing = conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
+            if existing is not None:
+                return self._row_to_task(existing)
             if objective_id is not None:
                 self._require_objective(conn, objective_id)
             for dependency_id in depends_on:
@@ -982,6 +986,113 @@ class SQLiteStore:
             )
         return record
 
+    def save_derived_memory(
+        self,
+        scope_type: str | MemoryScopeType,
+        scope_id: str,
+        source_kind: str | MemorySourceKind,
+        summary: str,
+        *,
+        source_id: str,
+        source_artifact_id: str | None = None,
+    ) -> MemoryRecord:
+        scope = MemoryScopeType(scope_type.value if isinstance(scope_type, MemoryScopeType) else scope_type)
+        kind = MemorySourceKind(source_kind.value if isinstance(source_kind, MemorySourceKind) else source_kind)
+        trimmed = summary.strip()
+        if not trimmed:
+            raise ValueError("Derived memory summary cannot be empty.")
+        source_links = self._validate_derived_memory_source(kind, source_id, source_artifact_id)
+        findings = scan_text_for_secrets(trimmed)
+        stored_summary = redact_secret_text(trimmed) if findings else trimmed
+        redaction_state = MemoryRedactionState.REDACTED if findings else MemoryRedactionState.NOT_REQUIRED
+        encoded = stored_summary.encode("utf-8")
+        memory_id = f"mem_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        lineage = {
+            "source": kind.value,
+            "source_id": source_id,
+            "source_artifact_id": source_artifact_id,
+            **source_links,
+            "secret_findings": [finding.to_dict() for finding in findings],
+            "permission_granting": False,
+            "policy_authority": False,
+            "approval_authority": False,
+            "redaction_state": redaction_state.value,
+            "authority_claims_stripped": _authority_claim_codes(trimmed),
+        }
+        record = MemoryRecord(
+            id=memory_id,
+            scope_type=scope,
+            scope_id=scope_id,
+            source_kind=kind,
+            source_id=source_id,
+            source_artifact_id=source_artifact_id,
+            summary=stored_summary,
+            redaction_state=redaction_state,
+            sha256=hashlib.sha256(encoded).hexdigest(),
+            size_bytes=len(encoded),
+            created_at=parse_dt(timestamp),
+            updated_at=parse_dt(timestamp),
+            lineage=sanitize_for_logging(lineage),
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_records (
+                  id, scope_type, scope_id, source_kind, source_id, source_artifact_id,
+                  summary, redaction_state, sha256, size_bytes, created_at, updated_at, lineage_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.id,
+                    record.scope_type.value,
+                    record.scope_id,
+                    record.source_kind.value,
+                    record.source_id,
+                    record.source_artifact_id,
+                    record.summary,
+                    record.redaction_state.value,
+                    record.sha256,
+                    record.size_bytes,
+                    timestamp,
+                    timestamp,
+                    json.dumps(record.lineage, sort_keys=True, default=str),
+                ),
+            )
+        return record
+
+    def _validate_derived_memory_source(
+        self,
+        source_kind: MemorySourceKind,
+        source_id: str,
+        source_artifact_id: str | None,
+    ) -> dict[str, Any]:
+        if source_kind == MemorySourceKind.ARTIFACT_SUMMARY:
+            if not source_artifact_id:
+                raise ValueError("artifact_summary memory requires source_artifact_id.")
+            artifact = self.get_artifact(source_artifact_id)
+            return {
+                "source_run_id": artifact.run_id,
+                "source_artifact_kind": artifact.kind,
+                "source_artifact_sha256": artifact.sha256,
+                "source_artifact_redaction_state": artifact.redaction_state,
+            }
+        if source_kind == MemorySourceKind.OBJECTIVE_STATE:
+            objective = self.get_objective(source_id)
+            return {"source_objective_id": objective.id, "source_objective_status": objective.status.value}
+        if source_kind == MemorySourceKind.RUN_REVIEW:
+            run = self.get_run(source_id)
+            return {"source_run_id": run.id, "source_run_status": run.status, "source_task_id": run.task_id}
+        if source_kind == MemorySourceKind.FAILED_ATTEMPT_SUMMARY:
+            attempt = self.get_task_attempt(source_id)
+            return {
+                "source_attempt_id": attempt.id,
+                "source_task_id": attempt.task_id,
+                "source_run_id": attempt.run_id,
+                "source_attempt_status": attempt.status.value,
+            }
+        raise ValueError(f"Unsupported derived memory source: {source_kind.value}")
+
     def list_memory_records(
         self,
         scope_type: str | MemoryScopeType | None = None,
@@ -1112,18 +1223,31 @@ class SQLiteStore:
         self,
         owner: str = DEFAULT_TASK_LEASE_OWNER,
         lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+        objective_id: str | None = None,
     ) -> dict[str, TaskAttempt | TaskLease | TaskRecord] | None:
         timestamp = now_iso()
         expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
             rows = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE status IN (?, ?)
-                ORDER BY priority DESC, created_at ASC
-                """,
-                (TaskStatus.READY.value, TaskStatus.BLOCKED.value),
+                (
+                    """
+                    SELECT * FROM tasks
+                    WHERE status IN (?, ?) AND objective_id = ?
+                    ORDER BY priority DESC, created_at ASC
+                    """
+                    if objective_id is not None
+                    else """
+                    SELECT * FROM tasks
+                    WHERE status IN (?, ?)
+                    ORDER BY priority DESC, created_at ASC
+                    """
+                ),
+                (TaskStatus.READY.value, TaskStatus.BLOCKED.value, objective_id)
+                if objective_id is not None
+                else (TaskStatus.READY.value, TaskStatus.BLOCKED.value),
             ).fetchall()
             for row in rows:
                 task = self._row_to_task(row)
@@ -1538,10 +1662,16 @@ class SQLiteStore:
                     "No backend, tool, Docker, shell, network, hosted provider, or paid provider was invoked.",
                     "",
                     f"- Task id: {task.id}",
+                    f"- Objective id: {task.objective_id or 'none'}",
+                    f"- Workbench id: {task.workbench_id or 'none'}",
+                    f"- Agent id: {task.agent_id or 'none'}",
                     f"- Attempt id: {attempt.id}",
                     f"- Lease id: {lease.id}",
                     f"- Run id: {run.id}",
                     f"- Policy sha256: {policy_hash}",
+                    f"- Workflow stage: {task.metadata.get('workflow_stage') or 'none'}",
+                    f"- Review role: {task.metadata.get('review_role') or 'none'}",
+                    "- Artifact evidence: events, transcript, final_report, manifest",
                     "",
                 ]
             ),
@@ -3401,6 +3531,11 @@ class SQLiteStore:
             for artifact in self.list_artifacts(run_id)
         ]
         context_provenance = self.build_context_provenance(run_id=run_id)
+        autonomy_event = next(
+            (event for event in reversed(self.list_events(run_id)) if event.event_type == "autonomy_decision"),
+            None,
+        )
+        autonomy_payload = autonomy_event.payload if autonomy_event is not None else {}
         return RunManifest(
             run_id=run.id,
             goal=run.goal,
@@ -3419,6 +3554,9 @@ class SQLiteStore:
             effective_policy_sha256=effective_policy_sha256(effective_policy),
             backend_descriptor_sha256=backend_descriptor_sha256(backend_descriptor),
             sandbox_profile=sandbox_profile_dict(_sandbox_profile_id_for_run(run.task_type)),
+            autonomy_decision_id=autonomy_payload.get("autonomy_decision_id"),
+            autonomous_approval_id=autonomy_payload.get("autonomous_approval_id"),
+            autonomous_outcome_id=autonomy_payload.get("autonomous_outcome_id"),
             context_provenance=context_provenance,
             untrusted_context_warnings=_context_warnings(context_provenance),
         )

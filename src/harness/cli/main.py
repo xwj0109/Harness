@@ -13,7 +13,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated
 
+import click
 import typer
+from typer.core import TyperGroup
 
 from harness.agent_authoring import (
     AgentBundleError,
@@ -25,6 +27,7 @@ from harness.agent_authoring import (
 )
 from harness import __version__
 from harness.approvals import ApprovalProfile, ApprovalStore
+from harness.autonomy import builtin_autonomy_policies, get_builtin_autonomy_policy
 from harness.backends.codex_cli import (
     AUTH_ERROR,
     CodexCliBackend,
@@ -35,7 +38,7 @@ from harness.backends.codex_cli import (
 )
 from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAICompatibleBackend
 from harness.capabilities import build_capability_catalog, get_capability
-from harness.chat import chat_context, run_chat_loop
+from harness.chat import chat_context, run_autonomous_read_loop, run_chat_loop
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
 from harness.codex_runner import (
     CodexReadOnlyRepoSummaryRunner,
@@ -43,6 +46,7 @@ from harness.codex_runner import (
     HostedBoundaryApprovalRequired,
     HostedSecretBlocked,
 )
+from harness.codex_direct_runner import CodexDirectAgentRunner, DirtyWorkspaceError
 from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
 from harness.daemon_adapters import execute_read_only_summary_lease
 from harness.execution import execute_lease, list_execution_adapter_descriptors
@@ -51,7 +55,8 @@ from harness.evals import run_safety_smoke, run_security_check, run_security_lay
 from harness.integrity import run_integrity_check
 from harness.isolation import ActiveRepoDirtyError
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import KillSwitchTargetKind, MemoryScopeType, TaskStatus
+from harness.models import KillSwitchTargetKind, MemoryScopeType, MemorySourceKind, TaskStatus
+from harness.objective_runner import run_next_active_objective_autonomously, run_objective_autonomously
 from harness.paths import resolve_project_root
 from harness.policy import (
     backend_descriptor_sha256,
@@ -81,7 +86,19 @@ from harness.tool_capabilities import get_tool_capability, list_tool_capabilitie
 from harness.traces import export_run_trace, to_otel_json
 from harness.tui_assets import TUI_HOME_IMAGE_SCHEMA_VERSION, TuiHomeImageError, set_tui_home_image
 
-app = typer.Typer(help="Local-first agent harness.", invoke_without_command=True)
+class HarnessRootGroup(TyperGroup):
+    def resolve_command(self, ctx, args):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError:
+            if args:
+                command = self.get_command(ctx, "__prompt")
+                if command is not None:
+                    return "__prompt", command, args
+            raise
+
+
+app = typer.Typer(help="Local-first agent harness.", invoke_without_command=True, cls=HarnessRootGroup)
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
 backends_app = typer.Typer(help="Configured backend metadata and preflight checks.", invoke_without_command=True)
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
@@ -101,6 +118,8 @@ evals_app = typer.Typer(help="Local evidence-only eval suites.")
 security_app = typer.Typer(help="Local metadata-only security detections.")
 integrity_app = typer.Typer(help="Local package and evidence integrity checks.")
 traces_app = typer.Typer(help="Local run trace export.")
+autonomy_app = typer.Typer(help="Autonomy policy profiles and decisions.")
+autonomy_policy_app = typer.Typer(help="Autonomy policy profile inspection.")
 daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
@@ -124,6 +143,7 @@ app.add_typer(evals_app, name="evals")
 app.add_typer(security_app, name="security")
 app.add_typer(integrity_app, name="integrity")
 app.add_typer(traces_app, name="traces")
+app.add_typer(autonomy_app, name="autonomy")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
 app.add_typer(tasks_app, name="tasks")
@@ -132,6 +152,7 @@ app.add_typer(quickstart_app, name="quickstart")
 app.add_typer(tui_home_app, name="tui-home")
 tests_app.add_typer(tests_image_app, name="image")
 specs_app.add_typer(specs_preview_app, name="preview")
+autonomy_app.add_typer(autonomy_policy_app, name="policy")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
 TaskStatusArg = Annotated[TaskStatus, typer.Argument(help="Task status.")]
@@ -173,6 +194,11 @@ def main(
         bool,
         typer.Option("--codex-like", help="Start the app in foreground Codex-like action mode."),
     ] = False,
+    autonomous: Annotated[
+        bool,
+        typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
+    ] = False,
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "manual",
 ) -> None:
     """Launch the unified Harness app when no subcommand is provided."""
 
@@ -182,13 +208,51 @@ def main(
     if output == OutputFormat.JSON:
         _emit_json(chat_context(project_root))
         raise typer.Exit()
+    autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
     if plain:
-        raise typer.Exit(code=run_chat_loop(project_root, sys.stdin, sys.stdout, codex_like=codex_like))
+        raise typer.Exit(
+            code=run_chat_loop(
+                project_root,
+                sys.stdin,
+                sys.stdout,
+                codex_like=codex_like,
+                autonomy_profile_id=autonomy_profile,
+            )
+        )
     if codex_like:
         _run_unified_app(project_root, codex_like=True)
     else:
         _run_unified_app(project_root)
     raise typer.Exit()
+
+
+@app.command("__prompt", hidden=True)
+def foreground_prompt(
+    prompt: Annotated[str, typer.Argument(help="Foreground Codex-style coding prompt.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    model: Annotated[str | None, typer.Option("--model", help="Codex model override for foreground prompt runs.")] = None,
+    reasoning_effort: Annotated[
+        str | None,
+        typer.Option("--reasoning-effort", help="Codex reasoning effort override for foreground prompt runs."),
+    ] = None,
+    no_stream: Annotated[bool, typer.Option("--no-stream", help="Disable live Codex event summaries.")] = False,
+    fail_on_dirty: Annotated[
+        bool,
+        typer.Option("--fail-on-dirty", help="Refuse foreground prompt runs when git status is dirty."),
+    ] = False,
+) -> None:
+    project_root = resolve_project_root(project)
+    result = _run_codex_direct_agent_cli(
+        prompt,
+        project_root,
+        output=output,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        stream=not no_stream,
+        fail_on_dirty=fail_on_dirty,
+    )
+    raise typer.Exit(code=0 if result.get("status") == "completed" else 1)
 
 
 @app.command("tui", hidden=True)
@@ -213,6 +277,11 @@ def chat(
         bool,
         typer.Option("--codex-like", help="Start the alias in foreground Codex-like action mode."),
     ] = False,
+    autonomous: Annotated[
+        bool,
+        typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
+    ] = False,
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "manual",
 ) -> None:
     """Compatibility alias for the unified Harness app."""
 
@@ -220,6 +289,7 @@ def chat(
     if output == OutputFormat.JSON:
         _emit_json(chat_context(project_root))
         return
+    autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
     if not plain:
         if codex_like:
             _run_unified_app(project_root, codex_like=True)
@@ -227,7 +297,15 @@ def chat(
             _run_unified_app(project_root)
         return
     try:
-        raise typer.Exit(code=run_chat_loop(project_root, sys.stdin, sys.stdout, codex_like=codex_like))
+        raise typer.Exit(
+            code=run_chat_loop(
+                project_root,
+                sys.stdin,
+                sys.stdout,
+                codex_like=codex_like,
+                autonomy_profile_id=autonomy_profile,
+            )
+        )
     except ValueError as exc:
         typer.echo(f"Chat command failed: {exc}")
         raise typer.Exit(code=1) from exc
@@ -462,6 +540,43 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+@app.command("act")
+def act(
+    request: Annotated[str, typer.Argument(help="Autonomous request.")],
+    project: ProjectOption = Path("."),
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id.")] = "safe-local",
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Run a bounded autonomous chat loop."""
+
+    project_root = resolve_project_root(project)
+    try:
+        get_builtin_autonomy_policy(autonomy)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc).strip("'"), param_hint="--autonomy") from exc
+    result = run_autonomous_read_loop(
+        request,
+        project_root,
+        autonomy_profile_id=autonomy,
+        allow_action_contracts=True,
+        auto_run_created_objective=True,
+    )
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return
+    typer.echo("Autonomous Act Loop")
+    _print_kv("Profile", result["autonomy_profile_id"])
+    _print_kv("Stop reason", result["stop_reason"])
+    _print_kv("Model turns", result["model_turns"])
+    _print_kv("Tool calls", result["tool_calls"])
+    _print_kv("Evidence", result["evidence_path"])
+    _print_section("Answer")
+    for line in result["lines"]:
+        typer.echo(line)
+    if not result["ok"]:
+        raise typer.Exit(code=1)
+
+
 @objectives_app.command("add")
 def objectives_add(
     title: Annotated[str, typer.Option("--title", help="Objective title.")],
@@ -541,6 +656,42 @@ def objectives_inspect(
         )
         return
     _print_objective(objective)
+
+
+@objectives_app.command("run")
+def objectives_run(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id.")] = "safe-local",
+    max_steps: Annotated[int | None, typer.Option("--max-steps", help="Maximum adapter dispatches for this run.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = run_objective_autonomously(
+            project_root,
+            objective_id,
+            autonomy_profile_id=autonomy,
+            max_steps=max_steps,
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.autonomous_objective_run/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Autonomous Objective Run")
+    _print_kv("Objective", result.objective_id)
+    _print_kv("Profile", result.autonomy_profile_id)
+    _print_kv("Stop reason", result.stop_reason)
+    _print_kv("Adapter dispatches", result.adapter_dispatches)
+    _print_kv("Evidence", str(result.evidence_path))
+    for step in result.step_results:
+        typer.echo(
+            f"Step {step.step}: task={step.task_id or 'none'} "
+            f"adapter={step.adapter_id or 'none'} decision={step.decision_status or step.execution_decision or 'none'}"
+        )
 
 
 @tasks_app.command("add")
@@ -1203,6 +1354,44 @@ def policy_explain(
     _print_kv("Reasons", "; ".join(policy.forbidden_reasons) if policy.forbidden_reasons else "none")
 
 
+@autonomy_policy_app.command("inspect")
+def autonomy_policy_inspect(
+    profile: Annotated[str, typer.Option("--profile", help="Built-in autonomy profile id.")] = "manual",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        policy = get_builtin_autonomy_policy(profile)
+    except KeyError as exc:
+        _emit_autonomy_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.autonomy_policy_inspect/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "available_profiles": sorted(builtin_autonomy_policies()),
+        "policy": policy.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Profile: {policy.id}")
+    typer.echo(f"Scope: {policy.scope.value}")
+    _print_section("Allowed")
+    _print_kv("Tools", ", ".join(policy.allowed_tools) if policy.allowed_tools else "none")
+    _print_kv("Adapters", ", ".join(policy.allowed_adapters) if policy.allowed_adapters else "none")
+    _print_kv("Task types", ", ".join(policy.allowed_task_types) if policy.allowed_task_types else "none")
+    _print_kv("Boundaries", ", ".join(policy.allowed_boundaries) if policy.allowed_boundaries else "none")
+    _print_section("Risks")
+    _print_kv("Auto-confirm", ", ".join(policy.auto_confirm_risks) if policy.auto_confirm_risks else "none")
+    _print_kv("Pause", ", ".join(policy.pause_on_risks) if policy.pause_on_risks else "none")
+    _print_kv("Forbidden", ", ".join(policy.forbidden_risks) if policy.forbidden_risks else "none")
+    _print_section("Budgets")
+    for key, value in policy.budget.model_dump(mode="json").items():
+        _print_kv(key, value if value is not None else "none")
+
+
 def _resolve_policy_explain(project_root: Path, subject_kind: str, subject_id: str):
     normalized_kind = subject_kind.strip().lower()
     if normalized_kind not in {"run", "task", "agent", "workbench", "backend"}:
@@ -1618,6 +1807,42 @@ def memory_save_note(
     typer.echo(f"Redaction: {record.redaction_state.value}")
 
 
+@memory_app.command("save-derived")
+def memory_save_derived(
+    scope: Annotated[MemoryScopeType, typer.Option("--scope", help="Memory scope type.")],
+    source_kind: Annotated[MemorySourceKind, typer.Option("--source-kind", help="Derived memory source kind.")],
+    source_id: Annotated[str, typer.Option("--source-id", help="Source run, task, objective, or attempt id.")],
+    summary: Annotated[str, typer.Option("--summary", help="Derived memory summary.")],
+    scope_id: Annotated[str | None, typer.Option("--scope-id", help="Scope id for workbench, agent, objective, or task.")] = None,
+    source_artifact_id: Annotated[str | None, typer.Option("--source-artifact-id", help="Source artifact id for artifact summaries.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        resolved_scope_id = _resolve_memory_scope_id(store, project_root, scope, scope_id)
+        record = store.save_derived_memory(
+            scope,
+            resolved_scope_id,
+            source_kind,
+            summary,
+            source_id=source_id,
+            source_artifact_id=source_artifact_id,
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_memory_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.memory_record/v1", "ok": True, "memory": record.model_dump(mode="json")})
+        return
+    typer.echo(f"Saved memory {record.id}")
+    typer.echo(f"Scope: {record.scope_type.value}:{record.scope_id}")
+    typer.echo(f"Source: {record.source_kind.value}:{record.source_id}")
+    typer.echo(f"Redaction: {record.redaction_state.value}")
+
+
 @memory_app.command("list")
 def memory_list(
     scope: Annotated[MemoryScopeType | None, typer.Option("--scope", help="Filter by memory scope type.")] = None,
@@ -2001,6 +2226,50 @@ def daemon_run_once(project: ProjectOption = Path("."), output: OutputOption = O
         typer.echo(f"Paused task: {reason['task_id']}\t{reason['decision']}")
 
 
+@daemon_app.command("run-autonomous")
+def daemon_run_autonomous(
+    project: ProjectOption = Path("."),
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id.")] = "daemon-safe",
+    max_steps: Annotated[int | None, typer.Option("--max-steps", help="Maximum adapter dispatches for this run.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = run_next_active_objective_autonomously(
+            project_root,
+            autonomy_profile_id=autonomy,
+            max_steps=max_steps,
+            owner=_daemon_owner(),
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_daemon_error("harness.autonomous_objective_run/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if result is None:
+        payload = {
+            "schema_version": "harness.autonomous_objective_run/v1",
+            "ok": True,
+            "project_root": str(project_root),
+            "autonomy_profile_id": autonomy,
+            "stop_reason": "no_active_objective",
+            "result": None,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            return
+        typer.echo("No active objective with runnable work.")
+        return
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Autonomous Daemon Objective Run")
+    _print_kv("Objective", result.objective_id)
+    _print_kv("Profile", result.autonomy_profile_id)
+    _print_kv("Stop reason", result.stop_reason)
+    _print_kv("Adapter dispatches", result.adapter_dispatches)
+    _print_kv("Evidence", str(result.evidence_path))
+
+
 @daemon_app.command("status")
 def daemon_status(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
@@ -2278,8 +2547,9 @@ def backends_preflight(project: ProjectOption = Path("."), output: OutputOption 
 @app.command()
 def run(
     goal: str,
-    task_type: Annotated[str, typer.Option("--task-type", help="Task type route.")],
+    task_type: Annotated[str, typer.Option("--task-type", help="Task type route.")] = "codex_direct_agent",
     project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
     approve_hosted_boundary: Annotated[
         bool,
         typer.Option("--approve-hosted-boundary", help="Approve one-time hosted Codex data boundary."),
@@ -2292,11 +2562,34 @@ def run(
         bool,
         typer.Option("--keep-isolation", help="Preserve isolated workspace for codex_code_edit runs."),
     ] = False,
+    model: Annotated[str | None, typer.Option("--model", help="Codex model override for direct agent runs.")] = None,
+    reasoning_effort: Annotated[
+        str | None,
+        typer.Option("--reasoning-effort", help="Codex reasoning effort override for direct agent runs."),
+    ] = None,
+    no_stream: Annotated[bool, typer.Option("--no-stream", help="Disable live Codex event summaries.")] = False,
+    fail_on_dirty: Annotated[
+        bool,
+        typer.Option("--fail-on-dirty", help="Refuse direct agent runs when git status is dirty."),
+    ] = False,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     cfg = load_config(project_root)
     store = SQLiteStore(project_root)
+    if task_type == "codex_direct_agent":
+        result = _run_codex_direct_agent_cli(
+            goal,
+            project_root,
+            output=output,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            stream=not no_stream,
+            fail_on_dirty=fail_on_dirty,
+            cfg=cfg,
+            store=store,
+        )
+        raise typer.Exit(code=0 if result.get("status") == "completed" else 1)
     if task_type == "read_only_repo_summary":
         backend_config = cfg.backends["codex_cli"]
         backend = CodexCliBackend(backend_config)
@@ -2424,7 +2717,7 @@ def run(
             typer.echo(f"  {kind}: {path}")
         return
     raise typer.BadParameter(
-        "Supported task types are read_only_repo_summary, repo_planning, simple_code_edit, and codex_code_edit."
+        "Supported task types are codex_direct_agent, read_only_repo_summary, repo_planning, simple_code_edit, and codex_code_edit."
     )
 
 
@@ -2464,18 +2757,36 @@ def approvals_add(
     backend: Annotated[str, typer.Option("--backend")],
     data_boundary: Annotated[str, typer.Option("--data-boundary")],
     task_types: Annotated[str, typer.Option("--task-types", help="Comma-separated task types.")],
-    duration_days: Annotated[int, typer.Option("--duration-days")],
+    duration_days: Annotated[int | None, typer.Option("--duration-days")] = None,
+    duration_hours: Annotated[int | None, typer.Option("--duration-hours")] = None,
     reason: Annotated[str | None, typer.Option("--reason")] = None,
+    autonomy_scope: Annotated[str | None, typer.Option("--autonomy-scope")] = None,
+    allowed_adapters: Annotated[str | None, typer.Option("--allowed-adapters", help="Comma-separated adapter ids.")] = None,
+    allowed_workbenches: Annotated[str | None, typer.Option("--allowed-workbenches", help="Comma-separated workbench ids.")] = None,
+    allowed_objectives: Annotated[str | None, typer.Option("--allowed-objectives", help="Comma-separated objective ids.")] = None,
+    max_runs: Annotated[int | None, typer.Option("--max-runs")] = None,
+    max_total_runtime_seconds: Annotated[int | None, typer.Option("--max-total-runtime-seconds")] = None,
+    max_context_bytes: Annotated[int | None, typer.Option("--max-context-bytes")] = None,
     project: ProjectOption = Path("."),
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
+    if duration_days is None and duration_hours is None:
+        raise typer.BadParameter("Specify --duration-days or --duration-hours.")
     approval = ApprovalStore(project_root).add(
         backend=backend,
         data_boundary=data_boundary,
-        task_types=[item.strip() for item in task_types.split(",") if item.strip()],
-        duration_days=duration_days,
+        task_types=_split_csv(task_types),
+        duration_days=duration_days or 0,
+        duration_hours=duration_hours,
         reason=reason,
+        allowed_adapters=_split_csv(allowed_adapters),
+        allowed_workbenches=_split_csv(allowed_workbenches),
+        allowed_objective_ids=_split_csv(allowed_objectives),
+        max_runs=max_runs,
+        max_total_runtime_seconds=max_total_runtime_seconds,
+        max_context_bytes=max_context_bytes,
+        autonomy_scope=autonomy_scope,
     )
     typer.echo(f"Created approval {approval.id}")
 
@@ -2604,6 +2915,12 @@ def dev_create_run(
 def _require_initialized(project_root: Path) -> None:
     if not (project_root / HARNESS_DIR / "harness.sqlite").exists():
         raise typer.BadParameter(f"Project is not initialized. Run 'harness init --project {project_root}'.")
+
+
+def _split_csv(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 def _update_gitignore(project_root: Path) -> None:
@@ -2764,6 +3081,9 @@ def _resolve_memory_scope_id(
     if scope == MemoryScopeType.OBJECTIVE:
         store.get_objective(scope_id)
         return scope_id
+    if scope == MemoryScopeType.TASK:
+        store.get_task(scope_id)
+        return scope_id
     raise ValueError(f"Unsupported memory scope: {scope.value}")
 
 
@@ -2820,6 +3140,22 @@ def _emit_policy_error(message: str, output: OutputFormat) -> None:
         _emit_json({"schema_version": "harness.effective_policy/v1", "ok": False, "errors": [message]})
     else:
         typer.echo(f"Policy command failed: {message}")
+
+
+def _resolve_autonomy_profile_option(autonomous: bool, autonomy: str) -> str:
+    profile = "safe-local" if autonomous and autonomy == "manual" else autonomy
+    try:
+        get_builtin_autonomy_policy(profile)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc).strip("'"), param_hint="--autonomy") from exc
+    return profile
+
+
+def _emit_autonomy_error(message: str, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.autonomy_policy_inspect/v1", "ok": False, "errors": [message]})
+    else:
+        typer.echo(f"Autonomy command failed: {message}")
 
 
 def _emit_artifact_error(schema_version: str, message: str, output: OutputFormat) -> None:
@@ -3474,6 +3810,106 @@ def _obtain_hosted_boundary_approval(
         created_at=now,
         reason="One-time CLI approval.",
     )
+
+
+def _run_codex_direct_agent_cli(
+    goal: str,
+    project_root: Path,
+    *,
+    output: OutputFormat,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+    stream: bool = True,
+    fail_on_dirty: bool = False,
+    cfg=None,
+    store: SQLiteStore | None = None,
+) -> dict:
+    _require_initialized(project_root)
+    cfg = cfg or load_config(project_root)
+    store = store or SQLiteStore(project_root)
+    backend = CodexCliBackend(cfg.backends["codex_cli"])
+    runner = CodexDirectAgentRunner(project_root, store, backend)
+    if output != OutputFormat.JSON:
+        typer.echo("Codex foreground agent")
+        _print_kv("Backend", backend.name)
+        _print_kv("Model", model or backend.config.settings.get("model", ""))
+        _print_kv("Sandbox", "workspace-write")
+    try:
+        result = runner.run(
+            goal,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            stream=stream and output != OutputFormat.JSON,
+            fail_on_dirty=fail_on_dirty,
+            progress_callback=_print_codex_direct_progress if output != OutputFormat.JSON else None,
+        )
+    except (
+        CodexUnavailable,
+        CodexSandboxUnavailable,
+        CodexEditCommandUnavailable,
+        CodexDangerousFlagError,
+        DirtyWorkspaceError,
+    ) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.codex_direct_agent/v1", **result})
+        return result
+    typer.echo(f"Created run {result['run_id']}")
+    typer.echo(f"Status: {result['status']}")
+    typer.echo(f"Exit status: {result['exit_status']}")
+    typer.echo(f"Approval mode: {result['approval_mode']}")
+    typer.echo(f"Changed files: {', '.join(result['changed_files']) if result['changed_files'] else 'none'}")
+    if result["diff_stat"].strip():
+        _print_section("Diff Stat")
+        typer.echo(result["diff_stat"].rstrip())
+    _print_section("Final Codex Message")
+    typer.echo(result["final_summary"])
+    _print_section("Artifacts")
+    for kind, path in result["artifacts"].items():
+        typer.echo(f"  {kind}: {path}")
+    _print_section("Next")
+    typer.echo(f"  harness show {result['run_id']} --project {project_root}")
+    return result
+
+
+def _print_codex_direct_progress(event: dict) -> None:
+    if event.get("type") == "event":
+        summary = _codex_event_summary(event.get("event") or {})
+        if summary:
+            typer.echo(f"codex: {summary}")
+    elif event.get("type") == "stdout":
+        line = str(event.get("line") or "").strip()
+        if line:
+            typer.echo(f"codex: {line[:240]}")
+
+
+def _codex_event_summary(event: dict) -> str:
+    event_type = str(event.get("type") or event.get("event") or event.get("kind") or "").strip()
+    text = _first_nested_text(event, keys={"summary", "text", "content", "message", "name", "tool", "command"})
+    if event_type and text:
+        return f"{event_type}: {text[:240]}"
+    if text:
+        return text[:240]
+    if event_type:
+        return event_type[:240]
+    return ""
+
+
+def _first_nested_text(value, *, keys: set[str]) -> str | None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in keys and isinstance(item, str) and item.strip():
+                return item.strip()
+        for item in value.values():
+            found = _first_nested_text(item, keys=keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = _first_nested_text(item, keys=keys)
+            if found:
+                return found
+    return None
 
 
 class CliPatchApprovalProvider:

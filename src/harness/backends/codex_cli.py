@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from harness.events import append_jsonl
 from harness.models import BackendCapabilities, BackendConfig, BackendStatus
@@ -248,6 +249,59 @@ class CodexCliBackend:
             final_message=final_message,
         )
 
+    def stream_read_only(
+        self,
+        project_root: Path,
+        prompt: str,
+        final_message_path: Path | None,
+    ) -> Iterator[dict[str, Any]]:
+        command = self.build_read_only_command(project_root, prompt, final_message_path)
+        process = subprocess.Popen(
+            command,
+            cwd=project_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_codex_env(),
+        )
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        events: list[dict[str, Any]] = []
+        stderr_thread = None
+        if process.stderr is not None:
+            stderr_thread = threading.Thread(target=_collect_pipe_lines, args=(process.stderr, stderr_lines), daemon=True)
+            stderr_thread.start()
+        assert process.stdout is not None
+        for line in process.stdout:
+            stdout_lines.append(line)
+            parsed = _parse_jsonl_event(line)
+            if parsed is not None:
+                events.append(parsed)
+                yield {"type": "event", "event": parsed, "line": line}
+            else:
+                yield {"type": "stdout", "line": line}
+        exit_status = process.wait(timeout=float(self.config.settings.get("timeout_seconds", 900)))
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1)
+        stderr = "".join(stderr_lines)
+        final_message = None
+        if final_message_path and final_message_path.exists():
+            final_message = str(
+                sanitize_for_logging(final_message_path.read_text(encoding="utf-8", errors="replace"))
+            )
+            final_message_path.write_text(final_message, encoding="utf-8")
+        yield {
+            "type": "completed",
+            "result": CodexRunResult(
+                command=command,
+                stdout="".join(stdout_lines),
+                stderr=stderr,
+                exit_status=exit_status,
+                json_events=events,
+                final_message=final_message,
+            ),
+        }
+
     def run_edit(self, isolated_workspace: Path, prompt: str, final_message_path: Path | None) -> tuple[CodexRunResult, BackendCapabilities, str]:
         command, capabilities, network_status = self.build_edit_command(isolated_workspace, prompt, final_message_path)
         result = subprocess.run(
@@ -278,29 +332,208 @@ class CodexCliBackend:
             network_status,
         )
 
+    def build_direct_agent_command(
+        self,
+        project_root: Path,
+        prompt: str,
+        final_message_path: Path | None,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> tuple[list[str], BackendCapabilities, str]:
+        capabilities = self.detect_capabilities()
+        if not capabilities.supports_cd:
+            raise CodexEditCommandUnavailable(
+                "Codex direct agent execution requires `--cd`; refusing to run. "
+                + _edit_capability_diagnostics(capabilities)
+            )
+        if not capabilities.supports_workspace_write_sandbox:
+            raise CodexEditCommandUnavailable(
+                "Codex direct agent execution requires workspace-write sandbox support; refusing to run. "
+                + _edit_capability_diagnostics(capabilities)
+            )
+        command = [self.command_name, "exec"]
+        if capabilities.supports_ask_for_approval:
+            command.extend(["--sandbox", "workspace-write", "--ask-for-approval", "on-request"])
+            approval_mode = "on-request via --ask-for-approval"
+            internal_approval_enforceable = True
+        elif capabilities.supports_full_auto and capabilities.supports_full_auto_workspace_write_on_request:
+            command.append("--full-auto")
+            approval_mode = "on-request via --full-auto"
+            internal_approval_enforceable = True
+        else:
+            command.extend(["--sandbox", "workspace-write"])
+            approval_mode = "workspace-write without explicit Codex approval flag"
+            internal_approval_enforceable = False
+        command.extend(["--cd", str(project_root)])
+        selected_model = model or self.config.settings.get("model")
+        if selected_model and capabilities.supports_model_arg:
+            command.extend(["--model", str(selected_model)])
+        command.extend(_reasoning_effort_args(reasoning_effort or self.config.settings.get("model_reasoning_effort")))
+        if self._should_skip_git_repo_check(capabilities):
+            command.append("--skip-git-repo-check")
+        if capabilities.supports_json_events:
+            command.append("--json")
+        if final_message_path and capabilities.supports_output_last_message:
+            command.extend(["--output-last-message", str(final_message_path)])
+        command.append(prompt)
+        validate_no_dangerous_codex_flags(command)
+        network_status = (
+            "Codex CLI exposes network-control capability; selected most restrictive supported configuration."
+            if capabilities.supports_network_control
+            else NETWORK_NOT_ENFORCEABLE
+        )
+        self.config.settings["last_codex_approval_mode"] = approval_mode
+        self.config.settings["last_codex_sandbox_mode"] = "workspace-write"
+        self.config.settings["last_codex_internal_command_approval_enforceable"] = internal_approval_enforceable
+        self.config.settings["last_apply_back_approval_required"] = False
+        return command, capabilities, network_status
+
+    def run_direct_agent(
+        self,
+        project_root: Path,
+        prompt: str,
+        final_message_path: Path | None,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> tuple[CodexRunResult, BackendCapabilities, str]:
+        command, capabilities, network_status = self.build_direct_agent_command(
+            project_root,
+            prompt,
+            final_message_path,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        result = subprocess.run(
+            command,
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            timeout=float(self.config.settings.get("timeout_seconds", 900)),
+            env=_codex_env(),
+        )
+        final_message = None
+        if final_message_path and final_message_path.exists():
+            final_message = str(
+                sanitize_for_logging(final_message_path.read_text(encoding="utf-8", errors="replace"))
+            )
+            final_message_path.write_text(final_message, encoding="utf-8")
+        events = _parse_jsonl_events(result.stdout)
+        return (
+            CodexRunResult(
+                command=command,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                exit_status=result.returncode,
+                json_events=events,
+                final_message=final_message,
+            ),
+            capabilities,
+            network_status,
+        )
+
+    def stream_direct_agent(
+        self,
+        project_root: Path,
+        prompt: str,
+        final_message_path: Path | None,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        command, capabilities, network_status = self.build_direct_agent_command(
+            project_root,
+            prompt,
+            final_message_path,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        process = subprocess.Popen(
+            command,
+            cwd=project_root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_codex_env(),
+        )
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        events: list[dict[str, Any]] = []
+        stderr_thread = None
+        if process.stderr is not None:
+            stderr_thread = threading.Thread(target=_collect_pipe_lines, args=(process.stderr, stderr_lines), daemon=True)
+            stderr_thread.start()
+        assert process.stdout is not None
+        for line in process.stdout:
+            stdout_lines.append(line)
+            parsed = _parse_jsonl_event(line)
+            if parsed is not None:
+                events.append(parsed)
+                yield {"type": "event", "event": parsed, "line": line}
+            else:
+                yield {"type": "stdout", "line": line}
+        exit_status = process.wait(timeout=float(self.config.settings.get("timeout_seconds", 900)))
+        if stderr_thread is not None:
+            stderr_thread.join(timeout=1)
+        final_message = None
+        if final_message_path and final_message_path.exists():
+            final_message = str(
+                sanitize_for_logging(final_message_path.read_text(encoding="utf-8", errors="replace"))
+            )
+            final_message_path.write_text(final_message, encoding="utf-8")
+        yield {
+            "type": "completed",
+            "capabilities": capabilities,
+            "network_status": network_status,
+            "result": CodexRunResult(
+                command=command,
+                stdout="".join(stdout_lines),
+                stderr="".join(stderr_lines),
+                exit_status=exit_status,
+                json_events=events,
+                final_message=final_message,
+            ),
+        }
+
     def _run_help(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, text=True, capture_output=True, timeout=15, env=_codex_env())
 
     def _reasoning_effort_args(self) -> list[str]:
-        effort = self.config.settings.get("model_reasoning_effort")
-        if effort is None:
-            return []
-        effort_value = str(effort)
-        if effort_value not in ALLOWED_REASONING_EFFORTS:
-            raise CodexDangerousFlagError(f"Unsupported Codex reasoning effort: {effort_value}")
-        return ["-c", f'model_reasoning_effort="{effort_value}"']
+        return _reasoning_effort_args(self.config.settings.get("model_reasoning_effort"))
+
+
+def _reasoning_effort_args(effort: Any) -> list[str]:
+    if effort is None:
+        return []
+    effort_value = str(effort)
+    if effort_value not in ALLOWED_REASONING_EFFORTS:
+        raise CodexDangerousFlagError(f"Unsupported Codex reasoning effort: {effort_value}")
+    return ["-c", f'model_reasoning_effort="{effort_value}"']
 
 
 def _parse_jsonl_events(stdout: str) -> list[dict[str, Any]]:
     events = []
     for line in stdout.splitlines():
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            events.append(sanitize_for_logging(parsed))
+        parsed = _parse_jsonl_event(line)
+        if parsed is not None:
+            events.append(parsed)
     return events
+
+
+def _parse_jsonl_event(line: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return sanitize_for_logging(parsed)
+    return None
+
+
+def _collect_pipe_lines(pipe: Any, lines: list[str]) -> None:
+    for line in pipe:
+        lines.append(line)
 
 
 def _codex_env() -> dict[str, str]:

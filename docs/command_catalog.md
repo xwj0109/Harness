@@ -8,6 +8,9 @@ Unless a command explicitly says otherwise in the operator guide, these surfaces
 
 ```bash
 harness --help
+harness "fix the failing tests" --project .
+harness "add a CLI flag and update tests" --project . --model gpt-5.5 --reasoning-effort medium
+harness run "fix the failing tests" --project .
 harness --project .
 harness --project . --output json
 harness --project . --plain
@@ -20,9 +23,11 @@ harness quickstart agent --project .
 harness quickstart agent --project . --output json
 ```
 
-Bare `harness` is the primary operator application. It launches the unified Textual app: passive dashboard context, palette/search sections, and the real chat/orchestrator prompt in one terminal surface. `harness --output json` is a read-only context probe that reports `harness.chat/v1` without launching the UI. `harness --plain` runs the line-oriented chat fallback for tests and unsuitable terminals. `--codex-like` starts the session in a testing-friendly foreground action mode where one explicit confirmation can create the approved Harness records and drive registered-adapter dispatch.
+`harness "prompt"` is the primary foreground coding path. It runs the configured `codex_cli` backend end-to-end in the active project workspace with Codex `workspace-write` sandboxing, streams concise Codex event summaries, records stdout/stderr/events/final-message artifacts, and prints a final report with status, changed files, diff stat, artifact paths, and the next `harness show <run_id>` command. `harness run "prompt"` defaults to the same direct foreground agent mode. Use `--output json` for the machine-readable report, `--no-stream` to suppress live event summaries, `--fail-on-dirty` to refuse a dirty workspace, and `--model` or `--reasoning-effort` to override the configured Codex settings for one run.
 
-The unified app is a conversational operator shell over explicit harness actions: it can initialize project state with `/init`, provide deterministic local guidance, inspect state, select an orchestrator, draft objective/task graphs, ask for confirmation, acquire daemon run-once leases, and dispatch already-leased work only through registered adapters. Repository summaries route to `read_only_summary/read_only_repo_summary`; repo planning requests route to `repo_planning/repo_planning`; coding-fix requests route to a small two-task template with `repo_planning/repo_planning` first and `codex_isolated_edit/codex_code_edit` second. Drafts show interpreted intent, proposed action, equivalent commands, safety boundary, required approvals, and the confirmation prompt. Results show task/adapter/lease/run/artifact evidence and next inspection commands. It does not call providers directly, run a generic shell, preflight backends for context display, persist chat history, or mutate active repository files from chat/model text.
+Bare `harness` with no prompt launches the unified Textual app: passive dashboard context, palette/search sections, and the real chat/orchestrator prompt in one terminal surface. `harness --output json` is a read-only context probe that reports `harness.chat/v1` without launching the UI. `harness --plain` runs the line-oriented chat fallback for tests and unsuitable terminals. `--codex-like` starts the session in a testing-friendly foreground action mode where one explicit confirmation can create the approved Harness records and drive registered-adapter dispatch.
+
+The unified app is a conversational operator shell over explicit harness actions: it can initialize project state with `/init`, provide deterministic local guidance, inspect state, select an orchestrator, draft objective/task graphs, ask for confirmation, acquire daemon run-once leases, and dispatch already-leased work only through registered adapters. Repository summaries route to `read_only_summary/read_only_repo_summary`; repo planning requests route to `repo_planning/repo_planning`; coding-fix requests route to a bounded reviewed workflow with `repo_planning/repo_planning`, `codex_isolated_edit/codex_code_edit`, sandbox-test evidence, implementation review, security review, and final synthesis. Drafts show interpreted intent, proposed action, equivalent commands, safety boundary, required approvals, and the confirmation prompt. Results show task/adapter/lease/run/artifact evidence and next inspection commands. It does not run a generic shell, persist chat history, or mutate active repository files from chat/model text outside the explicit foreground prompt and registered adapter paths.
 
 The dashboard, palette, and slash-command sections remain passive read-only context. They show project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, static generated terminal pixel art, local in-memory search over loaded dashboard and command metadata, session-local section collapse, and palette-only focus. They do not execute commands, spawn subprocesses, invoke a shell, copy commands to the clipboard, mutate harness state, persist UI preferences, load image files at runtime, or call providers. `home` and `quickstart agent` remain read-only/non-mutating orientation commands. `tui-home set-image` is an explicit local visual-customization command that imports the provided image into tracked static TUI art files; it does not touch project runtime state, execute adapters, preflight backends, or expose image contents.
 
@@ -79,6 +84,7 @@ Spec commands inspect or validate declarative registry state. They do not prefli
 harness objectives add --title "Research objective" --project . --output json
 harness objectives list --project .
 harness objectives inspect objective_abc123 --project . --output json
+harness objectives run objective_abc123 --project . --autonomy safe-local --output json
 harness tasks add --title "Read-only summary" \
   --agent my_agent \
   --workbench quant \
@@ -102,10 +108,13 @@ harness tasks run-next --project . --output json
 
 Task queue commands are manual SQLite control-plane operations. `tasks run-next` leases work for inspection/adapter handoff; it does not execute agents or create runs.
 
+`objectives run` is a bounded autonomous objective runner over existing task graphs. It selects only ready or dependency-unblocked tasks within the objective, leases before dispatch, evaluates the selected autonomy profile and adapter metadata before each registered-adapter dispatch, writes objective JSONL evidence under `.harness/autonomy/objectives/`, and stops on success, blocked state, approval requirement, denial, execution failure, or budget exhaustion. It does not create new tasks, expand graphs, call arbitrary tools, bypass approvals, or mutate the active repo.
+
 ## Daemon Control Plane
 
 ```bash
 harness daemon run-once --project . --output json
+harness daemon run-autonomous --project . --autonomy daemon-safe --output json
 harness daemon adapters --project . --output json
 harness daemon status --project .
 harness daemon inspect-lease task_lease_abc123 --project .
@@ -116,6 +125,8 @@ harness daemon stop --project . --output json
 ```
 
 `daemon run-once` is lease-only. `daemon adapters` lists registered adapter descriptors without preflighting backends or executing anything. `daemon inspect-lease` is read-only and reports generic `execution_eligibility`. `daemon execute` is a registered-adapter dispatcher for already-leased tasks only: no adapter means no execution, unknown adapter means fail closed, and adapter descriptors are documentation and validation metadata rather than permission grants. `daemon recover` reconciles existing linked-run evidence without creating a second run or retrying ambiguous work.
+
+`daemon run-autonomous` runs the next active objective that already has runnable work using the graph-driven objective runner and the selected autonomy profile. It is still bounded by leases, adapter descriptors, approval profiles, runtime controls, adapter breakers, budgets, and evidence requirements.
 
 `daemon inspect-lease` and `daemon execute` include `blocked_state_explanations` in JSON and print `Blocked state` rows in text output. These explanations normalize missing approvals, disabled adapters, unsafe metadata, unknown adapters, sandbox profile evidence gaps, breaker-open state, and forbidden path or secret-like blocks without changing the underlying decision.
 
@@ -137,6 +148,14 @@ Runtime controls are local kill switches and adapter breakers. They only narrow 
 harness capabilities list --project . --output json
 harness capabilities inspect dry_run --project . --output json
 harness memory save-note --scope project --summary "Local operator note" --project . --output json
+harness memory save-derived \
+  --scope objective \
+  --scope-id obj_abc123 \
+  --source-kind objective_state \
+  --source-id obj_abc123 \
+  --summary "Objective has one ready dry-run task." \
+  --project . \
+  --output json
 harness memory list --project . --output json
 harness memory inspect memory_abc123 --project . --output json
 harness memory forget memory_abc123 --project . --output json
@@ -147,7 +166,7 @@ harness progress --objective obj_abc123 --project . --output json
 
 Unavailable capabilities include structured `blocked_state_explanations` alongside existing readiness reasons so operators can see whether a capability is paused by a runtime control, breaker, approval requirement, or other local policy evidence.
 
-`harness memory save-note`, `list`, `inspect`, and `forget` return `harness.memory_record/v1` or `harness.memory_records/v1`. Memory records are explicit local operator notes in v1.8, scoped by project/workbench/agent/objective, redacted before persistence when secret-looking content appears, and forgotten by replacing retained content with `[FORGOTTEN]`.
+`harness memory save-note`, `save-derived`, `list`, `inspect`, and `forget` return `harness.memory_record/v1` or `harness.memory_records/v1`. Memory records are explicit local operator notes or artifact-derived working memory, scoped by project/workbench/agent/objective/task, redacted before persistence when secret-looking content appears, and forgotten by replacing retained content with `[FORGOTTEN]`. Derived memory source kinds include `artifact_summary`, `objective_state`, `run_review`, and `failed_attempt_summary`; they must link to source ids and remain non-authoritative for permissions, policy, or approvals.
 
 `harness progress --objective` returns `harness.orchestration_progress/v1`, a read-only objective/task/lease/run state summary with mode, blockers, active lease/run ids, task rows, and deterministic next commands.
 
@@ -183,6 +202,18 @@ harness artifacts inspect artifact_abc123 --project .
 harness policy explain --subject-kind task --subject-id task_abc123 --project . --output json
 harness tools list --project . --output json
 harness tools inspect repo_read --project . --output json
+harness autonomy policy inspect --project . --profile safe-local --output json
+harness act "summarize this repo" --project . --autonomy safe-local --output json
+harness approvals add \
+  --backend codex_cli \
+  --data-boundary hosted_provider \
+  --task-types repo_planning,codex_code_edit \
+  --duration-hours 8 \
+  --autonomy-scope supervised-codex \
+  --allowed-adapters repo_planning,codex_isolated_edit \
+  --allowed-objectives obj_abc123 \
+  --max-runs 4 \
+  --project .
 harness compare run_a run_b --project . --output json
 harness baseline set run_abc123 --name local --project . --output json
 harness baseline compare run_def456 --baseline local --project . --output json
@@ -196,7 +227,19 @@ harness integrity check --project . --output json
 harness traces export run_abc123 --format otel-json --project . --output json
 ```
 
-Evidence commands report metadata, manifests, hashes, verification status, policy decisions, local security findings, local integrity checks, security-layer audit checks, and trace/export envelopes. The security check is metadata-only: it inspects persisted local records and manifests without reading artifact bodies, calling providers, touching Docker, or creating new runtime evidence. The integrity check is package/local metadata-only: it hashes built-in specs, adapter descriptors, security docs when present, and static TUI assets without initializing project state or running adapters. The security-layer audit verifies the local-first completion scope without remediation or hidden execution. Evidence commands must not print artifact file contents, secret-like data, backend settings, API keys, environment variables, or provider configuration.
+Evidence commands report metadata, manifests, hashes, verification status, policy decisions, autonomy profiles, local security findings, local integrity checks, security-layer audit checks, and trace/export envelopes. The security check is metadata-only: it inspects persisted local records and manifests without reading artifact bodies, calling providers, touching Docker, or creating new runtime evidence. The integrity check is package/local metadata-only: it hashes built-in specs, adapter descriptors, security docs when present, and static TUI assets without initializing project state or running adapters. The security-layer audit verifies the local-first completion scope without remediation or hidden execution. Evidence commands must not print artifact file contents, secret-like data, backend settings, API keys, environment variables, or provider configuration.
+
+Autonomy policy inspection returns `harness.autonomy_policy_inspect/v1`. It is an explanation surface for built-in profiles such as `manual`, `safe-local`, `supervised-codex`, and `daemon-safe`; it does not execute tools, create approvals, mutate project state, or grant authority outside existing policy, sandbox, approval, lease, adapter, runtime-control, budget, and evidence gates.
+
+Line-oriented chat accepts `--autonomous` as shorthand for `--autonomy safe-local`. Non-manual autonomy affects only validated action contracts. It does not let the model call shell, mutate the active repo, create hosted approvals, apply back isolated changes, or bypass policy. Autonomous contract decisions are recorded under `.harness/autonomy/`.
+
+`safe-local` can auto-create only local Harness control-plane records that pass the autonomy policy, including objectives, dry-run tasks, dry-run task graphs, and explicit project memory notes. Chat-created tasks use stable idempotency keys to avoid duplicate task records for repeated equivalent requests. Memory records remain scoped, hashed, redacted when needed, and non-authoritative for permissions or approvals.
+
+Scoped hosted approval profiles can constrain autonomous Codex use by task type, adapter id, workbench id, objective id, autonomy scope, run count, total runtime, and context byte budget. These profiles can satisfy hosted-boundary checks for `supervised-codex` repo planning or isolated edits only inside their exact stored scope. Legacy hosted approvals without `--autonomy-scope supervised-codex` remain manual-flow approvals and do not satisfy strict autonomous Codex dispatch. They do not authorize apply-back, active repo writes, arbitrary network, shell commands, approval extension, or task type expansion.
+
+`harness act` returns `harness.autonomous_read_loop/v1`. It runs a bounded autonomous act loop: read tools may run within budget, and side-effecting tool requests become Harness action contracts evaluated by the selected autonomy profile. Auto-allowed local control-plane contracts can create objectives, tasks, task graphs, and memory notes. When an auto-created task graph produces an objective, `harness act` can immediately run that objective through the autonomous objective runner and return task/lease/run/artifact evidence to the model loop.
+
+Under `supervised-codex`, `harness act` can dispatch `repo_planning` and `codex_isolated_edit` only when scoped hosted approvals exist for the exact task type, adapter, objective/workbench scope, and autonomy scope. Isolated edits still run in isolated workspaces, reviewer/final-synthesis tasks run as local evidence-producing tasks, and apply-back remains a separate higher boundary that is denied unless an explicit apply-back policy later permits it.
 
 ## Packaging Smoke
 

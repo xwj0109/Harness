@@ -26,7 +26,8 @@ The v1.8 release is **Local Agent App Readiness**: local infrastructure, declara
 - Explicit `read_only_summary/read_only_repo_summary` lease adapter.
 - Explicit `codex_isolated_edit/codex_code_edit` adapter with hosted-boundary approval and isolated apply-back review.
 - Explicit `repo_planning/repo_planning` adapter with hosted-boundary approval and Codex read-only sandbox planning.
-- Unified `harness` app with passive dashboard context, deterministic chat actions, first-class summary/planning/coding-fix templates, in-memory transcript/progress, and `--plain` fallback.
+- Foreground Codex-style prompt execution through `harness "prompt"`, with direct workspace edits, Codex CLI workspace-write sandboxing, run artifacts, and final CLI reports.
+- Unified `harness` app with passive dashboard context, deterministic chat actions, first-class summary/planning/coding-fix templates, in-memory transcript/progress, and `--plain` fallback when no prompt is supplied.
 - TUI command-palette and right-panel guidance that reflects the registered adapter set without executing commands.
 - Read-only Capability Catalog over registered adapters through `harness capabilities list|inspect`.
 - Explicit local memory notes through `harness memory save-note|list|inspect|forget`, with scoped records and redaction state.
@@ -36,14 +37,23 @@ OpenAI API usage, paid API fallback, hosted fallback, generic shell execution, a
 
 Spec and agent lifecycle surfaces are inspection/control-plane commands. They do not execute agents, preflight backends, create runs, schedule work, or authorize tools. Bounded execution happens only through active leases and registered adapters. Chat is an operator surface over those same control-plane operations; it does not call Codex, Docker, shell, providers, or model backends directly.
 
-The primary operator loop is:
+The primary foreground coding loop is:
+
+```bash
+harness "fix the failing tests" --project .
+harness "add a CLI flag and update tests" --project . --model gpt-5.5 --reasoning-effort medium
+```
+
+This runs Codex CLI in the active project workspace with `workspace-write` sandboxing and writes a Harness run report under `.harness/runs/<run_id>/`. The direct foreground mode does not use Harness apply-back approval because edits happen in the active workspace; use `harness run "prompt" --task-type codex_code_edit` when you want the safer isolated-workspace review and apply-back flow.
+
+The app and chat surfaces are still available when no prompt is supplied:
 
 ```bash
 harness --project .
 harness --project . --plain --codex-like
 ```
 
-Inside the prompt, requests such as `summarize this repo`, `plan how to improve the CLI`, `fix the failing test with codex`, `show progress`, `show capabilities`, `show recent runs`, `review the last result`, `continue`, and `stop` route to explicit Harness actions. Chat first shows the interpreted intent, proposed action, equivalent CLI commands, safety boundary, required approvals, and confirmation prompt. Confirmed work still goes through objective/task records, daemon run-once leases, registered adapter dispatch, artifacts/events/manifests/progress, and an evidence summary with next inspection commands.
+Inside the chat prompt, requests such as `summarize this repo`, `plan how to improve the CLI`, `fix the failing test with codex`, `show progress`, `show capabilities`, `show recent runs`, `review the last result`, `continue`, and `stop` route to explicit Harness actions. Chat first shows the interpreted intent, proposed action, equivalent CLI commands, safety boundary, required approvals, and confirmation prompt. Confirmed work still goes through objective/task records, daemon run-once leases, registered adapter dispatch, artifacts/events/manifests/progress, and an evidence summary with next inspection commands.
 
 ## Repository Layout
 

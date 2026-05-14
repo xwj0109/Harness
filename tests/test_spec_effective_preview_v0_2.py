@@ -68,7 +68,15 @@ def test_cli_specs_preview_builtin_workbench_json_resolves_allowed_agents(tmp_pa
     preview = payload["preview"]
     assert preview["workbench"]["id"] == "coding"
     assert preview["default_model_profile"]["id"] == "codex_supervised"
-    assert list(preview["allowed_agents"]) == ["code_editor", "coding_orchestrator", "repo_inspector", "test_runner"]
+    assert list(preview["allowed_agents"]) == [
+        "code_editor",
+        "coding_orchestrator",
+        "factuality_reviewer",
+        "implementation_reviewer",
+        "repo_inspector",
+        "security_reviewer",
+        "test_runner",
+    ]
     assert preview["allowed_agents"]["repo_inspector"]["tool_policy"]["network"] == "forbidden"
     assert preview["allowed_agents"]["repo_inspector"]["parent_chain"] == []
     assert preview["allowed_agents"]["repo_inspector"]["profiles"] == []

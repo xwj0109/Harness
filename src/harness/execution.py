@@ -106,6 +106,11 @@ class DryRunExecutionAdapter:
             "Descriptors are documentation and validation metadata, not permission grants.",
             "Execution still requires an active lease and exact task metadata.",
         ],
+        autonomy_default="auto_allowed",
+        max_autonomous_retries=0,
+        required_autonomy_scopes=["safe-local", "daemon-safe", "supervised-codex"],
+        output_contracts=["harness.daemon_execute/v1", "harness.manifest/v1.1"],
+        terminal_evidence_required=["task", "lease", "run", "manifest", "policy_sha256"],
     )
 
     def inspect_eligibility(
@@ -164,6 +169,11 @@ class ReadOnlySummaryExecutionAdapter:
             "Hosted-boundary approval is validated before run creation.",
             "Execution still performs backend, policy, lease, and exact metadata checks.",
         ],
+        autonomy_default="approval_required",
+        max_autonomous_retries=0,
+        required_autonomy_scopes=["supervised-codex"],
+        output_contracts=["harness.daemon_execute/v1", "harness.manifest/v1.1"],
+        terminal_evidence_required=["task", "lease", "run", "manifest", "approval_id", "policy_sha256"],
     )
 
     def inspect_eligibility(
@@ -222,6 +232,19 @@ class CodexIsolatedEditExecutionAdapter:
             "Hosted-boundary approval is validated before run creation.",
             "A leased task is not apply-back approval; apply-back remains denied by default.",
         ],
+        autonomy_default="approval_required",
+        max_autonomous_retries=0,
+        required_autonomy_scopes=["supervised-codex"],
+        output_contracts=["harness.daemon_execute/v1", "harness.manifest/v1.1", "isolated_diff_artifacts"],
+        terminal_evidence_required=[
+            "task",
+            "lease",
+            "run",
+            "manifest",
+            "approval_id",
+            "diff_artifact",
+            "policy_sha256",
+        ],
     )
 
     def inspect_eligibility(
@@ -256,7 +279,14 @@ class CodexIsolatedEditExecutionAdapter:
             )
             return _rejected_result(store, lease, task, attempt, self.id, "codex_isolated_edit_blocked_policy", [reason])
 
-        approval = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", CODEX_CODE_EDIT_TASK_TYPE)
+        approval = ApprovalStore(project_root).find_valid(
+            "codex_cli",
+            "hosted_provider",
+            CODEX_CODE_EDIT_TASK_TYPE,
+            adapter_id=self.id,
+            workbench_id=task.workbench_id,
+            objective_id=task.objective_id,
+        )
         if approval is None:
             reason = "Missing valid hosted-provider Codex approval for codex_code_edit."
             _record_adapter_rejection(
@@ -453,6 +483,11 @@ class RepoPlanningExecutionAdapter:
             "Hosted-boundary approval is validated before run creation.",
             "Execution still performs backend, policy, lease, and exact metadata checks.",
         ],
+        autonomy_default="approval_required",
+        max_autonomous_retries=0,
+        required_autonomy_scopes=["supervised-codex"],
+        output_contracts=["harness.daemon_execute/v1", "harness.manifest/v1.1", "planning_artifacts"],
+        terminal_evidence_required=["task", "lease", "run", "manifest", "approval_id", "policy_sha256"],
     )
 
     def inspect_eligibility(
@@ -487,7 +522,14 @@ class RepoPlanningExecutionAdapter:
             )
             return _rejected_result(store, lease, task, attempt, self.id, "repo_planning_blocked_policy", [reason])
 
-        approval = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", REPO_PLANNING_TASK_TYPE)
+        approval = ApprovalStore(project_root).find_valid(
+            "codex_cli",
+            "hosted_provider",
+            REPO_PLANNING_TASK_TYPE,
+            adapter_id=self.id,
+            workbench_id=task.workbench_id,
+            objective_id=task.objective_id,
+        )
         if approval is None:
             reason = "Missing valid hosted-provider Codex approval for repo_planning."
             _record_adapter_rejection(
@@ -728,7 +770,7 @@ def evaluate_registered_adapter_security_decision(
             if approval not in required_approvals:
                 required_approvals.append(approval)
     task_required = [str(item) for item in task.required_approvals] if task is not None else []
-    descriptor_missing = _missing_descriptor_approvals(project_root, descriptor, task_type_value)
+    descriptor_missing = _missing_descriptor_approvals(project_root, descriptor, task, task_type_value)
     missing_approvals = sorted(set(task_required + descriptor_missing))
     if eligibility.get("reason_code") == "unresolved_task_approvals":
         missing_approvals = sorted(set(missing_approvals + required_approvals))
@@ -930,6 +972,7 @@ def _dedupe_context_warnings(records: list[Any]) -> list[str]:
 def _missing_descriptor_approvals(
     project_root: Path,
     descriptor: ExecutionAdapterDescriptor | None,
+    task: TaskRecord | None,
     task_type: str | None,
 ) -> list[str]:
     if descriptor is None or task_type is None:
@@ -937,7 +980,14 @@ def _missing_descriptor_approvals(
     missing: list[str] = []
     for approval in descriptor.required_approvals:
         if approval == "hosted_provider_codex":
-            found = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", task_type)
+            found = ApprovalStore(project_root).find_valid(
+                "codex_cli",
+                "hosted_provider",
+                task_type,
+                adapter_id=descriptor.id,
+                workbench_id=task.workbench_id if task is not None else None,
+                objective_id=task.objective_id if task is not None else None,
+            )
             if found is None:
                 missing.append(approval)
         else:

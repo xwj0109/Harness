@@ -41,16 +41,29 @@ QUANT_FORBIDDEN_ACTIONS = {
 }
 
 QUANT_GROUP_IDS = {"quant_research", "quant_development", "trading_analysis", "review"}
+CODING_REVIEWER_IDS = {"implementation_reviewer", "security_reviewer", "factuality_reviewer"}
 
 
 def test_builtin_spec_registry_contains_starter_specs() -> None:
     registry = builtin_spec_registry()
 
     assert {"local_reasoning", "codex_supervised"} <= set(registry.model_profiles)
-    assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | QUANT_AGENT_IDS) <= set(
+    assert ({"repo_inspector", "code_editor", "test_runner", "job_researcher"} | CODING_REVIEWER_IDS | QUANT_AGENT_IDS) <= set(
         registry.agents
     )
     assert {"coding", "quant", "personal"} <= set(registry.workbenches)
+
+
+def test_builtin_coding_workbench_contains_reviewer_agents() -> None:
+    registry = builtin_spec_registry()
+    workbench = registry.get_workbench("coding")
+
+    assert CODING_REVIEWER_IDS <= set(workbench.allowed_agents)
+    for agent_id in CODING_REVIEWER_IDS:
+        agent = registry.get_agent(agent_id)
+        assert agent.kind == AgentKind.REVIEWER
+        assert agent.tool_policy == "read_only"
+        assert agent.memory_scope == "project"
 
 
 def test_builtin_agent_references_resolve() -> None:

@@ -590,10 +590,17 @@ def test_chat_orchestrated_codex_flow_uses_registered_adapter_with_denied_apply_
     assert result["kind"] == "orchestration_result"
     assert result["ok"] is True
     assert len(store.list_objectives()) == 1
-    assert len(store.list_tasks(objective_id=state.latest_objective_id)) == 2
+    tasks = store.list_tasks(objective_id=state.latest_objective_id)
+    assert len(tasks) == 6
+    assert tasks[3].agent_id == "implementation_reviewer"
+    assert tasks[4].agent_id == "security_reviewer"
     assert [item["decision"] for item in result["orchestration"]["results"]] == [
         "repo_planning_completed",
         "codex_isolated_edit_completed_denied",
+        "dry_run_no_tool_execution",
+        "dry_run_no_tool_execution",
+        "dry_run_no_tool_execution",
+        "dry_run_no_tool_execution",
     ]
     assert (tmp_path / "app.py").read_bytes() == before
 

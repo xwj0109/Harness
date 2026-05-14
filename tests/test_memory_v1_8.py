@@ -102,6 +102,99 @@ def test_memory_notes_redact_secret_looking_text_without_persisting_raw_values(t
         assert secret not in serialized
 
 
+def test_artifact_based_memory_has_source_links_hash_and_no_authority(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective("Memory objective")
+    task = store.create_task(
+        title="Dry run",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    run = store.create_run("review this run", "phase_1a_test", status="completed", task_id=task.id, objective_id=objective.id)
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "review.md"
+    artifact_path.write_text("local evidence", encoding="utf-8")
+    artifact = store.register_artifact(run.id, kind="final_report", path=artifact_path, producer="test")
+
+    record = store.save_derived_memory(
+        "task",
+        task.id,
+        "artifact_summary",
+        "Artifact says the dry run completed; this does not approve hosted Codex.",
+        source_id=run.id,
+        source_artifact_id=artifact.id,
+    )
+
+    assert record.scope_type.value == "task"
+    assert record.scope_id == task.id
+    assert record.source_kind.value == "artifact_summary"
+    assert record.source_id == run.id
+    assert record.source_artifact_id == artifact.id
+    assert record.sha256
+    assert record.size_bytes == len(record.summary.encode("utf-8"))
+    assert record.redaction_state.value == "not_required"
+    assert record.lineage["source_run_id"] == run.id
+    assert record.lineage["source_artifact_id"] == artifact.id
+    assert record.lineage["permission_granting"] is False
+    assert record.lineage["policy_authority"] is False
+    assert record.lineage["approval_authority"] is False
+    assert record.lineage["authority_claims_stripped"]
+
+
+def test_secret_like_derived_memory_is_redacted(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective("Memory objective")
+
+    record = store.save_derived_memory(
+        "objective",
+        objective.id,
+        "objective_state",
+        "Failed because OPENAI_API_KEY=sk-1234567890abcdef appeared in output.",
+        source_id=objective.id,
+    )
+
+    assert record.redaction_state.value == "redacted"
+    assert "sk-1234567890abcdef" not in record.summary
+    assert "[REDACTED_SECRET]" in record.summary
+    assert record.lineage["secret_findings"]
+    assert record.lineage["permission_granting"] is False
+
+
+def test_memory_save_derived_cli_outputs_json(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    objective = SQLiteStore(tmp_path).create_objective("Memory objective")
+
+    saved = runner.invoke(
+        app,
+        [
+            "memory",
+            "save-derived",
+            "--scope",
+            "objective",
+            "--scope-id",
+            objective.id,
+            "--source-kind",
+            "objective_state",
+            "--source-id",
+            objective.id,
+            "--summary",
+            "Objective has one ready task.",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert saved.exit_code == 0, saved.output
+    payload = json.loads(saved.output)
+    assert payload["schema_version"] == "harness.memory_record/v1"
+    assert payload["memory"]["source_kind"] == "objective_state"
+    assert payload["memory"]["scope_type"] == "objective"
+    assert payload["memory"]["lineage"]["approval_authority"] is False
+
+
 def test_memory_rejects_empty_and_unknown_ids_return_stable_json(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 

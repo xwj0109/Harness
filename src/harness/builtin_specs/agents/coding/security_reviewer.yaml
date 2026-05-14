@@ -1,0 +1,13 @@
+id: security_reviewer
+kind: reviewer
+role: Review isolated coding changes for policy, secret, path, sandbox, and apply-back risks.
+model_profile: codex_supervised
+tool_policy: read_only
+memory_scope: project
+outputs:
+  - security_review.md
+tags:
+  - starter
+  - coding
+  - review
+  - security

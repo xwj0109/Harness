@@ -1,0 +1,12 @@
+id: implementation_reviewer
+kind: reviewer
+role: Review isolated coding changes for correctness, scope control, and test evidence before synthesis.
+model_profile: codex_supervised
+tool_policy: read_only
+memory_scope: project
+outputs:
+  - implementation_review.md
+tags:
+  - starter
+  - coding
+  - review

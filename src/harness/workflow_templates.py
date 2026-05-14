@@ -20,9 +20,14 @@ class WorkflowTaskTemplate:
     workbench_id: str | None = "coding"
     depends_on_indexes: list[int] = field(default_factory=list)
     priority: int = 0
+    task_metadata: dict[str, Any] = field(default_factory=dict)
 
-    def metadata(self) -> dict[str, str]:
-        return {"execution_adapter": self.execution_adapter, "task_type": self.task_type}
+    def metadata(self) -> dict[str, Any]:
+        return {
+            **dict(self.task_metadata),
+            "execution_adapter": self.execution_adapter,
+            "task_type": self.task_type,
+        }
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -34,6 +39,7 @@ class WorkflowTaskTemplate:
             "workbench_id": self.workbench_id,
             "depends_on_indexes": list(self.depends_on_indexes),
             "priority": self.priority,
+            "metadata": self.metadata(),
         }
 
 
@@ -127,7 +133,10 @@ def coding_fix_template(prompt: str, project_root: Path) -> WorkflowTemplate:
     return WorkflowTemplate(
         id="coding_fix",
         interpreted_intent="codex_isolated_edit",
-        proposed_action="Create a small two-step workflow: read-only planning first, then a Codex isolated edit after the plan task succeeds.",
+        proposed_action=(
+            "Create a bounded coding workflow: read-only planning, isolated edit, local test evidence, "
+            "implementation review, security review, and final synthesis."
+        ),
         objective_title=_title_for("Coding fix", goal),
         objective_description=f"Chat-requested coding fix: {goal}",
         tasks=[
@@ -138,6 +147,7 @@ def coding_fix_template(prompt: str, project_root: Path) -> WorkflowTemplate:
                 task_type="repo_planning",
                 agent_id="repo_inspector",
                 priority=1000,
+                task_metadata={"workflow_stage": "repo_planning", "completion_gate": False},
             ),
             WorkflowTaskTemplate(
                 title="Prepare isolated Codex edit",
@@ -147,20 +157,164 @@ def coding_fix_template(prompt: str, project_root: Path) -> WorkflowTemplate:
                 agent_id="code_editor",
                 depends_on_indexes=[0],
                 priority=999,
+                task_metadata={"workflow_stage": "codex_isolated_edit", "completion_gate": False},
+            ),
+            WorkflowTaskTemplate(
+                title="Record sandbox test evidence",
+                description=f"Record the approved sandbox test plan and evidence boundary for: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="test_runner",
+                depends_on_indexes=[1],
+                priority=998,
+                task_metadata={
+                    "workflow_stage": "test_sandbox",
+                    "review_gate": True,
+                    "completion_gate": True,
+                    "review_target_stage": "codex_isolated_edit",
+                },
+            ),
+            WorkflowTaskTemplate(
+                title="Implementation review",
+                description=f"Review the isolated edit artifact and test evidence for implementation correctness: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="implementation_reviewer",
+                depends_on_indexes=[2],
+                priority=997,
+                task_metadata={
+                    "workflow_stage": "implementation_review",
+                    "review_role": "implementation_reviewer",
+                    "review_gate": True,
+                    "completion_gate": True,
+                    "review_target_stage": "codex_isolated_edit",
+                },
+            ),
+            WorkflowTaskTemplate(
+                title="Security review",
+                description=f"Review the isolated edit artifact for policy, path, secret, and apply-back risks: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="security_reviewer",
+                depends_on_indexes=[3],
+                priority=996,
+                task_metadata={
+                    "workflow_stage": "security_review",
+                    "review_role": "security_reviewer",
+                    "review_gate": True,
+                    "completion_gate": True,
+                    "blocks_apply_back": True,
+                    "review_target_stage": "codex_isolated_edit",
+                },
+            ),
+            WorkflowTaskTemplate(
+                title="Final coding workflow report",
+                description=f"Synthesize objective, task, run, artifact, review, and policy evidence for: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="coding_orchestrator",
+                depends_on_indexes=[0, 1, 2, 3, 4],
+                priority=995,
+                task_metadata={
+                    "workflow_stage": "final_report",
+                    "review_gate": True,
+                    "completion_gate": True,
+                    "requires_evidence_links": "objective,task,run,artifact,policy",
+                },
             ),
         ],
         required_approvals=["hosted_provider_codex"],
         safety_boundary=[
             *_codex_read_only_boundary(),
             "The edit task runs only in an isolated workspace.",
+            "Local reviewer tasks must produce evidence before the workflow can complete.",
+            "The security review gates any later apply-back path.",
             "Apply-back is not automatic and remains denied by default.",
         ],
         equivalent_commands=[
             f'harness objectives add --title "{_title_for("Coding fix", goal)}" --workbench coding --project {project_root} --output json',
             "harness tasks add ... --execution-adapter repo_planning --task-type repo_planning",
             "harness tasks add ... --execution-adapter codex_isolated_edit --task-type codex_code_edit --depends-on <planning_task>",
+            "harness tasks add ... --execution-adapter dry_run --task-type phase_1a_test --agent test_runner --depends-on <edit_task>",
+            "harness tasks add ... --execution-adapter dry_run --task-type phase_1a_test --agent implementation_reviewer --depends-on <test_task>",
+            "harness tasks add ... --execution-adapter dry_run --task-type phase_1a_test --agent security_reviewer --depends-on <implementation_review_task>",
+            "harness tasks add ... --execution-adapter dry_run --task-type phase_1a_test --agent coding_orchestrator --depends-on <all_prior_tasks>",
             f"harness daemon run-once --project {project_root} --output json",
             f"harness daemon execute <lease_id> --project {project_root} --output json",
+        ],
+    )
+
+
+def research_brief_template(prompt: str, project_root: Path) -> WorkflowTemplate:
+    goal = _goal(prompt)
+    return WorkflowTemplate(
+        id="research_brief",
+        interpreted_intent="research_brief",
+        proposed_action="Create a bounded research workflow with read-only inspection, a brief, factuality review, and synthesis.",
+        objective_title=_title_for("Research brief", goal),
+        objective_description=f"Chat-requested research workflow: {goal}",
+        tasks=[
+            WorkflowTaskTemplate(
+                title="Read-only research inspection",
+                description=f"Inspect local repository context for the research request without mutation: {goal}",
+                execution_adapter="read_only_summary",
+                task_type="read_only_repo_summary",
+                agent_id="repo_inspector",
+                priority=1000,
+                task_metadata={"workflow_stage": "read_only_inspection", "completion_gate": False},
+            ),
+            WorkflowTaskTemplate(
+                title="Research brief",
+                description=f"Produce local research brief evidence for: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="repo_inspector",
+                depends_on_indexes=[0],
+                priority=999,
+                task_metadata={"workflow_stage": "research_brief", "completion_gate": True},
+            ),
+            WorkflowTaskTemplate(
+                title="Factuality review",
+                description=f"Review the research brief for unsupported claims and missing evidence: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="factuality_reviewer",
+                depends_on_indexes=[1],
+                priority=998,
+                task_metadata={
+                    "workflow_stage": "factuality_review",
+                    "review_role": "factuality_reviewer",
+                    "review_gate": True,
+                    "completion_gate": True,
+                },
+            ),
+            WorkflowTaskTemplate(
+                title="Research synthesis",
+                description=f"Synthesize research, factuality review, artifact, and policy evidence for: {goal}",
+                execution_adapter="dry_run",
+                task_type="phase_1a_test",
+                agent_id="coding_orchestrator",
+                depends_on_indexes=[0, 1, 2],
+                priority=997,
+                task_metadata={
+                    "workflow_stage": "research_synthesis",
+                    "review_gate": True,
+                    "completion_gate": True,
+                    "requires_evidence_links": "objective,task,run,artifact,policy",
+                },
+            ),
+        ],
+        required_approvals=["hosted_provider_codex"],
+        safety_boundary=[
+            *_codex_read_only_boundary(),
+            "Research reviewer tasks produce local evidence only.",
+            "Research synthesis cannot grant approvals or broaden policy.",
+        ],
+        equivalent_commands=[
+            f'harness objectives add --title "{_title_for("Research brief", goal)}" --workbench coding --project {project_root} --output json',
+            "harness tasks add ... --execution-adapter read_only_summary --task-type read_only_repo_summary",
+            "harness tasks add ... --execution-adapter dry_run --task-type phase_1a_test --agent factuality_reviewer",
+            f"harness objectives run <objective_id> --autonomy supervised-codex --project {project_root} --output json",
         ],
     )
 
@@ -172,6 +326,8 @@ def template_for_intent(intent: str, prompt: str, project_root: Path) -> Workflo
         return repo_planning_template(prompt, project_root)
     if intent == "coding_fix":
         return coding_fix_template(prompt, project_root)
+    if intent == "research_brief":
+        return research_brief_template(prompt, project_root)
     raise KeyError(f"Unknown workflow template intent: {intent}")
 
 

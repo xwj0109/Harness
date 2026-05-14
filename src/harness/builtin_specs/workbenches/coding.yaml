@@ -5,6 +5,9 @@ allowed_agents:
   - repo_inspector
   - code_editor
   - test_runner
+  - implementation_reviewer
+  - security_reviewer
+  - factuality_reviewer
 default_model_profile: codex_supervised
 forbidden_actions:
   - paid_api_fallback

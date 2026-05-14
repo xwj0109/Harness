@@ -110,6 +110,42 @@ def test_codex_edit_command_uses_model_and_low_reasoning(monkeypatch, tmp_path) 
     assert ["--sandbox", "workspace-write"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
 
 
+def test_codex_direct_agent_command_uses_workspace_write_and_overrides(monkeypatch, tmp_path) -> None:
+    exec_help = EXEC_HELP + "\n  --ask-for-approval <APPROVAL_POLICY>\n"
+
+    def fake_run(args, **kwargs):
+        if args == ["codex", "--help"]:
+            return completed(args, stdout="Commands:\n  exec\n")
+        if args == ["codex", "exec", "--help"]:
+            return completed(args, stdout=exec_help)
+        if args == ["codex", "login", "--help"]:
+            return completed(args, stdout="status")
+        return completed(args, stdout="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    backend = CodexCliBackend(codex_config())
+    command, _capabilities, _network_status = backend.build_direct_agent_command(
+        tmp_path,
+        "edit directly",
+        tmp_path / "final.md",
+        model="gpt-direct",
+        reasoning_effort="high",
+    )
+
+    assert ["--cd", str(tmp_path)] == command[command.index("--cd") : command.index("--cd") + 2]
+    assert ["--sandbox", "workspace-write"] == command[command.index("--sandbox") : command.index("--sandbox") + 2]
+    assert ["--ask-for-approval", "on-request"] == command[
+        command.index("--ask-for-approval") : command.index("--ask-for-approval") + 2
+    ]
+    assert ["--model", "gpt-direct"] == command[command.index("--model") : command.index("--model") + 2]
+    assert ["-c", 'model_reasoning_effort="high"'] in [
+        command[index : index + 2] for index, value in enumerate(command[:-1]) if value == "-c"
+    ]
+    assert "--dangerously-bypass-approvals-and-sandbox" not in command
+    assert "edit directly" == command[-1]
+    assert backend.config.settings["last_apply_back_approval_required"] is False
+
+
 def test_codex_skip_git_repo_check_is_capability_gated(monkeypatch, tmp_path) -> None:
     def fake_run(args, **kwargs):
         if args == ["codex", "--help"]:

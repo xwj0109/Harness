@@ -69,17 +69,17 @@ def pack_chat_context(project_root: Path, *, budget_chars: int = DEFAULT_CONTEXT
 
     candidates = [
         _harness_vocabulary_block(),
+        _builtin_registry_block(warnings),
+        _security_policy_block(),
+        _sandbox_profiles_block(warnings),
         _repo_tree_block(project_root, excluded_patterns, blocked_paths),
         _read_named_file_block(project_root, "README.md", excluded_patterns, blocked_paths, warnings),
         _read_named_file_block(project_root, "AGENTS.md", excluded_patterns, blocked_paths, warnings),
         _git_block(project_root, ["git", "status", "--short", "--branch"], "git_status", "Git status"),
         _git_block(project_root, ["git", "diff", "--stat"], "git_diff_stat", "Git diff stat"),
         _git_block(project_root, ["git", "diff", "--"], "git_diff", "Git diff", limit=MAX_DIFF_CHARS),
-        _operator_context_block(project_root, warnings),
         _recent_artifacts_block(project_root, warnings),
-        _builtin_registry_block(warnings),
-        _security_policy_block(),
-        _sandbox_profiles_block(warnings),
+        _operator_context_block(project_root, warnings),
     ]
 
     used = 0
@@ -269,9 +269,31 @@ def _builtin_registry_block(warnings: list[str]) -> ContextBlock | None:
             }
             for key, value in registry.agents.items()
         },
-        "model_profiles": {key: value.model_dump(mode="json") for key, value in registry.model_profiles.items()},
-        "tool_policies": {key: value.model_dump(mode="json") for key, value in registry.tool_policies.items()},
-        "memory_scopes": {key: value.model_dump(mode="json") for key, value in registry.memory_scopes.items()},
+        "model_profiles": {
+            key: {
+                "kind": value.kind.value,
+                "backend": value.backend,
+                "default": value.default,
+                "constraints": value.constraints,
+            }
+            for key, value in registry.model_profiles.items()
+        },
+        "tool_policies": {
+            key: {
+                "network": value.network.value,
+                "active_repo_write": value.active_repo_write.value,
+                "hosted_boundary": value.hosted_boundary.value,
+                "tools": {tool: permission.value for tool, permission in value.tools.items()},
+            }
+            for key, value in registry.tool_policies.items()
+        },
+        "memory_scopes": {
+            key: {
+                "allowed_paths": value.allowed_paths,
+                "forbidden_paths": value.forbidden_paths,
+            }
+            for key, value in registry.memory_scopes.items()
+        },
     }
     return _json_block("builtin_harness_domain", "Built-in agents, workbenches, profiles, policies, and memory scopes", payload)
 

@@ -118,7 +118,7 @@ def _task_progress(
     run_id = task.run_id or (attempt.run_id if attempt is not None else None)
     blocked_reasons = _graph_reason_strings(graph_reasons)
     blocked_reasons.extend(_metadata_blockers(task, adapter_id, task_type))
-    blocked_reasons.extend(_descriptor_approval_blockers(project_root, adapter_id, task_type))
+    blocked_reasons.extend(_descriptor_approval_blockers(project_root, task, adapter_id, task_type))
     if task.status == TaskStatus.WAITING_APPROVAL and not task.required_approvals:
         blocked_reasons.append("task is waiting for approval")
     if task.status == TaskStatus.BLOCKED and not blocked_reasons:
@@ -184,7 +184,12 @@ def _metadata_blockers(task: TaskRecord, adapter_id: str | None, task_type: str 
     return blockers
 
 
-def _descriptor_approval_blockers(project_root: Path, adapter_id: str | None, task_type: str | None) -> list[str]:
+def _descriptor_approval_blockers(
+    project_root: Path,
+    task: TaskRecord,
+    adapter_id: str | None,
+    task_type: str | None,
+) -> list[str]:
     if not adapter_id or not task_type:
         return []
     adapter = builtin_execution_adapters().get(adapter_id)
@@ -197,6 +202,9 @@ def _descriptor_approval_blockers(project_root: Path, adapter_id: str | None, ta
             backend=_approval_backend(approval),
             data_boundary=_approval_data_boundary(approval),
             task_type=task_type,
+            adapter_id=adapter_id,
+            workbench_id=task.workbench_id,
+            objective_id=task.objective_id,
         )
         is None
     ]

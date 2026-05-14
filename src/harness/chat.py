@@ -5,15 +5,24 @@ import json
 import shlex
 import sqlite3
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Callable, TextIO
 
 from harness.action_proposals import ActionContract, contract_from_tool_request
 from harness.approvals import ApprovalStore
+from harness.autonomy import (
+    AutonomyDecision,
+    AutonomyDecisionStatus,
+    AutonomyEvaluationInput,
+    AutonomousApprovalRecord,
+    evaluate_autonomy,
+    get_builtin_autonomy_policy,
+)
 from harness.backends.local_openai import LocalEndpointUnavailable
 from harness.capabilities import build_capability_catalog
-from harness.chat_model import ChatContext, ChatMessage, ChatModel, build_default_chat_model
+from harness.chat_model import ChatContext, ChatMessage, ChatModel, ChatResponse, build_default_chat_model
 from harness.chat_tools import (
     ChatToolRequest,
     chat_tool_specs_payload,
@@ -24,8 +33,10 @@ from harness.chat_tools import (
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
 from harness.context_pack import pack_chat_context
 from harness.execution import execute_lease, list_execution_adapter_descriptors
+from harness.events import append_jsonl
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import ArtifactRecord, RunRecord, TaskLease, TaskRecord
+from harness.objective_runner import run_objective_autonomously
 from harness.operator_context import build_operator_context, render_operator_context_lines
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
@@ -41,12 +52,224 @@ CHAT_SCHEMA_VERSION = "harness.chat/v1"
 CHAT_RESPONSE_SCHEMA_VERSION = "harness.chat_response/v1"
 CHAT_INTENT_SCHEMA_VERSION = "harness.chat_intent/v1"
 ORCHESTRATION_DRAFT_SCHEMA_VERSION = "harness.chat_orchestration_draft/v1"
+AUTONOMOUS_READ_LOOP_SCHEMA_VERSION = "harness.autonomous_read_loop/v1"
 
 CODEX_ORCHESTRATION_ADAPTER = "codex_isolated_edit"
 CODEX_ORCHESTRATION_TASK_TYPE = "codex_code_edit"
 DEFAULT_ORCHESTRATOR_ID = "coding_orchestrator"
 ORCHESTRATION_OWNER = "chat_orchestrator"
 MAX_CHAT_TOOL_CALLS = 3
+
+
+def run_autonomous_read_loop(
+    goal: str,
+    project_root: Path,
+    *,
+    autonomy_profile_id: str = "safe-local",
+    chat_model: ChatModel | None = None,
+    allow_action_contracts: bool = False,
+    auto_run_created_objective: bool = False,
+) -> dict[str, Any]:
+    project_root = resolve_project_root(project_root)
+    policy = get_builtin_autonomy_policy(autonomy_profile_id)
+    loop_id = f"act_{uuid.uuid4().hex[:12]}"
+    evidence_path = project_root / HARNESS_DIR / "autonomy" / f"{loop_id}.jsonl"
+    state = ChatSessionState(autonomy_profile_id=autonomy_profile_id)
+    context_payload = chat_context(project_root)
+    context_manifest = pack_chat_context(project_root)
+    chat_ctx = ChatContext(
+        project_root=str(project_root),
+        model_profile=context_payload["chat"]["default_model_profile"],
+        mode="act",
+        context_blocks=[block.to_payload() for block in context_manifest.blocks],
+        safety_boundaries=list(context_payload["safety_boundaries"]),
+    )
+    messages = _model_messages(goal, state, chat_ctx)
+    observations: list[dict[str, Any]] = []
+    stop_reason = "not_started"
+    final_answer = ""
+    model_turns = 0
+    tool_calls = 0
+    consecutive_failures = 0
+    append_jsonl(
+        evidence_path,
+        {
+            "schema_version": "harness.autonomous_read_loop_event/v1",
+            "loop_id": loop_id,
+            "event": "started",
+            "goal": sanitize_for_logging(goal),
+            "autonomy_profile_id": autonomy_profile_id,
+            "budgets": policy.budget.model_dump(mode="json"),
+        },
+    )
+    try:
+        model = chat_model or build_default_chat_model(project_root)
+        while model_turns < policy.budget.max_model_turns:
+            model_turns += 1
+            model_turn_id = f"{loop_id}:turn:{model_turns}"
+            model_response = model.complete(messages, chat_ctx)
+            content = str(sanitize_for_logging(model_response.content)).strip()
+            append_jsonl(
+                evidence_path,
+                {
+                    "schema_version": "harness.autonomous_read_loop_event/v1",
+                    "loop_id": loop_id,
+                    "event": "model_turn",
+                    "model_turn": model_turns,
+                    "model_turn_id": model_turn_id,
+                    "content": content,
+                },
+            )
+            tool_request = parse_tool_request(content)
+            if tool_request is None:
+                final_answer = content or "The model returned an empty response."
+                stop_reason = "final_answer"
+                break
+            if tool_calls >= policy.budget.max_tool_calls:
+                final_answer = "Stopped before running another tool because the tool-call budget is exhausted."
+                stop_reason = "tool_budget_exhausted"
+                break
+            tool_result = run_chat_tool(tool_request, default_chat_tool_context(project_root))
+            tool_calls += 1
+            observation = {
+                "tool": tool_result.tool,
+                "ok": tool_result.ok,
+                "error_type": tool_result.error_type,
+            }
+            observations.append(observation)
+            append_jsonl(
+                evidence_path,
+                {
+                    "schema_version": "harness.autonomous_read_loop_event/v1",
+                    "loop_id": loop_id,
+                    "event": "tool_observation",
+                    "model_turn": model_turns,
+                    "model_turn_id": model_turn_id,
+                    "tool_request": {
+                        "tool": tool_request.tool,
+                        "arguments": sanitize_for_logging(tool_request.arguments),
+                    },
+                    "observation": observation,
+                },
+            )
+            if tool_result.error_type == "action_contract_required":
+                if not allow_action_contracts:
+                    final_answer = "Stopped because the model requested a side-effecting Harness tool."
+                    stop_reason = "side_effect_tool_rejected"
+                    break
+                action_response = _action_contract_response(project_root, state, tool_request)
+                action_observation = {
+                    "tool": tool_request.tool,
+                    "ok": bool(action_response.get("ok")),
+                    "error_type": None if action_response.get("ok") else str(action_response.get("kind")),
+                    "kind": action_response.get("kind"),
+                }
+                observations.append(action_observation)
+                append_jsonl(
+                    evidence_path,
+                    {
+                        "schema_version": "harness.autonomous_read_loop_event/v1",
+                        "loop_id": loop_id,
+                        "event": "action_contract_observation",
+                        "model_turn": model_turns,
+                        "model_turn_id": model_turn_id,
+                        "observation": action_observation,
+                        "response": sanitize_for_logging(action_response),
+                    },
+                )
+                if not action_response.get("ok"):
+                    final_answer = "\n".join(str(line) for line in action_response.get("lines", []))
+                    stop_reason = str(action_response.get("kind") or "action_contract_failed")
+                    break
+                if (
+                    auto_run_created_objective
+                    and tool_request.tool == "create_task_graph"
+                    and state.latest_objective_id
+                    and _is_initialized(project_root)
+                ):
+                    objective_result = run_objective_autonomously(
+                        project_root,
+                        state.latest_objective_id,
+                        autonomy_profile_id=autonomy_profile_id,
+                    )
+                    objective_observation = {
+                        "tool": "objectives.run",
+                        "ok": objective_result.ok,
+                        "error_type": None if objective_result.ok else objective_result.stop_reason,
+                        "kind": "autonomous_objective_run",
+                        "objective_id": objective_result.objective_id,
+                        "stop_reason": objective_result.stop_reason,
+                        "adapter_dispatches": objective_result.adapter_dispatches,
+                    }
+                    observations.append(objective_observation)
+                    append_jsonl(
+                        evidence_path,
+                        {
+                            "schema_version": "harness.autonomous_read_loop_event/v1",
+                            "loop_id": loop_id,
+                            "event": "objective_run_observation",
+                            "model_turn": model_turns,
+                            "model_turn_id": model_turn_id,
+                            "observation": objective_observation,
+                            "response": objective_result.model_dump(mode="json"),
+                        },
+                    )
+                    state.latest_run_id = (
+                        objective_result.step_results[-1].run_id if objective_result.step_results else state.latest_run_id
+                    )
+                    if not objective_result.ok and objective_result.stop_reason not in {
+                        "approval_required",
+                        "requires_human_boundary",
+                    }:
+                        final_answer = f"Stopped after autonomous objective run: {objective_result.stop_reason}"
+                        stop_reason = objective_result.stop_reason
+                        break
+                messages.append(ChatMessage(role="assistant", content=content))
+                messages.append(ChatMessage(role="user", content=f"Harness action result:\n{json.dumps(sanitize_for_logging(action_response), sort_keys=True, default=str)}"))
+                continue
+            if not tool_result.ok:
+                consecutive_failures += 1
+                if consecutive_failures >= policy.budget.max_consecutive_failures:
+                    final_answer = "Stopped because tool failures exceeded the autonomy budget."
+                    stop_reason = "tool_failure_budget_exhausted"
+                    break
+            else:
+                consecutive_failures = 0
+            messages.append(ChatMessage(role="assistant", content=content))
+            messages.append(ChatMessage(role="user", content=f"Harness tool result:\n{tool_result.to_message()}"))
+        else:
+            final_answer = "Stopped because the model-turn budget is exhausted."
+            stop_reason = "model_turn_budget_exhausted"
+    except LocalEndpointUnavailable as exc:
+        final_answer = "\n".join(_local_model_unavailable_response(project_root, exc)["lines"])
+        stop_reason = "chat_model_unavailable"
+    append_jsonl(
+        evidence_path,
+        {
+            "schema_version": "harness.autonomous_read_loop_event/v1",
+            "loop_id": loop_id,
+            "event": "stopped",
+            "stop_reason": stop_reason,
+            "model_turns": model_turns,
+            "tool_calls": tool_calls,
+            "observations": observations,
+        },
+    )
+    return {
+        "schema_version": AUTONOMOUS_READ_LOOP_SCHEMA_VERSION,
+        "ok": stop_reason in {"final_answer", "tool_budget_exhausted", "model_turn_budget_exhausted"},
+        "loop_id": loop_id,
+        "project_root": str(project_root),
+        "autonomy_profile_id": autonomy_profile_id,
+        "goal": sanitize_for_logging(goal),
+        "stop_reason": stop_reason,
+        "final_answer": final_answer,
+        "lines": final_answer.splitlines() if final_answer else [],
+        "model_turns": model_turns,
+        "tool_calls": tool_calls,
+        "tool_results": observations,
+        "evidence_path": str(evidence_path),
+    }
 
 
 @dataclass
@@ -59,6 +282,7 @@ class OrchestratedTaskDraft:
     task_type: str = CODEX_ORCHESTRATION_TASK_TYPE
     depends_on_indexes: list[int] = field(default_factory=list)
     priority: int = 0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -70,6 +294,7 @@ class OrchestratedTaskDraft:
             "priority": self.priority,
             "execution_adapter": self.execution_adapter,
             "task_type": self.task_type,
+            "metadata": self.metadata,
         }
 
 
@@ -156,6 +381,7 @@ class ChatSessionState:
     latest_orchestration: dict[str, Any] | None = None
     stop_requested: bool = False
     codex_like_mode: bool = False
+    autonomy_profile_id: str = "manual"
     transcript: list[dict[str, Any]] = field(default_factory=list)
     progress: list[str] = field(default_factory=list)
 
@@ -175,6 +401,7 @@ class ChatSessionState:
         self.latest_orchestration = None
         self.stop_requested = False
         self.codex_like_mode = False
+        self.autonomy_profile_id = "manual"
         self.transcript = []
         self.progress = []
 
@@ -223,11 +450,12 @@ def handle_chat_input(
     project_root: Path,
     state: ChatSessionState | None = None,
     chat_model: ChatModel | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     state = state or ChatSessionState()
     project_root = resolve_project_root(project_root)
     raw = text.strip()
-    response = _dispatch_chat_input(raw, project_root, state, chat_model=chat_model)
+    response = _dispatch_chat_input(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
     if response.get("kind") != "reset":
         state.transcript.append({"role": "user", "content": str(sanitize_for_logging(raw))})
         state.transcript.append(
@@ -246,6 +474,7 @@ def _dispatch_chat_input(
     state: ChatSessionState,
     *,
     chat_model: ChatModel | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if not raw:
         return _response("empty", "No input", ["Type /help for available commands."])
@@ -261,8 +490,8 @@ def _dispatch_chat_input(
         state.pending_hosted_approval = False
         return _response("declined", "Declined", ["No action was taken."], ok=True)
     if raw.startswith("/"):
-        return _handle_slash(raw, project_root, state, chat_model=chat_model)
-    return _handle_intent(raw, project_root, state, chat_model=chat_model)
+        return _handle_slash(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
+    return _handle_intent(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
 
 
 def render_chat_response(response: dict[str, Any]) -> str:
@@ -273,15 +502,23 @@ def render_chat_response(response: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def run_chat_loop(project_root: Path, stdin: TextIO, stdout: TextIO, *, codex_like: bool = False) -> int:
+def run_chat_loop(
+    project_root: Path,
+    stdin: TextIO,
+    stdout: TextIO,
+    *,
+    codex_like: bool = False,
+    autonomy_profile_id: str = "manual",
+) -> int:
     project_root = resolve_project_root(project_root)
-    state = ChatSessionState(codex_like_mode=codex_like)
+    state = ChatSessionState(codex_like_mode=codex_like, autonomy_profile_id=autonomy_profile_id)
     state.selected_orchestrator_id = _default_orchestrator_id()
     context = chat_context(project_root)
     stdout.write("Harness chat\n")
     stdout.write(f"Project: {context['project_root']}\n")
     stdout.write(f"Orchestrator: {state.selected_orchestrator_id or 'none'}\n")
     stdout.write(f"Mode: {'codex-like' if state.codex_like_mode else 'normal'}\n")
+    stdout.write(f"Autonomy: {state.autonomy_profile_id}\n")
     stdout.write(f"Initialized: {context['initialized']}\n")
     stdout.write("Type /help for commands. Type /quit to exit.\n")
     while True:
@@ -398,6 +635,7 @@ def _handle_slash(
     state: ChatSessionState,
     *,
     chat_model: ChatModel | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     parts = raw.split()
     command = parts[0][1:]
@@ -499,6 +737,7 @@ def _handle_slash(
                 state,
                 chat_model=chat_model,
                 mode_override="plan",
+                progress_callback=progress_callback,
             )
         return _plan_response(state)
     if command == "act":
@@ -520,6 +759,7 @@ def _handle_slash(
             state,
             chat_model=chat_model,
             mode_override="act",
+            progress_callback=progress_callback,
         )
     if command == "diff":
         return _artifact_response(project_root, state.latest_diff_artifact) if state.latest_diff_artifact else _diff_response(project_root)
@@ -566,6 +806,7 @@ def _handle_intent(
     state: ChatSessionState,
     *,
     chat_model: ChatModel | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     intent = route_chat_intent(raw)["intent"]
     if intent == "init_project":
@@ -629,7 +870,7 @@ def _handle_intent(
         return _apply_back_review_response(project_root, state, choice="approve")
     if intent == "deny_apply_back":
         return _apply_back_review_response(project_root, state, choice="deny")
-    return _model_chat_response(raw, project_root, state, chat_model=chat_model)
+    return _model_chat_response(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
 
 
 def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any]:
@@ -668,6 +909,7 @@ def _model_chat_response(
     *,
     chat_model: ChatModel | None = None,
     mode_override: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     context_payload = chat_context(project_root)
     context_manifest = pack_chat_context(project_root)
@@ -682,7 +924,7 @@ def _model_chat_response(
     tool_results: list[dict[str, Any]] = []
     try:
         model = chat_model or build_default_chat_model(project_root)
-        model_response = model.complete(messages, chat_ctx)
+        model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
         for _index in range(MAX_CHAT_TOOL_CALLS):
             tool_request = parse_tool_request(model_response.content)
             if tool_request is None:
@@ -690,6 +932,20 @@ def _model_chat_response(
             tool_result = run_chat_tool(tool_request, default_chat_tool_context(project_root))
             if tool_result.error_type == "action_contract_required":
                 return _action_contract_response(project_root, state, tool_request)
+            if tool_result.error_type == "unknown_tool":
+                return _response(
+                    "action_contract_rejected",
+                    "Action Contract Rejected",
+                    [tool_result.content],
+                    ok=False,
+                    extra={
+                        "tool_request": {
+                            "tool": tool_request.tool,
+                            "arguments": sanitize_for_logging(tool_request.arguments),
+                        },
+                        "error_type": tool_result.error_type,
+                    },
+                )
             tool_results.append(
                 {
                     "tool": tool_result.tool,
@@ -697,9 +953,16 @@ def _model_chat_response(
                     "error_type": tool_result.error_type,
                 }
             )
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "kind": "tool_result",
+                        "content": f"Tool {tool_result.tool}: {'ok' if tool_result.ok else tool_result.error_type or 'failed'}",
+                    }
+                )
             messages.append(ChatMessage(role="assistant", content=model_response.content))
             messages.append(ChatMessage(role="user", content=f"Harness tool result:\n{tool_result.to_message()}"))
-            model_response = model.complete(messages, chat_ctx)
+            model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
     except LocalEndpointUnavailable as exc:
         return _local_model_unavailable_response(project_root, exc)
     content = str(sanitize_for_logging(model_response.content)).strip()
@@ -735,6 +998,30 @@ def _model_chat_response(
             "action_proposals": model_response.action_proposals,
         },
     )
+
+
+def _complete_model_turn(
+    model: ChatModel,
+    messages: list[ChatMessage],
+    chat_ctx: ChatContext,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+) -> Any:
+    if progress_callback is None:
+        return model.complete(messages, chat_ctx)
+    chunks: list[str] = []
+    action_proposals: list[dict[str, Any]] = []
+    saw_delta = False
+    for delta in model.stream(messages, chat_ctx):
+        saw_delta = True
+        content = str(sanitize_for_logging(delta.content))
+        kind = getattr(delta, "kind", "content")
+        if kind == "content":
+            chunks.append(content)
+        if progress_callback is not None and content.strip():
+            progress_callback({"kind": kind, "content": content})
+    if not saw_delta:
+        return model.complete(messages, chat_ctx)
+    return ChatResponse(content="".join(chunks), action_proposals=action_proposals)
 
 
 def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> list[ChatMessage]:
@@ -952,6 +1239,48 @@ def _action_contract_response(project_root: Path, state: ChatSessionState, tool_
             [str(exc)],
             ok=False,
         )
+    autonomy_decision = _evaluate_action_contract_autonomy(project_root, state, contract)
+    if state.autonomy_profile_id != "manual":
+        decision_evidence = _record_autonomy_decision(project_root, contract, autonomy_decision) if _is_initialized(project_root) else None
+        if autonomy_decision.status == AutonomyDecisionStatus.AUTO_ALLOWED:
+            if not _is_initialized(project_root):
+                return _uninitialized_response(project_root)
+            approval = _record_autonomous_approval(project_root, contract, autonomy_decision)
+            response = _execute_action_contract(project_root, state, contract, prepare_required_approvals=False)
+            response["autonomy_decision"] = autonomy_decision.model_dump(mode="json")
+            if decision_evidence is not None:
+                response["autonomy_decision_evidence"] = decision_evidence
+            response["autonomous_approval"] = approval.model_dump(mode="json")
+            outcome = _record_autonomous_outcome(project_root, contract, autonomy_decision, response)
+            _record_run_autonomy_event(project_root, decision_evidence, approval, outcome)
+            response["autonomous_outcome"] = outcome
+            response["lines"] = [
+                f"Autonomy profile {state.autonomy_profile_id} auto-approved this action contract.",
+                *response.get("lines", []),
+            ]
+            return response
+        if autonomy_decision.status in {
+            AutonomyDecisionStatus.DENIED,
+            AutonomyDecisionStatus.POLICY_MISMATCH,
+            AutonomyDecisionStatus.BUDGET_EXCEEDED,
+        }:
+            state.pending_action_contract = None
+            return _response(
+                "action_contract_denied",
+                "Action Contract Denied",
+                [
+                    f"Autonomy profile: {state.autonomy_profile_id}",
+                    f"Tool: {contract.tool}",
+                    f"Decision: {autonomy_decision.status.value}",
+                    *autonomy_decision.reasons,
+                ],
+                ok=False,
+                extra={
+                    "contract": contract.to_payload(),
+                    "autonomy_decision": autonomy_decision.model_dump(mode="json"),
+                    "autonomy_decision_evidence": decision_evidence,
+                },
+            )
     state.pending_action_contract = contract
     lines = [
         "I can do that through a Harness action contract.",
@@ -971,12 +1300,18 @@ def _action_contract_response(project_root: Path, state: ChatSessionState, tool_
         "Action Contract",
         lines,
         ok=True,
-        extra={"contract": contract.to_payload()},
+        extra={"contract": contract.to_payload(), "autonomy_decision": autonomy_decision.model_dump(mode="json")},
     )
 
 
-def _execute_action_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
-    approval_lines = _ensure_contract_required_approvals(project_root, contract)
+def _execute_action_contract(
+    project_root: Path,
+    state: ChatSessionState,
+    contract: ActionContract,
+    *,
+    prepare_required_approvals: bool = True,
+) -> dict[str, Any]:
+    approval_lines = _ensure_contract_required_approvals(project_root, contract) if prepare_required_approvals else []
     if contract.tool == "create_objective":
         response = _confirm_create_objective_contract(project_root, state, contract)
     elif contract.tool == "create_task":
@@ -1052,6 +1387,399 @@ def _hosted_codex_task_types_for_contract(contract: ActionContract) -> list[str]
     return sorted(task_types)
 
 
+def _evaluate_action_contract_autonomy(
+    project_root: Path,
+    state: ChatSessionState,
+    contract: ActionContract,
+) -> AutonomyDecision:
+    policy = get_builtin_autonomy_policy(state.autonomy_profile_id)
+    request = _autonomy_input_from_contract(project_root, state, contract)
+    decision = evaluate_autonomy(policy, request)
+    return _apply_adapter_autonomy_metadata(policy.id, request, decision)
+
+
+def _apply_adapter_autonomy_metadata(
+    policy_id: str,
+    request: AutonomyEvaluationInput,
+    decision: AutonomyDecision,
+) -> AutonomyDecision:
+    if request.adapter_id is None:
+        if request.tool_name == "dispatch_registered_adapter":
+            return decision.model_copy(
+                update={
+                    "status": AutonomyDecisionStatus.DENIED,
+                    "reasons": [*decision.reasons, "adapter dispatch requires a registered adapter id"],
+                    "requires_human": False,
+                }
+            )
+        return decision
+
+    descriptor = _execution_adapter_descriptor(request.adapter_id)
+    if descriptor is None:
+        return decision.model_copy(
+            update={
+                "status": AutonomyDecisionStatus.DENIED,
+                "reasons": [*decision.reasons, f"adapter is not registered: {request.adapter_id}"],
+                "requires_human": False,
+            }
+        )
+
+    if decision.status in {
+        AutonomyDecisionStatus.DENIED,
+        AutonomyDecisionStatus.POLICY_MISMATCH,
+        AutonomyDecisionStatus.BUDGET_EXCEEDED,
+    }:
+        return decision.model_copy(
+            update={
+                "reasons": [
+                    *decision.reasons,
+                    f"adapter autonomy default is {descriptor.autonomy_default}: {descriptor.id}",
+                ]
+            }
+        )
+
+    if descriptor.autonomy_default == "forbidden":
+        return decision.model_copy(
+            update={
+                "status": AutonomyDecisionStatus.DENIED,
+                "reasons": [*decision.reasons, f"adapter forbids autonomous dispatch: {descriptor.id}"],
+                "requires_human": False,
+            }
+        )
+
+    if descriptor.required_autonomy_scopes and policy_id not in descriptor.required_autonomy_scopes:
+        return decision.model_copy(
+            update={
+                "status": AutonomyDecisionStatus.APPROVAL_REQUIRED,
+                "reasons": [
+                    *decision.reasons,
+                    f"adapter requires an autonomy scope in {sorted(descriptor.required_autonomy_scopes)}",
+                ],
+                "requires_human": True,
+            }
+        )
+
+    if (
+        descriptor.autonomy_default == "approval_required"
+        and decision.status == AutonomyDecisionStatus.AUTO_ALLOWED
+        and descriptor.required_approvals
+        and not request.has_scoped_approval
+    ):
+        return decision.model_copy(
+            update={
+                "status": AutonomyDecisionStatus.APPROVAL_REQUIRED,
+                "reasons": [
+                    *decision.reasons,
+                    f"adapter requires scoped approval before autonomous dispatch: {descriptor.id}",
+                ],
+                "requires_human": True,
+            }
+        )
+
+    return decision.model_copy(
+        update={
+            "reasons": [
+                *decision.reasons,
+                f"adapter autonomy default is {descriptor.autonomy_default}: {descriptor.id}",
+            ]
+        }
+    )
+
+
+def _autonomy_input_from_contract(
+    project_root: Path,
+    state: ChatSessionState,
+    contract: ActionContract,
+) -> AutonomyEvaluationInput:
+    adapter_id = _adapter_id_for_contract(project_root, state, contract)
+    task_type = _task_type_for_contract(project_root, state, contract)
+    boundary = _boundary_for_contract(contract, adapter_id)
+    return AutonomyEvaluationInput(
+        tool_name=contract.tool,
+        risk=contract.risk,
+        boundary=boundary,
+        adapter_id=adapter_id,
+        task_type=task_type,
+        has_scoped_approval=_has_scoped_approval_for_contract(
+            project_root,
+            state,
+            contract,
+            adapter_id=adapter_id,
+            task_type=task_type,
+        ),
+        would_mutate_active_repo=contract.tool == "apply_back",
+        requires_network=False,
+        requires_paid_or_hosted_boundary=boundary in {"hosted_provider", "hosted_provider_codex"},
+        requires_sandbox=contract.tool in {"dispatch_registered_adapter", "edit_isolated", "run_tests"},
+        sandbox_enforced=contract.tool in {"dispatch_registered_adapter", "edit_isolated"},
+        adapter_breaker_open=_adapter_breaker_open(project_root, adapter_id),
+        idempotency_key=_contract_idempotency_key(contract),
+        evidence_contract=",".join(contract.evidence_plan) or "chat_action_contract",
+    )
+
+
+def _execution_adapter_descriptor(adapter_id: str):
+    for descriptor in list_execution_adapter_descriptors():
+        if descriptor.id == adapter_id:
+            return descriptor
+    return None
+
+
+def _adapter_breaker_open(project_root: Path, adapter_id: str | None) -> bool:
+    if adapter_id is None or not _is_initialized(project_root):
+        return False
+    try:
+        return SQLiteStore(project_root).adapter_breaker_state(adapter_id).status.value == "open"
+    except Exception:
+        return True
+
+
+def _adapter_id_for_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> str | None:
+    if contract.tool == "dispatch_registered_adapter":
+        adapter_id = contract.normalized_arguments.get("adapter_id") or contract.normalized_arguments.get("execution_adapter")
+        if adapter_id:
+            return str(adapter_id)
+        task = _task_for_latest_lease(project_root, state)
+        if task is not None:
+            adapter = task.metadata.get("execution_adapter")
+            return str(adapter) if adapter else None
+        return None
+    if contract.tool == "edit_isolated":
+        return "codex_isolated_edit"
+    if contract.tool == "create_task":
+        return str(contract.normalized_arguments.get("execution_adapter") or "")
+    return None
+
+
+def _task_type_for_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> str | None:
+    if contract.tool in {"create_task", "dispatch_registered_adapter"}:
+        task_type = contract.normalized_arguments.get("task_type")
+        if task_type:
+            return str(task_type)
+        if contract.tool == "dispatch_registered_adapter":
+            task = _task_for_latest_lease(project_root, state)
+            if task is not None:
+                lease_task_type = task.metadata.get("task_type")
+                return str(lease_task_type) if lease_task_type else None
+        return None
+    if contract.tool == "edit_isolated":
+        return "codex_code_edit"
+    if contract.tool == "create_task_graph":
+        task_types = {
+            str(task.get("task_type"))
+            for task in contract.normalized_arguments.get("tasks") or []
+            if isinstance(task, dict) and task.get("task_type")
+        }
+        if len(task_types) == 1:
+            return sorted(task_types)[0]
+        return None
+    return None
+
+
+def _contract_idempotency_key(contract: ActionContract) -> str:
+    stable = json.dumps(
+        {
+            "schema_version": contract.schema_version,
+            "tool": contract.tool,
+            "arguments": sanitize_for_logging(contract.normalized_arguments),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return f"chat_contract:{hashlib.sha256(stable.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _task_for_latest_lease(project_root: Path, state: ChatSessionState) -> TaskRecord | None:
+    if not state.latest_lease_id or not _is_initialized(project_root):
+        return None
+    store = SQLiteStore(project_root)
+    try:
+        lease = store.get_task_lease(state.latest_lease_id)
+        return store.get_task(lease.task_id)
+    except KeyError:
+        return None
+
+
+def _boundary_for_contract(contract: ActionContract, adapter_id: str | None) -> str:
+    if contract.tool == "apply_back":
+        return "active_repo_apply_back"
+    if contract.tool == "dispatch_registered_adapter":
+        if adapter_id in {"read_only_summary", "repo_planning", "codex_isolated_edit"}:
+            return "hosted_provider_codex"
+        return "local_artifact"
+    if "hosted_provider_codex" in contract.required_approvals or adapter_id in {
+        "read_only_summary",
+        "repo_planning",
+        "codex_isolated_edit",
+    }:
+        return "hosted_provider_codex"
+    if contract.tool == "run_tests":
+        return "docker_execution"
+    if contract.risk == "control_plane_write":
+        return "local_control_plane"
+    return "local_artifact"
+
+
+def _has_scoped_approval_for_contract(
+    project_root: Path,
+    state: ChatSessionState,
+    contract: ActionContract,
+    *,
+    adapter_id: str | None = None,
+    task_type: str | None = None,
+) -> bool:
+    if "hosted_provider_codex" not in contract.required_approvals:
+        return False
+    if not _is_initialized(project_root):
+        return False
+    if contract.tool == "dispatch_registered_adapter" and task_type:
+        task_types = [task_type]
+    else:
+        task_types = _hosted_codex_task_types_for_contract(contract)
+    approvals = ApprovalStore(project_root)
+    task = _task_for_latest_lease(project_root, state) if contract.tool == "dispatch_registered_adapter" else None
+    return all(
+        approvals.find_valid(
+            "codex_cli",
+            "hosted_provider",
+            task_type,
+            adapter_id=adapter_id,
+            workbench_id=task.workbench_id if task else contract.normalized_arguments.get("workbench_id"),
+            objective_id=task.objective_id if task else contract.normalized_arguments.get("objective_id"),
+            autonomy_scope=state.autonomy_profile_id,
+            strict_scope=state.autonomy_profile_id != "manual",
+        )
+        is not None
+        for task_type in task_types
+    )
+
+
+def _record_autonomous_approval(
+    project_root: Path,
+    contract: ActionContract,
+    decision: AutonomyDecision,
+) -> AutonomousApprovalRecord:
+    record = AutonomousApprovalRecord(
+        id=f"auto_{uuid.uuid4().hex[:12]}",
+        policy_id=decision.policy_id,
+        decision_status=decision.status,
+        tool_name=contract.tool,
+        adapter_id=decision.adapter_id,
+        task_type=decision.task_type,
+        boundary=decision.boundary or "unknown",
+        risk=decision.risk or str(contract.risk),
+        reasons=decision.reasons,
+    )
+    append_jsonl(
+        resolve_project_root(project_root) / HARNESS_DIR / "autonomy" / "approvals.jsonl",
+        record.to_jsonl_payload(),
+    )
+    return record
+
+
+def _record_autonomy_decision(
+    project_root: Path,
+    contract: ActionContract,
+    decision: AutonomyDecision,
+) -> dict[str, Any]:
+    payload = {
+        **decision.model_dump(mode="json"),
+        "contract_id": contract.id,
+        "contract_schema_version": contract.schema_version,
+        "record_id": f"adec_{uuid.uuid4().hex[:12]}",
+    }
+    append_jsonl(resolve_project_root(project_root) / HARNESS_DIR / "autonomy" / "decisions.jsonl", payload)
+    return payload
+
+
+def _record_autonomous_outcome(
+    project_root: Path,
+    contract: ActionContract,
+    decision: AutonomyDecision,
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "schema_version": "harness.autonomous_outcome/v1",
+        "record_id": f"aout_{uuid.uuid4().hex[:12]}",
+        "contract_id": contract.id,
+        "tool_name": contract.tool,
+        "policy_id": decision.policy_id,
+        "decision_status": decision.status.value,
+        "adapter_id": decision.adapter_id,
+        "task_type": decision.task_type,
+        "response_kind": response.get("kind"),
+        "ok": bool(response.get("ok")),
+        "objective_id": _response_record_id(response, "objective"),
+        "task_id": _response_record_id(response, "task"),
+        "memory_id": _response_record_id(response, "memory"),
+        "run_id": _response_record_id(response, "run"),
+        "artifact_ids": _response_artifact_ids(response),
+    }
+    append_jsonl(resolve_project_root(project_root) / HARNESS_DIR / "autonomy" / "outcomes.jsonl", payload)
+    return payload
+
+
+def _record_run_autonomy_event(
+    project_root: Path,
+    decision_evidence: dict[str, Any] | None,
+    approval: AutonomousApprovalRecord,
+    outcome: dict[str, Any],
+) -> None:
+    run_id = outcome.get("run_id")
+    if not run_id:
+        return
+    store = SQLiteStore(project_root)
+    store.append_event(
+        str(run_id),
+        "info",
+        "autonomy_decision",
+        "Autonomous approval metadata linked to this run.",
+        {
+            "autonomy_decision_id": decision_evidence.get("record_id") if decision_evidence else None,
+            "autonomous_approval_id": approval.id,
+            "autonomous_outcome_id": outcome.get("record_id"),
+            "autonomy_policy_id": approval.policy_id,
+            "adapter_id": approval.adapter_id,
+            "task_type": approval.task_type,
+        },
+    )
+    store.write_run_manifest(str(run_id))
+
+
+def _response_record_id(response: dict[str, Any], key: str) -> str | None:
+    direct = _nested_id(response.get(key))
+    if direct is not None:
+        return direct
+    result = response.get("result")
+    if isinstance(result, dict):
+        return _nested_id(result.get(key))
+    return None
+
+
+def _response_artifact_ids(response: dict[str, Any]) -> list[str]:
+    artifact_ids = [
+        str(item.get("id"))
+        for item in response.get("artifacts", [])
+        if isinstance(item, dict) and item.get("id")
+    ]
+    result = response.get("result")
+    if isinstance(result, dict):
+        manifest = result.get("manifest")
+        if isinstance(manifest, dict):
+            artifact_ids.extend(
+                str(item.get("id"))
+                for item in manifest.get("artifacts", [])
+                if isinstance(item, dict) and item.get("id")
+            )
+    return sorted(set(artifact_ids))
+
+
+def _nested_id(value: Any) -> str | None:
+    if isinstance(value, dict) and value.get("id"):
+        return str(value["id"])
+    return None
+
+
 def _confirm_create_objective_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
     store = _require_store(project_root)
     args = contract.normalized_arguments
@@ -1080,7 +1808,14 @@ def _confirm_create_task_contract(project_root: Path, state: ChatSessionState, c
         objective_id=args.get("objective_id"),
         workbench_id=args.get("workbench_id"),
         agent_id=args.get("agent_id"),
-        metadata={"execution_adapter": args["execution_adapter"], "task_type": args["task_type"], "created_from": "chat_action_contract", "contract_id": contract.id},
+        idempotency_key=_contract_idempotency_key(contract),
+        metadata={
+            "execution_adapter": args["execution_adapter"],
+            "task_type": args["task_type"],
+            "created_from": "chat_action_contract",
+            "contract_id": contract.id,
+            "idempotency_key": _contract_idempotency_key(contract),
+        },
     )
     state.latest_task_id = task.id
     return _response(
@@ -1119,6 +1854,7 @@ def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionSt
             project_root=project_root,
         )
         task_args = task_contract.normalized_arguments
+        task_idempotency_key = _contract_idempotency_key(task_contract)
         created_tasks.append(
             store.create_task(
                 title=str(task_args["title"]),
@@ -1128,8 +1864,15 @@ def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionSt
                 agent_id=task_args.get("agent_id"),
                 priority=int(raw_task.get("priority") or 0),
                 depends_on=depends_on,
-                required_approvals=(args.get("template") or {}).get("required_approvals") or [],
-                metadata={"execution_adapter": task_args["execution_adapter"], "task_type": task_args["task_type"], "created_from": "chat_action_contract", "contract_id": contract.id},
+                idempotency_key=task_idempotency_key,
+                metadata={
+                    **dict(task_args.get("metadata") or {}),
+                    "execution_adapter": task_args["execution_adapter"],
+                    "task_type": task_args["task_type"],
+                    "created_from": "chat_action_contract",
+                    "contract_id": contract.id,
+                    "idempotency_key": task_idempotency_key,
+                },
             )
         )
     state.latest_objective_id = objective.id
@@ -1592,6 +2335,7 @@ def _orchestration_from_template(template: WorkflowTemplate, state: ChatSessionS
             task_type=task.task_type,
             depends_on_indexes=list(task.depends_on_indexes),
             priority=task.priority,
+            metadata=task.metadata(),
         )
         for task in template.tasks
     ]
@@ -2368,6 +3112,7 @@ def _create_and_run_orchestration(
             spec_source_kind="builtin",
             depends_on=depends_on,
             metadata={
+                **dict(task_draft.metadata),
                 "execution_adapter": task_draft.execution_adapter,
                 "task_type": task_draft.task_type,
                 "chat_orchestrated": True,

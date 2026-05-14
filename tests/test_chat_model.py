@@ -121,6 +121,46 @@ def test_codex_cli_chat_model_uses_read_only_subscription_backend(tmp_path) -> N
     assert "explain orchestration" in backend.prompt
 
 
+def test_codex_cli_chat_model_streams_reasoning_before_final_answer(tmp_path) -> None:
+    class FakeCodexBackend:
+        def stream_read_only(self, project_root, prompt, final_message_path):
+            self.project_root = project_root
+            self.prompt = prompt
+            yield {
+                "type": "event",
+                "event": {
+                    "type": "agent_reasoning",
+                    "summary": [{"text": "Inspecting the Harness context."}],
+                },
+            }
+            final_message_path.write_text("Final answer.", encoding="utf-8")
+
+            class Result:
+                exit_status = 0
+                stderr = ""
+                stdout = ""
+                json_events = []
+                final_message = "Final answer."
+
+            yield {"type": "completed", "result": Result()}
+
+    backend = FakeCodexBackend()
+    model = CodexCliChatModel(backend, tmp_path)  # type: ignore[arg-type]
+
+    deltas = list(
+        model.stream(
+            [ChatMessage(role="user", content="explain orchestration")],
+            ChatContext(project_root=str(tmp_path), model_profile="codex_cli", mode="normal"),
+        )
+    )
+
+    assert [delta.kind for delta in deltas] == ["reasoning", "content"]
+    assert deltas[0].content == "Reasoning: Inspecting the Harness context."
+    assert deltas[1].content == "Final answer."
+    assert backend.project_root == tmp_path
+    assert "explain orchestration" in backend.prompt
+
+
 def test_mutation_request_falls_back_to_action_contract_when_model_only_refuses(tmp_path) -> None:
     model = FakeChatModel("I can't create the file directly from this read-only chat turn.")
     state = ChatSessionState()

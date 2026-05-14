@@ -23,8 +23,20 @@ def test_workflow_templates_describe_initial_operator_paths(tmp_path) -> None:
     assert summary.tasks[0].task_type == "read_only_repo_summary"
     assert planning.tasks[0].execution_adapter == "repo_planning"
     assert planning.tasks[0].task_type == "repo_planning"
-    assert [task.execution_adapter for task in coding.tasks] == ["repo_planning", "codex_isolated_edit"]
+    assert [task.execution_adapter for task in coding.tasks] == [
+        "repo_planning",
+        "codex_isolated_edit",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+    ]
     assert coding.tasks[1].depends_on_indexes == [0]
+    assert coding.tasks[3].agent_id == "implementation_reviewer"
+    assert coding.tasks[3].metadata()["review_role"] == "implementation_reviewer"
+    assert coding.tasks[4].agent_id == "security_reviewer"
+    assert coding.tasks[4].metadata()["blocks_apply_back"] is True
+    assert coding.tasks[5].metadata()["requires_evidence_links"] == "objective,task,run,artifact,policy"
     assert "hosted_provider_codex" in coding.required_approvals
 
 
@@ -64,7 +76,7 @@ def test_repo_planning_draft_uses_registered_adapter_contract(tmp_path) -> None:
     assert response["draft"]["required_approvals"] == ["hosted_provider_codex"]
 
 
-def test_coding_fix_template_creates_two_task_graph_and_blocks_on_missing_approval(tmp_path, monkeypatch) -> None:
+def test_coding_fix_template_creates_reviewed_task_graph_and_blocks_on_missing_approval(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 
     def fail_codex(*_args, **_kwargs):
@@ -74,7 +86,14 @@ def test_coding_fix_template_creates_two_task_graph_and_blocks_on_missing_approv
     state = ChatSessionState(codex_like_mode=True)
     draft = handle_chat_input("fix the failing test with codex", tmp_path, state)
     assert draft["kind"] == "orchestration_draft"
-    assert [task["execution_adapter"] for task in draft["draft"]["tasks"]] == ["repo_planning", "codex_isolated_edit"]
+    assert [task["execution_adapter"] for task in draft["draft"]["tasks"]] == [
+        "repo_planning",
+        "codex_isolated_edit",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+    ]
 
     response = handle_chat_input("yes", tmp_path, state)
 
@@ -83,8 +102,21 @@ def test_coding_fix_template_creates_two_task_graph_and_blocks_on_missing_approv
     assert response["ok"] is False
     assert state.latest_objective_id is not None
     tasks = store.list_tasks(objective_id=state.latest_objective_id)
-    assert [task.metadata["execution_adapter"] for task in tasks] == ["repo_planning", "codex_isolated_edit"]
+    assert [task.metadata["execution_adapter"] for task in tasks] == [
+        "repo_planning",
+        "codex_isolated_edit",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+        "dry_run",
+    ]
     assert tasks[1].depends_on == [tasks[0].id]
+    assert tasks[3].depends_on == [tasks[2].id]
+    assert tasks[3].metadata["review_role"] == "implementation_reviewer"
+    assert tasks[4].depends_on == [tasks[3].id]
+    assert tasks[4].metadata["review_role"] == "security_reviewer"
+    assert tasks[4].metadata["blocks_apply_back"] is True
+    assert set(tasks[5].depends_on) == {tasks[0].id, tasks[1].id, tasks[2].id, tasks[3].id, tasks[4].id}
     rendered = "\n".join(response["lines"])
     assert "Hosted-boundary approval is required before Codex run creation." in rendered
     assert "harness approvals add --backend codex_cli --data-boundary hosted_provider" in rendered

@@ -1,0 +1,13 @@
+id: factuality_reviewer
+kind: reviewer
+role: Review research artifacts for unsupported claims, missing evidence, and factual uncertainty.
+model_profile: codex_supervised
+tool_policy: read_only
+memory_scope: project
+outputs:
+  - factuality_review.md
+tags:
+  - starter
+  - coding
+  - review
+  - research
