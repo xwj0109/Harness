@@ -444,6 +444,37 @@ def test_chat_read_only_intent_routing() -> None:
     assert route_chat_intent("initialize this project")["intent"] == "init_project"
 
 
+def test_chat_model_path_emits_codex_like_progress_for_arbitrary_prompt(tmp_path) -> None:
+    (tmp_path / "README.md").write_text("# Sample Project\n\nLocal-first workflows.\n", encoding="utf-8")
+
+    class FakeChatModel:
+        def stream(self, _messages, _context):
+            from harness.chat_model import ChatDelta
+
+            yield ChatDelta(content="model answer", kind="content")
+
+    progress: list[dict] = []
+
+    response = handle_chat_input(
+        "an arbitrary prompt with no special routing",
+        tmp_path,
+        ChatSessionState(),
+        chat_model=FakeChatModel(),
+        progress_callback=progress.append,
+    )
+
+    contents = [item["content"] for item in progress]
+    assert response["kind"] == "llm_chat"
+    assert response["ok"] is True
+    assert contents[:3] == ["Turn started", "Ran intent routing", "- intent: unsupported"]
+    assert "Explored" in contents
+    assert any(item.startswith("- Project:") for item in contents)
+    assert any(item.startswith("- Context blocks:") for item in contents)
+    assert "Ran model turn" in contents
+    assert "model answer" in contents
+    assert response["lines"] == ["model answer"]
+
+
 def test_chat_next_recommendation_uses_local_state(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)

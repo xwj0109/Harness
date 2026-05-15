@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
@@ -259,6 +260,53 @@ class MemoryRedactionState(str, Enum):
     REDACTED = "redacted"
     BLOCKED = "blocked"
     FORGOTTEN = "forgotten"
+
+
+class RunEventType(str, Enum):
+    RUN_STARTED = "run.started"
+    POLICY_RESOLVED = "policy.resolved"
+    APPROVAL_REQUIRED = "approval.required"
+    WORKSPACE_PREPARED = "workspace.prepared"
+    BACKEND_STARTED = "backend.started"
+    MODEL_TOKEN = "model.token"
+    MODEL_MESSAGE_DELTA = "model.message_delta"
+    REASONING_SUMMARY_DELTA = "reasoning.summary_delta"
+    TOOL_CALL_STARTED = "tool_call.started"
+    TOOL_CALL_OUTPUT = "tool_call.output"
+    TOOL_CALL_FINISHED = "tool_call.finished"
+    FILE_READ = "file.read"
+    FILE_WRITE = "file.write"
+    DIFF_UPDATED = "diff.updated"
+    TEST_STARTED = "test.started"
+    TEST_OUTPUT = "test.output"
+    TEST_FINISHED = "test.finished"
+    TOKEN_USAGE_UPDATED = "token_usage.updated"
+    ARTIFACT_REGISTERED = "artifact.registered"
+    RUN_SUMMARY_CREATED = "run.summary_created"
+    RUN_FINISHED = "run.finished"
+    RUN_FAILED = "run.failed"
+
+
+class EventVisibility(str, Enum):
+    USER_VISIBLE = "user_visible"
+    INTERNAL = "internal"
+    RESTRICTED = "restricted"
+
+
+class RedactionState(str, Enum):
+    NOT_REQUIRED = "not_required"
+    REDACTED = "redacted"
+    RESTRICTED = "restricted"
+    BLOCKED = "blocked"
+
+
+class TokenUsageSnapshot(BaseModel):
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    total_tokens: int | None = None
+    estimated_cost_usd: Decimal | None = None
 
 
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
@@ -770,6 +818,7 @@ class EffectivePolicy(BaseModel):
 
 
 class EventRecord(BaseModel):
+    schema_version: str = "harness.event/v1"
     id: str
     run_id: str
     created_at: datetime
@@ -777,7 +826,27 @@ class EventRecord(BaseModel):
     event_type: str
     message: str
     session_id: str | None = None
+    task_id: str | None = None
+    trace_id: str | None = None
+    seq: int | None = None
+    visibility: EventVisibility = EventVisibility.USER_VISIBLE
+    redaction_state: RedactionState = RedactionState.REDACTED
     payload: dict[str, Any] = Field(default_factory=dict)
+
+    def jsonl_envelope(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "event_id": self.id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "trace_id": self.trace_id,
+            "seq": self.seq,
+            "timestamp": self.created_at,
+            "type": self.event_type,
+            "visibility": self.visibility.value,
+            "redaction_state": self.redaction_state.value,
+            "payload": self.payload,
+        }
 
 
 class ArtifactRecord(BaseModel):

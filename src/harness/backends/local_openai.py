@@ -7,8 +7,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Iterator, Protocol
 
+from harness.backends.streaming import BackendStreamEvent
 from harness.models import BackendConfig, BackendStatus
 
 
@@ -188,6 +189,16 @@ class LocalOpenAICompatibleBackend:
                 f"or vLLM and retry. Details: {exc}"
             ) from exc
         return str(response["choices"][0]["message"]["content"])
+
+    def stream_complete_backend_events(self, messages: list[dict[str, str]]) -> Iterator[BackendStreamEvent]:
+        yield BackendStreamEvent(type="status", text="Backend started.", payload={"streaming": False})
+        try:
+            content = self.complete(messages)
+        except Exception as exc:
+            yield BackendStreamEvent(type="error", text=str(exc), payload={"error_type": type(exc).__name__})
+            return
+        yield BackendStreamEvent(type="message_delta", text=content)
+        yield BackendStreamEvent(type="status", text="Backend completed.", payload={"status": "completed"})
 
     def _client(self) -> OpenAICompatibleHttpClient:
         return self.http_client or UrllibOpenAICompatibleHttpClient()

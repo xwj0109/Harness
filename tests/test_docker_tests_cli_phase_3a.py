@@ -91,6 +91,12 @@ def test_cli_tests_run_approval_executes_docker_and_writes_artifacts(tmp_path, m
     assert not (tmp_path / "tmp_output.txt").exists()
     run_id = result.output.split("Created run ", 1)[1].splitlines()[0]
     run_dir = tmp_path / ".harness" / "runs" / run_id
+    events = SQLiteStore(tmp_path).list_events(run_id)
+    assert any(
+        event.event_type == "approval.required"
+        and event.payload["approval_kind"] == "docker_execution"
+        for event in events
+    )
     assert (run_dir / "test_stdout.txt").read_text(encoding="utf-8") == "passed"
     assert "tests_passed" in (run_dir / "test_result.json").read_text(encoding="utf-8")
     assert "Tests passed." in (run_dir / "final_report.md").read_text(encoding="utf-8")
@@ -115,9 +121,17 @@ def test_cli_tests_run_denial_does_not_call_docker_run_and_cleans_workspace(tmp_
     assert FakeDockerRunner.created_workspaces
     assert not FakeDockerRunner.created_workspaces[0].exists()
     run_id = result.output.split("Created run ", 1)[1].splitlines()[0]
-    events = (tmp_path / ".harness" / "runs" / run_id / "events.jsonl").read_text(encoding="utf-8")
-    assert "test_execution_decision" in events
-    assert "denied" in events
+    events = SQLiteStore(tmp_path).list_events(run_id)
+    assert any(
+        event.event_type == "approval.required"
+        and event.payload["approval_kind"] == "docker_execution"
+        for event in events
+    )
+    assert any(
+        event.event_type == "test_execution_decision"
+        and event.payload["decision"] == "denied"
+        for event in events
+    )
 
 
 def test_run_in_existing_run_writes_suffixed_artifacts_and_uses_cwd(tmp_path) -> None:

@@ -30,6 +30,7 @@ from harness.models import (
     DaemonStatusResult,
     DaemonTickResult,
     EventRecord,
+    EventVisibility,
     ManifestArtifact,
     MemoryRecord,
     MemoryRedactionState,
@@ -55,6 +56,9 @@ from harness.models import (
     TaskStatus,
     TaskTransitionRecord,
     PolicyLevel,
+    RedactionState,
+    RunEventType,
+    TokenUsageSnapshot,
     run_mode_for_task_type,
 )
 from harness.agent_authoring import AgentBundleError, LoadedAgentBundle, agent_bundle_content_sha256, load_agent_bundle
@@ -259,6 +263,12 @@ class SQLiteStore:
             self._ensure_column(conn, "runs", "objective_id", "TEXT")
             self._ensure_column(conn, "runs", "session_id", "TEXT")
             self._ensure_column(conn, "events", "session_id", "TEXT")
+            self._ensure_column(conn, "events", "schema_version", "TEXT")
+            self._ensure_column(conn, "events", "seq", "INTEGER")
+            self._ensure_column(conn, "events", "task_id", "TEXT")
+            self._ensure_column(conn, "events", "trace_id", "TEXT")
+            self._ensure_column(conn, "events", "visibility", "TEXT")
+            self._ensure_column(conn, "events", "redaction_state", "TEXT")
             self._ensure_column(conn, "artifacts", "schema_version", "TEXT")
             self._ensure_column(conn, "artifacts", "sha256", "TEXT")
             self._ensure_column(conn, "artifacts", "size_bytes", "INTEGER")
@@ -3330,19 +3340,113 @@ class SQLiteStore:
         payload: dict[str, Any] | None = None,
         session_id: str | None = None,
     ) -> EventRecord:
+        return self._append_event_record(
+            run_id=run_id,
+            level=level,
+            event_type=event_type,
+            message=message,
+            payload=payload,
+            session_id=session_id,
+            visibility=EventVisibility.USER_VISIBLE,
+            redaction_state=RedactionState.REDACTED,
+        )
+
+    def append_run_event(
+        self,
+        run_id: str,
+        event_type: RunEventType | str,
+        payload: dict[str, Any] | None = None,
+        *,
+        message: str = "",
+        visibility: EventVisibility | str = EventVisibility.USER_VISIBLE,
+        redaction_state: RedactionState | str = RedactionState.REDACTED,
+        level: str = "info",
+        trace_id: str | None = None,
+        task_id: str | None = None,
+        session_id: str | None = None,
+    ) -> EventRecord:
+        event_value = event_type.value if isinstance(event_type, RunEventType) else str(event_type)
+        visibility_value = EventVisibility(visibility.value if isinstance(visibility, EventVisibility) else visibility)
+        redaction_value = RedactionState(redaction_state.value if isinstance(redaction_state, RedactionState) else redaction_state)
+        return self._append_event_record(
+            run_id=run_id,
+            level=level,
+            event_type=event_value,
+            message=message or event_value,
+            payload=payload,
+            session_id=session_id,
+            visibility=visibility_value,
+            redaction_state=redaction_value,
+            trace_id=trace_id,
+            task_id=task_id,
+        )
+
+    def append_token_usage_event(
+        self,
+        run_id: str,
+        usage: TokenUsageSnapshot,
+        *,
+        trace_id: str | None = None,
+        task_id: str | None = None,
+    ) -> EventRecord:
+        return self.append_run_event(
+            run_id,
+            RunEventType.TOKEN_USAGE_UPDATED,
+            usage.model_dump(mode="json", exclude_none=True),
+            message="Token usage updated.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+            trace_id=trace_id,
+            task_id=task_id,
+        )
+
+    def _append_event_record(
+        self,
+        *,
+        run_id: str,
+        level: str,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+        session_id: str | None = None,
+        visibility: EventVisibility = EventVisibility.USER_VISIBLE,
+        redaction_state: RedactionState = RedactionState.REDACTED,
+        trace_id: str | None = None,
+        task_id: str | None = None,
+    ) -> EventRecord:
         event_id = f"evt_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         payload = sanitize_for_logging(payload or {})
         payload_json = json.dumps(payload, sort_keys=True, default=str)
         run = self.get_run(run_id)
         session_id = session_id if session_id is not None else run.session_id
+        task_id = task_id if task_id is not None else run.task_id
+        seq: int
         with self.connect() as conn:
+            seq = self._next_event_seq(conn, run_id)
             conn.execute(
                 """
-                INSERT INTO events (id, run_id, created_at, level, event_type, message, payload_json, session_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO events (
+                  id, run_id, created_at, level, event_type, message, payload_json, session_id,
+                  schema_version, seq, task_id, trace_id, visibility, redaction_state
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (event_id, run_id, timestamp, level, event_type, message, payload_json, session_id),
+                (
+                    event_id,
+                    run_id,
+                    timestamp,
+                    level,
+                    event_type,
+                    str(sanitize_for_logging(message)),
+                    payload_json,
+                    session_id,
+                    "harness.event/v1",
+                    seq,
+                    task_id,
+                    trace_id,
+                    visibility.value,
+                    redaction_state.value,
+                ),
             )
         record = EventRecord(
             id=event_id,
@@ -3350,20 +3454,32 @@ class SQLiteStore:
             created_at=parse_dt(timestamp),
             level=level,
             event_type=event_type,
-            message=message,
+            message=str(sanitize_for_logging(message)),
             session_id=session_id,
+            task_id=task_id,
+            trace_id=trace_id,
+            seq=seq,
+            visibility=visibility,
+            redaction_state=redaction_state,
             payload=payload,
         )
-        append_jsonl(self.runs_dir / run_id / "events.jsonl", record.model_dump(mode="json"))
+        append_jsonl(self.runs_dir / run_id / "events.jsonl", record.jsonl_envelope())
         return record
+
+    def _next_event_seq(self, conn: sqlite3.Connection, run_id: str) -> int:
+        row = conn.execute("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM events WHERE run_id = ?", (run_id,)).fetchone()
+        return int(row["max_seq"] or 0) + 1
 
     def list_events(self, run_id: str) -> list[EventRecord]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM events WHERE run_id = ? ORDER BY created_at ASC", (run_id,)
+                "SELECT * FROM events WHERE run_id = ? ORDER BY COALESCE(seq, 0) ASC, created_at ASC", (run_id,)
             ).fetchall()
         return [
             EventRecord(
+                schema_version=(row["schema_version"] or "harness.event/v1")
+                if "schema_version" in row.keys()
+                else "harness.event/v1",
                 id=row["id"],
                 run_id=row["run_id"],
                 created_at=parse_dt(row["created_at"]),
@@ -3371,6 +3487,15 @@ class SQLiteStore:
                 event_type=row["event_type"],
                 message=row["message"],
                 session_id=row["session_id"] if "session_id" in row.keys() else None,
+                task_id=row["task_id"] if "task_id" in row.keys() else None,
+                trace_id=row["trace_id"] if "trace_id" in row.keys() else None,
+                seq=row["seq"] if "seq" in row.keys() else None,
+                visibility=EventVisibility(row["visibility"] or EventVisibility.USER_VISIBLE.value)
+                if "visibility" in row.keys()
+                else EventVisibility.USER_VISIBLE,
+                redaction_state=RedactionState(row["redaction_state"] or RedactionState.REDACTED.value)
+                if "redaction_state" in row.keys()
+                else RedactionState.REDACTED,
                 payload=json.loads(row["payload_json"]),
             )
             for row in rows

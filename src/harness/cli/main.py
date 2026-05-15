@@ -8,6 +8,7 @@ import sqlite3
 import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -58,8 +59,17 @@ from harness.evals import run_safety_smoke, run_security_check, run_security_lay
 from harness.integrity import run_integrity_check
 from harness.intent_router import IntentRoute, route_instruction
 from harness.isolation import ActiveRepoDirtyError
+from harness.live_artifacts import write_live_run_artifacts
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import KillSwitchTargetKind, MemoryScopeType, MemorySourceKind, SessionStatus, TaskStatus
+from harness.models import (
+    KillSwitchTargetKind,
+    MemoryScopeType,
+    MemorySourceKind,
+    RedactionState,
+    RunEventType,
+    SessionStatus,
+    TaskStatus,
+)
 from harness.objective_runner import run_next_active_objective_autonomously, run_objective_autonomously
 from harness.paths import resolve_project_root
 from harness.policy import (
@@ -70,6 +80,7 @@ from harness.policy import (
     resolve_task_effective_policy,
     resolve_workbench_effective_policy,
 )
+from harness.procedure_renderer import render_procedure_event
 from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, DockerImageManager
@@ -121,6 +132,7 @@ policy_app = typer.Typer(help="Runtime effective policy evidence.")
 artifacts_app = typer.Typer(help="Run artifact evidence inspection.")
 sessions_app = typer.Typer(help="Interactive session records.")
 actions_app = typer.Typer(help="Self-managed local action routing and execution.")
+runs_app = typer.Typer(help="Run listing and live event tailing.", invoke_without_command=True)
 tools_app = typer.Typer(help="Harness tool capability descriptors.")
 capabilities_app = typer.Typer(help="Read-only Harness capability catalog.")
 sandbox_app = typer.Typer(help="Read-only sandbox profile descriptors.")
@@ -148,6 +160,7 @@ app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(actions_app, name="actions")
+app.add_typer(runs_app, name="runs")
 app.add_typer(tools_app, name="tools")
 app.add_typer(capabilities_app, name="capabilities")
 app.add_typer(sandbox_app, name="sandbox")
@@ -178,6 +191,12 @@ class OutputFormat(str, Enum):
     JSON = "json"
 
 
+class StreamFormat(str, Enum):
+    HUMAN = "human"
+    JSONL = "jsonl"
+    NONE = "none"
+
+
 OutputOption = Annotated[OutputFormat, typer.Option("--output", help="Output format.")]
 SpecSourceOption = Annotated[str, typer.Option("--source", help="Spec source: builtin or explicit bundle path.")]
 PolicySubjectKindOption = Annotated[
@@ -186,6 +205,7 @@ PolicySubjectKindOption = Annotated[
 ]
 PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy subject id.")]
 TraceFormatOption = Annotated[str, typer.Option("--format", help="Trace format. Only otel-json is supported.")]
+TranscriptFormatOption = Annotated[str, typer.Option("--format", help="Transcript format: markdown or jsonl.")]
 
 TUI_SCHEMA_VERSION = "harness.tui/v1"
 TUI_INSTALL_HINT = "Install Harness with its default dependencies, including Textual."
@@ -375,8 +395,14 @@ def init(project: ProjectOption = Path(".")) -> None:
     typer.echo("Updated .gitignore with Harness local artifacts section if needed.")
 
 
-@app.command()
-def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+@runs_app.callback(invoke_without_command=True)
+def runs(
+    ctx: typer.Context,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
@@ -404,6 +430,59 @@ def runs(project: ProjectOption = Path("."), output: OutputOption = OutputFormat
                 record.backend_name or "none",
             ]
         )
+
+
+@runs_app.command("tail")
+def runs_tail(
+    run_id: str,
+    project: ProjectOption = Path("."),
+    jsonl: Annotated[bool, typer.Option("--jsonl", help="Emit raw JSONL events.")] = False,
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="Follow until the run reaches a terminal state.")] = False,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    _tail_run_events(store, run_id, jsonl=jsonl, follow=follow)
+
+
+@app.command("events")
+def events_command(
+    run_id: str,
+    project: ProjectOption = Path("."),
+    jsonl: Annotated[bool, typer.Option("--jsonl", help="Emit raw JSONL events.")] = False,
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="Follow until the run reaches a terminal state.")] = False,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    _tail_run_events(store, run_id, jsonl=jsonl, follow=follow)
+
+
+@app.command("transcript")
+def transcript_command(
+    run_id: str,
+    project: ProjectOption = Path("."),
+    format: TranscriptFormatOption = "markdown",
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    paths = write_live_run_artifacts(store, run_id)
+    if format == "jsonl":
+        typer.echo(paths["transcript"].read_text(encoding="utf-8"), nl=False)
+        return
+    if format != "markdown":
+        raise typer.BadParameter("Transcript format must be markdown or jsonl.")
+    typer.echo(paths["procedure"].read_text(encoding="utf-8"), nl=False)
+
+
+@app.command("summary")
+def summary_command(run_id: str, project: ProjectOption = Path(".")) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    paths = write_live_run_artifacts(store, run_id)
+    typer.echo(paths["final_report"].read_text(encoding="utf-8"), nl=False)
 
 
 @app.command()
@@ -919,6 +998,44 @@ def tasks_run_next(project: ProjectOption = Path("."), output: OutputOption = Ou
         typer.echo("No runnable ready task.")
     else:
         typer.echo(f"Leased task {task.id}")
+
+
+@tasks_app.command("run")
+def tasks_run(
+    task_id: str,
+    live: Annotated[bool, typer.Option("--live", help="Create a live run for this task.")] = False,
+    project: ProjectOption = Path("."),
+    stream: Annotated[StreamFormat, typer.Option("--stream", help="Live stream format.")] = StreamFormat.HUMAN,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        task = store.get_task(task_id)
+    except KeyError as exc:
+        _emit_task_error("harness.task_run/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if not live:
+        _emit_task_error("harness.task_run/v1", "Only --live task runs are supported by this command.", output)
+        raise typer.Exit(code=1)
+    task_type = str(task.metadata.get("task_type") or "codex_code_edit")
+    goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
+    result = _create_policy_first_live_run(
+        project_root=project_root,
+        goal=goal,
+        task_type=task_type,
+        agent=task.agent_id or "code_editor",
+        task_id=task.id,
+        task_file=None,
+    )
+    if output == OutputFormat.JSON:
+        _emit_json({"schema_version": "harness.task_run/v1", "ok": True, **result})
+        return
+    _emit_live_stream(project_root, result["run_id"], stream)
+    if stream != StreamFormat.JSONL:
+        typer.echo(f"Run: {result['run_id']}")
+        typer.echo(f"Status: {result['status']}")
 
 
 @specs_app.callback()
@@ -3164,6 +3281,33 @@ def run(
     )
 
 
+@app.command("run-live")
+def run_live(
+    task_file: Annotated[Path, typer.Option("--task-file", help="Task prompt file.")],
+    agent: Annotated[str, typer.Option("--agent", help="Agent id for the live run.")] = "code_editor",
+    project: ProjectOption = Path("."),
+    stream: Annotated[StreamFormat, typer.Option("--stream", help="Stream format.")] = StreamFormat.HUMAN,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    path = task_file if task_file.is_absolute() else project_root / task_file
+    if not path.exists() or not path.is_file():
+        raise typer.BadParameter(f"Task file not found: {task_file}")
+    result = _create_policy_first_live_run(
+        project_root=project_root,
+        goal=path.read_text(encoding="utf-8"),
+        task_type="codex_code_edit",
+        agent=agent,
+        task_id=None,
+        task_file=path,
+    )
+    _emit_live_stream(project_root, result["run_id"], stream)
+    if stream != StreamFormat.JSONL:
+        typer.echo(f"Run: {result['run_id']}")
+        typer.echo(f"Status: {result['status']}")
+        typer.echo(f"Artifacts: {result['run_dir']}")
+
+
 @approvals_app.callback()
 def approvals_callback(
     ctx: typer.Context,
@@ -4021,6 +4165,131 @@ def _print_compare_result(result: dict) -> None:
 
 def _emit_json(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _tail_run_events(store: SQLiteStore, run_id: str, *, jsonl: bool, follow: bool) -> None:
+    try:
+        store.get_run(run_id)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    path = store.runs_dir / run_id / "events.jsonl"
+    path.touch(exist_ok=True)
+    offset = 0
+    while True:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        for line in lines[offset:]:
+            if not line.strip():
+                continue
+            if jsonl:
+                typer.echo(line)
+            else:
+                typer.echo(render_procedure_event(json.loads(line)))
+        offset = len(lines)
+        if not follow:
+            return
+        run = store.get_run(run_id)
+        if run.status in {"completed", "completed_applied", "completed_denied", "failed", "cancelled", "canceled"}:
+            return
+        time.sleep(0.25)
+
+
+def _create_policy_first_live_run(
+    *,
+    project_root: Path,
+    goal: str,
+    task_type: str,
+    agent: str,
+    task_id: str | None,
+    task_file: Path | None,
+) -> dict:
+    store = SQLiteStore(project_root)
+    cfg = load_config(project_root)
+    approval = ApprovalStore(project_root).find_valid("codex_cli", "hosted_provider", task_type)
+    run = store.create_run(
+        goal=goal,
+        task_type=task_type,
+        status="running",
+        backend=cfg.backends.get("codex_cli"),
+        approval_id=approval.id if approval else None,
+        task_id=task_id,
+    )
+    paths = store.initialize_run_artifacts(run.id)
+    for kind, path in paths.items():
+        if kind not in {artifact.kind for artifact in store.list_artifacts(run.id)}:
+            store.register_artifact(run.id, kind=kind, path=path, producer="harness.live_run")
+    store.append_run_event(
+        run.id,
+        RunEventType.RUN_STARTED,
+        {
+            "agent": agent,
+            "backend": "codex_cli",
+            "mode": "edit-isolated",
+            "task_file": str(task_file) if task_file else None,
+        },
+        message="Live run started.",
+        redaction_state=RedactionState.REDACTED,
+        task_id=task_id,
+    )
+    store.append_run_event(
+        run.id,
+        RunEventType.POLICY_RESOLVED,
+        {
+            "hosted_provider": "approved" if approval else "approval_required",
+            "active_repo_write": "forbidden_until_apply_back_approval",
+            "isolated_workspace": "required",
+            "approval_id": approval.id if approval else None,
+        },
+        message="Resolved live run policy.",
+        redaction_state=RedactionState.NOT_REQUIRED,
+        task_id=task_id,
+    )
+    if approval is None:
+        store.append_run_event(
+            run.id,
+            RunEventType.APPROVAL_REQUIRED,
+            {
+                "approval_kind": "hosted_provider_codex",
+                "reason": "Codex hosted-boundary approval is required before backend execution.",
+                "backend": "codex_cli",
+                "task_type": task_type,
+            },
+            message="Hosted-boundary approval required.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+            task_id=task_id,
+        )
+        store.update_run_status(run.id, "waiting_approval")
+    else:
+        store.append_run_event(
+            run.id,
+            RunEventType.BACKEND_STARTED,
+            {"backend": "codex_cli", "streaming": False, "status": "not_dispatched_by_run_live"},
+            message="Hosted approval is present; dispatch through the registered Codex runner.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+            task_id=task_id,
+        )
+        store.update_run_status(run.id, "completed")
+        store.append_run_event(
+            run.id,
+            RunEventType.RUN_FINISHED,
+            {"status": "completed", "dispatch": "not_dispatched_by_run_live"},
+            message="Live run setup completed.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+            task_id=task_id,
+        )
+    artifact_paths = write_live_run_artifacts(store, run.id)
+    return {
+        "run_id": run.id,
+        "status": store.get_run(run.id).status,
+        "run_dir": str(store.runs_dir / run.id),
+        "artifacts": {key: str(path) for key, path in artifact_paths.items()},
+    }
+
+
+def _emit_live_stream(project_root: Path, run_id: str, stream: StreamFormat) -> None:
+    if stream == StreamFormat.NONE:
+        return
+    store = SQLiteStore(project_root)
+    _tail_run_events(store, run_id, jsonl=stream == StreamFormat.JSONL, follow=False)
 
 
 def _print_section(title: str) -> None:

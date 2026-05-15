@@ -91,6 +91,12 @@ def test_codex_runner_persists_metadata_and_artifacts(tmp_path, monkeypatch) -> 
     run = store.get_run(output["run_id"])
     assert run.approval_id == "appr_test"
     assert run.status == "completed"
+    events = store.list_events(run.id)
+    assert any(
+        event.event_type == "policy.resolved"
+        and event.payload["hosted_provider"] == "approved"
+        for event in events
+    )
     artifacts = {artifact.kind for artifact in store.list_artifacts(run.id)}
     assert {"codex_stdout", "codex_stderr", "codex_events", "codex_final_message"} <= artifacts
 

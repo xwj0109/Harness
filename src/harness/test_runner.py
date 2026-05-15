@@ -7,6 +7,7 @@ from typing import Protocol
 
 from harness.config import HarnessConfig
 from harness.memory.sqlite_store import SQLiteStore
+from harness.models import RedactionState, RunEventType
 from harness.paths import PathSecurityError, relative_to_project, resolve_under_project
 from harness.sandbox import (
     CommandValidationError,
@@ -128,6 +129,23 @@ class DockerTestRunner:
             self.docker_runner.preflight()
             workspace = self.docker_runner.create_workspace(self.project_root)
             details = self._approval_details(command, workspace.path, container_workdir)
+            self.store.append_run_event(
+                run_id,
+                RunEventType.APPROVAL_REQUIRED,
+                {
+                    "approval_kind": "docker_execution",
+                    "reason": "Docker test execution requires explicit approval.",
+                    "command": command,
+                    "cwd": cwd,
+                    "image": self.sandbox_config.image,
+                    "network": self.sandbox_config.network,
+                    "workdir": container_workdir,
+                },
+                message="Docker execution approval required.",
+                redaction_state=RedactionState.REDACTED,
+            )
+            if update_run_status:
+                self.store.update_run_status(run_id, "waiting_approval")
             approval = approval_provider.decide(details)
             self.store.append_event(
                 run_id,
@@ -155,9 +173,33 @@ class DockerTestRunner:
                     update_run_status,
                     write_final_report,
                 )
+            self.store.append_run_event(
+                run_id,
+                RunEventType.TEST_STARTED,
+                {"command": command, "cwd": cwd, "workdir": container_workdir},
+                message="Started Docker test execution.",
+                redaction_state=RedactionState.REDACTED,
+            )
             docker_result = self.docker_runner.run(workspace, command, workdir=container_workdir)
             stdout_path.write_text(str(sanitize_for_logging(docker_result.stdout)), encoding="utf-8")
             stderr_path.write_text(str(sanitize_for_logging(docker_result.stderr)), encoding="utf-8")
+            if docker_result.stdout:
+                self.store.append_run_event(
+                    run_id,
+                    RunEventType.TEST_OUTPUT,
+                    {"stream": "stdout", "text": sanitize_for_logging(docker_result.stdout)},
+                    message="Captured Docker test stdout.",
+                    redaction_state=RedactionState.REDACTED,
+                )
+            if docker_result.stderr:
+                self.store.append_run_event(
+                    run_id,
+                    RunEventType.TEST_OUTPUT,
+                    {"stream": "stderr", "text": sanitize_for_logging(docker_result.stderr)},
+                    message="Captured Docker test stderr.",
+                    redaction_state=RedactionState.REDACTED,
+                    level="warning",
+                )
             if docker_result.timed_out:
                 status = "tests_timed_out"
             elif docker_result.exit_code == 0:
@@ -253,6 +295,18 @@ class DockerTestRunner:
             "Docker test run completed.",
             result_payload,
         )
+        self.store.append_run_event(
+            run_id,
+            RunEventType.TEST_FINISHED,
+            {
+                "status": status,
+                "exit_code": result_payload["exit_code"],
+                "duration_seconds": result_payload["duration_seconds"],
+                "approval_decision": approval.decision,
+            },
+            message=f"Docker test execution finished with status {status}.",
+            redaction_state=RedactionState.NOT_REQUIRED if status == "execution_denied" else RedactionState.REDACTED,
+        )
         if update_run_status:
             self.store.update_run_status(run_id, status)
         if write_final_report:
@@ -263,6 +317,20 @@ class DockerTestRunner:
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 result_path=result_path,
+            )
+            self.store.append_run_event(
+                run_id,
+                RunEventType.RUN_SUMMARY_CREATED,
+                {"path": str(self.store.runs_dir / run_id / "final_report.md")},
+                message="Created Docker test run summary.",
+                redaction_state=RedactionState.REDACTED,
+            )
+            self.store.append_run_event(
+                run_id,
+                RunEventType.RUN_FINISHED if status not in {"sandbox_error", "docker_unavailable", "docker_image_missing"} else RunEventType.RUN_FAILED,
+                {"status": status},
+                message=f"Run finished with status {status}.",
+                redaction_state=RedactionState.NOT_REQUIRED,
             )
         return {
             "run_id": run_id,

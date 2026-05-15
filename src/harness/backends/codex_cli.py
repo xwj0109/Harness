@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from harness.events import append_jsonl
+from harness.backends.streaming import BackendStreamEvent, classify_codex_stream_item
 from harness.models import BackendCapabilities, BackendConfig, BackendStatus
 from harness.security import sanitize_for_logging
 
@@ -302,6 +303,15 @@ class CodexCliBackend:
             ),
         }
 
+    def stream_read_only_backend_events(
+        self,
+        project_root: Path,
+        prompt: str,
+        final_message_path: Path | None,
+    ) -> Iterator[BackendStreamEvent]:
+        for item in self.stream_read_only(project_root, prompt, final_message_path):
+            yield classify_codex_stream_item(item)
+
     def run_edit(self, isolated_workspace: Path, prompt: str, final_message_path: Path | None) -> tuple[CodexRunResult, BackendCapabilities, str]:
         command, capabilities, network_status = self.build_edit_command(isolated_workspace, prompt, final_message_path)
         result = subprocess.run(
@@ -495,6 +505,24 @@ class CodexCliBackend:
                 final_message=final_message,
             ),
         }
+
+    def stream_direct_agent_backend_events(
+        self,
+        project_root: Path,
+        prompt: str,
+        final_message_path: Path | None,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> Iterator[BackendStreamEvent]:
+        for item in self.stream_direct_agent(
+            project_root,
+            prompt,
+            final_message_path,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        ):
+            yield classify_codex_stream_item(item)
 
     def _run_help(self, args: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(args, text=True, capture_output=True, timeout=15, env=_codex_env())

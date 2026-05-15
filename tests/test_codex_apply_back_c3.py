@@ -157,6 +157,16 @@ def test_denied_apply_back_leaves_active_project_byte_for_byte_unchanged(tmp_pat
     assert result["apply_back_decision"] == "denied"
     assert (tmp_path / "app.py").read_bytes() == before
     events = SQLiteStore(tmp_path).list_events(result["run_id"])
+    assert any(
+        event.event_type == "policy.resolved"
+        and event.payload["hosted_provider"] == "approved"
+        for event in events
+    )
+    assert any(
+        event.event_type == "approval.required"
+        and event.payload["approval_kind"] == "active_repo_apply_back"
+        for event in events
+    )
     assert any(event.event_type == "apply_back_decision" and event.payload["decision"] == "denied" for event in events)
 
 

@@ -13,6 +13,7 @@ from harness.backends.codex_cli import (
 )
 from harness.events import append_jsonl
 from harness.memory.sqlite_store import SQLiteStore
+from harness.models import RedactionState, RunEventType
 from harness.security import scan_text_for_secrets, sanitize_for_logging
 
 
@@ -93,6 +94,18 @@ class CodexReadOnlyRepoSummaryRunner:
         run_dir = self.store.runs_dir / run_id
         final_message_path = run_dir / "codex_final_message.md"
         pre_status = self._git_status_porcelain()
+        self.store.append_run_event(
+            run_id,
+            RunEventType.POLICY_RESOLVED,
+            {
+                "hosted_provider": "approved",
+                "approval_id": approval.id,
+                "active_repo_write": "forbidden",
+                "run_mode": "read_only",
+            },
+            message="Resolved Codex read-only policy.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
         self.store.append_event(
             run_id,
             "info",
@@ -356,6 +369,18 @@ class CodexRepoPlanningRunner:
         run_dir = self.store.runs_dir / run.id
         final_message_path = run_dir / "codex_final_message.md"
         pre_status = self._git_status_porcelain()
+        self.store.append_run_event(
+            run.id,
+            RunEventType.POLICY_RESOLVED,
+            {
+                "hosted_provider": "approved",
+                "approval_id": approval.id,
+                "active_repo_write": "forbidden",
+                "run_mode": "planning",
+            },
+            message="Resolved Codex planning policy.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
         self.store.append_event(
             run.id,
             "info",

@@ -481,6 +481,7 @@ def _dispatch_chat_input(
 ) -> dict[str, Any]:
     if not raw:
         return _response("empty", "No input", ["Type /help for available commands."])
+    _emit_progress(progress_callback, "procedure", "Turn started")
     if raw in {"/quit", "quit", "exit"}:
         return _response("quit", "Goodbye", ["Exiting harness chat."], ok=True)
     if raw in {"/confirm", "yes", "y"}:
@@ -632,6 +633,15 @@ def route_chat_intent(text: str) -> dict[str, Any]:
     return {"schema_version": CHAT_INTENT_SCHEMA_VERSION, "ok": True, "input": text, "intent": intent}
 
 
+def _emit_progress(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    kind: str,
+    content: str,
+) -> None:
+    if progress_callback is not None and content.strip():
+        progress_callback({"kind": kind, "content": content})
+
+
 def _handle_slash(
     raw: str,
     project_root: Path,
@@ -644,6 +654,8 @@ def _handle_slash(
     command = parts[0][1:]
     arg = parts[1] if len(parts) > 1 else None
     tail = raw.partition(" ")[2].strip()
+    _emit_progress(progress_callback, "procedure", "Ran slash command routing")
+    _emit_progress(progress_callback, "procedure", f"- command: /{command}")
     if command == "help":
         return _response(
             "help",
@@ -815,6 +827,8 @@ def _handle_intent(
     if managed_action_response is not None:
         return managed_action_response
     intent = route_chat_intent(raw)["intent"]
+    _emit_progress(progress_callback, "procedure", "Ran intent routing")
+    _emit_progress(progress_callback, "procedure", f"- intent: {intent}")
     if intent == "init_project":
         return _init_response(project_root, state)
     if intent == "mode_codex_like":
@@ -983,6 +997,9 @@ def _model_chat_response(
 ) -> dict[str, Any]:
     context_payload = chat_context(project_root)
     context_manifest = pack_chat_context(project_root)
+    _emit_progress(progress_callback, "procedure", "Explored")
+    for line in _context_manifest_progress_lines(context_manifest):
+        _emit_progress(progress_callback, "procedure", line)
     chat_ctx = ChatContext(
         project_root=str(project_root),
         model_profile=context_payload["chat"]["default_model_profile"],
@@ -994,11 +1011,13 @@ def _model_chat_response(
     tool_results: list[dict[str, Any]] = []
     try:
         model = chat_model or build_default_chat_model(project_root)
+        _emit_progress(progress_callback, "procedure", "Ran model turn")
         model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
         for _index in range(MAX_CHAT_TOOL_CALLS):
             tool_request = parse_tool_request(model_response.content)
             if tool_request is None:
                 break
+            _emit_progress(progress_callback, "procedure", f"Ran {tool_request.tool}")
             tool_result = run_chat_tool(tool_request, default_chat_tool_context(project_root))
             if tool_result.error_type == "action_contract_required":
                 return _action_contract_response(project_root, state, tool_request)
@@ -1026,12 +1045,13 @@ def _model_chat_response(
             if progress_callback is not None:
                 progress_callback(
                     {
-                        "kind": "tool_result",
-                        "content": f"Tool {tool_result.tool}: {'ok' if tool_result.ok else tool_result.error_type or 'failed'}",
+                        "kind": "procedure",
+                        "content": f"- {tool_result.tool}: {'ok' if tool_result.ok else tool_result.error_type or 'failed'}",
                     }
                 )
             messages.append(ChatMessage(role="assistant", content=model_response.content))
             messages.append(ChatMessage(role="user", content=f"Harness tool result:\n{tool_result.to_message()}"))
+            _emit_progress(progress_callback, "procedure", "Ran model turn")
             model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
     except LocalEndpointUnavailable as exc:
         return _local_model_unavailable_response(project_root, exc)
@@ -1068,6 +1088,26 @@ def _model_chat_response(
             "action_proposals": model_response.action_proposals,
         },
     )
+
+
+def _context_manifest_progress_lines(context_manifest: Any) -> list[str]:
+    lines = [f"- Project: {context_manifest.project_root}"]
+    block_labels: list[str] = []
+    read_sources: list[str] = []
+    for block in context_manifest.blocks:
+        if block.source:
+            read_sources.append(str(block.source))
+        else:
+            block_labels.append(str(block.kind))
+    if block_labels:
+        lines.append(f"- Context blocks: {', '.join(block_labels[:8])}")
+    if read_sources:
+        lines.append(f"- Read {', '.join(read_sources[:6])}")
+    if context_manifest.blocked_paths:
+        lines.append(f"- Blocked paths: {len(context_manifest.blocked_paths)}")
+    if context_manifest.warnings:
+        lines.append(f"- Warnings: {', '.join(context_manifest.warnings[:3])}")
+    return lines
 
 
 def _complete_model_turn(

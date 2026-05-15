@@ -19,7 +19,7 @@ from harness.codex_runner import HostedBoundaryApprovalRequired
 from harness.events import append_jsonl
 from harness.isolation import ActiveRepoDirtyError, IsolationManager, inspect_isolated_diff
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import KillSwitchTargetKind
+from harness.models import RedactionState, RunEventType, KillSwitchTargetKind
 from harness.security import sanitize_for_logging
 from harness.tools.patch import PatchValidationError, apply_planned_updates, plan_unified_diff
 
@@ -120,6 +120,25 @@ class CodexCodeEditRunner:
         paths = self.store.initialize_run_artifacts(run_id)
         for kind, path in paths.items():
             self.store.register_artifact(run_id, kind=kind, path=path)
+        self.store.append_run_event(
+            run_id,
+            RunEventType.POLICY_RESOLVED,
+            {
+                "hosted_provider": "approved",
+                "approval_id": approval.id,
+                "active_repo_write": "forbidden_until_apply_back_approval",
+                "isolated_workspace": "required",
+            },
+            message="Resolved Codex edit policy.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        self.store.append_run_event(
+            run_id,
+            RunEventType.RUN_STARTED,
+            {"agent": "code_editor", "backend": self.backend.name, "mode": "edit-isolated"},
+            message="Codex edit run started.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
         run_dir = self.store.runs_dir / run_id
         workspace = None
         result: CodexRunResult | None = None
@@ -157,9 +176,26 @@ class CodexCodeEditRunner:
                     "active_pre_isolation_git_status": workspace.active_pre_isolation_git_status,
                 },
             )
+            self.store.append_run_event(
+                run_id,
+                RunEventType.WORKSPACE_PREPARED,
+                {
+                    "isolated_workspace": str(workspace.path),
+                    "strategy": workspace.strategy,
+                    "active_repo_write": "forbidden_until_apply_back_approval",
+                },
+                message="Prepared isolated workspace.",
+            )
             active_hashes = {path: entry.sha256 for path, entry in workspace.baseline_manifest.entries.items()}
             prompt = self._build_payload(goal, task_type)
             append_jsonl(paths["transcript"], {"role": "user", "content": sanitize_for_logging(prompt)})
+            self.store.append_run_event(
+                run_id,
+                RunEventType.BACKEND_STARTED,
+                {"backend": self.backend.name, "streaming": False},
+                message="Started Codex backend.",
+                redaction_state=RedactionState.NOT_REQUIRED,
+            )
             result, detected_capabilities, network_status = self.backend.run_edit(workspace.path, prompt, final_message_path)
             codex_artifacts = write_codex_artifacts(run_dir, result)
             for kind, path in codex_artifacts.items():
@@ -187,6 +223,24 @@ class CodexCodeEditRunner:
                     "capabilities": detected_capabilities.model_dump(mode="json"),
                     "network_status": network_status,
                 },
+            )
+            for changed_file in diff_result.allowed_changed_files:
+                self.store.append_run_event(
+                    run_id,
+                    RunEventType.FILE_WRITE,
+                    {"path": changed_file},
+                    message=f"Modified {changed_file}.",
+                )
+            self.store.append_run_event(
+                run_id,
+                RunEventType.DIFF_UPDATED,
+                {
+                    "changed_files": diff_result.changed_files,
+                    "allowed_changed_files": diff_result.allowed_changed_files,
+                    "diff_stat": diff_result.diff_stat,
+                    "valid": diff_result.valid,
+                },
+                message="Updated isolated workspace diff.",
             )
             self.store.append_event(
                 run_id,
@@ -290,6 +344,13 @@ class CodexCodeEditRunner:
             apply_back_failure=apply_back_failure,
             artifact_paths=artifact_paths,
         )
+        self.store.append_run_event(
+            run_id,
+            RunEventType.RUN_FINISHED if status_value != "failed" else RunEventType.RUN_FAILED,
+            {"status": status_value, "apply_back_decision": apply_back_decision.decision},
+            message=f"Run finished with status {status_value}.",
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
         return {
             "run_id": run_id,
             "status": status_value,
@@ -329,6 +390,19 @@ class CodexCodeEditRunner:
         pre_isolation_status: str,
     ) -> tuple[ApplyBackDecision, FreshnessCheckResult, list[str], str | None]:
         summary = self._apply_back_summary(diff_result)
+        self.store.append_run_event(
+            run_id,
+            RunEventType.APPROVAL_REQUIRED,
+            {
+                "approval_kind": "active_repo_apply_back",
+                "reason": "Apply-back requires explicit approval before mutating the active repository.",
+                "diff_artifact": str(diff_artifact),
+                "changed_files": diff_result.allowed_changed_files,
+            },
+            message="Apply-back approval required.",
+            redaction_state=RedactionState.REDACTED,
+        )
+        self.store.update_run_status(run_id, "waiting_approval")
         decision = self.apply_back_approval_provider.decide(summary, diff_result.unified_diff, diff_artifact)
         if not decision.approved:
             self._persist_apply_back_decision(run_id, decision)
@@ -567,6 +641,12 @@ class CodexCodeEditRunner:
         ]
         lines.extend(f"- {kind}: {path}" for kind, path in artifact_paths.items())
         artifact_paths["final_report"].write_text("\n".join(lines), encoding="utf-8")
+        self.store.append_run_event(
+            run_id,
+            RunEventType.RUN_SUMMARY_CREATED,
+            {"path": str(artifact_paths["final_report"])},
+            message="Created run summary.",
+        )
 
     def _apply_back_outcome(
         self,

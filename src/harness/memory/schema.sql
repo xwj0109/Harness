@@ -27,6 +27,12 @@ CREATE TABLE IF NOT EXISTS events (
   message TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   session_id TEXT,
+  schema_version TEXT,
+  seq INTEGER,
+  task_id TEXT,
+  trace_id TEXT,
+  visibility TEXT,
+  redaction_state TEXT,
   FOREIGN KEY(run_id) REFERENCES runs(id)
 );
 

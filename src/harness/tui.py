@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import re
+import time
 from pathlib import Path
 
+from harness.memory.sqlite_store import SQLiteStore
 from harness.operator_context import build_tui_dashboard
+from harness.procedure_renderer import render_procedure_event
+from rich.markup import escape
 
 
 COMMAND_PALETTE_GROUPS = [
@@ -869,6 +874,197 @@ def render_right_panel_status(model: dict) -> str:
     return f"Context | {active} | {query}"
 
 
+def build_codex_mode_model(project_root: Path, run_id: str | None = None) -> dict:
+    store = SQLiteStore(project_root)
+    selected_run = None
+    runs = []
+    try:
+        runs = store.list_runs()
+        selected_run = store.get_run(run_id) if run_id else (runs[0] if runs else None)
+    except Exception as exc:
+        return {
+            "schema_version": "harness.tui_codex_mode/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "run_id": run_id,
+            "status": "unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+            "panes": _empty_codex_panes(f"State unavailable: {type(exc).__name__}: {exc}"),
+            "controls": _codex_controls(None),
+        }
+    if selected_run is None:
+        return {
+            "schema_version": "harness.tui_codex_mode/v1",
+            "ok": True,
+            "project_root": str(project_root),
+            "run_id": None,
+            "status": "queued",
+            "state": "Queued",
+            "header": ["No live run selected.", "Submit a prompt to create a run."],
+            "panes": _empty_codex_panes("No persisted run events yet."),
+            "controls": _codex_controls(None),
+        }
+    events = [event.jsonl_envelope() for event in store.list_events(selected_run.id)]
+    artifacts = []
+    try:
+        artifacts = store.list_artifacts(selected_run.id)
+    except Exception:
+        artifacts = []
+    latest_usage = {}
+    for event in events:
+        if event.get("type") == "token_usage.updated":
+            latest_usage = dict(event.get("payload") or {})
+    model_output = _codex_model_output_rows(events)
+    panes = [
+        {
+            "id": "live_procedure",
+            "title": "Live Procedure",
+            "lines": [render_procedure_event(event) for event in events if event.get("visibility") == "user_visible"]
+            or ["No procedure events recorded."],
+        },
+        {
+            "id": "model_output",
+            "title": "Model Output",
+            "lines": model_output or ["No model output recorded."],
+        },
+        {
+            "id": "artifacts",
+            "title": "Artifacts",
+            "lines": [
+                f"{artifact.kind}: {artifact.path.name} | {artifact.redaction_state} | {artifact.evidence_status}"
+                for artifact in artifacts
+            ]
+            or ["No artifacts registered."],
+        },
+        {
+            "id": "controls",
+            "title": "Controls",
+            "lines": _codex_controls(selected_run.id),
+        },
+    ]
+    return {
+        "schema_version": "harness.tui_codex_mode/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "run_id": selected_run.id,
+        "task_id": selected_run.task_id,
+        "agent": "code_editor",
+        "backend": selected_run.backend_name or "none",
+        "mode": selected_run.task_type or "unknown",
+        "status": selected_run.status,
+        "state": _codex_visual_state(selected_run.status, events),
+        "token_usage": latest_usage,
+        "header": [
+            f"Run: {selected_run.id}",
+            f"Status: {_codex_visual_state(selected_run.status, events)}",
+            f"Backend: {selected_run.backend_name or 'none'}",
+            f"Mode: {selected_run.task_type or 'unknown'}",
+            _format_token_usage(latest_usage),
+        ],
+        "panes": panes,
+        "controls": panes[-1]["lines"],
+    }
+
+
+def render_codex_mode(model: dict) -> str:
+    lines = ["Codex Mode"]
+    for row in model.get("header", []):
+        lines.append(f"  {row}")
+    for pane in model.get("panes", []):
+        lines.extend(["", pane["title"]])
+        for row in pane.get("lines", []):
+            lines.append(f"  {row}")
+    return "\n".join(lines).strip()
+
+
+def _empty_codex_panes(message: str) -> list[dict]:
+    return [
+        {"id": "live_procedure", "title": "Live Procedure", "lines": [message]},
+        {"id": "model_output", "title": "Model Output", "lines": ["No model output recorded."]},
+        {"id": "artifacts", "title": "Artifacts", "lines": ["No artifacts registered."]},
+        {"id": "controls", "title": "Controls", "lines": _codex_controls(None)},
+    ]
+
+
+def _codex_model_output_rows(events: list[dict]) -> list[str]:
+    rows: list[str] = []
+    for event in events:
+        payload = event.get("payload") or {}
+        if event.get("type") in {"model.message_delta", "model.token"}:
+            text = payload.get("delta") or payload.get("text")
+            if text:
+                rows.append(str(text))
+        elif event.get("type") == "reasoning.summary_delta":
+            text = payload.get("delta") or payload.get("text")
+            if text:
+                rows.append(f"thinking summary: {text}")
+    return rows
+
+
+def _codex_controls(run_id: str | None) -> list[str]:
+    if not run_id:
+        return ["Stop run: unavailable", "Approve hosted boundary: unavailable", "Approve apply-back: unavailable"]
+    return [
+        f"Stop run: harness controls disable --target run:{run_id}",
+        "Approve hosted boundary: harness approvals add --backend codex_cli --data-boundary hosted_provider --project .",
+        f"Approve apply-back: harness apply {run_id} --project .",
+        f"Inspect diff: harness diff {run_id} --project .",
+        f"Open isolated workspace: harness show {run_id} --project .",
+    ]
+
+
+def _codex_visual_state(status: str, events: list[dict]) -> str:
+    if status in {"failed"} or any(event.get("type") == "run.failed" for event in events):
+        return "Failed"
+    if status in {"cancelled", "canceled"}:
+        return "Cancelled"
+    if status.startswith("completed") or any(event.get("type") == "run.finished" for event in events):
+        return "Succeeded"
+    if any(event.get("type") == "approval.required" for event in events):
+        return "Waiting approval"
+    if any(event.get("type") == "test.started" for event in events) and not any(
+        event.get("type") == "test.finished" for event in events
+    ):
+        return "Running tests"
+    if any(event.get("type") == "tool_call.started" for event in events) and not any(
+        event.get("type") == "tool_call.finished" for event in events
+    ):
+        return "Calling tool"
+    if any(event.get("type") == "file.write" for event in events):
+        return "Editing"
+    if any(event.get("type") == "backend.started" for event in events):
+        return "Thinking"
+    if any(event.get("type") == "workspace.prepared" for event in events):
+        return "Preparing workspace"
+    if any(event.get("type") == "policy.resolved" for event in events):
+        return "Resolving policy"
+    if any(event.get("type") == "run.started" for event in events):
+        return "Thinking"
+    return "Queued"
+
+
+def _format_token_usage(usage: dict) -> str:
+    if not usage:
+        return "Tokens: unavailable"
+    total = usage.get("total_tokens")
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    reasoning = usage.get("reasoning_tokens")
+    cost = usage.get("estimated_cost_usd")
+    parts = []
+    if total is not None:
+        parts.append(f"total={total}")
+    if input_tokens is not None:
+        parts.append(f"input={input_tokens}")
+    if output_tokens is not None:
+        parts.append(f"output={output_tokens}")
+    if reasoning is not None:
+        parts.append(f"reasoning_count={reasoning}")
+    if cost is not None:
+        parts.append(f"cost=${cost}")
+    return "Tokens: " + ", ".join(parts)
+
+
 def build_slash_commands(palette: dict | None = None) -> dict:
     palette = palette or build_command_palette()
     entries_by_id = {entry["id"]: entry for entry in palette["entries"]}
@@ -1053,6 +1249,224 @@ def render_chat_message(message: dict) -> str:
     lines = [f"{role}: {title}", ""]
     lines.extend(str(line) for line in message.get("lines", []))
     return "\n".join(lines)
+
+
+CODEX_ACCENT = "dark_cyan"
+CODEX_SEPARATOR_STYLE = "dim"
+CODEX_SEPARATOR_CHAR = "─"
+CODEX_IMPORTANT_PHRASES = (
+    "Agent Harness",
+    "local-first",
+    "supervised control plane",
+    "Codex",
+    "README",
+    "CLI",
+    "TUI",
+)
+
+
+def render_codex_like_transcript(
+    messages: list[dict], *, working_seconds: int | None = None, separator_width: int = 96
+) -> str:
+    separator_width = max(20, separator_width)
+    lines = [
+        "[bold]Tip:[/bold] GPT-5.5 is now available in Codex. It's our strongest agentic coding model yet, built to reason through large codebases, check assumptions with tools, and keep going until the work is done.",
+        "",
+        f"[bold]Learn more:[/bold] [{CODEX_ACCENT}]https://openai.com/index/introducing-gpt-5-5/[/{CODEX_ACCENT}]",
+    ]
+    for message in messages:
+        rendered = _render_codex_like_message(message, separator_width=separator_width)
+        if rendered:
+            lines.extend(["", rendered])
+    if working_seconds is not None:
+        lines.extend(["", f"[dim]○[/dim] [dim]Working ({working_seconds}s • esc to interrupt)[/dim]"])
+    return "\n".join(lines).strip()
+
+
+def _render_codex_like_message(message: dict, *, separator_width: int) -> str:
+    role = message.get("role")
+    title = str(message.get("title") or "").strip()
+    body_lines = [str(line) for line in message.get("lines", []) if str(line).strip()]
+    if role == "user":
+        return f"[on #eeeeee][dim]›[/dim] {_style_inline_text(title)}[/]"
+    if title == "Harness chat":
+        return ""
+    if title == "Codex-Like Mode":
+        return ""
+    if body_lines == ["Starting model turn..."]:
+        return ""
+    rendered: list[str] = []
+    if title and title not in {"Assistant", "Assistant Streaming"}:
+        rendered.append(_style_prose_line(title))
+    in_procedure_block = False
+    needs_separator_before_prose = False
+    previous_kind = "prose" if rendered else None
+    previous_raw = title if rendered else ""
+    for line in body_lines:
+        line_kind, line_rendered = _render_codex_like_line(line, in_procedure_block=in_procedure_block)
+        if line_kind in {"prose", "list"} and needs_separator_before_prose:
+            rendered.append(_style_separator(separator_width))
+            needs_separator_before_prose = False
+            previous_kind = "separator"
+            previous_raw = ""
+        if _needs_paragraph_gap(line_kind, previous_kind, previous_raw):
+            rendered.append("")
+        rendered.extend(line_rendered)
+        if line_kind == "procedure":
+            in_procedure_block = True
+            needs_separator_before_prose = True
+        elif line_kind == "child":
+            in_procedure_block = True
+        elif line_kind in {"prose", "list"}:
+            in_procedure_block = False
+        if line_kind != "blank":
+            previous_kind = line_kind
+            previous_raw = line.strip()
+    if not rendered and title:
+        rendered.append(_style_prose_line(title))
+    return "\n".join(rendered)
+
+
+def _render_codex_like_line(line: str, *, in_procedure_block: bool) -> tuple[str, list[str]]:
+    stripped = line.strip()
+    if not stripped:
+        return "blank", []
+    lowered = stripped.casefold()
+    if lowered.startswith("ran "):
+        return "procedure", [_style_ran_line(stripped)]
+    if lowered.startswith("explored"):
+        suffix = stripped[len("Explored") :].strip()
+        tail = f" {_style_inline_text(suffix)}" if suffix else ""
+        return "procedure", [f"[dim]•[/dim] [bold]Explored[/bold]{tail}"]
+    if stripped.startswith("Tool calls:"):
+        return "procedure", [f"[dim]•[/dim] [bold]Tool calls:[/bold]"]
+    if stripped.startswith("- "):
+        if in_procedure_block:
+            return "child", [_style_child_line(stripped[2:].strip())]
+        return "list", [_style_list_line(stripped[2:].strip())]
+    if stripped.startswith("* "):
+        return "list", [_style_list_line(stripped[2:].strip())]
+    numbered_match = re.match(r"^(\d+[.)])\s+(.+)$", stripped)
+    if numbered_match:
+        return "list", [_style_numbered_list_line(numbered_match.group(1), numbered_match.group(2))]
+    return "prose", [_style_prose_line(stripped)]
+
+
+def _style_prose_line(text: str) -> str:
+    label_match = re.match(r"^([A-Z][^:]{1,48}:)\s+(.+)$", text)
+    if label_match and "://" not in label_match.group(1):
+        return f"[bold]{escape(label_match.group(1))}[/bold] {_style_inline_text(label_match.group(2))}"
+    if _looks_like_prose_heading(text):
+        return f"[bold]{_style_inline_text(text)}[/bold]"
+    return _style_inline_text(text)
+
+
+def _style_list_line(text: str) -> str:
+    return f"[dim]•[/dim] {_style_inline_text(text)}"
+
+
+def _style_numbered_list_line(marker: str, text: str) -> str:
+    return f"[dim]{escape(marker)}[/dim] {_style_inline_text(text)}"
+
+
+def _style_separator(width: int) -> str:
+    return f"[{CODEX_SEPARATOR_STYLE}]{CODEX_SEPARATOR_CHAR * width}[/{CODEX_SEPARATOR_STYLE}]"
+
+
+def _needs_paragraph_gap(line_kind: str, previous_kind: str | None, previous_raw: str) -> bool:
+    if not previous_kind or previous_kind in {"procedure", "child", "separator"}:
+        return False
+    if line_kind == "prose" and previous_kind in {"prose", "list"}:
+        return True
+    if line_kind == "list" and previous_kind == "prose" and not previous_raw.rstrip().endswith(":"):
+        return True
+    return False
+
+
+def _looks_like_prose_heading(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.endswith(":") and len(stripped) <= 72 and not stripped.startswith(("-", "*"))
+
+
+def _style_ran_line(text: str) -> str:
+    _, _, tail = text.partition(" ")
+    command, _, args = tail.partition(" ")
+    if command:
+        command_text = f" [dim]{escape(command)}[/dim]"
+        if args:
+            command_text += f" [dim]{escape(args)}[/dim]"
+    else:
+        command_text = ""
+    return f"[green]●[/green] [bold]Ran[/bold]{command_text}"
+
+
+def _style_child_line(text: str) -> str:
+    label, sep, rest = text.partition(":")
+    if sep and label:
+        return f"  [dim]└[/dim] [{CODEX_ACCENT}]{escape(label)}:[/{CODEX_ACCENT}] [dim]{escape(rest.strip())}[/dim]"
+    first, _, tail = text.partition(" ")
+    if first in {"List", "Read"}:
+        return f"  [dim]└[/dim] [{CODEX_ACCENT}]{escape(first)}[/{CODEX_ACCENT}] {_style_inline_text(tail)}"
+    return f"  [dim]└[/dim] [dim]{_style_inline_text(text)}[/dim]"
+
+
+def _style_inline_text(text: str) -> str:
+    styled = escape(text)
+    styled = re.sub(r"\*\*(.+?)\*\*", r"[bold]\1[/bold]", styled)
+    styled = re.sub(r"__(.+?)__", r"[bold]\1[/bold]", styled)
+    styled = re.sub(r"`([^`]+)`", r"[dim]\1[/dim]", styled)
+    styled = re.sub(r"(?<![\\[])(/[\w./-]+)", rf"[{CODEX_ACCENT}]\1[/{CODEX_ACCENT}]", styled)
+    styled = _highlight_important_phrases(styled)
+    return styled
+
+
+def _highlight_important_phrases(styled: str) -> str:
+    for phrase in CODEX_IMPORTANT_PHRASES:
+        pattern = rf"(?<![\w\]/])({re.escape(phrase)})(?![\w\[])"
+        styled = re.sub(pattern, r"[bold]\1[/bold]", styled)
+    return styled
+
+
+def _append_streaming_content(lines: list[str], content: str) -> list[str]:
+    """Append model deltas as prose, while respecting explicit newlines."""
+    updated = list(lines)
+    chunks = content.splitlines(keepends=True)
+    if not chunks:
+        return updated
+    for chunk in chunks:
+        text = chunk.rstrip("\r\n")
+        if text.strip():
+            if updated and not _is_codex_procedure_line(updated[-1]):
+                normalized = text.strip()
+                separator = " " if text[:1].isspace() and not updated[-1].endswith((" ", "\t")) else ""
+                updated[-1] = f"{updated[-1]}{separator}{normalized}"
+            else:
+                updated.append(text.strip())
+        if chunk.endswith(("\n", "\r")) and (not updated or updated[-1].strip()):
+            updated.append("")
+    return [line for line in updated if line.strip()]
+
+
+def _is_codex_procedure_line(line: str) -> bool:
+    stripped = line.strip()
+    lowered = stripped.casefold()
+    return (
+        lowered.startswith("ran ")
+        or lowered.startswith("explored")
+        or lowered.startswith("turn ")
+        or lowered.startswith("tool ")
+        or lowered.startswith("tool calls:")
+        or stripped.startswith("- ")
+    )
+
+
+def _merge_codex_stream_and_final_lines(stream_lines: list[str], final_lines: list[str]) -> list[str]:
+    merged = [line for line in stream_lines if line.strip()]
+    for line in final_lines:
+        clean = line.strip()
+        if clean and clean not in merged:
+            merged.append(clean)
+    return merged[-120:]
 
 
 def render_pixel_art():
@@ -1289,23 +1703,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             "active_section_index": 0,
             "collapsed_section_ids": set(),
             "active_orchestrator": "coding_orchestrator",
-            "chat_mode": "codex-like" if codex_like else "normal",
+            "chat_mode": "live" if codex_like else "normal",
         },
         "",
         "dashboard",
     )
     initial_messages = [build_chat_welcome_message(project_root)]
-    if codex_like:
-        initial_messages.append(
-            {
-                "role": "assistant",
-                "title": "Codex-Like Mode",
-                "lines": [
-                    "One confirmation creates Harness records and drives foreground registered-adapter dispatch.",
-                    "Apply-back remains a separate explicit review.",
-                ],
-            }
-        )
 
     class HarnessPromptInput(Input):
         def on_key(self, event) -> None:
@@ -1386,12 +1789,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
             self._request_in_flight = False
+            self._request_started_at: float | None = None
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
             with Horizontal(id="layout"):
                 with VerticalScroll(id="chat"):
-                    yield Static(render_pixel_art(), id="pixel-art")
                     yield Static("", id="chat-content")
                 with VerticalScroll(id="side"):
                     yield Static(render_right_panel_status(initial_view), id="search-status")
@@ -1405,6 +1808,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self.query_one("#prompt", Input).focus()
             self._render_chat()
             self._render_current_view()
+            self.set_interval(0.5, self._refresh_live_view)
 
         def on_key(self, event) -> None:
             if isinstance(self.focused, Input):
@@ -1438,6 +1842,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             event.input.value = ""
             event.input.placeholder = "Model is responding..."
             self._request_in_flight = True
+            self._request_started_at = time.monotonic()
             self._render_chat()
             self._render_current_view()
             self.run_worker(lambda: self._run_chat_request(request, stream_index), thread=True)
@@ -1468,24 +1873,37 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if lines == ["Starting model turn..."]:
                 lines = []
             kind = str(update.get("kind") or "content")
-            for line in content.splitlines():
-                clean = line.strip()
-                if not clean:
-                    continue
-                if kind == "content":
-                    lines.append(clean)
-                elif not lines or lines[-1] != clean:
-                    lines.append(clean)
+            if kind == "content":
+                lines = _append_streaming_content(lines, content)
+            else:
+                for line in content.splitlines():
+                    clean = line.strip()
+                    if clean and (not lines or lines[-1] != clean):
+                        lines.append(clean)
             message["title"] = "Assistant Streaming"
             message["lines"] = lines[-80:]
             self._render_chat()
 
         def _finish_chat_request(self, stream_index: int, response: dict) -> None:
             self._latest_response = dict(response)
+            existing_lines: list[str] = []
             if stream_index < len(self._messages):
-                self._messages[stream_index] = _chat_response_to_tui_message(response)
+                existing_lines = [
+                    str(line)
+                    for line in self._messages[stream_index].get("lines", [])
+                    if str(line).strip() and str(line).strip() != "Starting model turn..."
+                ]
+            final_message = _chat_response_to_tui_message(response)
+            if existing_lines:
+                final_lines = [str(line) for line in final_message.get("lines", []) if str(line).strip()]
+                final_title = str(final_message.get("title") or "")
+                if final_title in {"", "Assistant"}:
+                    final_message["title"] = "Assistant Streaming"
+                final_message["lines"] = _merge_codex_stream_and_final_lines(existing_lines, final_lines)
+            if stream_index < len(self._messages):
+                self._messages[stream_index] = final_message
             else:
-                self._messages.append(_chat_response_to_tui_message(response))
+                self._messages.append(final_message)
             self._request_in_flight = False
             prompt = self.query_one("#prompt", Input)
             if self._chat_state.pending_action_contract is not None:
@@ -1494,6 +1912,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 prompt.placeholder = "Ask Harness or type /help"
             self._render_chat()
             self._render_current_view()
+            self._request_started_at = None
             if response.get("kind") == "quit":
                 self.exit()
 
@@ -1551,7 +1970,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
                     "active_orchestrator": self._chat_state.selected_orchestrator_id or "coding_orchestrator",
-                    "chat_mode": "codex-like" if self._chat_state.codex_like_mode else "normal",
+                    "chat_mode": "live" if self._chat_state.codex_like_mode else "normal",
                     "pending_action_contract": self._chat_state.pending_action_contract.to_payload()
                     if self._chat_state.pending_action_contract
                     else None,
@@ -1567,6 +1986,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         def _render_current_view(self) -> None:
             self._render_view(self._current_view())
 
+        def _refresh_live_view(self) -> None:
+            if self._request_in_flight:
+                self._render_chat()
+            self._render_current_view()
+
         def _clamp_section_cursor(self, view: dict) -> None:
             if not view["sections"]:
                 self._section_cursor_index = 0
@@ -1574,7 +1998,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._section_cursor_index = len(view["sections"]) - 1
 
         def _render_chat(self) -> None:
-            transcript = "\n\n".join(render_chat_message(message) for message in self._messages)
+            working_seconds = None
+            if self._request_in_flight and self._request_started_at is not None:
+                working_seconds = max(0, int(time.monotonic() - self._request_started_at))
+            chat_width = max(60, min(160, self.query_one("#chat", VerticalScroll).size.width - 4))
+            transcript = render_codex_like_transcript(
+                self._messages,
+                working_seconds=working_seconds,
+                separator_width=chat_width,
+            )
             self.query_one("#chat-content", Static).update(transcript)
             self.call_after_refresh(lambda: self.query_one("#chat", VerticalScroll).scroll_end(animate=False))
 
