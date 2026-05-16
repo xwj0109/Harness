@@ -1017,6 +1017,7 @@ def _model_chat_response(
             tool_request = parse_tool_request(model_response.content)
             if tool_request is None:
                 break
+            _emit_progress(progress_callback, "reasoning", f"Reasoning: requesting {tool_request.tool}.")
             _emit_progress(progress_callback, "procedure", f"Ran {tool_request.tool}")
             tool_result = run_chat_tool(tool_request, default_chat_tool_context(project_root))
             if tool_result.error_type == "action_contract_required":
@@ -1127,7 +1128,8 @@ def _complete_model_turn(
         kind = getattr(delta, "kind", "content")
         if kind == "content":
             chunks.append(content)
-        if progress_callback is not None and content.strip():
+        should_emit_progress = not (kind == "content" and parse_tool_request(content) is not None)
+        if progress_callback is not None and content.strip() and should_emit_progress:
             progress_callback({"kind": kind, "content": content})
     if not saw_delta:
         return model.complete(messages, chat_ctx)

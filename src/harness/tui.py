@@ -1317,6 +1317,8 @@ def _render_codex_like_message(message: dict, *, separator_width: int) -> str:
             needs_separator_before_prose = True
         elif line_kind == "child":
             in_procedure_block = True
+        elif line_kind == "reasoning":
+            in_procedure_block = False
         elif line_kind in {"prose", "list"}:
             in_procedure_block = False
         if line_kind != "blank":
@@ -1338,6 +1340,9 @@ def _render_codex_like_line(line: str, *, in_procedure_block: bool) -> tuple[str
         suffix = stripped[len("Explored") :].strip()
         tail = f" {_style_inline_text(suffix)}" if suffix else ""
         return "procedure", [f"[dim]•[/dim] [bold]Explored[/bold]{tail}"]
+    if lowered.startswith("reasoning:"):
+        _, _, reasoning = stripped.partition(":")
+        return "reasoning", [_style_reasoning_line(reasoning.strip() or "model reasoning")]
     if stripped.startswith("Tool calls:"):
         return "procedure", [f"[dim]•[/dim] [bold]Tool calls:[/bold]"]
     if stripped.startswith("- "):
@@ -1365,6 +1370,10 @@ def _style_list_line(text: str) -> str:
     return f"[dim]•[/dim] {_style_inline_text(text)}"
 
 
+def _style_reasoning_line(text: str) -> str:
+    return f"[dim]•[/dim] [dim]{_style_inline_text(text)}[/dim]"
+
+
 def _style_numbered_list_line(marker: str, text: str) -> str:
     return f"[dim]{escape(marker)}[/dim] {_style_inline_text(text)}"
 
@@ -1376,6 +1385,8 @@ def _style_separator(width: int) -> str:
 def _needs_paragraph_gap(line_kind: str, previous_kind: str | None, previous_raw: str) -> bool:
     if not previous_kind or previous_kind in {"procedure", "child", "separator"}:
         return False
+    if line_kind == "reasoning":
+        return previous_kind in {"prose", "list"}
     if line_kind == "prose" and previous_kind in {"prose", "list"}:
         return True
     if line_kind == "list" and previous_kind == "prose" and not previous_raw.rstrip().endswith(":"):
@@ -1453,6 +1464,7 @@ def _is_codex_procedure_line(line: str) -> bool:
     return (
         lowered.startswith("ran ")
         or lowered.startswith("explored")
+        or lowered.startswith("reasoning:")
         or lowered.startswith("turn ")
         or lowered.startswith("tool ")
         or lowered.startswith("tool calls:")

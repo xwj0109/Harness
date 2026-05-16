@@ -213,6 +213,34 @@ def test_codex_like_transcript_uses_connectors_only_for_procedure_children() -> 
     assert "[dim]└[/dim] [dark_cyan]CLI" not in rendered
 
 
+def test_codex_like_transcript_renders_reasoning_between_tool_calls() -> None:
+    rendered = render_codex_like_transcript(
+        [
+            {
+                "role": "assistant",
+                "title": "Assistant Streaming",
+                "lines": [
+                    "Ran model turn",
+                    "Reasoning: I need to inspect the README before answering.",
+                    "Ran read_file",
+                    "- read_file: ok",
+                    "Ran model turn",
+                    "Reasoning: The README gives enough project context.",
+                    "Final answer.",
+                ],
+            },
+        ],
+        separator_width=24,
+    )
+
+    assert "[green]●[/green] [bold]Ran[/bold] [dim]model[/dim] [dim]turn[/dim]" in rendered
+    assert "[dim]•[/dim] [dim]I need to inspect the [bold]README[/bold] before answering.[/dim]" in rendered
+    assert "[green]●[/green] [bold]Ran[/bold] [dim]read_file[/dim]" in rendered
+    assert "[dim]└[/dim] [dark_cyan]read_file:[/dark_cyan] [dim]ok[/dim]" in rendered
+    assert "[dim]•[/dim] [dim]The [bold]README[/bold] gives enough project context.[/dim]" in rendered
+    assert "[dim]────────────────────────[/dim]\nFinal answer." in rendered
+
+
 def test_codex_like_transcript_spaces_and_emphasizes_prose_paragraphs() -> None:
     rendered = render_codex_like_transcript(
         [

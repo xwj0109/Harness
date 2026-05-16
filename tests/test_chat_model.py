@@ -161,6 +161,45 @@ def test_codex_cli_chat_model_streams_reasoning_before_final_answer(tmp_path) ->
     assert "explain orchestration" in backend.prompt
 
 
+def test_chat_model_path_emits_reasoning_between_tool_calls(tmp_path) -> None:
+    (tmp_path / "README.md").write_text("# Harness\n\nLocal control plane.\n", encoding="utf-8")
+
+    class ToolThenAnswerModel:
+        def __init__(self) -> None:
+            self.turn = 0
+
+        def stream(self, _messages, _context):
+            self.turn += 1
+            if self.turn == 1:
+                yield ChatDelta(
+                    content='{"type":"harness.tool_request/v1","tool":"read_file","arguments":{"path":"README.md"}}',
+                    kind="content",
+                )
+                return
+            yield ChatDelta(content="The README describes Harness.", kind="content")
+
+        def complete(self, _messages, _context):
+            raise AssertionError("streaming path should be used when progress is requested")
+
+    progress: list[dict] = []
+    response = handle_chat_input(
+        "explain this repository",
+        tmp_path,
+        ChatSessionState(),
+        chat_model=ToolThenAnswerModel(),
+        progress_callback=progress.append,
+    )
+
+    contents = [item["content"] for item in progress]
+    assert response["kind"] == "llm_chat"
+    assert response["lines"] == ["The README describes Harness."]
+    assert "Reasoning: requesting read_file." in contents
+    assert "Ran read_file" in contents
+    assert "- read_file: ok" in contents
+    assert not any("harness.tool_request/v1" in content for content in contents)
+    assert contents.index("Reasoning: requesting read_file.") < contents.index("Ran read_file")
+
+
 def test_mutation_request_falls_back_to_action_contract_when_model_only_refuses(tmp_path) -> None:
     model = FakeChatModel("I can't create the file directly from this read-only chat turn.")
     state = ChatSessionState()
