@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import socket
@@ -13,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import click
 import typer
@@ -60,13 +63,41 @@ from harness.integrity import run_integrity_check
 from harness.intent_router import IntentRoute, route_instruction
 from harness.isolation import ActiveRepoDirtyError
 from harness.live_artifacts import write_live_run_artifacts
+from harness.local_server import (
+    _distribution_action_unsupported,
+    _distribution_status_projection,
+    _mcp_resources_projection,
+    _mcp_status_projection,
+    _plugin_catalog,
+    _pty_action_unsupported,
+    _pty_session_projection,
+    _pty_shell_projection,
+    _pr_action_unsupported,
+    _skill_catalog,
+    _session_diff_projection,
+    _version_check_projection,
+    _web_tool_policy_projection,
+    _worktree_projection,
+    build_openapi_spec,
+    generate_server_token,
+    serve_local_http,
+)
 from harness.memory.sqlite_store import SQLiteStore
+from harness.model_catalog import list_model_catalog, list_provider_catalog
 from harness.models import (
+    EventStreamType,
     KillSwitchTargetKind,
     MemoryScopeType,
     MemorySourceKind,
     RedactionState,
     RunEventType,
+    SessionPermissionBoundaryKind,
+    SessionPermissionScope,
+    SessionPermissionSource,
+    SessionPermissionStatus,
+    SessionMessageRole,
+    SessionMutationReversibility,
+    SessionPartKind,
     SessionStatus,
     TaskStatus,
 )
@@ -93,6 +124,15 @@ from harness.session_events import (
     render_session_event,
     session_transcript_path,
 )
+from harness.session_timeline import (
+    list_session_timeline,
+    list_session_transcript,
+    render_timeline_event,
+    render_transcript_entry,
+    timeline_event_jsonl,
+    transcript_entry_jsonl,
+)
+from harness.session_tools import default_session_tool_descriptors, execute_session_tool, get_session_tool_descriptor
 from harness.spec_loader import (
     SpecBundleError,
     diff_builtin_to_custom_spec_registry,
@@ -123,6 +163,16 @@ class HarnessRootGroup(TyperGroup):
 app = typer.Typer(help="Local-first agent harness.", invoke_without_command=True, cls=HarnessRootGroup)
 dev_app = typer.Typer(help="Phase 1A development diagnostics.")
 backends_app = typer.Typer(help="Configured backend metadata and preflight checks.", invoke_without_command=True)
+providers_app = typer.Typer(help="Provider catalog metadata without credential disclosure.")
+models_app = typer.Typer(help="Model catalog metadata without provider fallback.")
+mcp_app = typer.Typer(help="MCP configuration diagnostics without connecting to servers.")
+plugins_app = typer.Typer(help="Plugin discovery diagnostics without loading plugins.")
+skills_app = typer.Typer(help="Skill discovery diagnostics without loading skill bodies.")
+web_app = typer.Typer(help="Web fetch/search policy diagnostics without network access.")
+worktrees_app = typer.Typer(help="Git worktree diagnostics without creating, removing, or resetting worktrees.")
+pty_app = typer.Typer(help="Managed PTY diagnostics without starting terminal processes.")
+pr_app = typer.Typer(help="Pull request checkout/run helpers without network or git mutation.")
+distribution_app = typer.Typer(help="Distribution and update diagnostics without modifying installation.")
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
 tests_app = typer.Typer(help="Docker-sandboxed test execution.")
 tests_image_app = typer.Typer(help="Managed Docker test image helpers.")
@@ -153,11 +203,22 @@ quickstart_app = typer.Typer(help="Guided command composition without hidden exe
 tui_home_app = typer.Typer(help="TUI homepage visual customization.")
 app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
+app.add_typer(providers_app, name="providers")
+app.add_typer(models_app, name="models")
+app.add_typer(mcp_app, name="mcp")
+app.add_typer(plugins_app, name="plugins")
+app.add_typer(skills_app, name="skills")
+app.add_typer(web_app, name="web")
+app.add_typer(worktrees_app, name="worktrees")
+app.add_typer(pty_app, name="pty")
+app.add_typer(pr_app, name="pr")
+app.add_typer(distribution_app, name="distribution")
 app.add_typer(approvals_app, name="approvals")
 app.add_typer(tests_app, name="tests")
 app.add_typer(specs_app, name="specs")
 app.add_typer(policy_app, name="policy")
 app.add_typer(artifacts_app, name="artifacts")
+app.add_typer(sessions_app, name="session")
 app.add_typer(sessions_app, name="sessions")
 app.add_typer(actions_app, name="actions")
 app.add_typer(runs_app, name="runs")
@@ -189,6 +250,11 @@ TaskStatusArg = Annotated[TaskStatus, typer.Argument(help="Task status.")]
 class OutputFormat(str, Enum):
     TEXT = "text"
     JSON = "json"
+
+
+class ForegroundMode(str, Enum):
+    AUTO = "auto"
+    DIRECT = "direct"
 
 
 class StreamFormat(str, Enum):
@@ -272,20 +338,59 @@ def foreground_prompt(
         typer.Option("--reasoning-effort", help="Codex reasoning effort override for foreground prompt runs."),
     ] = None,
     no_stream: Annotated[bool, typer.Option("--no-stream", help="Disable live Codex event summaries.")] = False,
+    mode: Annotated[
+        ForegroundMode,
+        typer.Option("--mode", help="Foreground execution mode. Use direct for active-workspace Codex."),
+    ] = ForegroundMode.AUTO,
     fail_on_dirty: Annotated[
         bool,
         typer.Option("--fail-on-dirty", help="Refuse foreground prompt runs when git status is dirty."),
     ] = False,
+    continue_session: Annotated[
+        bool,
+        typer.Option("--continue", help="Append this prompt to the most recently updated non-archived session."),
+    ] = False,
+    session_id: Annotated[str | None, typer.Option("--session", help="Append this prompt to an existing session id.")] = None,
+    fork_session: Annotated[bool, typer.Option("--fork", help="Fork the selected session before running.")] = False,
+    title: Annotated[str | None, typer.Option("--title", help="Title for a new or forked session.")] = None,
+    agent_id: Annotated[str | None, typer.Option("--agent", help="Persist the selected agent id for this session.")] = None,
+    files: Annotated[list[Path] | None, typer.Option("--file", help="Record a file attachment reference.")] = None,
+    no_session: Annotated[
+        bool,
+        typer.Option("--no-session", help="Temporary compatibility path: run without session persistence."),
+    ] = False,
 ) -> None:
     project_root = resolve_project_root(project)
+    resolved_prompt, resolved_agent = _resolve_foreground_agent_selection(prompt, agent_id)
+    if mode == ForegroundMode.AUTO and resolved_agent in _NATIVE_AGENT_ALIASES and not no_session:
+        result = _run_native_agent_alias_session(
+            resolved_prompt,
+            project_root,
+            agent_id=resolved_agent,
+            output=output,
+            model=model,
+            session_id=session_id,
+            continue_session=continue_session,
+            fork_session=fork_session,
+            title=title,
+            file_refs=files or [],
+        )
+        raise typer.Exit(code=0 if result.get("ok") else 1)
     result = _run_codex_direct_agent_cli(
-        prompt,
+        resolved_prompt,
         project_root,
         output=output,
         model=model,
         reasoning_effort=reasoning_effort,
         stream=not no_stream,
         fail_on_dirty=fail_on_dirty,
+        session_id=session_id,
+        continue_session=continue_session,
+        fork_session=fork_session,
+        title=title,
+        agent_id=resolved_agent,
+        file_refs=files or [],
+        no_session=no_session,
     )
     raise typer.Exit(code=0 if result.get("status") == "completed" else 1)
 
@@ -1671,6 +1776,535 @@ def sessions_inspect(
     _print_section("Next")
     for action in payload["next_actions"]:
         typer.echo(action)
+
+
+@sessions_app.command("get")
+def sessions_get(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    sessions_inspect(session_id=session_id, project=project, output=output)
+
+
+@sessions_app.command("archive")
+def sessions_archive(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.archive_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {"schema_version": "harness.session_archive/v1", "ok": True, "session": session.model_dump(mode="json")}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Archived session {session.id}.")
+
+
+@sessions_app.command("delete")
+def sessions_delete(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.delete_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.session_delete/v1",
+        "ok": True,
+        "destructive": False,
+        "behavior": "archive",
+        "session": session.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Archived session {session.id}. Hard purge is not implemented for audit evidence.")
+
+
+@sessions_app.command("fork")
+def sessions_fork(
+    session_id: str,
+    message_id: Annotated[str | None, typer.Option("--message", help="Message id to fork from.")] = None,
+    title: Annotated[str | None, typer.Option("--title", help="Title for the child session.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.fork_session(session_id, message_id=message_id, title=title)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {"schema_version": "harness.session_fork/v1", "ok": True, "session": session.model_dump(mode="json")}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Forked session {session.id}.")
+
+
+@sessions_app.command("export")
+def sessions_export(
+    session_id: str,
+    metadata_only: Annotated[
+        bool,
+        typer.Option("--metadata-only", help="Export metadata, transcript, events, and artifact references only."),
+    ] = True,
+    sanitize: Annotated[bool, typer.Option("--sanitize/--no-sanitize", help="Sanitize exported text fields.")] = True,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    messages = store.list_session_messages(session.id)
+    parts = store.list_session_parts(session.id)
+    events = store.list_session_store_events(session.id)
+    payload = {
+        "schema_version": "harness.session_export/v1",
+        "ok": True,
+        "metadata_only": metadata_only,
+        "sanitize": sanitize,
+        "include_artifacts": False,
+        "session": session.model_dump(mode="json"),
+        "messages": [message.model_dump(mode="json") for message in messages],
+        "parts": [part.model_dump(mode="json") for part in parts],
+        "events": [event.model_dump(mode="json") for event in events],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_section("Session export")
+    _print_kv("Session id", session.id)
+    _print_kv("Messages", len(messages))
+    _print_kv("Parts", len(parts))
+    _print_kv("Events", len(events))
+    _print_kv("Artifacts included", "no")
+
+
+@sessions_app.command("tail")
+def sessions_tail(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    jsonl: Annotated[bool, typer.Option("--jsonl", help="Emit append-only session events as JSONL.")] = False,
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="Follow until the session reaches a terminal state.")] = False,
+    limit: Annotated[int, typer.Option("--limit", help="Maximum number of recent events to render before following.")] = 50,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), OutputFormat.TEXT)
+        raise typer.Exit(code=1) from exc
+    seen_ids: set[str] = set()
+    while True:
+        events = list_session_timeline(store, session_id, limit=limit if not seen_ids else None)
+        for event in events:
+            if event.id in seen_ids:
+                continue
+            typer.echo(timeline_event_jsonl(event) if jsonl else render_timeline_event(event))
+            seen_ids.add(event.id)
+        if not follow:
+            return
+        session = store.get_session(session_id)
+        if session.status in {
+            SessionStatus.COMPLETED,
+            SessionStatus.FAILED,
+            SessionStatus.CANCELLED,
+            SessionStatus.ARCHIVED,
+        }:
+            return
+        time.sleep(0.25)
+
+
+@sessions_app.command("transcript")
+def sessions_transcript(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    format: TranscriptFormatOption = "markdown",
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), OutputFormat.TEXT)
+        raise typer.Exit(code=1) from exc
+    entries = list_session_transcript(store, session_id)
+    if format == "jsonl":
+        for entry in entries:
+            typer.echo(transcript_entry_jsonl(entry))
+        return
+    if format != "markdown":
+        raise typer.BadParameter("Transcript format must be markdown or jsonl.")
+    for index, entry in enumerate(entries):
+        if index:
+            typer.echo("")
+        typer.echo(render_transcript_entry(entry))
+
+
+@sessions_app.command("diff")
+def sessions_diff(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        payload = _session_diff_projection(store, session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    if not payload["diffs"]:
+        typer.echo("No session diff artifacts found.")
+        return
+    for index, item in enumerate(payload["diffs"]):
+        if index:
+            typer.echo("")
+        typer.echo(f"Diff artifact: {item['id']} kind={item['kind']} run={item['run_id']}")
+        if item.get("preview"):
+            typer.echo(item["preview"])
+        if item.get("preview_truncated"):
+            typer.echo("[diff preview truncated]")
+    typer.echo("Revert, unrevert, and selected hunk apply are not enabled for session diffs yet.")
+
+
+@sessions_app.command("revert")
+def sessions_revert(
+    session_id: str,
+    message_id: Annotated[str | None, typer.Option("--message", help="Message id whose effects would be reverted.")] = None,
+    artifact_id: Annotated[str | None, typer.Option("--artifact", help="Diff/snapshot artifact id to target.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_session_mutation_unsupported(
+        "revert",
+        session_id,
+        output,
+        project=project,
+        message_id=message_id,
+        artifact_id=artifact_id,
+    )
+
+
+@sessions_app.command("unrevert")
+def sessions_unrevert(
+    session_id: str,
+    message_id: Annotated[str | None, typer.Option("--message", help="Message id whose effects would be restored.")] = None,
+    artifact_id: Annotated[str | None, typer.Option("--artifact", help="Diff/snapshot artifact id to target.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_session_mutation_unsupported(
+        "unrevert",
+        session_id,
+        output,
+        project=project,
+        message_id=message_id,
+        artifact_id=artifact_id,
+    )
+
+
+@sessions_app.command("apply-hunk")
+def sessions_apply_hunk(
+    session_id: str,
+    hunk_id: Annotated[str, typer.Option("--hunk", help="Selected hunk id to apply later.")] = "",
+    artifact_id: Annotated[str | None, typer.Option("--artifact", help="Diff artifact id containing the hunk.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_session_mutation_unsupported(
+        "apply-hunk",
+        session_id,
+        output,
+        project=project,
+        artifact_id=artifact_id,
+        hunk_id=hunk_id,
+    )
+
+
+@sessions_app.command("tools")
+def sessions_tools(
+    tool_id: Annotated[str | None, typer.Option("--tool", help="Inspect one session tool descriptor.")] = None,
+    plan_only: Annotated[bool, typer.Option("--plan-only", help="Show only tools allowed for the plan agent.")] = False,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        descriptors = [get_session_tool_descriptor(tool_id)] if tool_id else default_session_tool_descriptors()
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if plan_only:
+        descriptors = [descriptor for descriptor in descriptors if descriptor.allowed_in_plan_agent]
+    payload = {
+        "schema_version": "harness.session_tools/v1",
+        "ok": True,
+        "permission_granting": False,
+        "tools": [descriptor.model_dump(mode="json") for descriptor in descriptors],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_section("Session tools")
+    typer.echo("Descriptors are documentation and validation metadata, not permission grants.")
+    if not descriptors:
+        typer.echo("No session tools matched.")
+        return
+    _print_tsv(["tool", "side_effect", "boundary", "permission", "plan"])
+    for descriptor in descriptors:
+        _print_tsv_row(
+            [
+                descriptor.id,
+                descriptor.side_effect.value,
+                descriptor.boundary_kind.value,
+                descriptor.permission_key,
+                "yes" if descriptor.allowed_in_plan_agent else "no",
+            ]
+        )
+
+
+@sessions_app.command("tool")
+def sessions_tool(
+    session_id: str,
+    tool_id: str,
+    input_json: Annotated[
+        str,
+        typer.Option("--input-json", help="JSON object arguments for the session tool."),
+    ] = "{}",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        arguments = json.loads(input_json)
+        if not isinstance(arguments, dict):
+            raise ValueError("--input-json must decode to a JSON object.")
+        result = execute_session_tool(SQLiteStore(project_root), project_root, session_id, tool_id, arguments)
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.session_tool_execution/v1",
+        "ok": result.ok,
+        "result": result.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Tool: {result.tool_id}")
+    typer.echo(f"Status: {'ok' if result.ok else 'failed'}")
+    typer.echo(f"Run: {result.run_id}")
+    if result.permission_id:
+        typer.echo(f"Permission: {result.permission_id}")
+    if result.artifact_id:
+        typer.echo(f"Artifact: {result.artifact_id}")
+    typer.echo(result.preview)
+
+
+@sessions_app.command("todo")
+def sessions_todo(
+    session_id: str,
+    content: Annotated[str | None, typer.Option("--content", help="Todo content to append.")] = None,
+    status: Annotated[str | None, typer.Option("--status", help="Filter/list or append with this todo status.")] = None,
+    priority: Annotated[int, typer.Option("--priority", help="Todo priority when appending.")] = 0,
+    list_only: Annotated[bool, typer.Option("--list", help="List existing session todos.")] = False,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.get_session(session_id)
+        if list_only or content is None:
+            todos = store.list_session_todos(session_id, status=status)
+            payload = {
+                "schema_version": "harness.session_todos/v1",
+                "ok": True,
+                "session_id": session_id,
+                "todos": [todo.model_dump(mode="json") for todo in todos],
+            }
+            if output == OutputFormat.JSON:
+                _emit_json(payload)
+                return
+            if not todos:
+                typer.echo("No session todos found.")
+                return
+            _print_tsv(["todo_id", "status", "priority", "content"])
+            for todo in todos:
+                _print_tsv_row([todo.id, todo.status, str(todo.priority), todo.content])
+            return
+        todo = store.append_session_todo(session_id, content, status=status or "pending", priority=priority)
+    except (KeyError, ValueError) as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {"schema_version": "harness.session_todo/v1", "ok": True, "todo": todo.model_dump(mode="json")}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Added todo {todo.id}.")
+
+
+@sessions_app.command("question")
+def sessions_question(
+    session_id: str,
+    question: Annotated[str, typer.Option("--question", help="Question to persist for the operator.")],
+    choice: Annotated[list[str] | None, typer.Option("--choice", help="Optional answer choice.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.get_session(session_id)
+        part = store.append_session_question(session_id, question, choices=choice or [])
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {"schema_version": "harness.session_question/v1", "ok": True, "part": part.model_dump(mode="json")}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Recorded question part {part.id}.")
+
+
+@sessions_app.command("permission")
+def sessions_permission(
+    session_id: str,
+    request: Annotated[bool, typer.Option("--request", help="Create a pending permission request.")] = False,
+    resolve: Annotated[str | None, typer.Option("--resolve", help="Resolve an existing permission id.")] = None,
+    decision: Annotated[
+        SessionPermissionStatus | None,
+        typer.Option("--decision", help="Resolution decision: allowed, denied, or cancelled."),
+    ] = None,
+    tool: Annotated[str | None, typer.Option("--tool", help="Tool id for a new request.")] = None,
+    action: Annotated[str | None, typer.Option("--action", help="Normalized action for a new request.")] = None,
+    target: Annotated[
+        str | None,
+        typer.Option("--target", help="Normalized target pattern for a new request."),
+    ] = None,
+    boundary: Annotated[
+        SessionPermissionBoundaryKind,
+        typer.Option("--boundary", help="Permission boundary kind."),
+    ] = SessionPermissionBoundaryKind.LOCAL_ONLY,
+    risk: Annotated[str, typer.Option("--risk", help="Risk label for a new request.")] = "low",
+    scope: Annotated[
+        SessionPermissionScope,
+        typer.Option("--scope", help="Grant scope for a new request."),
+    ] = SessionPermissionScope.ONCE,
+    reason: Annotated[list[str] | None, typer.Option("--reason", help="Policy reason or resolution reason.")] = None,
+    status: Annotated[SessionPermissionStatus | None, typer.Option("--status", help="Filter listed permissions.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.get_session(session_id)
+        if request:
+            if not tool or not action or not target:
+                raise typer.BadParameter("--request requires --tool, --action, and --target.")
+            permission = store.request_session_permission(
+                session_id,
+                tool_id=tool,
+                normalized_action=action,
+                normalized_target_pattern=target,
+                boundary_kind=boundary,
+                risk=risk,
+                scope=scope,
+                source=SessionPermissionSource.POLICY,
+                policy_reasons=reason or [],
+            )
+            payload = {
+                "schema_version": "harness.session_permission/v1",
+                "ok": True,
+                "permission": permission.model_dump(mode="json"),
+            }
+        elif resolve is not None:
+            if decision is None:
+                raise typer.BadParameter("--resolve requires --decision.")
+            existing = store.get_session_permission(resolve)
+            if existing.session_id != session_id:
+                raise typer.BadParameter(f"Permission {resolve} does not belong to session {session_id}.")
+            permission = store.resolve_session_permission(
+                resolve,
+                decision,
+                source=SessionPermissionSource.USER,
+                reason="; ".join(reason or []) if reason else None,
+            )
+            payload = {
+                "schema_version": "harness.session_permission/v1",
+                "ok": True,
+                "permission": permission.model_dump(mode="json"),
+            }
+        else:
+            permissions = store.list_session_permissions(session_id, status=status)
+            payload = {
+                "schema_version": "harness.session_permissions/v1",
+                "ok": True,
+                "session_id": session_id,
+                "permissions": [permission.model_dump(mode="json") for permission in permissions],
+            }
+    except (KeyError, ValueError) as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    if "permissions" in payload:
+        permissions = payload["permissions"]
+        if not permissions:
+            typer.echo("No session permissions found.")
+            return
+        _print_tsv(["permission_id", "status", "scope", "tool", "target", "expires_at"])
+        for permission in permissions:
+            _print_tsv_row(
+                [
+                    permission["id"],
+                    permission["status"],
+                    permission["scope"],
+                    permission["tool_id"],
+                    permission["normalized_target_pattern"],
+                    permission["expires_at"],
+                ]
+            )
+        return
+    permission = payload["permission"]
+    typer.echo(f"Permission {permission['id']}: {permission['status']}")
 
 
 @app.command("resume")
@@ -3099,6 +3733,680 @@ def backends_preflight(project: ProjectOption = Path("."), output: OutputOption 
         _emit_json({"schema_version": "harness.backend_preflight/v1", "backends": results})
 
 
+@providers_app.command("list")
+def providers_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    providers = list_provider_catalog(cfg)
+    models = list_model_catalog(cfg)
+    cache = SQLiteStore(project_root).replace_provider_model_catalog_cache(providers, models)
+    payload = {
+        "schema_version": "harness.providers/v1",
+        "ok": True,
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+        "cache": cache,
+        "providers": [provider.model_dump(mode="json") for provider in providers],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["provider", "kind", "enabled", "credentials", "boundary", "model"])
+    for provider in providers:
+        _print_tsv_row(
+            [
+                provider.provider_id,
+                provider.kind.value,
+                str(provider.enabled),
+                provider.credential_status.value,
+                provider.metadata.data_boundary.value,
+                str(provider.settings_preview.get("model") or ""),
+            ]
+        )
+    typer.echo("Provider catalog entries are metadata only; credentials are not printed and no fallback is granted.")
+
+
+@providers_app.command("status")
+def providers_status(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    providers = list_provider_catalog(cfg)
+    models = list_model_catalog(cfg)
+    cache = SQLiteStore(project_root).replace_provider_model_catalog_cache(providers, models)
+    payload = {
+        "schema_version": "harness.providers_status/v1",
+        "ok": True,
+        "cache": cache,
+        "providers": [provider.model_dump(mode="json") for provider in providers],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    for provider in providers:
+        typer.echo(f"{provider.provider_id}:")
+        typer.echo(f"  enabled: {provider.enabled}")
+        typer.echo(f"  credential_status: {provider.credential_status.value}")
+        typer.echo(f"  data_boundary: {provider.metadata.data_boundary.value}")
+        if provider.constraints:
+            typer.echo(f"  constraints: {', '.join(provider.constraints)}")
+
+
+@providers_app.command("login")
+def providers_login(
+    provider_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    if provider_id not in cfg.backends:
+        _emit_session_error(f"Provider not found: {provider_id}", output)
+        raise typer.Exit(code=1)
+    payload = {
+        "schema_version": "harness.provider_auth/v1",
+        "ok": False,
+        "provider_id": provider_id,
+        "action": "login",
+        "error": "Provider login is not implemented yet; refusing to write credentials or call providers implicitly.",
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+@providers_app.command("logout")
+def providers_logout(
+    provider_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    if provider_id not in cfg.backends:
+        _emit_session_error(f"Provider not found: {provider_id}", output)
+        raise typer.Exit(code=1)
+    payload = {
+        "schema_version": "harness.provider_auth/v1",
+        "ok": False,
+        "provider_id": provider_id,
+        "action": "logout",
+        "error": "Provider logout is not implemented yet; refusing to remove credentials or call providers implicitly.",
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+@models_app.command("list")
+def models_list(
+    provider: Annotated[str | None, typer.Option("--provider", help="Filter by provider/backend id.")] = None,
+    verbose: Annotated[bool, typer.Option("--verbose", help="Show capability and source details.")] = False,
+    refresh: Annotated[
+        bool,
+        typer.Option("--refresh", help="Reserved for a later explicit provider refresh; currently fails closed."),
+    ] = False,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    if refresh:
+        _emit_session_error("Model refresh is not implemented yet; refusing to call providers implicitly.", output)
+        raise typer.Exit(code=1)
+    cfg = load_config(project_root)
+    if provider is not None and provider not in cfg.backends:
+        _emit_session_error(f"Provider not found: {provider}", output)
+        raise typer.Exit(code=1)
+    providers = list_provider_catalog(cfg)
+    all_models = list_model_catalog(cfg)
+    cache = SQLiteStore(project_root).replace_provider_model_catalog_cache(providers, all_models)
+    models = list_model_catalog(cfg, provider_id=provider)
+    payload = {
+        "schema_version": "harness.models/v1",
+        "ok": True,
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+        "cache": cache,
+        "models": [model.model_dump(mode="json") for model in models],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    if verbose:
+        _print_tsv(["provider", "model", "profile", "source", "tools", "context", "raw_ref"])
+        for model in models:
+            _print_tsv_row(
+                [
+                    model.provider_id,
+                    model.model_id,
+                    model.model_profile_id or "",
+                    model.source,
+                    str(model.tool_support),
+                    str(model.context_limit or ""),
+                    model.raw_model_ref,
+                ]
+            )
+    else:
+        _print_tsv(["provider", "model", "profile", "raw_ref"])
+        for model in models:
+            _print_tsv_row([model.provider_id, model.model_id, model.model_profile_id or "", model.raw_model_ref])
+    typer.echo("Model refs are explicit metadata; unavailable selections must fail visibly rather than fall back.")
+
+
+@mcp_app.command("list")
+def mcp_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    payload = _mcp_status_projection(cfg)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["name", "kind", "enabled", "requires_network", "connected", "tools_registered"])
+    for server in payload["servers"]:
+        _print_tsv_row(
+            [
+                server["name"],
+                server["kind"],
+                server["enabled"],
+                server["requires_network"],
+                server["connected"],
+                server["tool_registration_enabled"],
+            ]
+        )
+    typer.echo("MCP diagnostics are metadata only; no process or network connection was started.")
+
+
+@mcp_app.command("resources")
+def mcp_resources(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    payload = _mcp_resources_projection(cfg)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["resource", "server", "cached_only"])
+    for resource in payload["resources"]:
+        _print_tsv_row(
+            [
+                resource.get("uri") or resource.get("name") or "",
+                resource.get("server") or "",
+                payload["cached_only"],
+            ]
+        )
+    if not payload["resources"]:
+        _print_tsv_row(["none", "", payload["cached_only"]])
+    typer.echo("MCP resources are cached-only in this phase; no connection was attempted.")
+
+
+@mcp_app.command("add")
+def mcp_add(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_mcp_unsupported("add", output, server_name=name, project=project)
+
+
+@mcp_app.command("auth")
+def mcp_auth(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_mcp_unsupported("auth", output, server_name=name, project=project)
+
+
+@mcp_app.command("logout")
+def mcp_logout(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_mcp_unsupported("logout", output, server_name=name, project=project)
+
+
+@mcp_app.command("connect")
+def mcp_connect(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_mcp_unsupported("connect", output, server_name=name, project=project)
+
+
+@mcp_app.command("disconnect")
+def mcp_disconnect(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_mcp_unsupported("disconnect", output, server_name=name, project=project)
+
+
+@plugins_app.command("list")
+def plugins_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    payload = _plugin_catalog(project_root, cfg)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["name", "scope", "enabled", "origin", "loaded", "tools_registered"])
+    for plugin in payload["plugins"]:
+        _print_tsv_row(
+            [
+                plugin["name"],
+                plugin["scope"],
+                plugin["enabled"],
+                plugin["origin"],
+                plugin["runtime_loaded"],
+                plugin["tools_registered"],
+            ]
+        )
+    typer.echo("Plugin diagnostics are metadata only; no plugin code was loaded and no tools were registered.")
+
+
+@plugins_app.command("install")
+def plugins_install(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_plugin_unsupported("install", output, plugin_name=name, project=project)
+
+
+@plugins_app.command("update")
+def plugins_update(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_plugin_unsupported("update", output, plugin_name=name, project=project)
+
+
+@plugins_app.command("remove")
+def plugins_remove(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_plugin_unsupported("remove", output, plugin_name=name, project=project)
+
+
+@skills_app.command("list")
+def skills_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    payload = _skill_catalog(project_root, cfg)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["name", "scope", "enabled", "origin", "skill_file_exists", "loaded", "tool_registered"])
+    for skill in payload["skills"]:
+        _print_tsv_row(
+            [
+                skill["name"],
+                skill["scope"],
+                skill["enabled"],
+                skill["origin"],
+                skill.get("skill_file_exists", False),
+                skill["runtime_loaded"],
+                skill["tool_registered"],
+            ]
+        )
+    typer.echo("Skill diagnostics are metadata only; skill bodies are not loaded in this phase.")
+
+
+@skills_app.command("load")
+def skills_load(
+    name: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_skill_unsupported("load", output, skill_name=name, project=project)
+
+
+@web_app.command("tools")
+def web_tools(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    payload = _web_tool_policy_projection(cfg)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["tool", "enabled", "decision", "approval_required", "network_called"])
+    for tool in payload["tools"]:
+        _print_tsv_row(
+            [
+                tool["id"],
+                tool["enabled"],
+                tool["decision"],
+                tool["approval_required"],
+                tool["network_called"],
+            ]
+        )
+    typer.echo("Web tool diagnostics are policy-only; no fetch or search request was made.")
+
+
+@web_app.command("fetch")
+def web_fetch(
+    url: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_web_unsupported("web-fetch", "fetch", output, target=url, project=project)
+
+
+@web_app.command("search")
+def web_search(
+    query: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_web_unsupported("web-search", "search", output, target=query, project=project)
+
+
+@worktrees_app.command("list")
+def worktrees_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    payload = _worktree_projection(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    if not payload["available"]:
+        typer.echo(payload["reason"])
+        return
+    _print_tsv(["path", "current", "branch", "head", "mutation_supported"])
+    for worktree in payload["worktrees"]:
+        _print_tsv_row(
+            [
+                worktree["path"],
+                worktree["is_current"],
+                worktree.get("branch") or "",
+                worktree.get("head") or "",
+                worktree["mutation_supported"],
+            ]
+        )
+    typer.echo("Worktree diagnostics are metadata only; create/remove/reset are not enabled in this phase.")
+
+
+@worktrees_app.command("create")
+def worktrees_create(
+    path: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_worktree_unsupported("create", output, target=path, project=project)
+
+
+@worktrees_app.command("remove")
+def worktrees_remove(
+    path: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_worktree_unsupported("remove", output, target=path, project=project)
+
+
+@worktrees_app.command("reset")
+def worktrees_reset(
+    path: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_worktree_unsupported("reset", output, target=path, project=project)
+
+
+@pty_app.command("list")
+def pty_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    payload = _pty_session_projection()
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["pty_id", "status", "shell", "process_started"])
+    for session in payload["sessions"]:
+        _print_tsv_row(
+            [
+                session.get("id", ""),
+                session.get("status", ""),
+                session.get("shell", ""),
+                payload["process_started"],
+            ]
+        )
+    if not payload["sessions"]:
+        _print_tsv_row(["none", "", "", payload["process_started"]])
+    typer.echo("PTY diagnostics are metadata only; no terminal process was started.")
+
+
+@pty_app.command("shells")
+def pty_shells(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    payload = _pty_shell_projection()
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["path", "exists", "acceptable", "probed"])
+    for shell in payload["shells"]:
+        _print_tsv_row([shell["path"], shell["exists"], shell["acceptable"], payload["probed"]])
+    typer.echo("Shell candidates are not probed or accepted until PTY policy gates are implemented.")
+
+
+@pty_app.command("create")
+def pty_create(
+    command: Annotated[str | None, typer.Option("--command", help="Requested terminal command.")] = None,
+    shell: Annotated[str | None, typer.Option("--shell", help="Requested shell path.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_pty_unsupported("create", output, project=project, requested={"command": command, "shell": shell})
+
+
+@pty_app.command("write")
+def pty_write(
+    pty_id: str,
+    data: Annotated[str, typer.Option("--data", help="Input data to write later.")] = "",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_pty_unsupported("write", output, project=project, pty_id=pty_id, requested={"data": data})
+
+
+@pty_app.command("resize")
+def pty_resize(
+    pty_id: str,
+    cols: Annotated[int, typer.Option("--cols", help="Requested terminal columns.")] = 80,
+    rows: Annotated[int, typer.Option("--rows", help="Requested terminal rows.")] = 24,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_pty_unsupported("resize", output, project=project, pty_id=pty_id, requested={"cols": cols, "rows": rows})
+
+
+@pty_app.command("close")
+def pty_close(
+    pty_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_pty_unsupported("close", output, project=project, pty_id=pty_id)
+
+
+@pr_app.command("checkout")
+def pr_checkout(
+    pr: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_pr_unsupported("checkout", output, project=project, requested={"pr": pr})
+
+
+@pr_app.command("run")
+def pr_run(
+    pr: str,
+    adapter: Annotated[str | None, typer.Option("--adapter", help="Adapter to run after checkout later.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_pr_unsupported("run", output, project=project, requested={"pr": pr, "adapter": adapter})
+
+
+@distribution_app.command("status")
+def distribution_status(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    payload = _distribution_status_projection(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["field", "value"])
+    _print_tsv_row(["version", payload["version"]])
+    _print_tsv_row(["packaging_path", payload["packaging_path"]])
+    _print_tsv_row(["python_executable", payload["python_executable"]])
+    _print_tsv_row(["local_development_install_supported", payload["local_development_install_supported"]])
+    typer.echo("Distribution status is diagnostic only; no files were modified.")
+
+
+@distribution_app.command("version-check")
+def distribution_version_check(output: OutputOption = OutputFormat.TEXT) -> None:
+    payload = _version_check_projection()
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["field", "value"])
+    _print_tsv_row(["current_version", payload["current_version"]])
+    _print_tsv_row(["latest_version", payload["latest_version"] or "unknown"])
+    _print_tsv_row(["update_available", payload["update_available"]])
+    typer.echo(payload["reason"])
+
+
+@distribution_app.command("install")
+def distribution_install(
+    target: Annotated[str | None, typer.Option("--target", help="Requested install target for future implementations.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_distribution_unsupported("install", output, requested={"target": target})
+
+
+@distribution_app.command("upgrade")
+def distribution_upgrade(
+    version: Annotated[str | None, typer.Option("--version", help="Requested version for future implementations.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_distribution_unsupported("upgrade", output, requested={"version": version})
+
+
+@distribution_app.command("uninstall")
+def distribution_uninstall(
+    confirm: Annotated[str | None, typer.Option("--confirm", help="Future destructive confirmation token.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _emit_distribution_unsupported("uninstall", output, requested={"confirm": confirm})
+
+
+@app.command()
+def serve(
+    project: ProjectOption = Path("."),
+    host: Annotated[str, typer.Option("--host", help="Local interface to bind.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="Local port to bind.")] = 8765,
+    token: Annotated[str | None, typer.Option("--token", help="Bearer token for local API clients.")] = None,
+    openapi: Annotated[bool, typer.Option("--openapi", help="Print the OpenAPI document and exit.")] = False,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    server_url = f"http://{host}:{port}"
+    if openapi:
+        spec = build_openapi_spec(server_url=server_url)
+        if output == OutputFormat.JSON:
+            _emit_json(spec)
+            return
+        typer.echo(json.dumps(spec, indent=2, sort_keys=True))
+        return
+    resolved_token = token or os.environ.get("HARNESS_SERVER_TOKEN") or generate_server_token()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.local_server_start/v1",
+                "ok": True,
+                "url": server_url,
+                "auth": "bearer",
+                "token_generated": token is None and not os.environ.get("HARNESS_SERVER_TOKEN"),
+                "permission_granting": False,
+            }
+        )
+    else:
+        typer.echo(f"Harness local server: {server_url}")
+        typer.echo("Auth: bearer token")
+        if token is None and not os.environ.get("HARNESS_SERVER_TOKEN"):
+            typer.echo(f"Generated token: {resolved_token}")
+    serve_local_http(project_root, host=host, port=port, token=resolved_token)
+
+
+@app.command()
+def attach(
+    server_url: Annotated[str, typer.Option("--server-url", help="Existing Harness local server URL.")] = "http://127.0.0.1:8765",
+    token: Annotated[str | None, typer.Option("--token", help="Bearer token for the existing local server.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Read-only attachment probe for an already-running Harness local server."""
+    resolved_token = token or os.environ.get("HARNESS_SERVER_TOKEN")
+    if not resolved_token:
+        raise typer.BadParameter("Missing server token. Pass --token or set HARNESS_SERVER_TOKEN.")
+    try:
+        health = _local_server_get_json(server_url, "/health", resolved_token)
+        sessions = _local_server_get_json(server_url, "/sessions", resolved_token)
+        openapi = _local_server_get_json(server_url, "/openapi.json", resolved_token)
+    except HTTPError as exc:
+        raise typer.BadParameter(f"Server rejected attach request with HTTP {exc.code}.") from exc
+    except URLError as exc:
+        raise typer.BadParameter(f"Could not reach Harness server: {exc.reason}") from exc
+    payload = {
+        "schema_version": "harness.local_server_attach/v1",
+        "ok": True,
+        "server_url": server_url.rstrip("/"),
+        "health": health,
+        "session_count": len(sessions.get("sessions", [])),
+        "sessions": sessions.get("sessions", []),
+        "openapi_schema_version": openapi.get("info", {}).get("x-harness-schema-version"),
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Attached to Harness local server: {payload['server_url']}")
+    typer.echo(f"Project: {health.get('project_root', '')}")
+    typer.echo(f"Sessions: {payload['session_count']}")
+    typer.echo(f"OpenAPI schema: {payload['openapi_schema_version']}")
+    typer.echo("Mode: read-only projection; no permissions are granted by attach.")
+
+
+def _local_server_get_json(server_url: str, path: str, token: str) -> dict[str, object]:
+    request = Request(server_url.rstrip("/") + path)
+    request.add_header("Authorization", f"Bearer {token}")
+    with urlopen(request, timeout=5) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 @app.command()
 def run(
     goal: str,
@@ -3505,6 +4813,205 @@ def _require_initialized(project_root: Path) -> None:
     SQLiteStore(project_root).initialize()
 
 
+_NATIVE_AGENT_ALIASES = {"build", "plan", "general", "explore"}
+
+
+def _resolve_foreground_agent_selection(prompt: str, agent_id: str | None) -> tuple[str, str | None]:
+    match = re.search(r"(?<!\w)@([A-Za-z][A-Za-z0-9_-]*)\b", prompt)
+    mention_agent = match.group(1) if match else None
+    if agent_id is not None and mention_agent is not None and agent_id != mention_agent:
+        raise typer.BadParameter(f"--agent {agent_id} conflicts with prompt mention @{mention_agent}.")
+    resolved_agent = agent_id or mention_agent
+    if match is None:
+        return prompt, resolved_agent
+    cleaned = (prompt[: match.start()] + prompt[match.end() :]).strip()
+    return cleaned or prompt, resolved_agent
+
+
+def _run_native_agent_alias_session(
+    goal: str,
+    project_root: Path,
+    *,
+    agent_id: str,
+    output: OutputFormat,
+    model: str | None = None,
+    session_id: str | None = None,
+    continue_session: bool = False,
+    fork_session: bool = False,
+    title: str | None = None,
+    file_refs: list[Path] | None = None,
+) -> dict:
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    session = _resolve_prompt_session(
+        store,
+        session_id=session_id,
+        continue_session=continue_session,
+        fork_session=fork_session,
+        title=title,
+        agent_id=agent_id,
+        raw_model_ref=model,
+        goal=goal,
+    )
+    user_message = store.append_session_message(session.id, SessionMessageRole.USER, goal, agent_id=agent_id)
+    store.append_session_part(session.id, user_message.id, SessionPartKind.TEXT, text=goal, redaction_state=RedactionState.REDACTED)
+    for file_ref in file_refs or []:
+        store.append_session_part(
+            session.id,
+            user_message.id,
+            SessionPartKind.ARTIFACT_REF,
+            metadata={
+                "attachment_kind": "file_ref",
+                "path": str(file_ref),
+                "resolved_path": str((project_root / file_ref).resolve() if not file_ref.is_absolute() else file_ref.resolve()),
+            },
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+
+    alias_config = _native_agent_alias_config(agent_id)
+    objective = store.create_objective(
+        title=f"{agent_id} session",
+        description=f"Session-requested {agent_id} workflow: {goal}",
+        priority=1000,
+        workbench_id="coding",
+        metadata={"intent": alias_config["intent"], "agent_alias": agent_id},
+        session_id=session.id,
+    )
+    task = store.create_task(
+        title=f"{agent_id}: {goal[:80]}",
+        description=goal,
+        priority=1000,
+        objective_id=objective.id,
+        workbench_id="coding",
+        agent_id=agent_id,
+        metadata=alias_config["metadata"],
+        required_approvals=alias_config["required_approvals"],
+        session_id=session.id,
+    )
+    store.attach_session_to_objective(session.id, objective.id)
+    store.attach_session_to_task(session.id, task.id)
+    session_status = SessionStatus.WAITING_APPROVAL if task.status == TaskStatus.WAITING_APPROVAL else SessionStatus.IDLE
+    session = store.update_session(
+        session.id,
+        status=session_status,
+        objective_id=objective.id,
+        active_task_id=task.id,
+    )
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "agent.selected",
+        {
+            "agent_id": agent_id,
+            "mode": alias_config["mode"],
+            "execution_adapter": alias_config["metadata"]["execution_adapter"],
+            "task_type": alias_config["metadata"]["task_type"],
+            "summary": alias_config["summary"],
+        },
+        session_id=session.id,
+        task_id=task.id,
+        redaction_state=RedactionState.NOT_REQUIRED,
+    )
+    if task.status == TaskStatus.WAITING_APPROVAL:
+        store.append_store_event(
+            EventStreamType.SESSION,
+            session.id,
+            "run.blocked",
+            {
+                "summary": "Hosted-boundary approval is required before the isolated agent task can run.",
+                "required_approvals": alias_config["required_approvals"],
+            },
+            session_id=session.id,
+            task_id=task.id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+
+    result = {
+        "schema_version": "harness.native_agent_session/v1",
+        "ok": True,
+        "status": session.status.value,
+        "session": session.model_dump(mode="json"),
+        "task": task.model_dump(mode="json"),
+        "agent": alias_config,
+        "next_actions": _native_agent_next_actions(session.id, task.id, task.status),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(result)
+        return result
+    typer.echo(f"Session: {session.id}")
+    typer.echo(f"Agent: {agent_id}")
+    typer.echo(f"Task: {task.id}")
+    typer.echo(f"Status: {session.status.value}")
+    typer.echo(f"Execution adapter: {alias_config['metadata']['execution_adapter']}")
+    typer.echo("Next:")
+    for action in result["next_actions"]:
+        typer.echo(f"  {action}")
+    return result
+
+
+def _native_agent_alias_config(agent_id: str) -> dict:
+    if agent_id == "build":
+        return {
+            "id": "build",
+            "intent": "build_change",
+            "mode": "codex_edit",
+            "summary": "Build uses isolated Codex edit by default; active-workspace direct runs require --mode direct.",
+            "required_approvals": ["hosted_provider_codex"],
+            "metadata": {
+                "execution_adapter": "codex_isolated_edit",
+                "task_type": "codex_code_edit",
+                "agent_alias": "build",
+                "mutation_boundary": "isolated_workspace_apply_back",
+                "direct_active_workspace": False,
+            },
+        }
+    if agent_id == "plan":
+        return {
+            "id": "plan",
+            "intent": "plan_change",
+            "mode": "planning",
+            "summary": "Plan uses a read-only session-local tool loop placeholder and denies active edits.",
+            "required_approvals": [],
+            "metadata": {
+                "execution_adapter": "session_read_tools",
+                "task_type": "session_plan",
+                "agent_alias": "plan",
+                "allowed_tools": ["read", "glob", "grep", "artifact-read"],
+                "active_repo_write": "forbidden",
+                "external_network": "forbidden",
+            },
+        }
+    return {
+        "id": agent_id,
+        "intent": f"{agent_id}_research",
+        "mode": "read_only",
+        "summary": f"{agent_id} is bounded to read-only artifact-backed work until subagent execution lands.",
+        "required_approvals": [],
+        "metadata": {
+            "execution_adapter": "session_read_tools",
+            "task_type": "session_read_only_research",
+            "agent_alias": agent_id,
+            "allowed_tools": ["read", "glob", "grep", "artifact-read"],
+            "active_repo_write": "forbidden",
+            "external_network": "forbidden",
+            "subagent_placeholder": True,
+        },
+    }
+
+
+def _native_agent_next_actions(session_id: str, task_id: str, status: TaskStatus) -> list[str]:
+    actions = [
+        f"inspect session with harness session get {session_id}",
+        f"inspect task with harness tasks show {task_id}",
+    ]
+    if status == TaskStatus.WAITING_APPROVAL:
+        actions.insert(
+            0,
+            "approve hosted boundary with harness approvals add --backend codex_cli --data-boundary hosted_provider --task-type codex_code_edit",
+        )
+    return actions
+
+
 def _run_product_session(goal: str, project_root: Path, *, output: OutputFormat) -> dict:
     store = SQLiteStore(project_root)
     route = route_instruction(goal)
@@ -3802,6 +5309,258 @@ def _emit_session_error(message: str, output: OutputFormat) -> None:
         _emit_json(payload)
     else:
         typer.echo(message)
+
+
+def _emit_session_mutation_unsupported(
+    action: str,
+    session_id: str,
+    output: OutputFormat,
+    *,
+    project: Path,
+    message_id: str | None = None,
+    artifact_id: str | None = None,
+    hunk_id: str | None = None,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        store.get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.session_mutation_action/v1",
+        "ok": False,
+        "session_id": session_id,
+        "action": action,
+        "message_id": message_id,
+        "artifact_id": artifact_id,
+        "hunk_id": hunk_id,
+        "error": (
+            f"Session {action} is not implemented yet; refusing to mutate active workspace files or git state."
+        ),
+        "mutation_started": False,
+        "git_mutation_started": False,
+        "filesystem_modified": False,
+        "revert_supported": False,
+        "unrevert_supported": False,
+        "selected_hunk_apply_supported": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_mcp_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    server_name: str | None = None,
+    project: Path | None = None,
+) -> None:
+    if project is not None:
+        project_root = resolve_project_root(project)
+        _require_initialized(project_root)
+    payload = {
+        "schema_version": "harness.mcp_action/v1",
+        "ok": False,
+        "action": action,
+        "server": server_name,
+        "error": (
+            f"MCP {action} is not implemented yet; refusing to start processes, call network, "
+            "write credentials, or register tools implicitly."
+        ),
+        "process_started": False,
+        "network_called": False,
+        "tool_registration_enabled": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_plugin_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    plugin_name: str | None = None,
+    project: Path | None = None,
+) -> None:
+    if project is not None:
+        project_root = resolve_project_root(project)
+        _require_initialized(project_root)
+    payload = {
+        "schema_version": "harness.plugin_action/v1",
+        "ok": False,
+        "action": action,
+        "plugin": plugin_name,
+        "error": (
+            f"Plugin {action} is not implemented yet; refusing to fetch, modify plugin files, "
+            "load plugin code, or register tools implicitly."
+        ),
+        "filesystem_modified": False,
+        "network_called": False,
+        "runtime_loaded": False,
+        "tools_registered": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_skill_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    skill_name: str | None = None,
+    project: Path | None = None,
+) -> None:
+    if project is not None:
+        project_root = resolve_project_root(project)
+        _require_initialized(project_root)
+    payload = {
+        "schema_version": "harness.skill_action/v1",
+        "ok": False,
+        "action": action,
+        "skill": skill_name,
+        "error": (
+            f"Skill {action} is not implemented yet; refusing to load skill bodies or register skill tools implicitly."
+        ),
+        "skill_body_loaded": False,
+        "runtime_loaded": False,
+        "tool_registered": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_web_unsupported(
+    tool_id: str,
+    action: str,
+    output: OutputFormat,
+    *,
+    target: str,
+    project: Path,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    policy = _web_tool_policy_projection(cfg)
+    tool_policy = next((tool for tool in policy["tools"] if tool["id"] == tool_id), None)
+    payload = {
+        "schema_version": "harness.web_tool_action/v1",
+        "ok": False,
+        "action": action,
+        "tool": tool_id,
+        "target": target,
+        "decision": (tool_policy or {}).get("decision", "denied"),
+        "approval_required": bool((tool_policy or {}).get("approval_required", False)),
+        "allowed_domains": policy.get("allowed_domains", []),
+        "error": (
+            f"Web {action} execution is not implemented yet; refusing to call external network implicitly."
+        ),
+        "network_called": False,
+        "execution_started": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    typer.echo(f"Decision: {payload['decision']}")
+    typer.echo("Network called: false")
+    raise typer.Exit(code=1)
+
+
+def _emit_worktree_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    target: str,
+    project: Path,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    payload = {
+        "schema_version": "harness.worktree_action/v1",
+        "ok": False,
+        "action": action,
+        "target": target,
+        "error": (
+            f"Worktree {action} is not implemented yet; refusing to create, remove, reset, or mutate git worktrees implicitly."
+        ),
+        "git_mutation_started": False,
+        "filesystem_modified": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_pty_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    project: Path,
+    pty_id: str | None = None,
+    requested: dict[str, object] | None = None,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    payload = _pty_action_unsupported(action, requested or {}, pty_id=pty_id)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_pr_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    project: Path,
+    requested: dict[str, object],
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    payload = _pr_action_unsupported(action, requested)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
+
+
+def _emit_distribution_unsupported(
+    action: str,
+    output: OutputFormat,
+    *,
+    requested: dict[str, object],
+) -> None:
+    payload = _distribution_action_unsupported(action, requested)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=1)
+    typer.echo(payload["error"])
+    raise typer.Exit(code=1)
 
 
 def _emit_managed_action_error(schema_version: str, message: str, output: OutputFormat) -> None:
@@ -4840,16 +6599,57 @@ def _run_codex_direct_agent_cli(
     reasoning_effort: str | None = None,
     stream: bool = True,
     fail_on_dirty: bool = False,
+    session_id: str | None = None,
+    continue_session: bool = False,
+    fork_session: bool = False,
+    title: str | None = None,
+    agent_id: str | None = None,
+    file_refs: list[Path] | None = None,
+    no_session: bool = False,
     cfg=None,
     store: SQLiteStore | None = None,
 ) -> dict:
     _require_initialized(project_root)
     cfg = cfg or load_config(project_root)
     store = store or SQLiteStore(project_root)
+    session = None
+    user_message = None
+    if no_session and (session_id or continue_session or fork_session or title or agent_id or file_refs):
+        raise typer.BadParameter("--no-session cannot be combined with session selection, fork, title, agent, or file options.")
+    if not no_session:
+        session = _resolve_prompt_session(
+            store,
+            session_id=session_id,
+            continue_session=continue_session,
+            fork_session=fork_session,
+            title=title,
+            agent_id=agent_id,
+            raw_model_ref=model,
+            goal=goal,
+        )
+        user_message = store.append_session_message(session.id, SessionMessageRole.USER, goal, agent_id=agent_id)
+        store.append_session_part(session.id, user_message.id, SessionPartKind.TEXT, text=goal, redaction_state=RedactionState.REDACTED)
+        for file_ref in file_refs or []:
+            store.append_session_part(
+                session.id,
+                user_message.id,
+                SessionPartKind.ARTIFACT_REF,
+                metadata={
+                    "attachment_kind": "file_ref",
+                    "path": str(file_ref),
+                    "resolved_path": str((project_root / file_ref).resolve() if not file_ref.is_absolute() else file_ref.resolve()),
+                },
+                redaction_state=RedactionState.NOT_REQUIRED,
+            )
     backend = CodexCliBackend(cfg.backends["codex_cli"])
     runner = CodexDirectAgentRunner(project_root, store, backend)
+    progress_callback = None
+    if output != OutputFormat.JSON:
+        progress_callback = _codex_direct_session_progress_callback(store, session.id if session is not None else None)
     if output != OutputFormat.JSON:
         typer.echo("Codex foreground agent")
+        if session is not None:
+            _print_kv("Session", session.id)
         _print_kv("Backend", backend.name)
         _print_kv("Model", model or backend.config.settings.get("model", ""))
         _print_kv("Sandbox", "workspace-write")
@@ -4860,7 +6660,8 @@ def _run_codex_direct_agent_cli(
             reasoning_effort=reasoning_effort,
             stream=stream and output != OutputFormat.JSON,
             fail_on_dirty=fail_on_dirty,
-            progress_callback=_print_codex_direct_progress if output != OutputFormat.JSON else None,
+            session_id=session.id if session is not None else None,
+            progress_callback=progress_callback,
         )
     except (
         CodexUnavailable,
@@ -4869,7 +6670,56 @@ def _run_codex_direct_agent_cli(
         CodexDangerousFlagError,
         DirtyWorkspaceError,
     ) as exc:
+        if session is not None and user_message is not None:
+            store.append_session_part(
+                session.id,
+                user_message.id,
+                SessionPartKind.SUMMARY,
+                text=str(exc),
+                metadata={"status": "failed_before_run"},
+                redaction_state=RedactionState.REDACTED,
+            )
         raise typer.BadParameter(str(exc)) from exc
+    if session is not None:
+        run_id = result.get("run_id")
+        if run_id:
+            store.attach_session_to_run(session.id, str(run_id))
+        assistant_message = store.append_session_message(
+            session.id,
+            SessionMessageRole.ASSISTANT,
+            result.get("final_summary", ""),
+            run_id=str(run_id) if run_id else None,
+            agent_id=agent_id,
+            mutation_reversibility=SessionMutationReversibility.NOT_REVERSIBLE_ACTIVE_WORKSPACE,
+        )
+        store.append_session_part(
+            session.id,
+            assistant_message.id,
+            SessionPartKind.SUMMARY,
+            text=result.get("final_summary", ""),
+            run_id=str(run_id) if run_id else None,
+            redaction_state=RedactionState.REDACTED,
+        )
+        if run_id:
+            for artifact in store.list_artifacts(str(run_id)):
+                store.append_session_part(
+                    session.id,
+                    assistant_message.id,
+                    SessionPartKind.ARTIFACT_REF,
+                    artifact_id=artifact.id,
+                    run_id=str(run_id),
+                    metadata={
+                        "kind": artifact.kind,
+                        "path": str(artifact.path),
+                        "sha256": artifact.sha256,
+                        "size_bytes": artifact.size_bytes,
+                        "redaction_state": artifact.redaction_state,
+                    },
+                    redaction_state=RedactionState.NOT_REQUIRED
+                    if artifact.redaction_state == "not_required"
+                    else RedactionState.REDACTED,
+                )
+        result["session_id"] = session.id
     if output == OutputFormat.JSON:
         _emit_json({"schema_version": "harness.codex_direct_agent/v1", **result})
         return result
@@ -4889,6 +6739,107 @@ def _run_codex_direct_agent_cli(
     _print_section("Next")
     typer.echo(f"  harness show {result['run_id']} --project {project_root}")
     return result
+
+
+def _codex_direct_session_progress_callback(store: SQLiteStore, session_id: str | None):
+    def callback(event: dict) -> None:
+        if session_id is not None:
+            summary = _codex_event_summary(event.get("event") or {}) if event.get("type") == "event" else ""
+            if not summary and event.get("type") == "stdout":
+                summary = str(event.get("line") or "").strip()[:240]
+            kind = "model.message_delta" if event.get("type") in {"event", "stdout"} else "run.progress"
+            store.append_store_event(
+                EventStreamType.SESSION,
+                session_id,
+                kind,
+                {
+                    "summary": summary,
+                    "stream_type": event.get("type"),
+                    "event": event.get("event"),
+                    "line": event.get("line"),
+                },
+                session_id=session_id,
+                run_id=event.get("run_id"),
+                redaction_state=RedactionState.REDACTED,
+            )
+        _print_codex_direct_progress(event)
+
+    return callback
+
+
+def _resolve_prompt_session(
+    store: SQLiteStore,
+    *,
+    session_id: str | None,
+    continue_session: bool,
+    fork_session: bool,
+    title: str | None,
+    agent_id: str | None,
+    raw_model_ref: str | None,
+    goal: str,
+):
+    if session_id and continue_session:
+        raise typer.BadParameter("--session and --continue are mutually exclusive.")
+    if fork_session and not (session_id or continue_session):
+        raise typer.BadParameter("--fork requires --session or --continue.")
+    parsed_model = _parse_model_ref(raw_model_ref)
+    if session_id is not None:
+        session = store.get_session(session_id)
+    elif continue_session:
+        session = store.latest_session()
+        if session is None:
+            raise typer.BadParameter("No non-archived session exists to continue.")
+    else:
+        session = store.create_session(
+            title=title,
+            agent_id=agent_id,
+            raw_model_ref=raw_model_ref,
+            provider_id=parsed_model["provider_id"],
+            model_id=parsed_model["model_id"],
+            model_variant=parsed_model["model_variant"],
+            intent="foreground_prompt",
+            metadata={"created_by": "foreground_prompt", "initial_goal_preview": goal[:240]},
+        )
+    if fork_session:
+        session = store.fork_session(session.id, title=title)
+    updates = {}
+    if agent_id is not None:
+        updates["agent_id"] = agent_id
+    if raw_model_ref is not None:
+        updates.update(parsed_model)
+        updates["raw_model_ref"] = raw_model_ref
+    if title is not None and session.title != title:
+        session = store.update_session_title(session.id, title)
+    if updates:
+        session = store.update_session(
+            session.id,
+            agent_id=updates.get("agent_id"),
+        )
+        if raw_model_ref is not None:
+            store.update_session_model(
+                session.id,
+                raw_model_ref=raw_model_ref,
+                provider_id=parsed_model["provider_id"],
+                model_id=parsed_model["model_id"],
+                model_variant=parsed_model["model_variant"],
+            )
+            session = store.get_session(session.id)
+    return session
+
+
+def _parse_model_ref(raw_model_ref: str | None) -> dict[str, str | None]:
+    if not raw_model_ref:
+        return {"provider_id": None, "model_id": None, "model_variant": None}
+    provider_id = None
+    model_id = raw_model_ref
+    variant = None
+    if "/" in raw_model_ref:
+        provider_id, model_id = raw_model_ref.split("/", 1)
+    if "@" in model_id:
+        model_id, variant = model_id.rsplit("@", 1)
+    elif ":" in model_id:
+        model_id, variant = model_id.rsplit(":", 1)
+    return {"provider_id": provider_id or None, "model_id": model_id or None, "model_variant": variant or None}
 
 
 def _print_codex_direct_progress(event: dict) -> None:

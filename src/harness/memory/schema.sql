@@ -1,3 +1,10 @@
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id TEXT PRIMARY KEY,
+  checksum TEXT NOT NULL,
+  applied_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,
   goal TEXT,
@@ -115,17 +122,137 @@ CREATE TABLE IF NOT EXISTS objectives (
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   project_path TEXT NOT NULL,
+  title TEXT,
+  parent_session_id TEXT,
+  forked_from_message_id TEXT,
   objective_id TEXT,
   active_task_id TEXT,
   active_run_id TEXT,
   workbench_id TEXT,
   agent_id TEXT,
+  provider_id TEXT,
+  model_id TEXT,
+  model_variant TEXT,
+  raw_model_ref TEXT,
   mode TEXT,
   intent TEXT,
   status TEXT NOT NULL,
+  summary TEXT,
+  token_input INTEGER NOT NULL DEFAULT 0,
+  token_output INTEGER NOT NULL DEFAULT 0,
+  token_reasoning INTEGER NOT NULL DEFAULT 0,
+  token_cache_read INTEGER NOT NULL DEFAULT 0,
+  token_cache_write INTEGER NOT NULL DEFAULT 0,
+  estimated_cost_usd TEXT,
+  ui_preferences_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
+  archived_at TEXT,
   metadata_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_messages (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  parent_message_id TEXT,
+  role TEXT NOT NULL,
+  agent_id TEXT,
+  run_id TEXT,
+  objective_id TEXT,
+  mutation_reversibility TEXT NOT NULL DEFAULT 'none',
+  content_preview TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS session_parts (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  ordinal INTEGER NOT NULL,
+  text TEXT,
+  artifact_id TEXT,
+  run_id TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  redaction_state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(id),
+  FOREIGN KEY(message_id) REFERENCES session_messages(id)
+);
+
+CREATE TABLE IF NOT EXISTS session_run_links (
+  session_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  message_id TEXT,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY(session_id, run_id)
+);
+
+CREATE TABLE IF NOT EXISTS event_store (
+  id TEXT PRIMARY KEY,
+  stream_type TEXT NOT NULL,
+  stream_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  visibility TEXT NOT NULL,
+  redaction_state TEXT NOT NULL,
+  session_id TEXT,
+  message_id TEXT,
+  run_id TEXT,
+  task_id TEXT,
+  artifact_id TEXT,
+  actor_json TEXT NOT NULL DEFAULT '{}',
+  correlation_id TEXT,
+  causation_id TEXT,
+  payload_json TEXT NOT NULL,
+  artifact_refs_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  UNIQUE(stream_type, stream_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS session_todos (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  content TEXT NOT NULL,
+  status TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  source_message_id TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS session_permissions (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  run_id TEXT,
+  tool_id TEXT NOT NULL,
+  normalized_action TEXT NOT NULL,
+  normalized_target_pattern TEXT NOT NULL,
+  boundary_kind TEXT NOT NULL,
+  risk TEXT NOT NULL,
+  status TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  source TEXT NOT NULL,
+  revocable INTEGER NOT NULL DEFAULT 1,
+  policy_reasons_json TEXT NOT NULL DEFAULT '[]',
+  requested_at TEXT NOT NULL,
+  resolved_at TEXT,
+  expires_at TEXT NOT NULL,
+  FOREIGN KEY(session_id) REFERENCES sessions(id)
+);
+
+CREATE TABLE IF NOT EXISTS provider_model_catalog_cache (
+  id TEXT PRIMARY KEY,
+  catalog_kind TEXT NOT NULL,
+  provider_id TEXT NOT NULL,
+  backend_id TEXT NOT NULL,
+  model_id TEXT,
+  model_profile_id TEXT,
+  raw_model_ref TEXT,
+  payload_json TEXT NOT NULL,
+  refreshed_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_dependencies (
@@ -257,6 +384,45 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status_priority_created
 
 CREATE INDEX IF NOT EXISTS idx_tasks_objective_status
   ON tasks(objective_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_updated
+  ON sessions(updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_status_updated
+  ON sessions(status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_session_messages_session_created
+  ON session_messages(session_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_session_parts_message_ordinal
+  ON session_parts(message_id, ordinal);
+
+CREATE INDEX IF NOT EXISTS idx_event_store_stream_seq
+  ON event_store(stream_type, stream_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_event_store_session_seq
+  ON event_store(session_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_event_store_run_seq
+  ON event_store(run_id, seq);
+
+CREATE INDEX IF NOT EXISTS idx_session_run_links_run
+  ON session_run_links(run_id);
+
+CREATE INDEX IF NOT EXISTS idx_session_todos_session_status
+  ON session_todos(session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_session_permissions_session_status
+  ON session_permissions(session_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_session_permissions_subject_status
+  ON session_permissions(tool_id, normalized_action, boundary_kind, status);
+
+CREATE INDEX IF NOT EXISTS idx_provider_model_catalog_kind_provider
+  ON provider_model_catalog_cache(catalog_kind, provider_id);
+
+CREATE INDEX IF NOT EXISTS idx_provider_model_catalog_raw_ref
+  ON provider_model_catalog_cache(raw_model_ref);
 
 CREATE INDEX IF NOT EXISTS idx_project_agents_workbench
   ON project_agents(workbench_id, imported_at ASC);

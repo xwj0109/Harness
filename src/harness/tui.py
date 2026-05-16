@@ -13,12 +13,14 @@ from rich.markup import escape
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
     {"id": "agent_authoring", "title": "Agent Authoring"},
+    {"id": "native_agents", "title": "Native Agents"},
     {"id": "project_agents", "title": "Project Agents"},
     {"id": "built_in_specs", "title": "Built-In Specs"},
     {"id": "objectives_tasks", "title": "Objectives And Tasks"},
     {"id": "daemon_control", "title": "Daemon Control Plane"},
     {"id": "registered_adapters", "title": "Registered Adapters"},
     {"id": "runtime_evidence", "title": "Runtime Evidence"},
+    {"id": "sessions", "title": "Sessions"},
     {"id": "packaging_smoke", "title": "Packaging Smoke"},
 ]
 
@@ -67,6 +69,42 @@ COMMAND_PALETTE_ENTRIES = [
         "description": "Preview effective custom agent metadata.",
         "mutates_when_run": False,
         "safety_note": "Read-only preview.",
+    },
+    {
+        "id": "native_agents.build",
+        "group_id": "native_agents",
+        "title": "Use build agent",
+        "command": "harness \"describe the change\" --agent build --project . --output json",
+        "description": "Create a session-linked isolated Codex edit task.",
+        "mutates_when_run": True,
+        "safety_note": "Queues isolated edit metadata; active-workspace direct Codex requires --mode direct.",
+    },
+    {
+        "id": "native_agents.plan",
+        "group_id": "native_agents",
+        "title": "Use plan agent",
+        "command": "harness \"plan the change\" --agent plan --project . --output json",
+        "description": "Create a read-only session-local planning task.",
+        "mutates_when_run": True,
+        "safety_note": "Read/glob/grep/artifact-read only; active repo writes are forbidden.",
+    },
+    {
+        "id": "native_agents.general",
+        "group_id": "native_agents",
+        "title": "Use general subagent",
+        "command": "harness \"@general investigate this\" --project . --output json",
+        "description": "Create a bounded read-only subagent placeholder task.",
+        "mutates_when_run": True,
+        "safety_note": "Read-only metadata and artifact-backed work; no shell, network, or active edits.",
+    },
+    {
+        "id": "native_agents.explore",
+        "group_id": "native_agents",
+        "title": "Use explore subagent",
+        "command": "harness \"@explore inspect this area\" --project . --output json",
+        "description": "Create a bounded read-only exploration placeholder task.",
+        "mutates_when_run": True,
+        "safety_note": "Read-only metadata and artifact-backed work; no shell, network, or active edits.",
     },
     {
         "id": "project_agents.import",
@@ -213,6 +251,51 @@ COMMAND_PALETTE_ENTRIES = [
         "safety_note": "Metadata only; does not print artifact files.",
     },
     {
+        "id": "sessions.list",
+        "group_id": "sessions",
+        "title": "List sessions",
+        "command": "harness session list --project .",
+        "description": "List interactive session records.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only session continuity inspection.",
+    },
+    {
+        "id": "sessions.continue_last",
+        "group_id": "sessions",
+        "title": "Continue last session",
+        "command": "harness \"continue this work\" --project . --continue",
+        "description": "Append a prompt to the most recently updated non-archived session.",
+        "mutates_when_run": True,
+        "safety_note": "Creates a new message and may start a supervised foreground run when manually run.",
+    },
+    {
+        "id": "sessions.tail",
+        "group_id": "sessions",
+        "title": "Tail a session",
+        "command": "harness session tail sess_abc123 --project .",
+        "description": "Replay persisted session events.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only append-only event replay.",
+    },
+    {
+        "id": "sessions.transcript",
+        "group_id": "sessions",
+        "title": "Show session transcript",
+        "command": "harness session transcript sess_abc123 --project .",
+        "description": "Reconstruct a session transcript from persisted messages and parts.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only transcript reconstruction.",
+    },
+    {
+        "id": "sessions.tools",
+        "group_id": "sessions",
+        "title": "List session tools",
+        "command": "harness session tools --output json",
+        "description": "Inspect low-risk session tool descriptors.",
+        "mutates_when_run": False,
+        "safety_note": "Descriptors are metadata only; they do not grant permission.",
+    },
+    {
         "id": "packaging_smoke.wheel",
         "group_id": "packaging_smoke",
         "title": "Build local wheel",
@@ -228,6 +311,11 @@ TUI_VIEW_SECTIONS = [
         "id": "project_overview",
         "title": "Project Overview",
         "pane_ids": ["overview", "guidance", "commands"],
+    },
+    {
+        "id": "sessions",
+        "title": "Sessions",
+        "pane_ids": ["sessions"],
     },
     {
         "id": "queue_daemon",
@@ -257,6 +345,7 @@ TUI_VIEW_SECTIONS = [
             "command_palette_daemon_control",
             "command_palette_registered_adapters",
             "command_palette_runtime_evidence",
+            "command_palette_sessions",
             "command_palette_packaging_smoke",
             "command_palette_selected",
         ],
@@ -282,7 +371,19 @@ TUI_NAVIGATION_HINTS = [
 ]
 
 TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
-RIGHT_PANEL_SECTION_IDS = ("assistant", "action", "project", "now", "queue", "recent", "adapters", "progress", "next", "commands")
+RIGHT_PANEL_SECTION_IDS = (
+    "assistant",
+    "action",
+    "project",
+    "sessions",
+    "now",
+    "queue",
+    "recent",
+    "adapters",
+    "progress",
+    "next",
+    "commands",
+)
 
 SLASH_COMMAND_ALIASES = {
     "help": "orientation.quickstart_agent",
@@ -305,6 +406,16 @@ SLASH_COMMAND_ALIASES = {
     "execute-read-only": "registered_adapters.execute_read_only",
     "execute": "registered_adapters.execute",
     "runs": "runtime_evidence.runs",
+    "sessions": "sessions.list",
+    "session": "sessions.list",
+    "continue-session": "sessions.continue_last",
+    "tail-session": "sessions.tail",
+    "transcript-session": "sessions.transcript",
+    "session-tools": "sessions.tools",
+    "build": "native_agents.build",
+    "plan": "native_agents.plan",
+    "general": "native_agents.general",
+    "explore": "native_agents.explore",
     "policy": "runtime_evidence.policy",
     "artifacts": "runtime_evidence.artifacts",
     "wheel": "packaging_smoke.wheel",
@@ -333,6 +444,7 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
                 f"Active leases: {summary['active_leases']}",
                 f"Active daemons: {summary['active_daemons']}",
                 f"Recent runs: {summary['recent_runs']}",
+                f"Recent sessions: {summary.get('recent_sessions', 0)}",
                 f"Task status: {', '.join(active_statuses) if active_statuses else 'none'}",
                 *(
                     [
@@ -394,6 +506,39 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
                 for run in dashboard["recent_runs"]
             ]
             or ["none"],
+        },
+        {
+            "id": "sessions",
+            "title": "Recent Sessions",
+            "lines": (
+                [
+                    (
+                        f"{session['id']} {session['status']} "
+                        f"{session.get('title') or session.get('intent') or 'untitled'} "
+                        f"model={session.get('raw_model_ref') or 'default'} "
+                        f"run={session.get('active_run_id') or 'none'}"
+                    )
+                    for session in dashboard.get("recent_sessions", [])
+                ]
+                or ["none"]
+            )
+            + (
+                [
+                    "",
+                    "Timeline:",
+                    *(dashboard.get("active_session", {}).get("timeline") or ["none"])[-5:],
+                    "",
+                    "Transcript:",
+                    *(dashboard.get("active_session", {}).get("transcript") or ["none"])[-3:],
+                ]
+                if dashboard.get("active_session")
+                else []
+            ),
+        },
+        {
+            "id": "models",
+            "title": "Models",
+            "lines": _model_catalog_pane_rows(dashboard),
         },
         {
             "id": "commands",
@@ -608,6 +753,11 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
             ],
         },
         {
+            "id": "sessions",
+            "title": "Sessions",
+            "rows": _right_panel_session_rows(dashboard, state),
+        },
+        {
             "id": "now",
             "title": "Now",
             "rows": _right_panel_now_rows(dashboard),
@@ -643,12 +793,26 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
 
 def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
     chat_cfg = dashboard.get("chat") or {}
+    model_catalog = dashboard.get("model_catalog") or {}
+    active_model = model_catalog.get("active_model") or {}
+    model_label = (
+        active_model.get("raw_model_ref")
+        or active_model.get("model_profile_id")
+        or chat_cfg.get("default_model_profile")
+        or state.get("model_profile")
+        or "codex_cli"
+    )
     rows = [
-        f"Model: {chat_cfg.get('default_model_profile') or state.get('model_profile') or 'codex_cli'}",
+        f"Model: {model_label}",
+        f"Provider: {active_model.get('provider_id') or 'default'}",
+        f"Known model: {active_model.get('known_catalog_entry') if active_model else 'n/a'}",
         f"Mode: {state.get('chat_mode') or chat_cfg.get('mode') or 'normal'}",
         "Read tools: autonomous",
         "Side effects: action contracts",
     ]
+    if model_catalog.get("models"):
+        rows.append(f"Catalog models: {len(model_catalog['models'])}")
+    rows.append("Fallback: explicit failure only")
     latest_response = state.get("latest_response") or {}
     tool_results = latest_response.get("tool_results") or []
     if tool_results:
@@ -710,6 +874,71 @@ def _right_panel_now_rows(dashboard: dict) -> list[str]:
     return ["Idle", "Ask Harness what to do next."]
 
 
+def _right_panel_session_rows(dashboard: dict, state: dict) -> list[str]:
+    sessions = dashboard.get("recent_sessions") or []
+    active_session = dashboard.get("active_session") or {}
+    active_session_id = state.get("active_session_id")
+    rows = []
+    if active_session_id:
+        rows.append(f"Active: {active_session_id}")
+    if sessions:
+        latest = sessions[0]
+        rows.append(
+            f"Latest: {latest['status']} | {latest.get('title') or latest.get('intent') or latest['id']}"
+        )
+        if latest.get("raw_model_ref"):
+            rows.append(f"Model: {latest['raw_model_ref']}")
+        model_catalog = dashboard.get("model_catalog") or {}
+        active_model = model_catalog.get("active_model") or {}
+        if active_model:
+            rows.append(f"Known model: {active_model.get('known_catalog_entry')}")
+            if active_model.get("provider_id"):
+                rows.append(f"Provider: {active_model['provider_id']}")
+        if latest.get("agent_id"):
+            rows.append(f"Agent: {latest['agent_id']}")
+        timeline = active_session.get("timeline") or []
+        if timeline:
+            rows.append(f"Timeline: {timeline[-1]}")
+        transcript = active_session.get("transcript") or []
+        if transcript:
+            first_line = str(transcript[-1]).splitlines()[0]
+            rows.append(f"Transcript: {first_line}")
+        rows.append(f"Continue: harness \"continue this work\" --project . --continue")
+        return rows
+    rows.append("No sessions yet.")
+    rows.append("Start: harness \"prompt\" --project .")
+    return rows
+
+
+def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
+    catalog = dashboard.get("model_catalog") or {}
+    providers = catalog.get("providers") or []
+    models = catalog.get("models") or []
+    active = catalog.get("active_model") or {}
+    rows = [
+        f"Providers: {len(providers)}",
+        f"Models: {len(models)}",
+        f"No hidden fallback: {catalog.get('no_hidden_fallback', True)}",
+    ]
+    if active:
+        rows.append(
+            "Active: "
+            f"{active.get('raw_model_ref') or active.get('model_id') or 'default'} "
+            f"known={active.get('known_catalog_entry')}"
+        )
+    rows.append("Provider status:")
+    rows.extend(
+        [
+            f"{provider['provider_id']} enabled={provider['enabled']} credentials={provider['credential_status']}"
+            for provider in providers[:4]
+        ]
+        or ["none"]
+    )
+    rows.append("Model refs:")
+    rows.extend([f"{model['raw_model_ref']} profile={model.get('model_profile_id') or '-'}" for model in models[:5]] or ["none"])
+    return rows
+
+
 def _right_panel_queue_rows(dashboard: dict) -> list[str]:
     labels = {
         "ready": "Ready",
@@ -737,6 +966,9 @@ def _right_panel_queue_rows(dashboard: dict) -> list[str]:
 
 def _right_panel_recent_rows(dashboard: dict) -> list[str]:
     rows = []
+    if dashboard.get("recent_sessions"):
+        session = dashboard["recent_sessions"][0]
+        rows.append(f"Session: {session['status']} | {session.get('title') or session.get('intent') or session['id']}")
     if dashboard.get("tasks"):
         task = dashboard["tasks"][0]
         rows.append(f"Task: {task['status']} | {task['title']}")
@@ -1108,6 +1340,74 @@ def filter_slash_commands(slash_commands: dict, query: str) -> dict:
         "total_matches": len(commands),
         "commands": commands,
     }
+
+
+def render_slash_command_suggestions(
+    slash_commands: dict,
+    query: str,
+    *,
+    selected_index: int = 0,
+    limit: int = 8,
+) -> str:
+    raw_query = query.strip()
+    if not raw_query.startswith("/"):
+        return ""
+
+    matching_commands = _matching_slash_commands(slash_commands, raw_query)
+    if not matching_commands:
+        return f"[dim]No slash commands match {escape(raw_query)}. Type /help to list commands.[/dim]"
+
+    selected_index = min(max(selected_index, 0), len(matching_commands) - 1)
+    visible_limit = max(1, limit)
+    if len(matching_commands) <= visible_limit:
+        start_index = 0
+    else:
+        start_index = max(0, min(selected_index - visible_limit + 1, len(matching_commands) - visible_limit))
+    visible_commands = matching_commands[start_index : start_index + visible_limit]
+    slash_width = min(max(len(command["slash"]) for command in visible_commands), 24)
+    lines = []
+    if start_index > 0:
+        lines.append(f"[dim]... {start_index} previous. Keep using arrows to navigate.[/dim]")
+    for index, command in enumerate(visible_commands):
+        command_index = start_index + index
+        slash = escape(command["slash"].ljust(slash_width))
+        description = escape(command["description"])
+        if command_index == selected_index:
+            lines.append(f"[bold blue]{slash}[/]  [bold blue]{description}[/]")
+        else:
+            lines.append(f"[bold]{slash}[/]  [dim]{description}[/]")
+    remaining = len(matching_commands) - (start_index + len(visible_commands))
+    if remaining > 0:
+        lines.append(f"[dim]... {remaining} more. Keep typing to filter.[/dim]")
+    return "\n".join(lines)
+
+
+def _matching_slash_commands(slash_commands: dict, query: str) -> list[dict]:
+    raw_query = query.strip()
+    if not raw_query.startswith("/"):
+        return []
+    command_query = raw_query.split(maxsplit=1)[0]
+    filtered = filter_slash_commands(slash_commands, command_query)
+    normalized_query = command_query.lstrip("/").casefold()
+    if not normalized_query:
+        return filtered["commands"]
+
+    def rank(command: dict) -> int:
+        name = str(command["name"]).casefold()
+        slash = str(command["slash"]).casefold()
+        title = str(command["title"]).casefold()
+        description = str(command["description"]).casefold()
+        if name.startswith(normalized_query) or slash.startswith(f"/{normalized_query}"):
+            return 0
+        if normalized_query in name or normalized_query in slash:
+            return 1
+        if title.startswith(normalized_query):
+            return 2
+        if normalized_query in title or normalized_query in description:
+            return 3
+        return 4
+
+    return sorted(filtered["commands"], key=rank)
 
 
 def _slash_command_matches(command: dict, normalized_query: str) -> bool:
@@ -1701,6 +2001,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.css.query import NoMatches
     from textual.widgets import Footer, Header, Input, Static
     from harness.chat import ChatSessionState, handle_chat_input
 
@@ -1724,7 +2025,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
     class HarnessPromptInput(Input):
         def on_key(self, event) -> None:
-            if event.key == "tab":
+            if event.key == "enter" and self.app.should_insert_slash_suggestion:
+                event.prevent_default()
+                event.stop()
+                self.app.action_insert_selected_slash_suggestion()
+            elif event.key in {"down", "up"} and self.app.slash_suggestions_visible:
+                event.prevent_default()
+                event.stop()
+                self.app.action_move_slash_suggestion(1 if event.key == "down" else -1)
+            elif event.key == "tab":
                 event.prevent_default()
                 event.stop()
                 self.app.action_section_next()
@@ -1761,6 +2070,16 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         #prompt {
             margin: 0 1 1 1;
+        }
+
+        #slash-status {
+            margin: 0 1;
+            padding: 0 1;
+            border: round $surface;
+        }
+
+        #slash-status.hidden {
+            display: none;
         }
 
         .message {
@@ -1800,8 +2119,23 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._focus_mode = "dashboard"
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
+            self._slash_suggestion_index = 0
             self._request_in_flight = False
             self._request_started_at: float | None = None
+
+        @property
+        def slash_suggestions_visible(self) -> bool:
+            prompt = self.query_one("#prompt", Input)
+            return bool(_matching_slash_commands(slash_commands, prompt.value))
+
+        @property
+        def should_insert_slash_suggestion(self) -> bool:
+            prompt = self.query_one("#prompt", Input)
+            request = prompt.value.strip()
+            if not request:
+                return False
+            inserted = self._request_from_prompt_submission(request)
+            return bool(inserted and inserted != request)
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
@@ -1811,8 +2145,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 with VerticalScroll(id="side"):
                     yield Static(render_right_panel_status(initial_view), id="search-status")
                     yield Static(_render_navigation_hints(initial_view), id="palette-status")
-                    yield Static("", id="slash-status")
                     yield Static("", id="pane-container")
+            yield Static("", id="slash-status", classes="hidden")
             yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
             yield Footer()
 
@@ -1836,22 +2170,22 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def on_input_changed(self, event: Input.Changed) -> None:
             if event.input.id == "prompt":
+                self._slash_suggestion_index = 0
                 self._render_current_view()
-                filtered_slash = filter_slash_commands(slash_commands, event.value)
-                self.query_one("#slash-status", Static).update(
-                    f"Slash commands: {filtered_slash['total_matches']}"
-                )
+                self._render_slash_suggestions(event.value)
 
         def on_input_submitted(self, event: Input.Submitted) -> None:
             if event.input.id != "prompt":
                 return
-            request = event.value.strip()
+            request = self._request_from_prompt_submission(event.value)
             if not request or self._request_in_flight:
                 return
             self._messages.append({"role": "user", "title": request, "lines": []})
             stream_index = len(self._messages)
             self._messages.append({"role": "assistant", "title": "Assistant", "lines": ["Starting model turn..."]})
             event.input.value = ""
+            self._slash_suggestion_index = 0
+            self._render_slash_suggestions("")
             event.input.placeholder = "Model is responding..."
             self._request_in_flight = True
             self._request_started_at = time.monotonic()
@@ -1924,6 +2258,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 prompt.placeholder = "Ask Harness or type /help"
             self._render_chat()
             self._render_current_view()
+            self._render_slash_suggestions(prompt.value)
             self._request_started_at = None
             if response.get("kind") == "quit":
                 self.exit()
@@ -1932,6 +2267,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             prompt = self.query_one("#prompt", Input)
             if prompt.value:
                 prompt.value = ""
+                self._render_slash_suggestions("")
             else:
                 self._focus_mode = "dashboard"
                 self._collapsed_section_ids.clear()
@@ -1947,6 +2283,42 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         def action_toggle_palette_focus(self) -> None:
             self._focus_mode = "palette" if self._focus_mode == "dashboard" else "dashboard"
             self._render_current_view()
+
+        def action_move_slash_suggestion(self, step: int) -> None:
+            prompt = self.query_one("#prompt", Input)
+            matching_commands = _matching_slash_commands(slash_commands, prompt.value)
+            if not matching_commands:
+                self._slash_suggestion_index = 0
+                self._render_slash_suggestions(prompt.value)
+                return
+            self._slash_suggestion_index = (self._slash_suggestion_index + step) % len(matching_commands)
+            self._render_slash_suggestions(prompt.value)
+
+        def action_insert_selected_slash_suggestion(self) -> None:
+            prompt = self.query_one("#prompt", Input)
+            inserted = self._request_from_prompt_submission(prompt.value)
+            if not inserted:
+                return
+            prompt.value = inserted
+            try:
+                prompt.cursor_position = len(inserted)
+            except AttributeError:
+                pass
+            self._slash_suggestion_index = 0
+            self._render_slash_suggestions("")
+
+        def _request_from_prompt_submission(self, prompt_value: str) -> str:
+            request = prompt_value.strip()
+            matching_commands = _matching_slash_commands(slash_commands, request)
+            if not matching_commands:
+                return request
+            command_token = request.split(maxsplit=1)[0]
+            if any(command_token == str(command["slash"]) for command in slash_commands["commands"]):
+                return request
+            selected_index = min(max(self._slash_suggestion_index, 0), len(matching_commands) - 1)
+            selected_slash = str(matching_commands[selected_index]["slash"])
+            _, _, args = request.partition(" ")
+            return f"{selected_slash} {args}".strip()
 
         def action_toggle_section_collapse(self) -> None:
             view = self._current_view()
@@ -1996,12 +2368,37 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             )
 
         def _render_current_view(self) -> None:
-            self._render_view(self._current_view())
+            try:
+                self._render_view(self._current_view())
+            except NoMatches:
+                return
+
+        def _render_slash_suggestions(self, prompt_value: str) -> None:
+            status = self.query_one("#slash-status", Static)
+            matching_commands = _matching_slash_commands(slash_commands, prompt_value)
+            if matching_commands and self._slash_suggestion_index >= len(matching_commands):
+                self._slash_suggestion_index = len(matching_commands) - 1
+            elif not matching_commands:
+                self._slash_suggestion_index = 0
+            rendered = render_slash_command_suggestions(
+                slash_commands,
+                prompt_value,
+                selected_index=self._slash_suggestion_index,
+            )
+            if rendered:
+                status.remove_class("hidden")
+                status.update(rendered)
+            else:
+                status.update("")
+                status.add_class("hidden")
 
         def _refresh_live_view(self) -> None:
-            if self._request_in_flight:
-                self._render_chat()
-            self._render_current_view()
+            try:
+                if self._request_in_flight:
+                    self._render_chat()
+                self._render_current_view()
+            except NoMatches:
+                return
 
         def _clamp_section_cursor(self, view: dict) -> None:
             if not view["sections"]:

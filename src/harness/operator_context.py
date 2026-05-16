@@ -6,13 +6,20 @@ from pathlib import Path
 
 from harness import __version__
 from harness.capabilities import build_capability_catalog
-from harness.config import HARNESS_DIR
+from harness.config import HARNESS_DIR, default_config, load_config
 from harness.execution import list_execution_adapter_descriptors
 from harness.memory.sqlite_store import SQLiteStore
+from harness.model_catalog import list_model_catalog, list_provider_catalog
 from harness.models import TaskStatus
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
 from harness.security import sanitize_for_logging
+from harness.session_timeline import (
+    list_session_timeline,
+    list_session_transcript,
+    render_timeline_event,
+    render_transcript_entry,
+)
 
 
 OPERATOR_CONTEXT_SCHEMA_VERSION = "harness.operator_context/v1"
@@ -36,6 +43,7 @@ def build_operator_context(project_root: Path) -> dict:
             "active_leases": 0,
             "active_daemons": 0,
             "recent_runs": 0,
+            "recent_sessions": 0,
         },
         "task_status_counts": {status.value: 0 for status in TaskStatus},
         "agents": [],
@@ -47,6 +55,16 @@ def build_operator_context(project_root: Path) -> dict:
             "latest_events": [],
         },
         "recent_runs": [],
+        "recent_sessions": [],
+        "active_session": None,
+        "model_catalog": {
+            "schema_version": "harness.operator_model_catalog/v1",
+            "providers": [],
+            "models": [],
+            "active_model": None,
+            "permission_granting": False,
+            "no_hidden_fallback": True,
+        },
         "memory": {
             "schema_version": "harness.memory_summary/v1",
             "total": 0,
@@ -76,6 +94,7 @@ def build_operator_context(project_root: Path) -> dict:
         "command_suggestions": [
             f"harness home --project {project_root}",
             f"harness chat --project {project_root}",
+            f"harness session list --project {project_root}",
             f"harness agents list --project {project_root}",
             f"harness tasks list --project {project_root}",
             f"harness daemon status --project {project_root}",
@@ -121,7 +140,15 @@ def build_operator_context(project_root: Path) -> dict:
         tasks = store.list_tasks()
         leases = store.list_task_leases()
         runs = store.list_runs()[:5]
+        sessions = store.list_sessions()[:5]
         memory_records = store.list_memory_records()[:5]
+        try:
+            cfg = load_config(project_root)
+        except FileNotFoundError:
+            cfg = default_config()
+        provider_catalog = list_provider_catalog(cfg)
+        model_catalog = list_model_catalog(cfg)
+        catalog_cache = store.replace_provider_model_catalog_cache(provider_catalog, model_catalog)
         daemon_status = store.daemon_status()
         controls = store.list_execution_controls()
         breakers = store.list_adapter_breaker_states(
@@ -153,6 +180,7 @@ def build_operator_context(project_root: Path) -> dict:
         "active_leases": len(active_leases),
         "active_daemons": len(daemon_status.active_daemons),
         "recent_runs": len(runs),
+        "recent_sessions": len(sessions),
     }
     dashboard["runtime_controls"] = {
         "schema_version": "harness.execution_controls_summary/v1",
@@ -205,6 +233,54 @@ def build_operator_context(project_root: Path) -> dict:
         }
         for run in runs
     ]
+    dashboard["recent_sessions"] = [
+        {
+            "id": session.id,
+            "title": sanitize_for_logging(session.title),
+            "status": session.status.value,
+            "intent": sanitize_for_logging(session.intent),
+            "agent_id": sanitize_for_logging(session.agent_id),
+            "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
+            "active_run_id": session.active_run_id,
+            "active_task_id": session.active_task_id,
+            "updated_at": session.updated_at.isoformat(),
+        }
+        for session in sessions
+    ]
+    if sessions:
+        dashboard["active_session"] = _session_preview(store, sessions[0].id)
+    dashboard["model_catalog"] = {
+        "schema_version": "harness.operator_model_catalog/v1",
+        "providers": [
+            {
+                "provider_id": provider.provider_id,
+                "enabled": provider.enabled,
+                "kind": provider.kind.value,
+                "credential_status": provider.credential_status.value,
+                "data_boundary": provider.metadata.data_boundary.value,
+                "constraints": provider.constraints,
+            }
+            for provider in provider_catalog
+        ],
+        "models": [
+            {
+                "provider_id": model.provider_id,
+                "model_id": sanitize_for_logging(model.model_id),
+                "raw_model_ref": sanitize_for_logging(model.raw_model_ref),
+                "model_profile_id": sanitize_for_logging(model.model_profile_id),
+                "source": model.source,
+                "context_limit": model.context_limit,
+                "tool_support": model.tool_support,
+                "reasoning_support": model.reasoning_support,
+                "modalities": model.modalities,
+            }
+            for model in model_catalog
+        ],
+        "active_model": _active_model_summary(sessions, model_catalog),
+        "cache": catalog_cache,
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+    }
     dashboard["memory"] = {
         "schema_version": "harness.memory_summary/v1",
         "total": len(store.list_memory_records()),
@@ -318,6 +394,55 @@ def build_operator_context(project_root: Path) -> dict:
     return dashboard
 
 
+def _session_preview(store: SQLiteStore, session_id: str) -> dict:
+    session = store.get_session(session_id)
+    timeline_events = list_session_timeline(store, session_id, limit=8)
+    transcript_entries = list_session_transcript(store, session_id)[-4:]
+    return {
+        "schema_version": "harness.session_preview/v1",
+        "id": session.id,
+        "status": session.status.value,
+        "title": sanitize_for_logging(session.title),
+        "agent_id": sanitize_for_logging(session.agent_id),
+        "provider_id": sanitize_for_logging(session.provider_id),
+        "model_id": sanitize_for_logging(session.model_id),
+        "model_variant": sanitize_for_logging(session.model_variant),
+        "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
+        "active_run_id": session.active_run_id,
+        "timeline": [render_timeline_event(event) for event in timeline_events],
+        "transcript": [render_transcript_entry(entry) for entry in transcript_entries],
+    }
+
+
+def _active_model_summary(sessions: list, model_catalog: list) -> dict | None:
+    if not sessions:
+        return None
+    latest = sessions[0]
+    raw_ref = latest.raw_model_ref
+    provider_id = latest.provider_id
+    model_id = latest.model_id
+    matched = None
+    for model in model_catalog:
+        if raw_ref and model.raw_model_ref == raw_ref:
+            matched = model
+            break
+        if provider_id and model_id and model.provider_id == provider_id and model.model_id == model_id:
+            matched = model
+            break
+    return {
+        "session_id": latest.id,
+        "raw_model_ref": sanitize_for_logging(raw_ref),
+        "provider_id": sanitize_for_logging(provider_id or (matched.provider_id if matched else None)),
+        "model_id": sanitize_for_logging(model_id or (matched.model_id if matched else None)),
+        "model_variant": sanitize_for_logging(latest.model_variant),
+        "known_catalog_entry": matched is not None,
+        "model_profile_id": sanitize_for_logging(matched.model_profile_id if matched else None),
+        "tool_support": matched.tool_support if matched else None,
+        "context_limit": matched.context_limit if matched else None,
+        "no_hidden_fallback": True,
+    }
+
+
 def _objective_for_progress(objectives: list, tasks: list) -> object | None:
     if not objectives:
         return None
@@ -370,7 +495,8 @@ def render_operator_context_lines(context: dict, *, active_orchestrator: str | N
         f"Active orchestrator: {active_orchestrator or 'none'}",
         "Summary: "
         f"tasks={summary['tasks_total']} objectives={summary['objectives']} "
-        f"active_leases={summary['active_leases']} recent_runs={summary['recent_runs']}",
+        f"active_leases={summary['active_leases']} recent_runs={summary['recent_runs']} "
+        f"recent_sessions={summary.get('recent_sessions', 0)}",
         f"Adapters: {adapters or 'none'}",
         f"Capabilities: {capabilities or 'none'}",
     ]
@@ -379,6 +505,12 @@ def render_operator_context_lines(context: dict, *, active_orchestrator: str | N
     if context.get("guidance"):
         lines.append("Guidance:")
         lines.extend(f"- {item['description']} ({item['command']})" for item in context["guidance"])
+    if context.get("recent_sessions"):
+        lines.append("Recent sessions:")
+        lines.extend(
+            f"- {session['id']} {session['status']} {session.get('title') or session.get('intent') or 'untitled'}"
+            for session in context["recent_sessions"][:3]
+        )
     lines.append("Safety: passive dashboard context, no backend preflight, no hidden execution.")
     return lines
 

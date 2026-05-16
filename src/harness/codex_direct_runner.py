@@ -12,7 +12,7 @@ from harness.backends.codex_cli import (
 )
 from harness.events import append_jsonl
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import BackendCapabilities
+from harness.models import BackendCapabilities, RunEventType
 from harness.security import sanitize_for_logging
 
 
@@ -43,6 +43,7 @@ class CodexDirectAgentRunner:
         reasoning_effort: str | None = None,
         stream: bool = True,
         fail_on_dirty: bool = False,
+        session_id: str | None = None,
         progress_callback: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         pre_status = self._git_status_porcelain()
@@ -56,6 +57,14 @@ class CodexDirectAgentRunner:
             task_type=task_type,
             status="running",
             backend=self.backend.config.model_copy(update={"capabilities": status.capabilities}),
+            session_id=session_id,
+        )
+        self.store.append_run_event(
+            run.id,
+            RunEventType.RUN_STARTED,
+            {"task_type": task_type, "backend": self.backend.name},
+            message="Codex direct foreground run started.",
+            session_id=session_id,
         )
         paths = self.store.initialize_run_artifacts(run.id)
         for kind, path in paths.items():
@@ -89,7 +98,7 @@ class CodexDirectAgentRunner:
                     capabilities = event.get("capabilities") or capabilities
                     network_status = str(event.get("network_status") or "")
                 elif progress_callback is not None:
-                    progress_callback(sanitize_for_logging(event))
+                    progress_callback(sanitize_for_logging({"run_id": run.id, "session_id": session_id, **event}))
             if result is None:
                 raise CodexUnavailable("Codex direct agent stream ended without a completion event.")
         else:
@@ -141,6 +150,13 @@ class CodexDirectAgentRunner:
         )
         status_value = "completed" if result.exit_status == 0 else "failed"
         self.store.update_run_status(run.id, status_value)
+        self.store.append_run_event(
+            run.id,
+            RunEventType.RUN_FINISHED if status_value == "completed" else RunEventType.RUN_FAILED,
+            {"status": status_value, "exit_status": result.exit_status},
+            message=f"Codex direct foreground run {status_value}.",
+            session_id=session_id,
+        )
         final_summary = result.final_message or _fallback_final_summary(result)
         artifact_paths = {**paths, **codex_artifacts, "codex_final_message": final_message_path}
         self._write_report(

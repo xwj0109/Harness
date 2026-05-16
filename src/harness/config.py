@@ -60,6 +60,81 @@ class ChatConfig(BaseModel):
     allow_codex_subscription_chat: bool = True
 
 
+class NamedReferenceConfig(BaseModel):
+    kind: str = "local"
+    path: str | None = None
+    url: str | None = None
+    description: str | None = None
+
+
+class LspServerConfig(BaseModel):
+    command: list[str] = Field(default_factory=list)
+    file_extensions: list[str] = Field(default_factory=list)
+    enabled: bool = False
+
+
+class LspConfig(BaseModel):
+    enabled: bool = False
+    servers: dict[str, LspServerConfig] = Field(default_factory=dict)
+
+
+class FormatterProfileConfig(BaseModel):
+    command: list[str] = Field(default_factory=list)
+    file_extensions: list[str] = Field(default_factory=list)
+    enabled: bool = False
+    format_on_accepted_edit: bool = False
+
+
+class FormatterConfig(BaseModel):
+    enabled: bool = False
+    profiles: dict[str, FormatterProfileConfig] = Field(default_factory=dict)
+
+
+class McpServerConfig(BaseModel):
+    kind: str = "local"
+    command: list[str] = Field(default_factory=list)
+    url: str | None = None
+    enabled: bool = False
+    description: str | None = None
+
+
+class McpConfig(BaseModel):
+    enabled: bool = False
+    servers: dict[str, McpServerConfig] = Field(default_factory=dict)
+
+
+class PluginConfig(BaseModel):
+    path: str | None = None
+    url: str | None = None
+    version: str | None = None
+    enabled: bool = False
+    description: str | None = None
+
+
+class PluginsConfig(BaseModel):
+    enabled: bool = False
+    project: dict[str, PluginConfig] = Field(default_factory=dict)
+
+
+class SkillConfig(BaseModel):
+    path: str | None = None
+    enabled: bool = False
+    description: str | None = None
+
+
+class SkillsConfig(BaseModel):
+    enabled: bool = False
+    project: dict[str, SkillConfig] = Field(default_factory=dict)
+
+
+class WebToolsConfig(BaseModel):
+    enabled: bool = False
+    fetch_enabled: bool = False
+    search_enabled: bool = False
+    approval_required: bool = True
+    allowed_domains: list[str] = Field(default_factory=list)
+
+
 class HarnessConfig(BaseModel):
     project_name: str = "agent-harness-project"
     context_excludes: list[str] = Field(default_factory=lambda: list(DEFAULT_CONTEXT_EXCLUDES))
@@ -72,6 +147,13 @@ class HarnessConfig(BaseModel):
     )
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
+    references: dict[str, NamedReferenceConfig] = Field(default_factory=dict)
+    lsp: LspConfig = Field(default_factory=LspConfig)
+    formatter: FormatterConfig = Field(default_factory=FormatterConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
+    plugins: PluginsConfig = Field(default_factory=PluginsConfig)
+    skills: SkillsConfig = Field(default_factory=SkillsConfig)
+    web_tools: WebToolsConfig = Field(default_factory=WebToolsConfig)
     backends: dict[str, BackendConfig]
 
 

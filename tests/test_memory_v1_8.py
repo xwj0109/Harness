@@ -313,6 +313,7 @@ def test_operator_context_includes_memory_summary_without_backend_preflight(tmp_
     store = SQLiteStore(tmp_path)
     store.initialize()
     record = store.save_memory_note("project", str(tmp_path), "Remember local-only context.")
+    session = store.create_session(title="Memory context session", agent_id="repo_inspector", raw_model_ref="codex/gpt-test")
 
     def fail_backend(*_args, **_kwargs):
         raise AssertionError("memory context must not preflight backends")
@@ -327,6 +328,10 @@ def test_operator_context_includes_memory_summary_without_backend_preflight(tmp_
     assert context["memory"]["total"] == 1
     assert context["memory"]["recent"][0]["id"] == record.id
     assert context["memory"]["recent"][0]["summary"] == "Remember local-only context."
+    assert context["summary"]["recent_sessions"] == 1
+    assert context["recent_sessions"][0]["id"] == session.id
+    assert context["recent_sessions"][0]["title"] == "Memory context session"
+    assert context["recent_sessions"][0]["agent_id"] == "repo_inspector"
 
 
 def test_chat_memory_commands_are_deterministic_and_reset_keeps_memory(tmp_path, monkeypatch) -> None:

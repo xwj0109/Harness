@@ -29,6 +29,7 @@ from harness.models import (
     DaemonStatus,
     DaemonStatusResult,
     DaemonTickResult,
+    EventStreamType,
     EventRecord,
     EventVisibility,
     ManifestArtifact,
@@ -45,8 +46,20 @@ from harness.models import (
     RunCompareResult,
     RunManifest,
     RunRecord,
+    SessionMessageRecord,
+    SessionMessageRole,
+    SessionMutationReversibility,
+    SessionPartKind,
+    SessionPartRecord,
+    SessionPermissionBoundaryKind,
+    SessionPermissionRequest,
+    SessionPermissionScope,
+    SessionPermissionSource,
+    SessionPermissionStatus,
     SessionSpec,
     SessionStatus,
+    SessionTodoRecord,
+    StoredEventRecord,
     TaskAttempt,
     TaskDependency,
     TaskDependencyType,
@@ -80,6 +93,38 @@ LEGACY_TASK_STATUS_VALUES = {
     "completed": TaskStatus.SUCCEEDED,
     "canceled": TaskStatus.CANCELLED,
 }
+
+SESSION_TODO_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+
+
+def _normalize_session_todo_status(status: str) -> str:
+    normalized = str(status).strip().lower().replace("-", "_")
+    if normalized == "done":
+        normalized = "completed"
+    if normalized not in SESSION_TODO_STATUSES:
+        raise ValueError(f"Unsupported session todo status: {status}")
+    return normalized
+
+
+def _permission_expiry_iso(expires_at: datetime | str | None, scope: SessionPermissionScope) -> str:
+    if isinstance(expires_at, datetime):
+        value = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    if isinstance(expires_at, str) and expires_at:
+        return expires_at
+    now = datetime.now(timezone.utc)
+    if scope == SessionPermissionScope.SESSION:
+        return (now + timedelta(hours=24)).isoformat()
+    return (now + timedelta(minutes=15)).isoformat()
+
+
+def _model_dump_jsonable(value: Any) -> dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return value
+    raise TypeError(f"Catalog cache values must be Pydantic models or dicts, got {type(value).__name__}.")
+
 
 TASK_STATUS_QUERY_ALIASES = {
     TaskStatus.READY: ("ready", "queued"),
@@ -282,13 +327,52 @@ class SQLiteStore:
             self._ensure_column(conn, "tasks", "approval_state", "TEXT")
             self._ensure_column(conn, "tasks", "session_id", "TEXT")
             self._ensure_column(conn, "objectives", "session_id", "TEXT")
+            self._ensure_column(conn, "sessions", "title", "TEXT")
+            self._ensure_column(conn, "sessions", "parent_session_id", "TEXT")
+            self._ensure_column(conn, "sessions", "forked_from_message_id", "TEXT")
+            self._ensure_column(conn, "sessions", "provider_id", "TEXT")
+            self._ensure_column(conn, "sessions", "model_id", "TEXT")
+            self._ensure_column(conn, "sessions", "model_variant", "TEXT")
+            self._ensure_column(conn, "sessions", "raw_model_ref", "TEXT")
+            self._ensure_column(conn, "sessions", "summary", "TEXT")
+            self._ensure_column(conn, "sessions", "token_input", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "sessions", "token_output", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "sessions", "token_reasoning", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "sessions", "token_cache_read", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "sessions", "token_cache_write", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(conn, "sessions", "estimated_cost_usd", "TEXT")
+            self._ensure_column(conn, "sessions", "ui_preferences_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "sessions", "archived_at", "TEXT")
             self._migrate_task_rows(conn)
             self._migrate_artifact_rows(conn)
+            self._record_schema_migration(conn, "20260516_001_sessions", schema, "Session spine tables and append-only event store.")
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _record_schema_migration(
+        self, conn: sqlite3.Connection, migration_id: str, schema_text: str, description: str
+    ) -> None:
+        checksum = hashlib.sha256(schema_text.encode("utf-8")).hexdigest()
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (id, checksum, applied_at, metadata_json)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                migration_id,
+                checksum,
+                now_iso(),
+                json.dumps({"description": description}, sort_keys=True, default=str),
+            ),
+        )
+
+    def list_schema_migrations(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM schema_migrations ORDER BY applied_at ASC, id ASC").fetchall()
+        return [dict(row) for row in rows]
 
     def _migrate_task_rows(self, conn: sqlite3.Connection) -> None:
         timestamp = now_iso()
@@ -343,20 +427,32 @@ class SQLiteStore:
     def create_session(
         self,
         *,
+        title: str | None = None,
+        parent_session_id: str | None = None,
+        forked_from_message_id: str | None = None,
         objective_id: str | None = None,
         active_task_id: str | None = None,
         active_run_id: str | None = None,
         workbench_id: str | None = None,
         agent_id: str | None = None,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        model_variant: str | None = None,
+        raw_model_ref: str | None = None,
         mode: str | None = None,
         intent: str | None = None,
         status: SessionStatus = SessionStatus.ACTIVE,
+        summary: str | None = None,
+        ui_preferences: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SessionSpec:
         session_id = f"sess_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         metadata = sanitize_for_logging(metadata or {})
+        ui_preferences = sanitize_for_logging(ui_preferences or {})
         with self.connect() as conn:
+            if parent_session_id is not None:
+                self._require_session(conn, parent_session_id)
             if objective_id is not None:
                 self._require_objective(conn, objective_id)
             if active_task_id is not None:
@@ -366,22 +462,32 @@ class SQLiteStore:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                  id, project_path, objective_id, active_task_id, active_run_id,
-                  workbench_id, agent_id, mode, intent, status, created_at, updated_at,
-                  metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  id, project_path, title, parent_session_id, forked_from_message_id,
+                  objective_id, active_task_id, active_run_id, workbench_id, agent_id,
+                  provider_id, model_id, model_variant, raw_model_ref, mode, intent, status,
+                  summary, ui_preferences_json, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     str(self.project_root),
+                    title,
+                    parent_session_id,
+                    forked_from_message_id,
                     objective_id,
                     active_task_id,
                     active_run_id,
                     workbench_id,
                     agent_id,
+                    provider_id,
+                    model_id,
+                    model_variant,
+                    raw_model_ref,
                     mode,
                     intent,
                     status.value,
+                    summary,
+                    json.dumps(ui_preferences, sort_keys=True, default=str),
                     timestamp,
                     timestamp,
                     json.dumps(metadata, sort_keys=True, default=str),
@@ -389,6 +495,20 @@ class SQLiteStore:
             )
         (self.harness_dir / "sessions" / session_id).mkdir(parents=True, exist_ok=True)
         (self.harness_dir / "sessions" / session_id / "transcript.jsonl").touch(exist_ok=True)
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.created",
+            {
+                "title": title,
+                "intent": intent,
+                "objective_id": objective_id,
+                "active_task_id": active_task_id,
+                "active_run_id": active_run_id,
+            },
+            session_id=session_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
         return self.get_session(session_id)
 
     def get_session(self, session_id: str) -> SessionSpec:
@@ -397,6 +517,161 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Session not found: {session_id}")
         return self._row_to_session(row)
+
+    def archive_session(self, session_id: str) -> SessionSpec:
+        self.get_session(session_id)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, archived_at = COALESCE(archived_at, ?), updated_at = ?
+                WHERE id = ?
+                """,
+                (SessionStatus.ARCHIVED.value, timestamp, timestamp, session_id),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.archived",
+            {"archived_at": timestamp},
+            session_id=session_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        return self.get_session(session_id)
+
+    def delete_session(self, session_id: str) -> SessionSpec:
+        return self.archive_session(session_id)
+
+    def update_session_model(
+        self,
+        session_id: str,
+        *,
+        raw_model_ref: str | None,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        model_variant: str | None = None,
+    ) -> SessionSpec:
+        self.get_session(session_id)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET raw_model_ref = ?, provider_id = ?, model_id = ?, model_variant = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (raw_model_ref, provider_id, model_id, model_variant, timestamp, session_id),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.model_selected",
+            {
+                "raw_model_ref": raw_model_ref,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "model_variant": model_variant,
+            },
+            session_id=session_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        return self.get_session(session_id)
+
+    def update_session_title(self, session_id: str, title: str | None) -> SessionSpec:
+        self.get_session(session_id)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute("UPDATE sessions SET title = ?, updated_at = ? WHERE id = ?", (title, timestamp, session_id))
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.title_updated",
+            {"title": title},
+            session_id=session_id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return self.get_session(session_id)
+
+    def replace_provider_model_catalog_cache(self, providers: list[Any], models: list[Any]) -> dict[str, Any]:
+        timestamp = now_iso()
+        provider_rows = []
+        model_rows = []
+        for provider in providers:
+            payload = sanitize_for_logging(_model_dump_jsonable(provider))
+            provider_rows.append(
+                (
+                    f"catalog_provider_{payload['provider_id']}",
+                    "provider",
+                    payload["provider_id"],
+                    payload["backend_id"],
+                    None,
+                    None,
+                    None,
+                    json.dumps(payload, sort_keys=True, default=str),
+                    timestamp,
+                )
+            )
+        for index, model in enumerate(models):
+            payload = sanitize_for_logging(_model_dump_jsonable(model))
+            row_id = f"catalog_model_{payload['provider_id']}_{payload.get('model_profile_id') or 'backend'}_{index}"
+            model_rows.append(
+                (
+                    row_id,
+                    "model",
+                    payload["provider_id"],
+                    payload["backend_id"],
+                    payload["model_id"],
+                    payload.get("model_profile_id"),
+                    payload["raw_model_ref"],
+                    json.dumps(payload, sort_keys=True, default=str),
+                    timestamp,
+                )
+            )
+        with self.connect() as conn:
+            conn.execute("DELETE FROM provider_model_catalog_cache")
+            conn.executemany(
+                """
+                INSERT INTO provider_model_catalog_cache (
+                  id, catalog_kind, provider_id, backend_id, model_id, model_profile_id,
+                  raw_model_ref, payload_json, refreshed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                provider_rows + model_rows,
+            )
+        return {
+            "schema_version": "harness.provider_model_catalog_cache/v1",
+            "refreshed_at": timestamp,
+            "provider_count": len(provider_rows),
+            "model_count": len(model_rows),
+            "source": "local_config_and_builtin_specs",
+            "permission_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def list_provider_model_catalog_cache(self, catalog_kind: str | None = None) -> list[dict[str, Any]]:
+        params: tuple[Any, ...] = ()
+        query = "SELECT * FROM provider_model_catalog_cache"
+        if catalog_kind is not None:
+            query += " WHERE catalog_kind = ?"
+            params = (catalog_kind,)
+        query += " ORDER BY catalog_kind, provider_id, model_profile_id, model_id, id"
+        with self.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "catalog_kind": row["catalog_kind"],
+                "provider_id": row["provider_id"],
+                "backend_id": row["backend_id"],
+                "model_id": row["model_id"],
+                "model_profile_id": row["model_profile_id"],
+                "raw_model_ref": row["raw_model_ref"],
+                "payload": json.loads(row["payload_json"]),
+                "refreshed_at": row["refreshed_at"],
+            }
+            for row in rows
+        ]
 
     def list_sessions(self, status: str | None = None) -> list[SessionSpec]:
         with self.connect() as conn:
@@ -408,6 +683,67 @@ class SQLiteStore:
                     (SessionStatus(status).value,),
                 ).fetchall()
         return [self._row_to_session(row) for row in rows]
+
+    def latest_session(self, *, include_archived: bool = False) -> SessionSpec | None:
+        with self.connect() as conn:
+            if include_archived:
+                row = conn.execute("SELECT * FROM sessions ORDER BY updated_at DESC LIMIT 1").fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    WHERE status != ?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (SessionStatus.ARCHIVED.value,),
+                ).fetchone()
+        return self._row_to_session(row) if row is not None else None
+
+    def fork_session(
+        self,
+        session_id: str,
+        *,
+        message_id: str | None = None,
+        title: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionSpec:
+        parent = self.get_session(session_id)
+        if message_id is not None:
+            with self.connect() as conn:
+                row = conn.execute(
+                    "SELECT id FROM session_messages WHERE id = ? AND session_id = ?",
+                    (message_id, session_id),
+                ).fetchone()
+            if row is None:
+                raise KeyError(f"Session message not found: {message_id}")
+        child_metadata = dict(parent.metadata)
+        child_metadata.update(sanitize_for_logging(metadata or {}))
+        child = self.create_session(
+            title=title or (f"Fork of {parent.title}" if parent.title else None),
+            parent_session_id=parent.id,
+            forked_from_message_id=message_id,
+            workbench_id=parent.workbench_id,
+            agent_id=parent.agent_id,
+            provider_id=parent.provider_id,
+            model_id=parent.model_id,
+            model_variant=parent.model_variant,
+            raw_model_ref=parent.raw_model_ref,
+            mode=parent.mode.value if parent.mode is not None else None,
+            intent=parent.intent,
+            ui_preferences=parent.ui_preferences,
+            metadata=child_metadata,
+        )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            child.id,
+            "session.forked",
+            {"parent_session_id": parent.id, "message_id": message_id},
+            session_id=child.id,
+            message_id=message_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        return child
 
     def update_session(
         self,
@@ -461,6 +797,533 @@ class SQLiteStore:
                 ),
             )
         return self.get_session(session_id)
+
+    def append_session_message(
+        self,
+        session_id: str,
+        role: SessionMessageRole | str,
+        content_preview: str,
+        *,
+        parent_message_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        objective_id: str | None = None,
+        mutation_reversibility: SessionMutationReversibility | str = SessionMutationReversibility.NONE,
+    ) -> SessionMessageRecord:
+        message_id = f"msg_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        role_value = SessionMessageRole(role.value if isinstance(role, SessionMessageRole) else role)
+        reversibility_value = SessionMutationReversibility(
+            mutation_reversibility.value
+            if isinstance(mutation_reversibility, SessionMutationReversibility)
+            else mutation_reversibility
+        )
+        preview = str(sanitize_for_logging(content_preview))[:16 * 1024]
+        with self.connect() as conn:
+            self._require_session(conn, session_id)
+            if run_id is not None:
+                self._require_run(conn, run_id)
+            conn.execute(
+                """
+                INSERT INTO session_messages (
+                  id, session_id, parent_message_id, role, agent_id, run_id, objective_id,
+                  mutation_reversibility, content_preview, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    session_id,
+                    parent_message_id,
+                    role_value.value,
+                    agent_id,
+                    run_id,
+                    objective_id,
+                    reversibility_value.value,
+                    preview,
+                    timestamp,
+                ),
+            )
+            if run_id is not None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO session_run_links (session_id, run_id, message_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (session_id, run_id, message_id, timestamp),
+                )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.message.appended",
+            {"role": role_value.value, "content_preview": preview, "run_id": run_id},
+            session_id=session_id,
+            message_id=message_id,
+            run_id=run_id,
+            redaction_state=RedactionState.REDACTED,
+            created_at=timestamp,
+        )
+        return SessionMessageRecord(
+            id=message_id,
+            session_id=session_id,
+            parent_message_id=parent_message_id,
+            role=role_value,
+            agent_id=agent_id,
+            run_id=run_id,
+            objective_id=objective_id,
+            mutation_reversibility=reversibility_value,
+            content_preview=preview,
+            created_at=parse_dt(timestamp),
+        )
+
+    def append_session_part(
+        self,
+        session_id: str,
+        message_id: str,
+        kind: SessionPartKind | str,
+        *,
+        text: str | None = None,
+        artifact_id: str | None = None,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        redaction_state: RedactionState | str = RedactionState.NOT_REQUIRED,
+    ) -> SessionPartRecord:
+        part_id = f"part_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        kind_value = SessionPartKind(kind.value if isinstance(kind, SessionPartKind) else kind)
+        redaction_value = RedactionState(redaction_state.value if isinstance(redaction_state, RedactionState) else redaction_state)
+        metadata = sanitize_for_logging(metadata or {})
+        sanitized_text = str(sanitize_for_logging(text)) if text is not None else None
+        with self.connect() as conn:
+            self._require_session(conn, session_id)
+            message = conn.execute(
+                "SELECT id FROM session_messages WHERE id = ? AND session_id = ?", (message_id, session_id)
+            ).fetchone()
+            if message is None:
+                raise KeyError(f"Session message not found: {message_id}")
+            row = conn.execute(
+                """
+                SELECT COALESCE(MAX(ordinal), 0) AS max_ordinal
+                FROM session_parts
+                WHERE session_id = ? AND message_id = ?
+                """,
+                (session_id, message_id),
+            ).fetchone()
+            ordinal = int(row["max_ordinal"] or 0) + 1
+            conn.execute(
+                """
+                INSERT INTO session_parts (
+                  id, session_id, message_id, kind, ordinal, text, artifact_id, run_id,
+                  metadata_json, redaction_state, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    part_id,
+                    session_id,
+                    message_id,
+                    kind_value.value,
+                    ordinal,
+                    sanitized_text,
+                    artifact_id,
+                    run_id,
+                    json.dumps(metadata, sort_keys=True, default=str),
+                    redaction_value.value,
+                    timestamp,
+                ),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.part.appended",
+            {"kind": kind_value.value, "ordinal": ordinal, "artifact_id": artifact_id, "run_id": run_id},
+            session_id=session_id,
+            message_id=message_id,
+            run_id=run_id,
+            artifact_id=artifact_id,
+            redaction_state=redaction_value,
+            created_at=timestamp,
+        )
+        return SessionPartRecord(
+            id=part_id,
+            session_id=session_id,
+            message_id=message_id,
+            kind=kind_value,
+            ordinal=ordinal,
+            text=sanitized_text,
+            artifact_id=artifact_id,
+            run_id=run_id,
+            metadata=metadata,
+            redaction_state=redaction_value,
+            created_at=parse_dt(timestamp),
+        )
+
+    def append_session_snapshot_ref(
+        self,
+        session_id: str,
+        message_id: str,
+        snapshot_id: str,
+        *,
+        snapshot_kind: str,
+        artifact_id: str | None = None,
+        run_id: str | None = None,
+        reversible: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionPartRecord:
+        snapshot_metadata = {
+            "snapshot_id": snapshot_id,
+            "snapshot_kind": snapshot_kind,
+            "reversible": reversible,
+            "revert_supported": False,
+            **(metadata or {}),
+        }
+        if artifact_id:
+            snapshot_metadata["artifact_id"] = artifact_id
+        part = self.append_session_part(
+            session_id,
+            message_id,
+            SessionPartKind.SNAPSHOT_REF,
+            artifact_id=artifact_id,
+            run_id=run_id,
+            metadata=snapshot_metadata,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.snapshot.recorded",
+            {
+                "snapshot_id": snapshot_id,
+                "snapshot_kind": snapshot_kind,
+                "message_id": message_id,
+                "artifact_id": artifact_id,
+                "run_id": run_id,
+                "reversible": reversible,
+                "revert_supported": False,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            message_id=message_id,
+            run_id=run_id,
+            artifact_id=artifact_id,
+            artifact_refs=[artifact_id] if artifact_id else [],
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        return part
+
+    def list_session_messages(self, session_id: str) -> list[SessionMessageRecord]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM session_messages WHERE session_id = ? ORDER BY created_at ASC, id ASC",
+                (session_id,),
+            ).fetchall()
+        return [
+            SessionMessageRecord(
+                id=row["id"],
+                session_id=row["session_id"],
+                parent_message_id=row["parent_message_id"],
+                role=SessionMessageRole(row["role"]),
+                agent_id=row["agent_id"],
+                run_id=row["run_id"],
+                objective_id=row["objective_id"],
+                mutation_reversibility=SessionMutationReversibility(row["mutation_reversibility"]),
+                content_preview=row["content_preview"],
+                created_at=parse_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def list_session_parts(self, session_id: str, message_id: str | None = None) -> list[SessionPartRecord]:
+        params: list[Any] = [session_id]
+        where = "session_id = ?"
+        if message_id is not None:
+            where += " AND message_id = ?"
+            params.append(message_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM session_parts WHERE {where} ORDER BY message_id ASC, ordinal ASC", params
+            ).fetchall()
+        return [
+            SessionPartRecord(
+                id=row["id"],
+                session_id=row["session_id"],
+                message_id=row["message_id"],
+                kind=SessionPartKind(row["kind"]),
+                ordinal=row["ordinal"],
+                text=row["text"],
+                artifact_id=row["artifact_id"],
+                run_id=row["run_id"],
+                metadata=json.loads(row["metadata_json"] or "{}"),
+                redaction_state=RedactionState(row["redaction_state"]),
+                created_at=parse_dt(row["created_at"]),
+            )
+            for row in rows
+        ]
+
+    def append_session_todo(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        status: str = "pending",
+        priority: int = 0,
+        source_message_id: str | None = None,
+    ) -> SessionTodoRecord:
+        todo_id = f"todo_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        status_value = _normalize_session_todo_status(status)
+        sanitized_content = str(sanitize_for_logging(content))[:16 * 1024]
+        with self.connect() as conn:
+            self._require_session(conn, session_id)
+            if source_message_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM session_messages WHERE id = ? AND session_id = ?",
+                    (source_message_id, session_id),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Session message not found: {source_message_id}")
+            conn.execute(
+                """
+                INSERT INTO session_todos (
+                  id, session_id, content, status, priority, source_message_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (todo_id, session_id, sanitized_content, status_value, priority, source_message_id, timestamp, timestamp),
+            )
+        message = self.append_session_message(
+            session_id,
+            SessionMessageRole.TOOL,
+            f"Todo {status_value}: {sanitized_content}",
+            parent_message_id=source_message_id,
+        )
+        self.append_session_part(
+            session_id,
+            message.id,
+            SessionPartKind.TODO_UPDATE,
+            text=sanitized_content,
+            metadata={"todo_id": todo_id, "status": status_value, "priority": priority},
+            redaction_state=RedactionState.REDACTED,
+        )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "todo.updated",
+            {"todo_id": todo_id, "status": status_value, "priority": priority, "summary": sanitized_content},
+            session_id=session_id,
+            message_id=message.id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return SessionTodoRecord(
+            id=todo_id,
+            session_id=session_id,
+            content=sanitized_content,
+            status=status_value,
+            priority=priority,
+            source_message_id=source_message_id,
+            created_at=parse_dt(timestamp),
+            updated_at=parse_dt(timestamp),
+        )
+
+    def list_session_todos(self, session_id: str, status: str | None = None) -> list[SessionTodoRecord]:
+        params: list[Any] = [session_id]
+        where = "session_id = ?"
+        if status is not None:
+            where += " AND status = ?"
+            params.append(_normalize_session_todo_status(status))
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM session_todos WHERE {where} ORDER BY priority DESC, created_at ASC, id ASC",
+                params,
+            ).fetchall()
+        return [self._row_to_session_todo(row) for row in rows]
+
+    def append_session_question(
+        self,
+        session_id: str,
+        question: str,
+        *,
+        choices: list[str] | None = None,
+        source_message_id: str | None = None,
+    ) -> SessionPartRecord:
+        sanitized_question = str(sanitize_for_logging(question))[:16 * 1024]
+        sanitized_choices = [str(sanitize_for_logging(choice))[:2048] for choice in choices or []]
+        message = self.append_session_message(
+            session_id,
+            SessionMessageRole.TOOL,
+            sanitized_question,
+            parent_message_id=source_message_id,
+        )
+        part = self.append_session_part(
+            session_id,
+            message.id,
+            SessionPartKind.QUESTION,
+            text=sanitized_question,
+            metadata={"choices": sanitized_choices},
+            redaction_state=RedactionState.REDACTED,
+        )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "question.requested",
+            {"summary": sanitized_question, "choices": sanitized_choices},
+            session_id=session_id,
+            message_id=message.id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return part
+
+    def request_session_permission(
+        self,
+        session_id: str,
+        *,
+        tool_id: str,
+        normalized_action: str,
+        normalized_target_pattern: str,
+        boundary_kind: SessionPermissionBoundaryKind | str,
+        risk: str,
+        run_id: str | None = None,
+        scope: SessionPermissionScope | str = SessionPermissionScope.ONCE,
+        source: SessionPermissionSource | str = SessionPermissionSource.POLICY,
+        expires_at: datetime | str | None = None,
+        policy_reasons: list[str] | None = None,
+        revocable: bool = True,
+    ) -> SessionPermissionRequest:
+        permission_id = f"perm_{uuid.uuid4().hex[:12]}"
+        requested_at = now_iso()
+        boundary_value = SessionPermissionBoundaryKind(
+            boundary_kind.value if isinstance(boundary_kind, SessionPermissionBoundaryKind) else boundary_kind
+        )
+        scope_value = SessionPermissionScope(scope.value if isinstance(scope, SessionPermissionScope) else scope)
+        source_value = SessionPermissionSource(source.value if isinstance(source, SessionPermissionSource) else source)
+        expiry = _permission_expiry_iso(expires_at, scope_value)
+        reasons = [str(sanitize_for_logging(reason)) for reason in policy_reasons or []]
+        action = str(sanitize_for_logging(normalized_action))
+        target = str(sanitize_for_logging(normalized_target_pattern))
+        clean_tool_id = str(sanitize_for_logging(tool_id))
+        clean_risk = str(sanitize_for_logging(risk))
+        with self.connect() as conn:
+            self._require_session(conn, session_id)
+            if run_id is not None:
+                self._require_run(conn, run_id)
+            conn.execute(
+                """
+                INSERT INTO session_permissions (
+                  id, session_id, run_id, tool_id, normalized_action, normalized_target_pattern,
+                  boundary_kind, risk, status, scope, source, revocable, policy_reasons_json,
+                  requested_at, resolved_at, expires_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    permission_id,
+                    session_id,
+                    run_id,
+                    clean_tool_id,
+                    action,
+                    target,
+                    boundary_value.value,
+                    clean_risk,
+                    SessionPermissionStatus.PENDING.value,
+                    scope_value.value,
+                    source_value.value,
+                    1 if revocable else 0,
+                    json.dumps(reasons, sort_keys=True, default=str),
+                    requested_at,
+                    None,
+                    expiry,
+                ),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "permission.requested",
+            {
+                "permission_id": permission_id,
+                "tool_id": clean_tool_id,
+                "normalized_action": action,
+                "normalized_target_pattern": target,
+                "boundary_kind": boundary_value.value,
+                "risk": clean_risk,
+                "scope": scope_value.value,
+                "source": source_value.value,
+                "expires_at": expiry,
+                "summary": f"{clean_tool_id} {action} {target}",
+                "policy_reasons": reasons,
+            },
+            session_id=session_id,
+            run_id=run_id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return self.get_session_permission(permission_id)
+
+    def resolve_session_permission(
+        self,
+        permission_id: str,
+        status: SessionPermissionStatus | str,
+        *,
+        source: SessionPermissionSource | str = SessionPermissionSource.USER,
+        reason: str | None = None,
+    ) -> SessionPermissionRequest:
+        status_value = SessionPermissionStatus(status.value if isinstance(status, SessionPermissionStatus) else status)
+        if status_value not in {SessionPermissionStatus.ALLOWED, SessionPermissionStatus.DENIED, SessionPermissionStatus.CANCELLED}:
+            raise ValueError(f"Unsupported permission resolution status: {status_value.value}")
+        source_value = SessionPermissionSource(source.value if isinstance(source, SessionPermissionSource) else source)
+        resolved_at = now_iso()
+        current = self.get_session_permission(permission_id)
+        if current.status != SessionPermissionStatus.PENDING:
+            raise ValueError(f"Permission request is not pending: {permission_id}")
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE session_permissions
+                SET status = ?, source = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                (status_value.value, source_value.value, resolved_at, permission_id),
+            )
+        resolved = self.get_session_permission(permission_id)
+        self.append_store_event(
+            EventStreamType.SESSION,
+            resolved.session_id,
+            "permission.resolved",
+            {
+                "permission_id": permission_id,
+                "status": status_value.value,
+                "source": source_value.value,
+                "reason": str(sanitize_for_logging(reason)) if reason else None,
+                "summary": f"{resolved.tool_id} {status_value.value}",
+            },
+            session_id=resolved.session_id,
+            run_id=resolved.run_id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return resolved
+
+    def get_session_permission(self, permission_id: str) -> SessionPermissionRequest:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM session_permissions WHERE id = ?", (permission_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Session permission not found: {permission_id}")
+        return self._row_to_session_permission(row)
+
+    def list_session_permissions(
+        self,
+        session_id: str,
+        status: SessionPermissionStatus | str | None = None,
+    ) -> list[SessionPermissionRequest]:
+        params: list[Any] = [session_id]
+        where = "session_id = ?"
+        if status is not None:
+            status_value = SessionPermissionStatus(status.value if isinstance(status, SessionPermissionStatus) else status)
+            where += " AND status = ?"
+            params.append(status_value.value)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM session_permissions WHERE {where} ORDER BY requested_at ASC, id ASC",
+                params,
+            ).fetchall()
+        return [self._row_to_session_permission(row) for row in rows]
 
     def attach_session_to_objective(self, session_id: str, objective_id: str) -> SessionSpec:
         self.get_session(session_id)
@@ -3288,6 +4151,11 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Run not found: {run_id}")
 
+    def _require_session(self, conn: sqlite3.Connection, session_id: str) -> None:
+        row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Session not found: {session_id}")
+
     def list_task_transitions(self, task_id: str) -> list[TaskTransitionRecord]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -3350,6 +4218,136 @@ class SQLiteStore:
             visibility=EventVisibility.USER_VISIBLE,
             redaction_state=RedactionState.REDACTED,
         )
+
+    def append_store_event(
+        self,
+        stream_type: EventStreamType | str,
+        stream_id: str,
+        kind: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        visibility: EventVisibility | str = EventVisibility.USER_VISIBLE,
+        redaction_state: RedactionState | str = RedactionState.REDACTED,
+        session_id: str | None = None,
+        message_id: str | None = None,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        artifact_id: str | None = None,
+        actor: dict[str, Any] | None = None,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+        artifact_refs: list[str] | None = None,
+        created_at: str | None = None,
+    ) -> StoredEventRecord:
+        stream_value = EventStreamType(stream_type.value if isinstance(stream_type, EventStreamType) else stream_type)
+        visibility_value = EventVisibility(visibility.value if isinstance(visibility, EventVisibility) else visibility)
+        redaction_value = RedactionState(redaction_state.value if isinstance(redaction_state, RedactionState) else redaction_state)
+        event_id = f"evt2_{uuid.uuid4().hex[:12]}"
+        timestamp = created_at or now_iso()
+        sanitized_payload = sanitize_for_logging(payload or {})
+        sanitized_actor = sanitize_for_logging(actor or {})
+        sanitized_artifact_refs = sanitize_for_logging(artifact_refs or [])
+        with self.connect() as conn:
+            seq = self._next_store_event_seq(conn, stream_value.value, stream_id)
+            conn.execute(
+                """
+                INSERT INTO event_store (
+                  id, stream_type, stream_id, seq, kind, visibility, redaction_state,
+                  session_id, message_id, run_id, task_id, artifact_id, actor_json,
+                  correlation_id, causation_id, payload_json, artifact_refs_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    stream_value.value,
+                    stream_id,
+                    seq,
+                    kind,
+                    visibility_value.value,
+                    redaction_value.value,
+                    session_id,
+                    message_id,
+                    run_id,
+                    task_id,
+                    artifact_id,
+                    json.dumps(sanitized_actor, sort_keys=True, default=str),
+                    correlation_id,
+                    causation_id,
+                    json.dumps(sanitized_payload, sort_keys=True, default=str),
+                    json.dumps(sanitized_artifact_refs, sort_keys=True, default=str),
+                    timestamp,
+                ),
+            )
+        return StoredEventRecord(
+            id=event_id,
+            stream_type=stream_value,
+            stream_id=stream_id,
+            seq=seq,
+            kind=kind,
+            visibility=visibility_value,
+            redaction_state=redaction_value,
+            session_id=session_id,
+            message_id=message_id,
+            run_id=run_id,
+            task_id=task_id,
+            artifact_id=artifact_id,
+            actor=sanitized_actor,
+            correlation_id=correlation_id,
+            causation_id=causation_id,
+            payload=sanitized_payload,
+            artifact_refs=sanitized_artifact_refs,
+            created_at=parse_dt(timestamp),
+        )
+
+    def _next_store_event_seq(self, conn: sqlite3.Connection, stream_type: str, stream_id: str) -> int:
+        row = conn.execute(
+            """
+            SELECT COALESCE(MAX(seq), 0) AS max_seq
+            FROM event_store
+            WHERE stream_type = ? AND stream_id = ?
+            """,
+            (stream_type, stream_id),
+        ).fetchone()
+        return int(row["max_seq"] or 0) + 1
+
+    def list_store_events(
+        self,
+        stream_type: EventStreamType | str,
+        stream_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> list[StoredEventRecord]:
+        stream_value = EventStreamType(stream_type.value if isinstance(stream_type, EventStreamType) else stream_type)
+        params: list[Any] = [stream_value.value, stream_id]
+        where = "stream_type = ? AND stream_id = ?"
+        if after_seq is not None:
+            where += " AND seq > ?"
+            params.append(after_seq)
+        sql = f"SELECT * FROM event_store WHERE {where} ORDER BY seq ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_stored_event(row) for row in rows]
+
+    def list_session_store_events(
+        self, session_id: str, *, after_seq: int | None = None, limit: int | None = None
+    ) -> list[StoredEventRecord]:
+        params: list[Any] = [session_id]
+        where = "session_id = ?"
+        if after_seq is not None:
+            where += " AND seq > ?"
+            params.append(after_seq)
+        sql = f"SELECT * FROM event_store WHERE {where} ORDER BY created_at ASC, id ASC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [self._row_to_stored_event(row) for row in rows]
 
     def append_run_event(
         self,
@@ -3462,6 +4460,24 @@ class SQLiteStore:
             visibility=visibility,
             redaction_state=redaction_state,
             payload=payload,
+        )
+        self.append_store_event(
+            EventStreamType.RUN,
+            run_id,
+            event_type,
+            {
+                "level": level,
+                "message": str(sanitize_for_logging(message)),
+                "payload": payload,
+                "legacy_event_id": event_id,
+            },
+            visibility=visibility,
+            redaction_state=redaction_state,
+            session_id=session_id,
+            run_id=run_id,
+            task_id=task_id,
+            correlation_id=trace_id,
+            created_at=timestamp,
         )
         append_jsonl(self.runs_dir / run_id / "events.jsonl", record.jsonl_envelope())
         return record
@@ -3585,6 +4601,29 @@ class SQLiteStore:
                 created_at=parse_dt(timestamp),
             ),
         )
+        if session_id is not None:
+            self.append_store_event(
+                EventStreamType.SESSION,
+                session_id,
+                RunEventType.ARTIFACT_REGISTERED.value,
+                {
+                    "artifact_id": artifact_id,
+                    "kind": kind,
+                    "path": str(path),
+                    "sha256": sha256,
+                    "size_bytes": size_bytes,
+                    "producer": producer,
+                    "redaction_state": redaction_state,
+                },
+                session_id=session_id,
+                run_id=run_id,
+                artifact_id=artifact_id,
+                artifact_refs=[artifact_id],
+                redaction_state=RedactionState.NOT_REQUIRED
+                if redaction_state == "not_required"
+                else RedactionState.REDACTED,
+                created_at=timestamp,
+            )
         self.write_run_manifest(run_id)
         return record
 
@@ -4129,17 +5168,99 @@ class SQLiteStore:
         return SessionSpec(
             id=row["id"],
             project_path=Path(row["project_path"]),
+            title=row["title"] if "title" in row.keys() else None,
+            parent_session_id=row["parent_session_id"] if "parent_session_id" in row.keys() else None,
+            forked_from_message_id=row["forked_from_message_id"] if "forked_from_message_id" in row.keys() else None,
             objective_id=row["objective_id"],
             active_task_id=row["active_task_id"],
             active_run_id=row["active_run_id"],
             workbench_id=row["workbench_id"],
             agent_id=row["agent_id"],
+            provider_id=row["provider_id"] if "provider_id" in row.keys() else None,
+            model_id=row["model_id"] if "model_id" in row.keys() else None,
+            model_variant=row["model_variant"] if "model_variant" in row.keys() else None,
+            raw_model_ref=row["raw_model_ref"] if "raw_model_ref" in row.keys() else None,
             mode=row["mode"],
             intent=row["intent"],
             status=SessionStatus(row["status"]),
+            summary=row["summary"] if "summary" in row.keys() else None,
+            token_input=row["token_input"] if "token_input" in row.keys() and row["token_input"] is not None else 0,
+            token_output=row["token_output"] if "token_output" in row.keys() and row["token_output"] is not None else 0,
+            token_reasoning=row["token_reasoning"]
+            if "token_reasoning" in row.keys() and row["token_reasoning"] is not None
+            else 0,
+            token_cache_read=row["token_cache_read"]
+            if "token_cache_read" in row.keys() and row["token_cache_read"] is not None
+            else 0,
+            token_cache_write=row["token_cache_write"]
+            if "token_cache_write" in row.keys() and row["token_cache_write"] is not None
+            else 0,
+            estimated_cost_usd=row["estimated_cost_usd"]
+            if "estimated_cost_usd" in row.keys() and row["estimated_cost_usd"]
+            else None,
+            ui_preferences=json.loads(row["ui_preferences_json"] or "{}")
+            if "ui_preferences_json" in row.keys()
+            else {},
             created_at=parse_dt(row["created_at"]),
             updated_at=parse_dt(row["updated_at"]),
+            archived_at=parse_dt(row["archived_at"])
+            if "archived_at" in row.keys() and row["archived_at"]
+            else None,
             metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_session_todo(self, row: sqlite3.Row) -> SessionTodoRecord:
+        return SessionTodoRecord(
+            id=row["id"],
+            session_id=row["session_id"],
+            content=row["content"],
+            status=row["status"],
+            priority=row["priority"],
+            source_message_id=row["source_message_id"],
+            created_at=parse_dt(row["created_at"]),
+            updated_at=parse_dt(row["updated_at"]),
+        )
+
+    def _row_to_session_permission(self, row: sqlite3.Row) -> SessionPermissionRequest:
+        return SessionPermissionRequest(
+            id=row["id"],
+            session_id=row["session_id"],
+            run_id=row["run_id"],
+            tool_id=row["tool_id"],
+            normalized_action=row["normalized_action"],
+            normalized_target_pattern=row["normalized_target_pattern"],
+            boundary_kind=SessionPermissionBoundaryKind(row["boundary_kind"]),
+            risk=row["risk"],
+            status=SessionPermissionStatus(row["status"]),
+            scope=SessionPermissionScope(row["scope"]),
+            source=SessionPermissionSource(row["source"]),
+            revocable=bool(row["revocable"]),
+            requested_at=parse_dt(row["requested_at"]),
+            resolved_at=parse_dt(row["resolved_at"]) if row["resolved_at"] else None,
+            expires_at=parse_dt(row["expires_at"]),
+            policy_reasons=json.loads(row["policy_reasons_json"] or "[]"),
+        )
+
+    def _row_to_stored_event(self, row: sqlite3.Row) -> StoredEventRecord:
+        return StoredEventRecord(
+            id=row["id"],
+            stream_type=EventStreamType(row["stream_type"]),
+            stream_id=row["stream_id"],
+            seq=row["seq"],
+            kind=row["kind"],
+            visibility=EventVisibility(row["visibility"]),
+            redaction_state=RedactionState(row["redaction_state"]),
+            session_id=row["session_id"],
+            message_id=row["message_id"],
+            run_id=row["run_id"],
+            task_id=row["task_id"],
+            artifact_id=row["artifact_id"],
+            actor=json.loads(row["actor_json"] or "{}"),
+            correlation_id=row["correlation_id"],
+            causation_id=row["causation_id"],
+            payload=json.loads(row["payload_json"] or "{}"),
+            artifact_refs=json.loads(row["artifact_refs_json"] or "[]"),
+            created_at=parse_dt(row["created_at"]),
         )
 
     def _row_to_task(self, row: sqlite3.Row) -> TaskRecord:

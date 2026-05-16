@@ -71,10 +71,13 @@ class TaskStatus(str, Enum):
 
 class SessionStatus(str, Enum):
     ACTIVE = "active"
+    IDLE = "idle"
+    RUNNING = "running"
     WAITING_APPROVAL = "waiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+    ARCHIVED = "archived"
 
 
 class ObjectiveStatus(str, Enum):
@@ -298,6 +301,79 @@ class RedactionState(str, Enum):
     REDACTED = "redacted"
     RESTRICTED = "restricted"
     BLOCKED = "blocked"
+
+
+class SessionPartKind(str, Enum):
+    TEXT = "text"
+    MODEL_DELTA = "model_delta"
+    REASONING_SUMMARY = "reasoning_summary"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    PERMISSION_REQUEST = "permission_request"
+    QUESTION = "question"
+    TODO_UPDATE = "todo_update"
+    DIFF = "diff"
+    TEST_OUTPUT = "test_output"
+    TERMINAL_OUTPUT = "terminal_output"
+    ARTIFACT_REF = "artifact_ref"
+    RUN_REF = "run_ref"
+    SNAPSHOT_REF = "snapshot_ref"
+    SUMMARY = "summary"
+
+
+class SessionMessageRole(str, Enum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+    SYSTEM = "system"
+
+
+class SessionMutationReversibility(str, Enum):
+    NONE = "none"
+    NOT_REVERSIBLE_ACTIVE_WORKSPACE = "not_reversible_active_workspace"
+    REVERSIBLE_SNAPSHOT = "reversible_snapshot"
+    REVERSIBLE_ISOLATED_WORKSPACE = "reversible_isolated_workspace"
+    UNKNOWN = "unknown"
+
+
+class SessionPermissionBoundaryKind(str, Enum):
+    LOCAL_ONLY = "local_only"
+    HOSTED_PROVIDER = "hosted_provider"
+    EXTERNAL_NETWORK = "external_network"
+    ACTIVE_REPO_WRITE = "active_repo_write"
+    SHELL = "shell"
+    MCP = "mcp"
+    PTY = "pty"
+
+
+class SessionPermissionScope(str, Enum):
+    ONCE = "once"
+    SESSION = "session"
+    PROJECT = "project"
+    PROFILE = "profile"
+
+
+class SessionPermissionSource(str, Enum):
+    USER = "user"
+    POLICY = "policy"
+    CONFIG = "config"
+    APPROVAL_PROFILE = "approval_profile"
+
+
+class SessionPermissionStatus(str, Enum):
+    PENDING = "pending"
+    ALLOWED = "allowed"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
+
+
+class EventStreamType(str, Enum):
+    SESSION = "session"
+    RUN = "run"
+    TASK = "task"
+    ARTIFACT = "artifact"
+    PERMISSION = "permission"
 
 
 class TokenUsageSnapshot(BaseModel):
@@ -630,17 +706,139 @@ class SessionSpec(BaseModel):
     schema_version: str = "harness.session/v1"
     id: str
     project_path: Path
+    title: str | None = None
+    parent_session_id: str | None = None
+    forked_from_message_id: str | None = None
     objective_id: str | None = None
     active_task_id: str | None = None
     active_run_id: str | None = None
     workbench_id: str | None = None
     agent_id: str | None = None
+    provider_id: str | None = None
+    model_id: str | None = None
+    model_variant: str | None = None
+    raw_model_ref: str | None = None
     mode: RunMode | None = None
     intent: str | None = None
     status: SessionStatus
+    summary: str | None = None
+    token_input: int = 0
+    token_output: int = 0
+    token_reasoning: int = 0
+    token_cache_read: int = 0
+    token_cache_write: int = 0
+    estimated_cost_usd: Decimal | None = None
+    ui_preferences: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     updated_at: datetime
+    archived_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionMessageRecord(BaseModel):
+    schema_version: str = "harness.session_message/v1"
+    id: str
+    session_id: str
+    parent_message_id: str | None = None
+    role: SessionMessageRole
+    agent_id: str | None = None
+    run_id: str | None = None
+    objective_id: str | None = None
+    mutation_reversibility: SessionMutationReversibility = SessionMutationReversibility.NONE
+    created_at: datetime
+    content_preview: str
+
+
+class SessionPartRecord(BaseModel):
+    schema_version: str = "harness.session_part/v1"
+    id: str
+    session_id: str
+    message_id: str
+    kind: SessionPartKind
+    ordinal: int
+    text: str | None = None
+    artifact_id: str | None = None
+    run_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    redaction_state: RedactionState = RedactionState.NOT_REQUIRED
+    created_at: datetime
+
+
+class SessionTodoRecord(BaseModel):
+    schema_version: str = "harness.session_todo/v1"
+    id: str
+    session_id: str
+    content: str
+    status: Literal["pending", "in_progress", "completed", "cancelled"]
+    priority: int = 0
+    source_message_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class SessionPermissionRequest(BaseModel):
+    schema_version: str = "harness.session_permission/v1"
+    id: str
+    session_id: str
+    run_id: str | None = None
+    tool_id: str
+    normalized_action: str
+    normalized_target_pattern: str
+    boundary_kind: SessionPermissionBoundaryKind
+    risk: str
+    status: SessionPermissionStatus
+    scope: SessionPermissionScope
+    source: SessionPermissionSource
+    revocable: bool = True
+    requested_at: datetime
+    resolved_at: datetime | None = None
+    expires_at: datetime
+    policy_reasons: list[str] = Field(default_factory=list)
+
+
+class StoredEventRecord(BaseModel):
+    schema_version: str = "harness.event/v2"
+    id: str
+    stream_type: EventStreamType
+    stream_id: str
+    seq: int
+    kind: str
+    visibility: EventVisibility = EventVisibility.USER_VISIBLE
+    redaction_state: RedactionState = RedactionState.REDACTED
+    session_id: str | None = None
+    message_id: str | None = None
+    run_id: str | None = None
+    task_id: str | None = None
+    artifact_id: str | None = None
+    actor: dict[str, Any] = Field(default_factory=dict)
+    correlation_id: str | None = None
+    causation_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    artifact_refs: list[str] = Field(default_factory=list)
+    created_at: datetime
+
+    def jsonl_envelope(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "event_id": self.id,
+            "stream_type": self.stream_type.value,
+            "stream_id": self.stream_id,
+            "seq": self.seq,
+            "kind": self.kind,
+            "occurred_at": self.created_at,
+            "session_id": self.session_id,
+            "message_id": self.message_id,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "artifact_id": self.artifact_id,
+            "actor": self.actor,
+            "correlation_id": self.correlation_id,
+            "causation_id": self.causation_id,
+            "visibility": self.visibility.value,
+            "redaction_state": self.redaction_state.value,
+            "payload": self.payload,
+            "artifact_refs": self.artifact_refs,
+        }
 
 
 class TaskRecord(BaseModel):

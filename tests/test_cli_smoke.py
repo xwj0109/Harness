@@ -6,6 +6,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from harness.approvals import ApprovalStore
@@ -36,6 +37,7 @@ from harness.tui import (
     render_palette_status,
     render_right_panel,
     render_right_panel_status,
+    render_slash_command_suggestions,
     render_view_status,
 )
 
@@ -590,6 +592,8 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
         "leases",
         "daemon",
         "runs",
+        "sessions",
+        "models",
         "commands",
         "guidance",
         "safety",
@@ -700,6 +704,10 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
         ],
     )
     assert created_run.exit_code == 0, created_run.output
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="TUI session", agent_id="tui_agent", raw_model_ref="codex/gpt-test")
+    message = store.append_session_message(session.id, "user", "Inspect the active session")
+    store.append_session_part(session.id, message.id, "text", text="Inspect the active session")
 
     dashboard = build_tui_dashboard(tmp_path)
     panes = build_tui_panes(dashboard)
@@ -710,6 +718,7 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["summary"]["tasks_total"] == 1
     assert dashboard["summary"]["active_leases"] == 1
     assert dashboard["summary"]["recent_runs"] == 1
+    assert dashboard["summary"]["recent_sessions"] == 1
     assert dashboard["agents"][0]["agent_id"] == "tui_agent"
     assert dashboard["agents"][0]["workbench_id"] == "quant"
     assert dashboard["tasks"][0]["title"] == "tui task"
@@ -722,6 +731,17 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["daemon"]["latest_events"]
     assert dashboard["task_status_counts"]["leased"] == 1
     assert dashboard["recent_runs"][0]["task_type"] == "phase_1a_test"
+    assert dashboard["recent_sessions"][0]["id"] == session.id
+    assert dashboard["recent_sessions"][0]["title"] == "TUI session"
+    assert dashboard["recent_sessions"][0]["agent_id"] == "tui_agent"
+    assert dashboard["model_catalog"]["no_hidden_fallback"] is True
+    assert dashboard["model_catalog"]["active_model"]["raw_model_ref"] == "codex/gpt-test"
+    assert dashboard["model_catalog"]["active_model"]["known_catalog_entry"] is False
+    assert any(model["raw_model_ref"] == "codex_cli/gpt-5.5" for model in dashboard["model_catalog"]["models"])
+    assert dashboard["active_session"]["id"] == session.id
+    assert dashboard["active_session"]["raw_model_ref"] == "codex/gpt-test"
+    assert any("Message appended" in line for line in dashboard["active_session"]["timeline"])
+    assert any("Inspect the active session" in line for line in dashboard["active_session"]["transcript"])
     assert [pane["id"] for pane in panes] == [
         "overview",
         "agents",
@@ -729,6 +749,8 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
         "leases",
         "daemon",
         "runs",
+        "sessions",
+        "models",
         "commands",
         "guidance",
         "safety",
@@ -743,6 +765,19 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "Tasks: 1" in rendered
     assert "Active leases: 1" in rendered
     assert "Recent Runs" in rendered
+    assert "Recent Sessions" in rendered
+    assert "TUI session" in rendered
+    assert "Models" in rendered
+    assert "No hidden fallback: True" in rendered
+    assert "codex_cli/gpt-5.5" in rendered
+    assert "Timeline:" in rendered
+    assert "Transcript:" in rendered
+    assert "Inspect the active session" in rendered
+    right_panel = render_right_panel(build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard"))
+    assert "Timeline:" in right_panel
+    assert "Transcript: user " in right_panel
+    assert "Known model: False" in right_panel
+    assert "Fallback: explicit failure only" in right_panel
     assert "harness daemon status --project" in rendered
     serialized = json.dumps(dashboard)
     assert "api_key" not in serialized
@@ -868,12 +903,14 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert group_ids == [
         "orientation",
         "agent_authoring",
+        "native_agents",
         "project_agents",
         "built_in_specs",
         "objectives_tasks",
         "daemon_control",
         "registered_adapters",
         "runtime_evidence",
+        "sessions",
         "packaging_smoke",
     ]
     assert len(entry_ids) == len(set(entry_ids))
@@ -884,6 +921,8 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     daemon_entries = filter_command_palette(palette, "daemon")
     read_only_entries = filter_command_palette(palette, "execute-read-only")
     planning_entries = filter_command_palette(palette, "repo_planning")
+    build_entries = filter_command_palette(palette, "build agent")
+    plan_agent_entries = filter_command_palette(palette, "plan agent")
     adapter_entries = filter_command_palette(palette, "adapter")
     packaging_entries = filter_command_palette(palette, "wheel")
     missing_entries = filter_command_palette(palette, "does-not-exist")
@@ -893,6 +932,8 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert any(entry["id"] == "daemon_control.run_once" for entry in daemon_entries["entries"])
     assert [entry["id"] for entry in read_only_entries["entries"]] == ["registered_adapters.execute_read_only"]
     assert any(entry["id"] == "objectives_tasks.add_repo_planning_task" for entry in planning_entries["entries"])
+    assert any(entry["id"] == "native_agents.build" for entry in build_entries["entries"])
+    assert any(entry["id"] == "native_agents.plan" for entry in plan_agent_entries["entries"])
     assert any(entry["id"] == "registered_adapters.execute" for entry in adapter_entries["entries"])
     assert [entry["id"] for entry in packaging_entries["entries"]] == ["packaging_smoke.wheel"]
     assert missing_entries["entries"] == []
@@ -945,6 +986,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["schema_version"] == "harness.tui_view/v1"
     assert [section["id"] for section in view["sections"]] == [
         "project_overview",
+        "sessions",
         "queue_daemon",
         "agents_specs",
         "runtime_evidence",
@@ -952,10 +994,11 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "safety",
     ]
     assert view["sections"][0]["pane_ids"] == ["overview", "guidance", "commands"]
-    assert view["sections"][1]["pane_ids"] == ["tasks", "leases", "daemon"]
-    assert view["sections"][4]["pane_ids"][0] == "command_palette"
-    assert view["sections"][4]["pane_ids"][-1] == "command_palette_selected"
-    assert view["pane_order"][:6] == ["overview", "guidance", "commands", "tasks", "leases", "daemon"]
+    assert view["sections"][1]["pane_ids"] == ["sessions"]
+    assert view["sections"][2]["pane_ids"] == ["tasks", "leases", "daemon"]
+    assert view["sections"][5]["pane_ids"][0] == "command_palette"
+    assert view["sections"][5]["pane_ids"][-1] == "command_palette_selected"
+    assert view["pane_order"][:7] == ["overview", "guidance", "commands", "sessions", "tasks", "leases", "daemon"]
     assert view["pane_order"][-1] == "safety"
     assert view["empty_state"] is None
     assert view["focus_mode"] == "dashboard"
@@ -964,7 +1007,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["search"]["dashboard_panes"] == len(panes)
     assert view["search"]["palette_matches"] == len(palette["entries"])
     assert render_view_status(view).startswith(
-        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 6 | Panes:"
+        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 7 | Panes:"
     )
     assert f"Palette commands: {len(palette['entries'])}" in render_view_status(view)
     assert {hint["key"] for hint in view["navigation_hints"]} == {
@@ -1077,6 +1120,7 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
         "assistant",
         "action",
         "project",
+        "sessions",
         "now",
         "queue",
         "recent",
@@ -1090,6 +1134,7 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
     assert "Model: codex_cli" in rendered
     assert "Side effects: action contracts" in rendered
     assert "No pending action." in rendered
+    assert "No sessions yet." in rendered
     assert "/init" in rendered
     assert "summarize this repo" in rendered
     assert "State:" not in rendered
@@ -1263,21 +1308,68 @@ def test_tui_palette_focus_filters_palette_without_hiding_dashboard(tmp_path) ->
 
 def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) -> None:
     pytest.importorskip("textual")
-    from textual.widgets import Input
+    from textual.widgets import Input, Static
 
     async def run_pilot() -> None:
         app = create_harness_app(tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:
             prompt = app.query_one("#prompt", Input)
+            slash_status = app.query_one("#slash-status", Static)
             assert app.use_command_palette is False
 
             await pilot.press("/")
             await pilot.pause()
             assert prompt.value == "/"
+            assert "/help" in str(slash_status.content)
+            assert "Print the MVP agent command sequence" in str(slash_status.content)
+            assert "[bold blue]/help" in str(slash_status.content)
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert prompt.value == "/"
+            assert "[bold blue]/home" in str(slash_status.content)
+
+            await pilot.press("up")
+            await pilot.pause()
+            assert prompt.value == "/"
+            assert "[bold blue]/help" in str(slash_status.content)
+            assert app._request_from_prompt_submission("/") == "/help"
+
+            for _ in range(8):
+                await pilot.press("down")
+            await pilot.pause()
+            assert prompt.value == "/"
+            assert "... 1 previous. Keep using arrows to navigate." in str(slash_status.content)
+            assert "[bold blue]/agent" in str(slash_status.content)
+
+            await pilot.press("e", "x", "e")
+            await pilot.pause()
+            assert prompt.value == "/exe"
+            assert "/execute" in str(slash_status.content)
+            assert "/home" not in str(slash_status.content)
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert prompt.value == "/exe"
+            assert "[bold blue]/execute" in str(slash_status.content)
+            assert app._request_from_prompt_submission("/exe") == "/execute"
+            message_count = len(app._messages)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert prompt.value == "/execute"
+            assert len(app._messages) == message_count
+
+            await pilot.press("enter")
+            await pilot.pause()
+            rendered = "\n".join(render_chat_message(message) for message in app._messages)
+            assert "/execute" in rendered
+            assert len(app._messages) > message_count
 
             await pilot.press("escape")
             await pilot.pause()
             assert prompt.value == ""
+            assert str(slash_status.content) == ""
 
             assert app._section_cursor_index == 0
             await pilot.press("tab")
@@ -1413,6 +1505,28 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
     assert "subprocess" not in serialized
+
+
+def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
+    slash_commands = build_slash_commands()
+
+    all_suggestions = render_slash_command_suggestions(slash_commands, "/")
+    execute_suggestions = render_slash_command_suggestions(slash_commands, "/execute")
+    plain_text = render_slash_command_suggestions(slash_commands, "execute")
+    missing = render_slash_command_suggestions(slash_commands, "/does-not-exist")
+    selected_second = render_slash_command_suggestions(slash_commands, "/", selected_index=1)
+    selected_after_first_page = render_slash_command_suggestions(slash_commands, "/", selected_index=8)
+
+    assert "[bold blue]/help" in all_suggestions
+    assert "[bold cyan]" not in all_suggestions
+    assert "[bold blue]/home" in selected_second
+    assert "... 1 previous. Keep using arrows to navigate." in selected_after_first_page
+    assert "[bold blue]/agent" in selected_after_first_page
+    assert "Print the MVP agent command sequence without running it." in all_suggestions
+    assert "/execute-read-only" in execute_suggestions
+    assert "/home" not in execute_suggestions
+    assert plain_text == ""
+    assert "No slash commands match /does-not-exist" in missing
 
 
 def test_tui_chat_slash_command_responses_are_templates_only() -> None:
@@ -2054,6 +2168,411 @@ def test_cli_tools_unknown_id_returns_stable_json_error(tmp_path) -> None:
         "ok": False,
         "errors": ["Tool capability not found: generic_shell"],
     }
+
+
+def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["mcp"] = {
+        "enabled": True,
+        "servers": {
+            "local_docs": {
+                "kind": "local",
+                "enabled": True,
+                "command": ["mcp-docs", "--stdio"],
+                "description": "Local docs server",
+            },
+            "remote_tracker": {
+                "kind": "remote",
+                "enabled": True,
+                "url": "https://example.com/mcp",
+                "description": "Remote tracker",
+            },
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    listed = runner.invoke(app, ["mcp", "list", "--project", str(tmp_path), "--output", "json"])
+    resources = runner.invoke(app, ["mcp", "resources", "--project", str(tmp_path), "--output", "json"])
+    connect = runner.invoke(app, ["mcp", "connect", "remote_tracker", "--project", str(tmp_path), "--output", "json"])
+
+    assert listed.exit_code == 0, listed.output
+    list_payload = json.loads(listed.output)
+    assert list_payload["schema_version"] == "harness.mcp_status/v1"
+    assert list_payload["enabled"] is True
+    assert list_payload["connected"] is False
+    assert list_payload["process_started"] is False
+    assert list_payload["network_called"] is False
+    assert list_payload["tool_registration_enabled"] is False
+    assert [server["name"] for server in list_payload["servers"]] == ["local_docs", "remote_tracker"]
+    assert list_payload["servers"][1]["requires_network"] is True
+
+    assert resources.exit_code == 0, resources.output
+    resources_payload = json.loads(resources.output)
+    assert resources_payload["schema_version"] == "harness.mcp_resources/v1"
+    assert resources_payload["resources"] == []
+    assert resources_payload["cached_only"] is True
+    assert resources_payload["network_called"] is False
+    assert resources_payload["process_started"] is False
+
+    assert connect.exit_code == 1
+    connect_payload = json.loads(connect.output)
+    assert connect_payload["schema_version"] == "harness.mcp_action/v1"
+    assert connect_payload["ok"] is False
+    assert connect_payload["action"] == "connect"
+    assert connect_payload["server"] == "remote_tracker"
+    assert connect_payload["process_started"] is False
+    assert connect_payload["network_called"] is False
+    assert connect_payload["tool_registration_enabled"] is False
+    assert connect_payload["permission_granting"] is False
+
+
+def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "plugins" / "reviewer").mkdir(parents=True)
+    skill_dir = tmp_path / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Review\n\nDo not load this body in diagnostics.\n", encoding="utf-8")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["plugins"] = {
+        "enabled": True,
+        "project": {
+            "reviewer": {
+                "enabled": True,
+                "path": "plugins/reviewer",
+                "version": "0.1.0",
+                "description": "Project review plugin",
+            }
+        },
+    }
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {
+            "review": {
+                "enabled": True,
+                "path": "skills/review",
+                "description": "Review skill",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    plugins = runner.invoke(app, ["plugins", "list", "--project", str(tmp_path), "--output", "json"])
+    skills = runner.invoke(app, ["skills", "list", "--project", str(tmp_path), "--output", "json"])
+    install = runner.invoke(app, ["plugins", "install", "reviewer", "--project", str(tmp_path), "--output", "json"])
+    load = runner.invoke(app, ["skills", "load", "review", "--project", str(tmp_path), "--output", "json"])
+
+    assert plugins.exit_code == 0, plugins.output
+    plugins_payload = json.loads(plugins.output)
+    assert plugins_payload["schema_version"] == "harness.plugins/v1"
+    assert plugins_payload["runtime_loaded"] is False
+    assert plugins_payload["tools_registered"] is False
+    project_plugins = [plugin for plugin in plugins_payload["plugins"] if plugin["scope"] == "project"]
+    assert len(project_plugins) == 1
+    assert project_plugins[0]["name"] == "reviewer"
+    assert project_plugins[0]["origin"] == "config"
+    assert project_plugins[0]["runtime_loaded"] is False
+    assert project_plugins[0]["tools_registered"] is False
+
+    assert skills.exit_code == 0, skills.output
+    skills_payload = json.loads(skills.output)
+    assert skills_payload["schema_version"] == "harness.skills/v1"
+    assert skills_payload["runtime_loaded"] is False
+    assert skills_payload["tool_registered"] is False
+    project_skills = [skill for skill in skills_payload["skills"] if skill["scope"] == "project"]
+    assert len(project_skills) == 1
+    assert project_skills[0]["name"] == "review"
+    assert project_skills[0]["skill_file_exists"] is True
+    assert "Do not load this body" not in skills.output
+
+    assert install.exit_code == 1
+    install_payload = json.loads(install.output)
+    assert install_payload["schema_version"] == "harness.plugin_action/v1"
+    assert install_payload["filesystem_modified"] is False
+    assert install_payload["network_called"] is False
+    assert install_payload["runtime_loaded"] is False
+    assert install_payload["tools_registered"] is False
+    assert install_payload["permission_granting"] is False
+
+    assert load.exit_code == 1
+    load_payload = json.loads(load.output)
+    assert load_payload["schema_version"] == "harness.skill_action/v1"
+    assert load_payload["skill_body_loaded"] is False
+    assert load_payload["runtime_loaded"] is False
+    assert load_payload["tool_registered"] is False
+    assert load_payload["permission_granting"] is False
+
+
+def test_cli_web_tools_project_policy_and_fail_closed_execution(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": True,
+        "search_enabled": True,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    tools = runner.invoke(app, ["web", "tools", "--project", str(tmp_path), "--output", "json"])
+    fetch = runner.invoke(
+        app,
+        ["web", "fetch", "https://docs.example.com/page", "--project", str(tmp_path), "--output", "json"],
+    )
+    search = runner.invoke(app, ["web", "search", "harness docs", "--project", str(tmp_path), "--output", "json"])
+
+    assert tools.exit_code == 0, tools.output
+    tools_payload = json.loads(tools.output)
+    assert tools_payload["schema_version"] == "harness.web_tools/v1"
+    assert tools_payload["enabled"] is True
+    assert tools_payload["network_called"] is False
+    assert tools_payload["execution_supported"] is False
+    assert tools_payload["permission_granting"] is False
+    by_id = {tool["id"]: tool for tool in tools_payload["tools"]}
+    assert by_id["web-fetch"]["decision"] == "approval_required"
+    assert by_id["web-search"]["decision"] == "approval_required"
+    assert by_id["web-fetch"]["allowed_domains"] == ["docs.example.com"]
+
+    assert fetch.exit_code == 1
+    fetch_payload = json.loads(fetch.output)
+    assert fetch_payload["schema_version"] == "harness.web_tool_action/v1"
+    assert fetch_payload["tool"] == "web-fetch"
+    assert fetch_payload["decision"] == "approval_required"
+    assert fetch_payload["approval_required"] is True
+    assert fetch_payload["network_called"] is False
+    assert fetch_payload["execution_started"] is False
+    assert fetch_payload["permission_granting"] is False
+
+    assert search.exit_code == 1
+    search_payload = json.loads(search.output)
+    assert search_payload["schema_version"] == "harness.web_tool_action/v1"
+    assert search_payload["tool"] == "web-search"
+    assert search_payload["decision"] == "approval_required"
+    assert search_payload["network_called"] is False
+    assert search_payload["execution_started"] is False
+    assert search_payload["permission_granting"] is False
+
+
+def test_cli_worktrees_list_and_lifecycle_fail_closed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("print('one')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
+
+    listed = runner.invoke(app, ["worktrees", "list", "--project", str(tmp_path), "--output", "json"])
+    created = runner.invoke(app, ["worktrees", "create", "candidate", "--project", str(tmp_path), "--output", "json"])
+
+    assert listed.exit_code == 0, listed.output
+    list_payload = json.loads(listed.output)
+    assert list_payload["schema_version"] == "harness.worktrees/v1"
+    assert list_payload["available"] is True
+    assert list_payload["mutation_supported"] is False
+    assert list_payload["permission_granting"] is False
+    assert len(list_payload["worktrees"]) == 1
+    assert list_payload["worktrees"][0]["path"] == str(tmp_path)
+    assert list_payload["worktrees"][0]["is_current"] is True
+
+    assert created.exit_code == 1
+    create_payload = json.loads(created.output)
+    assert create_payload["schema_version"] == "harness.worktree_action/v1"
+    assert create_payload["action"] == "create"
+    assert create_payload["git_mutation_started"] is False
+    assert create_payload["filesystem_modified"] is False
+    assert create_payload["permission_granting"] is False
+    assert not (tmp_path / "candidate").exists()
+
+
+def test_cli_session_diff_lists_artifact_preview_without_mutation(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Diff session")
+    run = store.create_run("Diff run", "codex_isolated_edit", session_id=session.id)
+    diff_path = store.runs_dir / run.id / "isolated_unified_diff.patch"
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_text("--- a/app.py\n+++ b/app.py\n@@\n-old\n+new\n", encoding="utf-8")
+    artifact = store.register_artifact(run.id, "isolated_unified_diff", diff_path, session_id=session.id)
+
+    result = runner.invoke(app, ["session", "diff", session.id, "--project", str(tmp_path), "--output", "json"])
+    text = runner.invoke(app, ["session", "diff", session.id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.session_diffs/v1"
+    assert payload["session_id"] == session.id
+    assert payload["revert_supported"] is False
+    assert payload["unrevert_supported"] is False
+    assert payload["selected_hunk_apply_supported"] is False
+    assert payload["mutation_started"] is False
+    assert payload["permission_granting"] is False
+    assert payload["diffs"][0]["id"] == artifact.id
+    assert "+new" in payload["diffs"][0]["preview"]
+
+    assert text.exit_code == 0
+    assert "Diff artifact:" in text.output
+    assert "+new" in text.output
+    assert "Revert, unrevert, and selected hunk apply are not enabled" in text.output
+
+
+def test_cli_session_revert_unrevert_and_apply_hunk_fail_closed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Mutation session")
+
+    revert = runner.invoke(
+        app,
+        ["session", "revert", session.id, "--message", "msg_123", "--project", str(tmp_path), "--output", "json"],
+    )
+    unrevert = runner.invoke(
+        app,
+        ["session", "unrevert", session.id, "--artifact", "art_123", "--project", str(tmp_path), "--output", "json"],
+    )
+    apply_hunk = runner.invoke(
+        app,
+        [
+            "session",
+            "apply-hunk",
+            session.id,
+            "--artifact",
+            "art_123",
+            "--hunk",
+            "hunk_1",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    for result, action in [(revert, "revert"), (unrevert, "unrevert"), (apply_hunk, "apply-hunk")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.session_mutation_action/v1"
+        assert payload["ok"] is False
+        assert payload["action"] == action
+        assert payload["mutation_started"] is False
+        assert payload["git_mutation_started"] is False
+        assert payload["filesystem_modified"] is False
+        assert payload["permission_granting"] is False
+    assert json.loads(apply_hunk.output)["hunk_id"] == "hunk_1"
+
+
+def test_cli_pty_projection_and_lifecycle_fail_closed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    listed = runner.invoke(app, ["pty", "list", "--project", str(tmp_path), "--output", "json"])
+    shells = runner.invoke(app, ["pty", "shells", "--project", str(tmp_path), "--output", "json"])
+    created = runner.invoke(
+        app,
+        ["pty", "create", "--command", "bash", "--project", str(tmp_path), "--output", "json"],
+    )
+    written = runner.invoke(
+        app,
+        ["pty", "write", "pty_123", "--data", "echo hello", "--project", str(tmp_path), "--output", "json"],
+    )
+    resized = runner.invoke(
+        app,
+        ["pty", "resize", "pty_123", "--cols", "100", "--rows", "30", "--project", str(tmp_path), "--output", "json"],
+    )
+    closed = runner.invoke(app, ["pty", "close", "pty_123", "--project", str(tmp_path), "--output", "json"])
+
+    assert listed.exit_code == 0, listed.output
+    listed_payload = json.loads(listed.output)
+    assert listed_payload["schema_version"] == "harness.pty_sessions/v1"
+    assert listed_payload["sessions"] == []
+    assert listed_payload["process_started"] is False
+    assert listed_payload["permission_granting"] is False
+
+    assert shells.exit_code == 0, shells.output
+    shells_payload = json.loads(shells.output)
+    assert shells_payload["schema_version"] == "harness.pty_shells/v1"
+    assert shells_payload["probed"] is False
+    assert shells_payload["process_started"] is False
+    assert all(shell["acceptable"] is False for shell in shells_payload["shells"])
+
+    for result, action in [(created, "create"), (written, "write"), (resized, "resize"), (closed, "close")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.pty_action/v1"
+        assert payload["ok"] is False
+        assert payload["action"] == action
+        assert payload["process_started"] is False
+        assert payload["input_written"] is False
+        assert payload["terminal_resized"] is False
+        assert payload["terminal_closed"] is False
+        assert payload["websocket_token_issued"] is False
+        assert payload["permission_granting"] is False
+    assert json.loads(written.output)["pty_id"] == "pty_123"
+
+
+def test_cli_pr_checkout_and_run_fail_closed_without_network_or_git_mutation(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    checkout = runner.invoke(
+        app,
+        ["pr", "checkout", "https://github.com/example/repo/pull/42", "--project", str(tmp_path), "--output", "json"],
+    )
+    run = runner.invoke(
+        app,
+        ["pr", "run", "42", "--adapter", "repo_planning", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    for result, action in [(checkout, "checkout"), (run, "run")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.pr_action/v1"
+        assert payload["ok"] is False
+        assert payload["action"] == action
+        assert payload["network_called"] is False
+        assert payload["git_mutation_started"] is False
+        assert payload["worktree_created"] is False
+        assert payload["checkout_started"] is False
+        assert payload["adapter_started"] is False
+        assert payload["permission_granting"] is False
+    assert json.loads(checkout.output)["pr"] == "https://github.com/example/repo/pull/42"
+    assert json.loads(run.output)["adapter"] == "repo_planning"
+
+
+def test_cli_distribution_status_version_check_and_actions_are_safe(tmp_path) -> None:
+    status = runner.invoke(app, ["distribution", "status", "--project", str(tmp_path), "--output", "json"])
+    version_check = runner.invoke(app, ["distribution", "version-check", "--output", "json"])
+    install = runner.invoke(app, ["distribution", "install", "--target", "user", "--output", "json"])
+    upgrade = runner.invoke(app, ["distribution", "upgrade", "--version", "0.2.0", "--output", "json"])
+    uninstall = runner.invoke(app, ["distribution", "uninstall", "--confirm", "harness", "--output", "json"])
+
+    assert status.exit_code == 0
+    status_payload = json.loads(status.output)
+    assert status_payload["schema_version"] == "harness.distribution_status/v1"
+    assert status_payload["packaging_path"] == "python_wheel_first"
+    assert status_payload["network_called"] is False
+    assert status_payload["filesystem_modified"] is False
+    assert status_payload["subprocess_started"] is False
+    assert status_payload["permission_granting"] is False
+    assert version_check.exit_code == 0
+    version_payload = json.loads(version_check.output)
+    assert version_payload["schema_version"] == "harness.version_check/v1"
+    assert version_payload["latest_version"] is None
+    assert version_payload["update_available"] is None
+    assert version_payload["network_called"] is False
+    assert version_payload["subprocess_started"] is False
+    assert version_payload["permission_granting"] is False
+    for result, action in [(install, "install"), (upgrade, "upgrade"), (uninstall, "uninstall")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.distribution_action/v1"
+        assert payload["ok"] is False
+        assert payload["action"] == action
+        assert payload["network_called"] is False
+        assert payload["filesystem_modified"] is False
+        assert payload["subprocess_started"] is False
+        assert payload["package_manager_started"] is False
+        assert payload["permission_granting"] is False
 
 
 def test_cli_runs_default_output_remains_text(tmp_path) -> None:
