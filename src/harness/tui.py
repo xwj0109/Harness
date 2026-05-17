@@ -12,6 +12,7 @@ from rich.markup import escape
 
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
+    {"id": "ui_controls", "title": "UI Controls"},
     {"id": "agent_authoring", "title": "Agent Authoring"},
     {"id": "native_agents", "title": "Native Agents"},
     {"id": "project_agents", "title": "Project Agents"},
@@ -42,6 +43,60 @@ COMMAND_PALETTE_ENTRIES = [
         "description": "Print the MVP agent command sequence without running it.",
         "mutates_when_run": False,
         "safety_note": "Command composition only.",
+    },
+    {
+        "id": "ui_controls.clear_search",
+        "group_id": "ui_controls",
+        "title": "Clear search",
+        "command": "ui:clear-search",
+        "description": "Clear the active TUI search/composer text without submitting a prompt.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.palette_focus",
+        "group_id": "ui_controls",
+        "title": "Focus command palette",
+        "command": "ui:focus-palette",
+        "description": "Switch the side panel into command palette focus.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.dashboard_focus",
+        "group_id": "ui_controls",
+        "title": "Focus dashboard",
+        "command": "ui:focus-dashboard",
+        "description": "Switch the side panel back to dashboard focus.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.toggle_section",
+        "group_id": "ui_controls",
+        "title": "Collapse or expand current section",
+        "command": "ui:toggle-section",
+        "description": "Toggle the currently selected dashboard section.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.expand_all",
+        "group_id": "ui_controls",
+        "title": "Expand all sections",
+        "command": "ui:expand-all",
+        "description": "Expand every dashboard section.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.settings",
+        "group_id": "ui_controls",
+        "title": "Show TUI settings",
+        "command": "ui:settings",
+        "description": "Focus the read-only TUI settings catalog.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only; preferences are not persisted from the palette.",
     },
     {
         "id": "agent_authoring.scaffold",
@@ -80,6 +135,15 @@ COMMAND_PALETTE_ENTRIES = [
         "safety_note": "Queues isolated edit metadata; active-workspace direct Codex requires --mode direct.",
     },
     {
+        "id": "native_agents.select_build",
+        "group_id": "native_agents",
+        "title": "Select build agent",
+        "command": "ui:select-agent build",
+        "description": "Set the TUI composer agent mode to build without running a task.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only; submitting work still uses Harness CLI/session policy.",
+    },
+    {
         "id": "native_agents.plan",
         "group_id": "native_agents",
         "title": "Use plan agent",
@@ -87,6 +151,15 @@ COMMAND_PALETTE_ENTRIES = [
         "description": "Create a read-only session-local planning task.",
         "mutates_when_run": True,
         "safety_note": "Read/glob/grep/artifact-read only; active repo writes are forbidden.",
+    },
+    {
+        "id": "native_agents.select_plan",
+        "group_id": "native_agents",
+        "title": "Select plan agent",
+        "command": "ui:select-agent plan",
+        "description": "Set the TUI composer agent mode to plan without running a task.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only; plan submissions remain read/glob/grep/artifact-read bounded.",
     },
     {
         "id": "native_agents.general",
@@ -330,7 +403,12 @@ TUI_VIEW_SECTIONS = [
     {
         "id": "runtime_evidence",
         "title": "Runtime Evidence",
-        "pane_ids": ["runs"],
+        "pane_ids": ["runs", "terminal"],
+    },
+    {
+        "id": "settings",
+        "title": "Settings",
+        "pane_ids": ["settings"],
     },
     {
         "id": "command_palette",
@@ -338,6 +416,7 @@ TUI_VIEW_SECTIONS = [
         "pane_ids": [
             "command_palette",
             "command_palette_orientation",
+            "command_palette_ui_controls",
             "command_palette_agent_authoring",
             "command_palette_project_agents",
             "command_palette_built_in_specs",
@@ -367,7 +446,7 @@ TUI_NAVIGATION_HINTS = [
     {"key": "shift+c", "label": "Expand"},
     {"key": "ctrl+q", "label": "Quit"},
     {"key": "enter", "label": "Send"},
-    {"key": "copy-only", "label": "Read-only context"},
+    {"key": "safe-actions", "label": "UI-only actions"},
 ]
 
 TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
@@ -388,6 +467,11 @@ RIGHT_PANEL_SECTION_IDS = (
 SLASH_COMMAND_ALIASES = {
     "help": "orientation.quickstart_agent",
     "home": "orientation.home",
+    "clear": "ui_controls.clear_search",
+    "palette": "ui_controls.palette_focus",
+    "dashboard": "ui_controls.dashboard_focus",
+    "toggle-section": "ui_controls.toggle_section",
+    "expand-all": "ui_controls.expand_all",
     "quickstart": "orientation.quickstart_agent",
     "scaffold": "agent_authoring.scaffold",
     "validate": "agent_authoring.validate",
@@ -408,6 +492,7 @@ SLASH_COMMAND_ALIASES = {
     "runs": "runtime_evidence.runs",
     "sessions": "sessions.list",
     "session": "sessions.list",
+    "settings": "ui_controls.settings",
     "continue-session": "sessions.continue_last",
     "tail-session": "sessions.tail",
     "transcript-session": "sessions.transcript",
@@ -507,6 +592,28 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
             ]
             or ["none"],
         },
+        *(
+            [
+                {
+                    "id": "terminal",
+                    "title": "Terminal Tabs",
+                    "lines": _terminal_tab_pane_rows(dashboard),
+                }
+            ]
+            if (dashboard.get("terminal_tabs") or {}).get("tab_count", 0)
+            else []
+        ),
+        {
+            "id": "settings",
+            "title": "TUI Settings",
+            "lines": _tui_settings_pane_rows(
+                build_tui_settings_catalog(
+                    (dashboard.get("active_session") or {}).get("ui_preferences") or {},
+                    source="active_session" if dashboard.get("active_session") else "defaults",
+                    session_id=(dashboard.get("active_session") or {}).get("id"),
+                ),
+            ),
+        },
         {
             "id": "sessions",
             "title": "Recent Sessions",
@@ -527,6 +634,7 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
                     "",
                     "Timeline:",
                     *(dashboard.get("active_session", {}).get("timeline") or ["none"])[-5:],
+                    *_active_session_ui_activation_rows(dashboard.get("active_session") or {}),
                     "",
                     "Transcript:",
                     *(dashboard.get("active_session", {}).get("transcript") or ["none"])[-3:],
@@ -567,13 +675,446 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
     return panes
 
 
-def build_command_palette() -> dict:
+def _tui_settings_pane_rows(catalog: dict, *, source: str | None = None) -> list[str]:
+    preferences = catalog.get("preferences") or {}
+    themes = catalog.get("themes") or []
+    keybindings = catalog.get("keybindings") or []
+    settings = catalog.get("settings") or []
+    source_label = source or catalog.get("source_label") or "defaults"
+    return [
+        f"Source: {source_label}",
+        f"Session: {catalog.get('session_id') or 'none'}",
+        f"Policy: {(catalog.get('policy_boundary') or {}).get('kind') or 'unknown'}",
+        f"Evidence: {catalog.get('evidence_status') or 'unknown'}",
+        "Preferences:",
+        *[f"{key}={preferences[key]}" for key in sorted(preferences)],
+        "Themes:",
+        *[
+            f"{theme['id']} textual={theme.get('textual_theme') or 'system'} default={theme.get('default', False)}"
+            for theme in themes
+        ],
+        "Keybindings:",
+        *[f"{binding['key']} -> {binding['action']}" for binding in keybindings],
+        "Setting definitions:",
+        *[
+            f"{setting['key']} kind={setting['kind']} scope={setting['scope']} default={setting['default']}"
+            for setting in settings
+        ],
+        f"Filesystem modified: {catalog.get('filesystem_modified', False)}",
+        f"Process started: {catalog.get('process_started', False)}",
+        f"Permission granting: {catalog.get('permission_granting', False)}",
+        f"Preferences persisted: {catalog.get('preferences_persisted', False)}",
+        f"Backend settings exposed: {catalog.get('backend_settings_exposed', False)}",
+        f"Persist command: {catalog.get('persist_command') or 'none'}",
+    ]
+
+
+def _active_session_ui_activation_rows(active_session: dict) -> list[str]:
+    activation = active_session.get("latest_ui_activation") or {}
+    if not activation:
+        return []
+    return [
+        "",
+        (
+            "Latest UI action: "
+            f"{activation.get('entry_id') or 'unknown'} "
+            f"action={activation.get('action_type') or 'unknown'} "
+            f"source={activation.get('source') or 'unknown'}"
+        ),
+        (
+            "UI flags: "
+            f"command={activation.get('command_started', False)} "
+            f"process={activation.get('process_started', False)} "
+            f"filesystem={activation.get('filesystem_modified', False)} "
+            f"permission={activation.get('permission_granting', False)} "
+            f"authority={activation.get('authority_granting', False)}"
+        ),
+    ]
+
+
+def build_command_palette(custom_commands: list[dict] | None = None) -> dict:
+    groups = [dict(group) for group in COMMAND_PALETTE_GROUPS]
+    entries = [_with_palette_activation(entry) for entry in COMMAND_PALETTE_ENTRIES]
+    if custom_commands:
+        groups.append({"id": "project_commands", "title": "Project Commands"})
+        for command in custom_commands:
+            entries.append(
+                _with_palette_activation(
+                    {
+                        "id": f"project_commands.{command['name']}",
+                        "group_id": "project_commands",
+                        "title": command["title"],
+                        "command": f"harness commands run {command['name']} --project .",
+                        "description": command["description"],
+                        "mutates_when_run": command.get("mutates_when_run"),
+                        "safety_note": command["safety_note"],
+                        "custom_command": True,
+                        "command_id": command["id"],
+                    }
+                )
+            )
     return {
         "schema_version": "harness.tui_command_palette/v1",
         "ok": True,
-        "groups": [dict(group) for group in COMMAND_PALETTE_GROUPS],
-        "entries": [dict(entry) for entry in COMMAND_PALETTE_ENTRIES],
+        "groups": groups,
+        "entries": entries,
     }
+
+
+_SAFE_PALETTE_UI_ACTIONS = {
+    "orientation.home": {
+        "type": "focus_section",
+        "section_id": "project_overview",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode", "active_section_id", "active_section_index"],
+    },
+    "ui_controls.clear_search": {
+        "type": "clear_search",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_search_cleared_in_memory",
+        "state_fields": ["focus_mode", "query"],
+    },
+    "ui_controls.palette_focus": {
+        "type": "set_focus_mode",
+        "focus_mode": "palette",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode"],
+    },
+    "ui_controls.dashboard_focus": {
+        "type": "set_focus_mode",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode"],
+    },
+    "ui_controls.toggle_section": {
+        "type": "toggle_section",
+        "evidence_status": "ui_section_toggle_in_memory",
+        "state_fields": ["active_section_id", "collapsed_section_ids"],
+    },
+    "ui_controls.expand_all": {
+        "type": "expand_all",
+        "evidence_status": "ui_sections_expanded_in_memory",
+        "state_fields": ["collapsed_section_ids"],
+    },
+    "ui_controls.settings": {
+        "type": "focus_section",
+        "section_id": "settings",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode", "active_section_id", "active_section_index"],
+    },
+    "native_agents.select_build": {
+        "type": "select_agent",
+        "agent_id": "build",
+        "evidence_status": "ui_agent_selected_in_memory",
+        "state_fields": ["selected_agent_id"],
+    },
+    "native_agents.select_plan": {
+        "type": "select_agent",
+        "agent_id": "plan",
+        "evidence_status": "ui_agent_selected_in_memory",
+        "state_fields": ["selected_agent_id"],
+    },
+    "sessions.list": {
+        "type": "focus_section",
+        "section_id": "sessions",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode", "active_section_id", "active_section_index"],
+    },
+    "runtime_evidence.runs": {
+        "type": "focus_section",
+        "section_id": "runtime_evidence",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode", "active_section_id", "active_section_index"],
+    },
+    "objectives_tasks.list_tasks": {
+        "type": "focus_section",
+        "section_id": "queue_daemon",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_focus_in_memory",
+        "state_fields": ["focus_mode", "active_section_id", "active_section_index"],
+    },
+}
+
+
+def _safe_palette_policy_boundary() -> dict:
+    return {
+        "kind": "safe_ui_activation",
+        "source": "tui_command_palette",
+        "command_execution_allowed": False,
+        "provider_call_allowed": False,
+        "shell_allowed": False,
+        "adapter_dispatch_allowed": False,
+        "child_process_allowed": False,
+        "filesystem_mutation_allowed": False,
+        "permission_grant_allowed": False,
+        "authority_grant_allowed": False,
+        "session_message_allowed": False,
+        "in_memory_ui_state_only": True,
+    }
+
+
+def _palette_no_side_effect_flags() -> dict:
+    return {
+        "request_started": False,
+        "command_started": False,
+        "provider_started": False,
+        "shell_started": False,
+        "adapter_started": False,
+        "child_process_started": False,
+        "process_started": False,
+        "filesystem_modified": False,
+        "permission_granting": False,
+        "authority_granting": False,
+        "session_message_created": False,
+    }
+
+
+def _with_palette_activation(entry: dict) -> dict:
+    item = dict(entry)
+    action = _SAFE_PALETTE_UI_ACTIONS.get(str(item.get("id")))
+    if action:
+        item["activation"] = {
+            "kind": "ui_action",
+            "supported": True,
+            "action": dict(action),
+            "evidence_status": "ui_only_in_memory",
+            "policy_boundary": _safe_palette_policy_boundary(),
+            "blocked_reasons": [],
+            **_palette_no_side_effect_flags(),
+        }
+    else:
+        item["activation"] = {
+            "kind": "manual_command",
+            "supported": False,
+            "reason": "This palette entry is exposed as an explicit command preview and is not executed by the TUI.",
+            "evidence_status": "manual_preview_only",
+            "policy_boundary": _safe_palette_policy_boundary(),
+            "blocked_reasons": ["manual_command_preview_only"],
+            **_palette_no_side_effect_flags(),
+        }
+    return item
+
+
+def activate_command_palette_entry(
+    palette: dict,
+    entry_id: str,
+    view_state: dict | None = None,
+) -> dict:
+    no_side_effects = _palette_no_side_effect_flags()
+    policy_boundary = _safe_palette_policy_boundary()
+    entry = next((item for item in palette.get("entries", []) if item.get("id") == entry_id), None)
+    if entry is None:
+        return {
+            "schema_version": "harness.tui_palette_activation/v1",
+            "ok": False,
+            "entry_id": entry_id,
+            "error": "Command palette entry not found.",
+            "activation_kind": "missing",
+            "ui_action_applied": False,
+            "evidence_status": "missing_entry",
+            "policy_boundary": policy_boundary,
+            "blocked_reasons": ["palette_entry_not_found"],
+            **no_side_effects,
+            "view_state": dict(view_state or {}),
+        }
+    activation = entry.get("activation") or {}
+    if activation.get("kind") != "ui_action" or not activation.get("supported"):
+        return {
+            "schema_version": "harness.tui_palette_activation/v1",
+            "ok": False,
+            "entry_id": entry_id,
+            "error": activation.get("reason") or "Palette entry is not an in-process TUI action.",
+            "activation_kind": activation.get("kind") or "manual_command",
+            "ui_action_applied": False,
+            "evidence_status": activation.get("evidence_status") or "manual_preview_only",
+            "policy_boundary": activation.get("policy_boundary") or policy_boundary,
+            "blocked_reasons": activation.get("blocked_reasons") or ["manual_command_preview_only"],
+            **no_side_effects,
+            "command": entry.get("command"),
+            "view_state": dict(view_state or {}),
+        }
+    state = dict(view_state or {})
+    collapsed = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+    action = dict(activation.get("action") or {})
+    if action.get("type") == "focus_section":
+        state["focus_mode"] = action.get("focus_mode") or "dashboard"
+        state["active_section_id"] = action.get("section_id")
+        state["active_section_index"] = _section_index(action.get("section_id"))
+    elif action.get("type") == "clear_search":
+        state["focus_mode"] = action.get("focus_mode") or "dashboard"
+        state["query"] = ""
+    elif action.get("type") == "set_focus_mode":
+        state["focus_mode"] = action.get("focus_mode") or "dashboard"
+    elif action.get("type") == "toggle_section":
+        section_id = _section_id_at_index(state.get("active_section_index"))
+        if section_id in collapsed:
+            collapsed.remove(section_id)
+        else:
+            collapsed.add(section_id)
+        state["active_section_id"] = section_id
+        state["collapsed_section_ids"] = sorted(collapsed)
+    elif action.get("type") == "expand_all":
+        collapsed.clear()
+        state["collapsed_section_ids"] = []
+    elif action.get("type") == "select_agent":
+        agent_id = str(action.get("agent_id") or "").strip()
+        if agent_id:
+            state["selected_agent_id"] = agent_id
+    local_state_changes = {
+        "changed_fields": list(action.get("state_fields") or []),
+        "creates_message": False,
+        "starts_request": False,
+        "executes_command": False,
+        "mutates_filesystem": False,
+        "grants_permission": False,
+    }
+    return {
+        "schema_version": "harness.tui_palette_activation/v1",
+        "ok": True,
+        "entry_id": entry_id,
+        "activation_kind": "ui_action",
+        "action": action,
+        "ui_action_applied": True,
+        "evidence_status": action.get("evidence_status") or activation.get("evidence_status") or "ui_only_in_memory",
+        "policy_boundary": activation.get("policy_boundary") or policy_boundary,
+        "blocked_reasons": [],
+        "local_state_changes": local_state_changes,
+        **no_side_effects,
+        "view_state": state,
+    }
+
+
+def _section_index(section_id: object) -> int:
+    for index, section in enumerate(TUI_VIEW_SECTIONS):
+        if section["id"] == section_id:
+            return index
+    return 0
+
+
+def _section_id_at_index(index: object) -> str:
+    try:
+        value = int(index or 0)
+    except (TypeError, ValueError):
+        value = 0
+    if not TUI_VIEW_SECTIONS:
+        return ""
+    return str(TUI_VIEW_SECTIONS[value % len(TUI_VIEW_SECTIONS)]["id"])
+
+
+TUI_SETTING_DEFINITIONS = [
+    {
+        "key": "theme",
+        "label": "Theme",
+        "kind": "choice",
+        "default": "light",
+        "choices": ["light", "dark", "system"],
+        "scope": "session",
+    },
+    {
+        "key": "terminal_font_size",
+        "label": "Terminal font size",
+        "kind": "integer",
+        "default": 13,
+        "min": 9,
+        "max": 24,
+        "scope": "session",
+    },
+    {
+        "key": "keybinding_preset",
+        "label": "Keybinding preset",
+        "kind": "choice",
+        "default": "harness",
+        "choices": ["harness", "opencode-like"],
+        "scope": "session",
+    },
+    {
+        "key": "composer_mode",
+        "label": "Composer mode",
+        "kind": "choice",
+        "default": "multiline",
+        "choices": ["multiline", "single-line"],
+        "scope": "session",
+    },
+]
+
+
+def build_tui_settings_catalog(
+    preferences: dict | None = None,
+    *,
+    source: str = "defaults",
+    session_id: str | None = None,
+) -> dict:
+    normalized = normalize_tui_preferences(preferences or {})
+    is_session_source = source == "active_session" and bool(session_id)
+    return {
+        "schema_version": "harness.tui_settings/v1",
+        "ok": True,
+        "source": "active_session" if is_session_source else "defaults",
+        "source_label": "active session preferences" if is_session_source else "defaults",
+        "session_id": session_id if is_session_source else None,
+        "evidence_status": "read_only_settings_metadata",
+        "policy_boundary": {
+            "kind": "tui_settings_read_only",
+            "source": "settings_catalog",
+            "preference_persistence_allowed": False,
+            "backend_settings_allowed": False,
+            "process_start_allowed": False,
+            "filesystem_mutation_allowed": False,
+            "permission_grant_allowed": False,
+            "authority_grant_allowed": False,
+        },
+        "settings": [dict(setting) for setting in TUI_SETTING_DEFINITIONS],
+        "preferences": normalized,
+        "preference_source": "session_ui_preferences" if is_session_source else "defaults",
+        "persist_command": (
+            f"harness session preferences {session_id} --project . --set key=value"
+            if is_session_source
+            else "harness session preferences <session-id> --project . --set key=value"
+        ),
+        "themes": [
+            {"id": "light", "textual_theme": "textual-light", "default": True},
+            {"id": "dark", "textual_theme": "textual-dark", "default": False},
+            {"id": "system", "textual_theme": None, "default": False},
+        ],
+        "keybindings": [
+            {"key": "ctrl+q", "action": "quit", "label": "Quit", "customizable": False},
+            {"key": "escape", "action": "clear_search", "label": "Clear input", "customizable": True},
+            {"key": "tab", "action": "section_next", "label": "Next section", "customizable": True},
+            {"key": "shift+tab", "action": "section_previous", "label": "Previous section", "customizable": True},
+            {"key": "ctrl+p", "action": "toggle_palette_focus", "label": "Palette focus", "customizable": True},
+            {"key": "f2", "action": "toggle_palette_focus", "label": "Palette focus", "customizable": True},
+        ],
+        "preferences_persisted": False,
+        "backend_settings_exposed": False,
+        "authority_granting": False,
+        "filesystem_modified": False,
+        "process_started": False,
+        "permission_granting": False,
+    }
+
+
+def normalize_tui_preferences(preferences: dict) -> dict:
+    definitions = {setting["key"]: setting for setting in TUI_SETTING_DEFINITIONS}
+    normalized = {key: definition["default"] for key, definition in definitions.items()}
+    for key, value in preferences.items():
+        if key not in definitions:
+            continue
+        definition = definitions[key]
+        if definition["kind"] == "choice":
+            text = str(value).strip()
+            if text in definition["choices"]:
+                normalized[key] = text
+        elif definition["kind"] == "integer":
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            normalized[key] = max(definition["min"], min(definition["max"], number))
+    return normalized
 
 
 def filter_command_palette(palette: dict, query: str) -> dict:
@@ -611,8 +1152,8 @@ def build_command_palette_panes(filtered_palette: dict) -> list[dict]:
             "id": "command_palette",
             "title": "Command Palette",
             "lines": [
-                "Copy-only command templates.",
-                "The TUI displays commands for manual use; it does not execute or copy them.",
+                "Safe UI actions activate in-process; command entries remain manual previews.",
+                "The TUI never starts providers, shells, adapters, or filesystem mutation from the palette.",
                 f"Visible commands: {filtered_palette['total_matches']}",
             ],
         }
@@ -644,6 +1185,7 @@ def build_command_palette_panes(filtered_palette: dict) -> list[dict]:
                     f"Group: {entry['group_id']}",
                     f"Title: {entry['title']}",
                     f"Mutates when run: {entry['mutates_when_run']}",
+                    f"Activation: {entry.get('activation', {}).get('kind', 'manual_command')}",
                     "Command:",
                     entry["command"],
                     "Description:",
@@ -806,10 +1348,13 @@ def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
         f"Model: {model_label}",
         f"Provider: {active_model.get('provider_id') or 'default'}",
         f"Known model: {active_model.get('known_catalog_entry') if active_model else 'n/a'}",
+        f"Model executable: {active_model.get('executable') if active_model else 'n/a'}",
         f"Mode: {state.get('chat_mode') or chat_cfg.get('mode') or 'normal'}",
         "Read tools: autonomous",
         "Side effects: action contracts",
     ]
+    if active_model.get("blocked_reasons"):
+        rows.append("Model blocked: " + ", ".join(active_model["blocked_reasons"]))
     if model_catalog.get("models"):
         rows.append(f"Catalog models: {len(model_catalog['models'])}")
     rows.append("Fallback: explicit failure only")
@@ -834,6 +1379,28 @@ def _right_panel_action_rows(state: dict) -> list[str]:
             "Confirm: yes or /confirm",
             "Cancel: no",
         ]
+    latest_activation = state.get("latest_palette_activation") or {}
+    if latest_activation:
+        rows = [
+            "Latest UI action",
+            f"Entry: {latest_activation.get('entry_id') or 'unknown'}",
+            f"Status: {'succeeded' if latest_activation.get('ok') else 'failed'}",
+            f"Kind: {latest_activation.get('activation_kind') or 'unknown'}",
+        ]
+        action = latest_activation.get("action") or {}
+        if action:
+            rows.append(f"Action: {action.get('type') or 'unknown'}")
+        rows.extend(
+            [
+                f"Command started: {latest_activation.get('command_started', False)}",
+                f"Process started: {latest_activation.get('process_started', False)}",
+                f"Filesystem modified: {latest_activation.get('filesystem_modified', False)}",
+                f"Permission granting: {latest_activation.get('permission_granting', False)}",
+            ]
+        )
+        if "session_event_persisted" in latest_activation:
+            rows.append(f"Session event persisted: {latest_activation.get('session_event_persisted')}")
+        return rows
     latest_response = state.get("latest_response") or {}
     if latest_response.get("kind") == "self_managed_local_action":
         report_path = latest_response.get("report_path")
@@ -899,6 +1466,19 @@ def _right_panel_session_rows(dashboard: dict, state: dict) -> list[str]:
         timeline = active_session.get("timeline") or []
         if timeline:
             rows.append(f"Timeline: {timeline[-1]}")
+        activation = active_session.get("latest_ui_activation") or {}
+        if activation:
+            rows.append(
+                f"UI action: {activation.get('entry_id') or 'unknown'} "
+                f"action={activation.get('action_type') or 'unknown'}"
+            )
+            rows.append(
+                "UI flags: "
+                f"cmd={activation.get('command_started', False)} "
+                f"proc={activation.get('process_started', False)} "
+                f"fs={activation.get('filesystem_modified', False)} "
+                f"perm={activation.get('permission_granting', False)}"
+            )
         transcript = active_session.get("transcript") or []
         if transcript:
             first_line = str(transcript[-1]).splitlines()[0]
@@ -924,7 +1504,22 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
         rows.append(
             "Active: "
             f"{active.get('raw_model_ref') or active.get('model_id') or 'default'} "
-            f"known={active.get('known_catalog_entry')}"
+            f"known={active.get('known_catalog_entry')} executable={active.get('executable')}"
+        )
+        if active.get("session_id"):
+            rows.append(f"Switch: harness session model {active['session_id']} <provider/model> --project .")
+        rows.append(f"Provider enabled: {active.get('provider_enabled')}")
+        if active.get("blocked_reasons"):
+            rows.append("Blocked: " + ", ".join(active["blocked_reasons"]))
+        rows.extend(
+            [
+                f"Provider execution: {active.get('provider_execution_started', False)}",
+                f"Model execution: {active.get('model_execution_started', False)}",
+                f"Network: {active.get('network_accessed', False)}",
+                f"Hidden fallback: provider={active.get('hidden_provider_fallback', False)} model={active.get('hidden_model_fallback', False)}",
+                f"Permission grant: {active.get('permission_granting', False)}",
+                f"Authority grant: {active.get('authority_granting', False)}",
+            ]
         )
     rows.append("Provider status:")
     rows.extend(
@@ -936,6 +1531,39 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
     )
     rows.append("Model refs:")
     rows.extend([f"{model['raw_model_ref']} profile={model.get('model_profile_id') or '-'}" for model in models[:5]] or ["none"])
+    return rows
+
+
+def _terminal_tab_pane_rows(dashboard: dict) -> list[str]:
+    payload = dashboard.get("terminal_tabs") or {}
+    tabs = payload.get("tabs") or []
+    if not tabs:
+        return ["none"]
+    rows = [
+        "Read-only persisted PTY tab projection.",
+        f"Policy: {(payload.get('policy_boundary') or {}).get('kind') or 'unknown'}",
+        f"Blocked: {','.join(payload.get('blocked_reasons') or ['none'])}",
+        "No terminal process, websocket, live stream, artifact content read, or terminal control is started.",
+    ]
+    for tab in tabs[:5]:
+        preview = str(tab.get("scrollback_preview") or "").replace("\n", "\\n")
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        rows.append(
+            (
+                f"{tab.get('id')} {tab.get('status')} "
+                f"title={tab.get('title') or 'untitled'} "
+                f"events={tab.get('event_count', 0)} "
+                f"output={tab.get('output_event_count', 0)} "
+                f"artifacts={tab.get('artifact_ref_count', 0)} "
+                f"restore={tab.get('restoration_ready')}"
+            )
+        )
+        tab_blocked = ",".join(tab.get("blocked_reasons") or ["none"])
+        rows.append(f"boundary={((tab.get('policy_boundary') or {}).get('kind') or 'unknown')} blocked={tab_blocked}")
+        if preview:
+            rows.append(f"preview: {preview}")
+    rows.append("Terminal tabs are disabled until PTY policy gates are implemented.")
     return rows
 
 
@@ -1297,7 +1925,7 @@ def _format_token_usage(usage: dict) -> str:
     return "Tokens: " + ", ".join(parts)
 
 
-def build_slash_commands(palette: dict | None = None) -> dict:
+def build_slash_commands(palette: dict | None = None, custom_commands: list[dict] | None = None) -> dict:
     palette = palette or build_command_palette()
     entries_by_id = {entry["id"]: entry for entry in palette["entries"]}
     commands = []
@@ -1314,6 +1942,31 @@ def build_slash_commands(palette: dict | None = None) -> dict:
                 "command": entry["command"],
                 "mutates_when_run": entry["mutates_when_run"],
                 "safety_note": entry["safety_note"],
+                "activation": dict(entry.get("activation") or {}),
+                "custom_command": False,
+            }
+        )
+    for command in custom_commands or []:
+        commands.append(
+            {
+                "name": command["name"],
+                "slash": command["slash"],
+                "entry_id": f"project_commands.{command['name']}",
+                "group_id": "project_commands",
+                "title": command["title"],
+                "description": command["description"],
+                "command": f"harness commands run {command['name']} --project .",
+                "mutates_when_run": command.get("mutates_when_run"),
+                "safety_note": command["safety_note"],
+                "activation": {
+                    "kind": "manual_command",
+                    "supported": False,
+                    "process_started": False,
+                    "filesystem_modified": False,
+                    "permission_granting": False,
+                },
+                "custom_command": True,
+                "command_id": command["id"],
             }
         )
     return {
@@ -1993,6 +2646,40 @@ def _render_navigation_hints(view: dict) -> str:
     return " | ".join(f"{hint['key']}: {hint['label']}" for hint in view["navigation_hints"])
 
 
+def _render_composer_status(dashboard: dict, selected_agent_id: str | None = None) -> str:
+    active_session = dashboard.get("active_session") or {}
+    model_catalog = dashboard.get("model_catalog") or {}
+    active_model = model_catalog.get("active_model") or {}
+    composer_context = active_session.get("composer_context") or {}
+    session_id = active_session.get("id") or "new session"
+    agent_id = selected_agent_id or active_session.get("agent_id") or "default"
+    model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref") or "default"
+    attachment_count = composer_context.get("attachment_count", 0)
+    context_tokens = composer_context.get("total_estimated_tokens", 0)
+    return (
+        f"Composer: multiline | Agent selector: palette select build/plan | Submit: ctrl+enter | Continue: harness \"...\" --continue | "
+        f"Session: {session_id} | Agent: {agent_id} | Model: {model_ref} | Attachments: {attachment_count} | Context est: {context_tokens} tokens"
+    )
+
+
+def _render_session_rail(dashboard: dict) -> str:
+    sessions = dashboard.get("recent_sessions") or []
+    active_session = dashboard.get("active_session") or {}
+    lines = ["Sessions", ""]
+    if not sessions:
+        lines.extend(["No sessions", 'Start: harness "prompt" --project .'])
+        return "\n".join(lines)
+    active_id = active_session.get("id")
+    for session in sessions[:12]:
+        marker = ">" if session.get("id") == active_id else " "
+        title = str(session.get("title") or session.get("id") or "untitled")
+        status = str(session.get("status") or "unknown")
+        lines.append(f"{marker} {title[:22]}")
+        lines.append(f"  {session.get('id')} {status}")
+    lines.extend(["", 'Continue: harness "..." --continue'])
+    return "\n".join(lines)
+
+
 def create_read_only_tui_app(project_root: Path):
     return create_harness_app(project_root)
 
@@ -2002,7 +2689,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.css.query import NoMatches
-    from textual.widgets import Footer, Header, Input, Static
+    from textual.widgets import Footer, Header, Static, TextArea
     from harness.chat import ChatSessionState, handle_chat_input
 
     dashboard = build_tui_dashboard(project_root)
@@ -2023,12 +2710,41 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
     )
     initial_messages = [build_chat_welcome_message(project_root)]
 
-    class HarnessPromptInput(Input):
+    class HarnessPromptInput(TextArea):
+        def __init__(self, *, placeholder: str, id: str) -> None:
+            super().__init__("", id=id)
+            self.placeholder = placeholder
+
+        @property
+        def value(self) -> str:
+            return self.text
+
+        @value.setter
+        def value(self, text: str) -> None:
+            self.load_text(text)
+
         def on_key(self, event) -> None:
-            if event.key == "enter" and self.app.should_insert_slash_suggestion:
+            if event.key in {"ctrl+enter", "ctrl+j"}:
+                event.prevent_default()
+                event.stop()
+                self.app.action_submit_prompt()
+            elif event.key == "enter" and self.app.should_insert_slash_suggestion:
                 event.prevent_default()
                 event.stop()
                 self.app.action_insert_selected_slash_suggestion()
+            elif event.key == "enter" and self.value.strip().startswith("/"):
+                event.prevent_default()
+                event.stop()
+                if not self.app.action_activate_safe_slash_command():
+                    self.app.action_submit_prompt()
+            elif event.key == "enter" and self.app.palette_focus_active:
+                event.prevent_default()
+                event.stop()
+                self.app.action_activate_selected_palette_entry()
+            elif event.key in {"ctrl+up", "ctrl+down"}:
+                event.prevent_default()
+                event.stop()
+                self.app.action_cycle_prompt_history(-1 if event.key == "ctrl+up" else 1)
             elif event.key in {"down", "up"} and self.app.slash_suggestions_visible:
                 event.prevent_default()
                 event.stop()
@@ -2061,6 +2777,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             padding: 1;
         }
 
+        #session-rail {
+            width: 32;
+            border: round $surface;
+            margin: 1 0 1 1;
+            padding: 1;
+        }
+
         #side {
             width: 1fr;
             border: round $surface;
@@ -2070,6 +2793,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         #prompt {
             margin: 0 1 1 1;
+            height: 5;
+        }
+
+        #composer-status {
+            margin: 0 1;
+            padding: 0 1;
+            border: round $surface;
         }
 
         #slash-status {
@@ -2116,30 +2846,44 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._messages = [dict(message) for message in initial_messages]
             self._chat_state = ChatSessionState(codex_like_mode=codex_like)
             self._latest_response: dict = {}
+            self._latest_palette_activation: dict = {}
             self._focus_mode = "dashboard"
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
             self._slash_suggestion_index = 0
             self._request_in_flight = False
             self._request_started_at: float | None = None
+            self._prompt_history: list[str] = []
+            self._prompt_history_index: int | None = None
+            self._selected_agent_id = "plan"
+            self._dashboard_cache: dict | None = dict(dashboard)
+            self._dashboard_cache_at = time.monotonic()
+            self._refresh_timer = None
+            self._live_refresh_failures = 0
 
         @property
         def slash_suggestions_visible(self) -> bool:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", TextArea)
             return bool(_matching_slash_commands(slash_commands, prompt.value))
 
         @property
         def should_insert_slash_suggestion(self) -> bool:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", TextArea)
             request = prompt.value.strip()
             if not request:
                 return False
             inserted = self._request_from_prompt_submission(request)
             return bool(inserted and inserted != request)
 
+        @property
+        def palette_focus_active(self) -> bool:
+            return self._focus_mode == "palette"
+
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
             with Horizontal(id="layout"):
+                with VerticalScroll(id="session-rail"):
+                    yield Static(_render_session_rail(dashboard), id="session-rail-content")
                 with VerticalScroll(id="chat"):
                     yield Static("", id="chat-content")
                 with VerticalScroll(id="side"):
@@ -2147,17 +2891,23 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     yield Static(_render_navigation_hints(initial_view), id="palette-status")
                     yield Static("", id="pane-container")
             yield Static("", id="slash-status", classes="hidden")
+            yield Static(_render_composer_status(dashboard, self._selected_agent_id), id="composer-status")
             yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
             yield Footer()
 
         def on_mount(self) -> None:
-            self.query_one("#prompt", Input).focus()
+            self.query_one("#prompt", TextArea).focus()
             self._render_chat()
             self._render_current_view()
-            self.set_interval(0.5, self._refresh_live_view)
+            self._refresh_timer = self.set_interval(2.0, self._refresh_live_view)
+
+        def on_unmount(self) -> None:
+            timer = self._refresh_timer
+            if timer is not None and hasattr(timer, "stop"):
+                timer.stop()
 
         def on_key(self, event) -> None:
-            if isinstance(self.focused, Input):
+            if isinstance(self.focused, TextArea):
                 return
             if event.character == "c":
                 event.prevent_default()
@@ -2168,30 +2918,47 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 event.stop()
                 self.action_expand_all_sections()
 
-        def on_input_changed(self, event: Input.Changed) -> None:
-            if event.input.id == "prompt":
+        def on_text_area_changed(self, event: TextArea.Changed) -> None:
+            if event.text_area.id == "prompt":
                 self._slash_suggestion_index = 0
                 self._render_current_view()
-                self._render_slash_suggestions(event.value)
+                self._render_slash_suggestions(event.text_area.text)
 
-        def on_input_submitted(self, event: Input.Submitted) -> None:
-            if event.input.id != "prompt":
+        def action_submit_prompt(self) -> None:
+            prompt = self.query_one("#prompt", TextArea)
+            if self._focus_mode == "palette":
+                self.action_activate_selected_palette_entry()
                 return
-            request = self._request_from_prompt_submission(event.value)
+            if self._activate_safe_slash_command(prompt.value):
+                return
+            request = self._request_from_prompt_submission(prompt.value)
             if not request or self._request_in_flight:
                 return
+            self._prompt_history.append(request)
+            self._prompt_history_index = None
             self._messages.append({"role": "user", "title": request, "lines": []})
             stream_index = len(self._messages)
             self._messages.append({"role": "assistant", "title": "Assistant", "lines": ["Starting model turn..."]})
-            event.input.value = ""
+            prompt.value = ""
             self._slash_suggestion_index = 0
             self._render_slash_suggestions("")
-            event.input.placeholder = "Model is responding..."
+            prompt.placeholder = "Model is responding..."
             self._request_in_flight = True
             self._request_started_at = time.monotonic()
             self._render_chat()
             self._render_current_view()
             self.run_worker(lambda: self._run_chat_request(request, stream_index), thread=True)
+
+        def action_cycle_prompt_history(self, step: int) -> None:
+            if not self._prompt_history:
+                return
+            if self._prompt_history_index is None:
+                self._prompt_history_index = len(self._prompt_history) - 1 if step < 0 else 0
+            else:
+                self._prompt_history_index = (self._prompt_history_index + step) % len(self._prompt_history)
+            prompt = self.query_one("#prompt", TextArea)
+            prompt.value = self._prompt_history[self._prompt_history_index]
+            self._render_slash_suggestions(prompt.value)
 
         def _run_chat_request(self, request: str, stream_index: int) -> None:
             def progress(update: dict) -> None:
@@ -2251,7 +3018,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             else:
                 self._messages.append(final_message)
             self._request_in_flight = False
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", TextArea)
             if self._chat_state.pending_action_contract is not None:
                 prompt.placeholder = "Type yes to confirm, no to cancel, or ask a follow-up"
             else:
@@ -2264,7 +3031,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self.exit()
 
         def action_clear_search(self) -> None:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", TextArea)
             if prompt.value:
                 prompt.value = ""
                 self._render_slash_suggestions("")
@@ -2284,8 +3051,189 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._focus_mode = "palette" if self._focus_mode == "dashboard" else "dashboard"
             self._render_current_view()
 
+        def action_activate_selected_palette_entry(self) -> None:
+            prompt = self.query_one("#prompt", TextArea)
+            filtered = filter_command_palette(palette, prompt.value)
+            entry = filtered["entries"][0] if filtered["entries"] else None
+            if entry is None:
+                self._latest_palette_activation = {
+                    **activate_command_palette_entry(
+                        palette,
+                        str(prompt.value or "missing"),
+                        {
+                            "focus_mode": self._focus_mode,
+                            "active_section_index": self._section_cursor_index,
+                            "collapsed_section_ids": self._collapsed_section_ids,
+                        },
+                    ),
+                    "source": "palette_enter",
+                    "enter_consumed": True,
+                    "chat_submitted": False,
+                    "slash_suggestion_inserted": False,
+                }
+                self._render_palette_activation_status("No matching palette action.", ok=False)
+                self._render_current_view()
+                return
+            activation = activate_command_palette_entry(
+                palette,
+                str(entry["id"]),
+                {
+                    "focus_mode": self._focus_mode,
+                    "active_section_index": self._section_cursor_index,
+                    "collapsed_section_ids": self._collapsed_section_ids,
+                },
+            )
+            self._latest_palette_activation = {
+                **activation,
+                "source": "palette_enter",
+                "enter_consumed": True,
+                "chat_submitted": False,
+                "slash_suggestion_inserted": False,
+            }
+            if activation.get("ok"):
+                state = activation.get("view_state") or {}
+                self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
+                self._section_cursor_index = int(state.get("active_section_index") or 0)
+                self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+                self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
+                prompt.value = str(state.get("query", ""))
+                self._record_palette_activation_event(activation, source="palette")
+                self._render_palette_activation_status(f"Activated {entry['id']}.", ok=True)
+            else:
+                self._focus_mode = "palette"
+                self._render_palette_activation_status(
+                    f"Manual preview only: {entry.get('command') or entry['id']}",
+                    ok=False,
+                )
+            self._render_current_view()
+
+        def _record_palette_activation_event(self, activation: dict, *, source: str) -> None:
+            if not activation.get("ok"):
+                return
+            try:
+                dashboard = self._dashboard_snapshot(force=True)
+                active_session = dashboard.get("active_session") or {}
+                session_id = active_session.get("id")
+                if not session_id:
+                    return
+                store = SQLiteStore(project_root)
+                payload = {
+                    "source": source,
+                    "entry_id": activation.get("entry_id"),
+                    "activation_kind": activation.get("activation_kind"),
+                    "action": activation.get("action") or {},
+                    "ui_action_applied": bool(activation.get("ui_action_applied")),
+                    "command_started": bool(activation.get("command_started")),
+                    "provider_started": bool(activation.get("provider_started")),
+                    "shell_started": bool(activation.get("shell_started")),
+                    "adapter_started": bool(activation.get("adapter_started")),
+                    "child_process_started": bool(activation.get("child_process_started")),
+                    "process_started": bool(activation.get("process_started")),
+                    "filesystem_modified": bool(activation.get("filesystem_modified")),
+                    "permission_granting": bool(activation.get("permission_granting")),
+                    "authority_granting": bool(activation.get("authority_granting")),
+                    "session_message_created": bool(activation.get("session_message_created")),
+                    "evidence_status": "ui_only_persisted",
+                    "policy_boundary": activation.get("policy_boundary") or _safe_palette_policy_boundary(),
+                    "blocked_reasons": activation.get("blocked_reasons") or [],
+                }
+                store.append_store_event(
+                    "session",
+                    str(session_id),
+                    "tui.ui_activation.applied",
+                    payload,
+                    session_id=str(session_id),
+                    redaction_state="redacted",
+                )
+                self._latest_palette_activation = {
+                    **activation,
+                    "session_event_persisted": True,
+                    "session_id": str(session_id),
+                }
+            except Exception:
+                self._latest_palette_activation = {
+                    **activation,
+                    "session_event_persisted": False,
+                }
+
+        def _activate_safe_slash_command(self, value: str) -> bool:
+            request = value.strip()
+            if not request.startswith("/"):
+                return False
+            command_name = request[1:].split(maxsplit=1)[0]
+            try:
+                filtered = filter_slash_commands(slash_commands, command_name)
+                exact_matches = [command for command in filtered["commands"] if command["name"] == command_name]
+                if len(exact_matches) != 1:
+                    return False
+                command = exact_matches[0]
+                activation = command.get("activation") or {}
+                if activation.get("kind") != "ui_action" or not activation.get("supported"):
+                    return False
+                prompt = self.query_one("#prompt", TextArea)
+                result = activate_command_palette_entry(
+                    palette,
+                    str(command["entry_id"]),
+                    {
+                        "focus_mode": self._focus_mode,
+                        "active_section_index": self._section_cursor_index,
+                        "collapsed_section_ids": self._collapsed_section_ids,
+                    },
+                )
+                if not result.get("ok"):
+                    return False
+                self._latest_palette_activation = {
+                    **result,
+                    "source": "slash",
+                    "slash": command["slash"],
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                }
+                state = result.get("view_state") or {}
+                self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
+                self._section_cursor_index = int(state.get("active_section_index") or 0)
+                self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+                self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
+                prompt.value = str(state.get("query", ""))
+                self._record_palette_activation_event(result, source="slash")
+                self._render_palette_activation_status(f"Activated {command['slash']}.", ok=True)
+                self._render_current_view()
+                return True
+            except Exception as exc:
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_palette_activation/v1",
+                    "ok": False,
+                    "entry_id": f"slash.{command_name}" if command_name else "slash",
+                    "error": str(exc),
+                    "activation_kind": "slash_error",
+                    "ui_action_applied": False,
+                    "source": "slash",
+                    "slash": f"/{command_name}" if command_name else request,
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                    "blocked_reasons": ["slash_activation_error"],
+                    **_palette_no_side_effect_flags(),
+                }
+                self._render_palette_activation_status(f"Slash command failed safely: {exc}", ok=False)
+                self._render_current_view()
+                return True
+
+        def action_activate_safe_slash_command(self) -> bool:
+            prompt = self.query_one("#prompt", TextArea)
+            return self._activate_safe_slash_command(prompt.value)
+
+        def _render_palette_activation_status(self, message: str, *, ok: bool) -> None:
+            status = self.query_one("#slash-status", Static)
+            status.remove_class("hidden")
+            prefix = "Palette" if ok else "Palette"
+            status.update(f"{prefix}: {escape(message)}")
+
         def action_move_slash_suggestion(self, step: int) -> None:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", TextArea)
             matching_commands = _matching_slash_commands(slash_commands, prompt.value)
             if not matching_commands:
                 self._slash_suggestion_index = 0
@@ -2295,7 +3243,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._render_slash_suggestions(prompt.value)
 
         def action_insert_selected_slash_suggestion(self) -> None:
-            prompt = self.query_one("#prompt", Input)
+            prompt = self.query_one("#prompt", TextArea)
             inserted = self._request_from_prompt_submission(prompt.value)
             if not inserted:
                 return
@@ -2345,8 +3293,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._render_current_view()
 
         def _current_view(self) -> dict:
-            prompt = self.query_one("#prompt", Input)
-            refreshed_dashboard = build_tui_dashboard(project_root)
+            prompt = self.query_one("#prompt", TextArea)
+            refreshed_dashboard = self._dashboard_snapshot()
             return build_right_panel_model(
                 refreshed_dashboard,
                 {
@@ -2362,6 +3310,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "latest_lease_id": self._chat_state.latest_lease_id,
                     "latest_run_id": self._chat_state.latest_run_id,
                     "latest_response": self._latest_response,
+                    "latest_palette_activation": self._latest_palette_activation,
+                    "selected_agent_id": self._selected_agent_id,
                 },
                 prompt.value,
                 focus_mode=self._focus_mode,
@@ -2396,9 +3346,29 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             try:
                 if self._request_in_flight:
                     self._render_chat()
+                self._dashboard_snapshot(force=True)
                 self._render_current_view()
+                self._live_refresh_failures = 0
             except NoMatches:
                 return
+            except Exception as exc:
+                self._live_refresh_failures += 1
+                if self._live_refresh_failures >= 3 and self._refresh_timer is not None and hasattr(self._refresh_timer, "stop"):
+                    self._refresh_timer.stop()
+                try:
+                    self._render_palette_activation_status(
+                        f"Live refresh paused: {exc.__class__.__name__}: {exc}",
+                        ok=False,
+                    )
+                except Exception:
+                    return
+
+        def _dashboard_snapshot(self, *, force: bool = False) -> dict:
+            now = time.monotonic()
+            if force or self._dashboard_cache is None or now - self._dashboard_cache_at >= 1.5:
+                self._dashboard_cache = build_tui_dashboard(project_root)
+                self._dashboard_cache_at = now
+            return self._dashboard_cache
 
         def _clamp_section_cursor(self, view: dict) -> None:
             if not view["sections"]:
@@ -2423,6 +3393,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._clamp_section_cursor(view)
             self.query_one("#search-status", Static).update(render_right_panel_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
+            refreshed_dashboard = self._dashboard_snapshot()
+            self.query_one("#session-rail-content", Static).update(_render_session_rail(refreshed_dashboard))
+            self.query_one("#composer-status", Static).update(
+                _render_composer_status(refreshed_dashboard, self._selected_agent_id)
+            )
             container = self.query_one("#pane-container", Static)
             container.update(render_right_panel(view))
 

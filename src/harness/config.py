@@ -90,12 +90,21 @@ class FormatterConfig(BaseModel):
     profiles: dict[str, FormatterProfileConfig] = Field(default_factory=dict)
 
 
+class McpResourceConfig(BaseModel):
+    uri: str
+    path: str
+    enabled: bool = True
+    content_type: str | None = None
+    description: str | None = None
+
+
 class McpServerConfig(BaseModel):
     kind: str = "local"
     command: list[str] = Field(default_factory=list)
     url: str | None = None
     enabled: bool = False
     description: str | None = None
+    resources: dict[str, McpResourceConfig] = Field(default_factory=dict)
 
 
 class McpConfig(BaseModel):
@@ -106,9 +115,12 @@ class McpConfig(BaseModel):
 class PluginConfig(BaseModel):
     path: str | None = None
     url: str | None = None
+    spec: str | None = None
+    entrypoint: str | None = None
     version: str | None = None
     enabled: bool = False
     description: str | None = None
+    options: dict[str, Any] = Field(default_factory=dict)
 
 
 class PluginsConfig(BaseModel):
@@ -118,6 +130,8 @@ class PluginsConfig(BaseModel):
 
 class SkillConfig(BaseModel):
     path: str | None = None
+    spec: str | None = None
+    version: str | None = None
     enabled: bool = False
     description: str | None = None
 
@@ -133,6 +147,7 @@ class WebToolsConfig(BaseModel):
     search_enabled: bool = False
     approval_required: bool = True
     allowed_domains: list[str] = Field(default_factory=list)
+    search_endpoint_url: str | None = None
 
 
 class HarnessConfig(BaseModel):

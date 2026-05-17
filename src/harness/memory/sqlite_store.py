@@ -5,6 +5,7 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,13 @@ LEGACY_TASK_STATUS_VALUES = {
 }
 
 SESSION_TODO_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+SCHEMA_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "20260516_001_sessions",
+        "20260516_001_sessions.sql",
+        "Session spine tables and append-only event store.",
+    ),
+)
 
 
 def _normalize_session_todo_status(status: str) -> str:
@@ -104,6 +112,27 @@ def _normalize_session_todo_status(status: str) -> str:
     if normalized not in SESSION_TODO_STATUSES:
         raise ValueError(f"Unsupported session todo status: {status}")
     return normalized
+
+
+def _session_local_tool_evidence(tool_id: str) -> dict[str, Any]:
+    return {
+        "policy_boundary": {
+            "kind": "session_local_state",
+            "boundary_kind": SessionPermissionBoundaryKind.LOCAL_ONLY.value,
+            "source": f"session_{tool_id}",
+        },
+        "tool_id": tool_id,
+        "session_local": True,
+        "repository_files_modified": False,
+        "filesystem_modified": False,
+        "active_repo_modified": False,
+        "git_mutation_started": False,
+        "process_started": False,
+        "network_accessed": False,
+        "permission_granting": False,
+        "authority_granting": False,
+        "blocked_reasons": [],
+    }
 
 
 def _permission_expiry_iso(expires_at: datetime | str | None, scope: SessionPermissionScope) -> str:
@@ -300,9 +329,12 @@ class SQLiteStore:
         approvals = self.harness_dir / "approvals.yaml"
         if not approvals.exists():
             approvals.write_text("approvals: []\n", encoding="utf-8")
-        schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
         with self.connect() as conn:
-            conn.executescript(schema)
+            self._ensure_schema_migrations_table(conn)
+            self._apply_schema_migrations(conn)
+            # After migration integrity is validated, replay the additive schema as a repair pass for
+            # older or partially initialized .harness databases with missing IF NOT EXISTS tables.
+            conn.executescript(Path(__file__).with_name("schema.sql").read_text(encoding="utf-8"))
             self._ensure_column(conn, "runs", "approval_id", "TEXT")
             self._ensure_column(conn, "runs", "task_id", "TEXT")
             self._ensure_column(conn, "runs", "objective_id", "TEXT")
@@ -345,7 +377,55 @@ class SQLiteStore:
             self._ensure_column(conn, "sessions", "archived_at", "TEXT")
             self._migrate_task_rows(conn)
             self._migrate_artifact_rows(conn)
-            self._record_schema_migration(conn, "20260516_001_sessions", schema, "Session spine tables and append-only event store.")
+
+    def _ensure_schema_migrations_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+              id TEXT PRIMARY KEY,
+              checksum TEXT NOT NULL,
+              applied_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+
+    def _apply_schema_migrations(self, conn: sqlite3.Connection) -> None:
+        migrations_dir = Path(__file__).with_name("migrations")
+        known: dict[str, tuple[Path, str]] = {
+            migration_id: (migrations_dir / filename, description)
+            for migration_id, filename, description in SCHEMA_MIGRATIONS
+        }
+        applied_rows = conn.execute("SELECT id, checksum FROM schema_migrations ORDER BY id ASC").fetchall()
+        applied = {row["id"]: row["checksum"] for row in applied_rows}
+        unknown = sorted(migration_id for migration_id in applied if migration_id not in known)
+        if unknown:
+            raise RuntimeError(
+                "Unknown future schema migration(s) present; refusing to mutate state: " + ", ".join(unknown)
+            )
+        for migration_id, filename, description in SCHEMA_MIGRATIONS:
+            migration_path = migrations_dir / filename
+            migration_sql = migration_path.read_text(encoding="utf-8")
+            checksum = hashlib.sha256(migration_sql.encode("utf-8")).hexdigest()
+            if migration_id in applied:
+                if applied[migration_id] != checksum:
+                    raise RuntimeError(
+                        f"Schema migration checksum mismatch for {migration_id}; refusing to mutate state."
+                    )
+                continue
+            conn.executescript(migration_sql)
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (id, checksum, applied_at, metadata_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    migration_id,
+                    checksum,
+                    now_iso(),
+                    json.dumps({"description": description, "path": filename}, sort_keys=True, default=str),
+                ),
+            )
 
     def _ensure_column(self, conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -505,6 +585,19 @@ class SQLiteStore:
                 "objective_id": objective_id,
                 "active_task_id": active_task_id,
                 "active_run_id": active_run_id,
+                "raw_model_ref": raw_model_ref,
+                "provider_id": provider_id,
+                "model_id": model_id,
+                "model_variant": model_variant,
+                "model_selection_source": "session_create",
+                "model_override_persisted": raw_model_ref is not None,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "hidden_provider_fallback": False,
+                "hidden_model_fallback": False,
+                "no_hidden_fallback": True,
+                "permission_granting": False,
+                "authority_granting": False,
             },
             session_id=session_id,
             redaction_state=RedactionState.NOT_REQUIRED,
@@ -543,6 +636,36 @@ class SQLiteStore:
     def delete_session(self, session_id: str) -> SessionSpec:
         return self.archive_session(session_id)
 
+    def cancel_session(self, session_id: str, *, reason: str | None = None) -> SessionSpec:
+        self.get_session(session_id)
+        timestamp = now_iso()
+        sanitized_reason = sanitize_for_logging(reason) if reason is not None else None
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (SessionStatus.CANCELLED.value, timestamp, session_id),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.cancelled",
+            {
+                "cancelled_at": timestamp,
+                "reason": sanitized_reason,
+                "process_stopped": False,
+                "run_cancelled": False,
+                "task_cancelled": False,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            redaction_state=RedactionState.REDACTED if sanitized_reason else RedactionState.NOT_REQUIRED,
+        )
+        return self.get_session(session_id)
+
     def update_session_model(
         self,
         session_id: str,
@@ -572,6 +695,15 @@ class SQLiteStore:
                 "provider_id": provider_id,
                 "model_id": model_id,
                 "model_variant": model_variant,
+                "model_selection_source": "session_update",
+                "model_override_persisted": raw_model_ref is not None,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "hidden_provider_fallback": False,
+                "hidden_model_fallback": False,
+                "no_hidden_fallback": True,
+                "permission_granting": False,
+                "authority_granting": False,
             },
             session_id=session_id,
             redaction_state=RedactionState.NOT_REQUIRED,
@@ -588,6 +720,77 @@ class SQLiteStore:
             session_id,
             "session.title_updated",
             {"title": title},
+            session_id=session_id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return self.get_session(session_id)
+
+    def update_session_summary(
+        self,
+        session_id: str,
+        *,
+        summary: str | None = None,
+        token_input: int | None = None,
+        token_output: int | None = None,
+        token_reasoning: int | None = None,
+        token_cache_read: int | None = None,
+        token_cache_write: int | None = None,
+        estimated_cost_usd: Decimal | str | None = None,
+    ) -> SessionSpec:
+        current = self.get_session(session_id)
+        sanitized_summary = sanitize_for_logging(summary) if summary is not None else current.summary
+        cost_value = (
+            str(Decimal(str(estimated_cost_usd)))
+            if estimated_cost_usd is not None
+            else (str(current.estimated_cost_usd) if current.estimated_cost_usd is not None else None)
+        )
+        values = {
+            "summary": sanitized_summary,
+            "token_input": current.token_input if token_input is None else int(token_input),
+            "token_output": current.token_output if token_output is None else int(token_output),
+            "token_reasoning": current.token_reasoning if token_reasoning is None else int(token_reasoning),
+            "token_cache_read": current.token_cache_read if token_cache_read is None else int(token_cache_read),
+            "token_cache_write": current.token_cache_write if token_cache_write is None else int(token_cache_write),
+            "estimated_cost_usd": cost_value,
+        }
+        if any(value < 0 for key, value in values.items() if key.startswith("token_")):
+            raise ValueError("Session token counters must be non-negative.")
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET summary = ?, token_input = ?, token_output = ?, token_reasoning = ?,
+                    token_cache_read = ?, token_cache_write = ?, estimated_cost_usd = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    values["summary"],
+                    values["token_input"],
+                    values["token_output"],
+                    values["token_reasoning"],
+                    values["token_cache_read"],
+                    values["token_cache_write"],
+                    values["estimated_cost_usd"],
+                    timestamp,
+                    session_id,
+                ),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.summary_updated",
+            {
+                "summary": values["summary"],
+                "token_input": values["token_input"],
+                "token_output": values["token_output"],
+                "token_reasoning": values["token_reasoning"],
+                "token_cache_read": values["token_cache_read"],
+                "token_cache_write": values["token_cache_write"],
+                "estimated_cost_usd": values["estimated_cost_usd"],
+                "mutable_projection": True,
+                "permission_granting": False,
+            },
             session_id=session_id,
             redaction_state=RedactionState.REDACTED,
         )
@@ -700,6 +903,15 @@ class SQLiteStore:
                 ).fetchone()
         return self._row_to_session(row) if row is not None else None
 
+    def list_child_sessions(self, session_id: str) -> list[SessionSpec]:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY updated_at DESC, id ASC",
+                (session_id,),
+            ).fetchall()
+        return [self._row_to_session(row) for row in rows]
+
     def fork_session(
         self,
         session_id: str,
@@ -796,6 +1008,34 @@ class SQLiteStore:
                     session_id,
                 ),
             )
+        return self.get_session(session_id)
+
+    def update_session_ui_preferences(self, session_id: str, preferences: dict[str, Any]) -> SessionSpec:
+        current = self.get_session(session_id)
+        updated = dict(current.ui_preferences)
+        updated.update(sanitize_for_logging(preferences))
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET ui_preferences_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(updated, sort_keys=True, default=str), timestamp, session_id),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.ui_preferences.updated",
+            {
+                "keys": sorted(preferences),
+                "mutable_projection": True,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            redaction_state=RedactionState.REDACTED,
+        )
         return self.get_session(session_id)
 
     def append_session_message(
@@ -1060,6 +1300,108 @@ class SQLiteStore:
             for row in rows
         ]
 
+    def record_session_message_retraction(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        reason: str | None = None,
+    ) -> StoredEventRecord:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM session_messages WHERE id = ? AND session_id = ?",
+                (message_id, session_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session message not found: {message_id}")
+        sanitized_reason = sanitize_for_logging(reason) if reason is not None else None
+        return self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.message.retracted",
+            {
+                "message_id": message_id,
+                "reason": sanitized_reason,
+                "message_mutated": False,
+                "parts_mutated": False,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            message_id=message_id,
+            redaction_state=RedactionState.REDACTED if sanitized_reason else RedactionState.NOT_REQUIRED,
+        )
+
+    def record_session_part_correction(
+        self,
+        session_id: str,
+        part_id: str,
+        *,
+        corrected_text: str,
+        reason: str | None = None,
+    ) -> StoredEventRecord:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id, message_id FROM session_parts WHERE id = ? AND session_id = ?",
+                (part_id, session_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session part not found: {part_id}")
+        sanitized_text = str(sanitize_for_logging(corrected_text))[:16 * 1024]
+        sanitized_reason = sanitize_for_logging(reason) if reason is not None else None
+        return self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.part.corrected",
+            {
+                "part_id": part_id,
+                "message_id": row["message_id"],
+                "corrected_text": sanitized_text,
+                "reason": sanitized_reason,
+                "part_mutated": False,
+                "message_mutated": False,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            message_id=row["message_id"],
+            redaction_state=RedactionState.REDACTED,
+        )
+
+    def record_session_part_retraction(
+        self,
+        session_id: str,
+        part_id: str,
+        *,
+        reason: str | None = None,
+    ) -> StoredEventRecord:
+        self.get_session(session_id)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT id, message_id FROM session_parts WHERE id = ? AND session_id = ?",
+                (part_id, session_id),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f"Session part not found: {part_id}")
+        sanitized_reason = sanitize_for_logging(reason) if reason is not None else None
+        return self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.part.retracted",
+            {
+                "part_id": part_id,
+                "message_id": row["message_id"],
+                "reason": sanitized_reason,
+                "part_deleted": False,
+                "part_mutated": False,
+                "message_mutated": False,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            message_id=row["message_id"],
+            redaction_state=RedactionState.REDACTED if sanitized_reason else RedactionState.NOT_REQUIRED,
+        )
+
     def append_session_todo(
         self,
         session_id: str,
@@ -1073,6 +1415,7 @@ class SQLiteStore:
         timestamp = now_iso()
         status_value = _normalize_session_todo_status(status)
         sanitized_content = str(sanitize_for_logging(content))[:16 * 1024]
+        safety_evidence = _session_local_tool_evidence("todo")
         with self.connect() as conn:
             self._require_session(conn, session_id)
             if source_message_id is not None:
@@ -1102,14 +1445,14 @@ class SQLiteStore:
             message.id,
             SessionPartKind.TODO_UPDATE,
             text=sanitized_content,
-            metadata={"todo_id": todo_id, "status": status_value, "priority": priority},
+            metadata={"todo_id": todo_id, "status": status_value, "priority": priority, **safety_evidence},
             redaction_state=RedactionState.REDACTED,
         )
         self.append_store_event(
             EventStreamType.SESSION,
             session_id,
             "todo.updated",
-            {"todo_id": todo_id, "status": status_value, "priority": priority, "summary": sanitized_content},
+            {"todo_id": todo_id, "status": status_value, "priority": priority, "summary": sanitized_content, **safety_evidence},
             session_id=session_id,
             message_id=message.id,
             redaction_state=RedactionState.REDACTED,
@@ -1148,6 +1491,7 @@ class SQLiteStore:
     ) -> SessionPartRecord:
         sanitized_question = str(sanitize_for_logging(question))[:16 * 1024]
         sanitized_choices = [str(sanitize_for_logging(choice))[:2048] for choice in choices or []]
+        safety_evidence = _session_local_tool_evidence("question")
         message = self.append_session_message(
             session_id,
             SessionMessageRole.TOOL,
@@ -1159,14 +1503,14 @@ class SQLiteStore:
             message.id,
             SessionPartKind.QUESTION,
             text=sanitized_question,
-            metadata={"choices": sanitized_choices},
+            metadata={"choices": sanitized_choices, **safety_evidence},
             redaction_state=RedactionState.REDACTED,
         )
         self.append_store_event(
             EventStreamType.SESSION,
             session_id,
             "question.requested",
-            {"summary": sanitized_question, "choices": sanitized_choices},
+            {"summary": sanitized_question, "choices": sanitized_choices, **safety_evidence},
             session_id=session_id,
             message_id=message.id,
             redaction_state=RedactionState.REDACTED,
@@ -4248,6 +4592,7 @@ class SQLiteStore:
         sanitized_actor = sanitize_for_logging(actor or {})
         sanitized_artifact_refs = sanitize_for_logging(artifact_refs or [])
         with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             seq = self._next_store_event_seq(conn, stream_value.value, stream_id)
             conn.execute(
                 """

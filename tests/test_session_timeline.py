@@ -161,3 +161,50 @@ def test_session_snapshot_refs_are_append_only_and_not_revert_grants(tmp_path) -
     assert len(snapshot_events) == 1
     assert snapshot_events[0].payload["revert_supported"] is False
     assert snapshot_events[0].payload["permission_granting"] is False
+
+
+def test_session_timeline_renders_persisted_tui_activation_as_ui_only_evidence(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    session = store.create_session(title="UI activation")
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "tui.ui_activation.applied",
+        {
+            "source": "slash",
+            "entry_id": "ui_controls.settings",
+            "activation_kind": "ui_action",
+            "action": {"type": "focus_section", "section_id": "settings"},
+            "ui_action_applied": True,
+            "command_started": False,
+            "process_started": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "evidence_status": "ui_only_persisted",
+            "policy_boundary": {
+                "kind": "safe_ui_activation",
+                "ui_state_only": True,
+                "command_execution_allowed": False,
+                "process_start_allowed": False,
+                "filesystem_mutation_allowed": False,
+                "permission_grant_allowed": False,
+                "authority_grant_allowed": False,
+            },
+            "blocked_reasons": [],
+        },
+        session_id=session.id,
+    )
+
+    rendered_timeline = "\n".join(render_timeline_event(event) for event in list_session_timeline(store, session.id))
+    timeline_jsonl = "\n".join(timeline_event_jsonl(event) for event in list_session_timeline(store, session.id))
+
+    assert "UI action applied" in rendered_timeline
+    assert "ui_controls.settings action=focus_section source=slash" in rendered_timeline
+    assert "command_started=False" in rendered_timeline
+    assert "process_started=False" in rendered_timeline
+    assert "filesystem_modified=False" in rendered_timeline
+    assert "permission_granting=False" in rendered_timeline
+    assert "authority_granting=False" in rendered_timeline
+    assert '"kind": "tui.ui_activation.applied"' in timeline_jsonl

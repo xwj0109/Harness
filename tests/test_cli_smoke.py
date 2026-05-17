@@ -13,10 +13,11 @@ from harness.approvals import ApprovalStore
 from harness.backends.codex_cli import CodexRunResult
 from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
 from harness.config import default_config
-from harness.models import BackendStatus, BillingMode, DataBoundary, ExecutionLocation
+from harness.models import BackendStatus, BillingMode, DataBoundary, EventStreamType, ExecutionLocation
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
 from harness.tui import (
+    activate_command_palette_entry,
     build_focused_tui_view_model,
     build_tui_dashboard,
     build_tui_panes,
@@ -27,6 +28,7 @@ from harness.tui import (
     build_right_panel_model,
     create_harness_app,
     build_slash_commands,
+    build_tui_settings_catalog,
     handle_slash_command,
     filter_command_palette,
     filter_slash_commands,
@@ -40,6 +42,7 @@ from harness.tui import (
     render_slash_command_suggestions,
     render_view_status,
 )
+from harness.command_catalog import build_command_catalog
 
 
 runner = CliRunner()
@@ -592,6 +595,7 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
         "leases",
         "daemon",
         "runs",
+        "settings",
         "sessions",
         "models",
         "commands",
@@ -705,9 +709,32 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     )
     assert created_run.exit_code == 0, created_run.output
     store = SQLiteStore(tmp_path)
-    session = store.create_session(title="TUI session", agent_id="tui_agent", raw_model_ref="codex/gpt-test")
+    session = store.create_session(
+        title="TUI session",
+        agent_id="tui_agent",
+        raw_model_ref="codex/gpt-test",
+        ui_preferences={"theme": "dark", "terminal_font_size": 18, "keybinding_preset": "opencode-like"},
+    )
     message = store.append_session_message(session.id, "user", "Inspect the active session")
     store.append_session_part(session.id, message.id, "text", text="Inspect the active session")
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "tui.ui_activation.applied",
+        {
+            "source": "slash",
+            "entry_id": "ui_controls.settings",
+            "activation_kind": "ui_action",
+            "action": {"type": "focus_section", "section_id": "settings"},
+            "ui_action_applied": True,
+            "command_started": False,
+            "process_started": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        },
+        session_id=session.id,
+    )
 
     dashboard = build_tui_dashboard(tmp_path)
     panes = build_tui_panes(dashboard)
@@ -734,13 +761,29 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["recent_sessions"][0]["id"] == session.id
     assert dashboard["recent_sessions"][0]["title"] == "TUI session"
     assert dashboard["recent_sessions"][0]["agent_id"] == "tui_agent"
+    assert dashboard["recent_sessions"][0]["ui_preferences"]["theme"] == "dark"
     assert dashboard["model_catalog"]["no_hidden_fallback"] is True
     assert dashboard["model_catalog"]["active_model"]["raw_model_ref"] == "codex/gpt-test"
     assert dashboard["model_catalog"]["active_model"]["known_catalog_entry"] is False
+    assert dashboard["model_catalog"]["active_model"]["executable"] is False
+    assert dashboard["model_catalog"]["active_model"]["provider_known"] is False
+    assert dashboard["model_catalog"]["active_model"]["provider_enabled"] is False
+    assert dashboard["model_catalog"]["active_model"]["blocked_reasons"] == ["provider_unknown", "model_unknown"]
+    assert dashboard["model_catalog"]["active_model"]["provider_execution_started"] is False
+    assert dashboard["model_catalog"]["active_model"]["model_execution_started"] is False
+    assert dashboard["model_catalog"]["active_model"]["network_accessed"] is False
+    assert dashboard["model_catalog"]["active_model"]["hidden_provider_fallback"] is False
+    assert dashboard["model_catalog"]["active_model"]["hidden_model_fallback"] is False
+    assert dashboard["model_catalog"]["active_model"]["permission_granting"] is False
+    assert dashboard["model_catalog"]["active_model"]["authority_granting"] is False
     assert any(model["raw_model_ref"] == "codex_cli/gpt-5.5" for model in dashboard["model_catalog"]["models"])
     assert dashboard["active_session"]["id"] == session.id
     assert dashboard["active_session"]["raw_model_ref"] == "codex/gpt-test"
+    assert dashboard["active_session"]["ui_preferences"]["theme"] == "dark"
+    assert dashboard["active_session"]["latest_ui_activation"]["entry_id"] == "ui_controls.settings"
+    assert dashboard["active_session"]["latest_ui_activation"]["process_started"] is False
     assert any("Message appended" in line for line in dashboard["active_session"]["timeline"])
+    assert any("UI action applied" in line for line in dashboard["active_session"]["timeline"])
     assert any("Inspect the active session" in line for line in dashboard["active_session"]["transcript"])
     assert [pane["id"] for pane in panes] == [
         "overview",
@@ -749,12 +792,30 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
         "leases",
         "daemon",
         "runs",
+        "settings",
         "sessions",
         "models",
         "commands",
         "guidance",
         "safety",
     ]
+    settings_pane = next(pane for pane in panes if pane["id"] == "settings")
+    settings_text = "\n".join(settings_pane["lines"])
+    assert "Source: active session preferences" in settings_text
+    assert f"Session: {session.id}" in settings_text
+    assert "Policy: tui_settings_read_only" in settings_text
+    assert "Evidence: read_only_settings_metadata" in settings_text
+    assert "theme=dark" in settings_text
+    assert "terminal_font_size=18" in settings_text
+    assert "keybinding_preset=opencode-like" in settings_text
+    assert "composer_mode=multiline" in settings_text
+    assert "Preferences persisted: False" in settings_text
+    assert "Backend settings exposed: False" in settings_text
+    assert f"Persist command: harness session preferences {session.id} --project . --set key=value" in settings_text
+    sessions_pane = next(pane for pane in panes if pane["id"] == "sessions")
+    sessions_text = "\n".join(sessions_pane["lines"])
+    assert "Latest UI action: ui_controls.settings action=focus_section source=slash" in sessions_text
+    assert "UI flags: command=False process=False filesystem=False permission=False authority=False" in sessions_text
     assert any("tui_agent" in line for line in panes[1]["lines"])
     assert any("tui task" in line for line in panes[2]["lines"])
     assert any(dashboard["active_leases"][0]["id"] in line for line in panes[3]["lines"])
@@ -769,6 +830,10 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "TUI session" in rendered
     assert "Models" in rendered
     assert "No hidden fallback: True" in rendered
+    assert "known=False executable=False" in rendered
+    assert f"Switch: harness session model {session.id} <provider/model> --project ." in rendered
+    assert "Blocked: provider_unknown, model_unknown" in rendered
+    assert "Hidden fallback: provider=False model=False" in rendered
     assert "codex_cli/gpt-5.5" in rendered
     assert "Timeline:" in rendered
     assert "Transcript:" in rendered
@@ -777,6 +842,8 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "Timeline:" in right_panel
     assert "Transcript: user " in right_panel
     assert "Known model: False" in right_panel
+    assert "Model executable: False" in right_panel
+    assert "Model blocked: provider_unknown, model_unknown" in right_panel
     assert "Fallback: explicit failure only" in right_panel
     assert "harness daemon status --project" in rendered
     serialized = json.dumps(dashboard)
@@ -874,6 +941,46 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     assert [pane["id"] for pane in run_filtered["panes"]] == ["runs"]
     assert "daemon" in [pane["id"] for pane in daemon_filtered["panes"]]
     assert [pane["id"] for pane in command_filtered["panes"]] == ["commands"]
+    settings = next(pane for pane in panes if pane["id"] == "settings")
+    settings_text = "\n".join(settings["lines"])
+    catalog = build_tui_settings_catalog()
+    assert catalog["schema_version"] == "harness.tui_settings/v1"
+    assert catalog["source"] == "defaults"
+    assert catalog["source_label"] == "defaults"
+    assert catalog["session_id"] is None
+    assert catalog["preference_source"] == "defaults"
+    assert catalog["evidence_status"] == "read_only_settings_metadata"
+    assert catalog["policy_boundary"]["kind"] == "tui_settings_read_only"
+    assert catalog["policy_boundary"]["preference_persistence_allowed"] is False
+    assert catalog["policy_boundary"]["backend_settings_allowed"] is False
+    assert catalog["policy_boundary"]["process_start_allowed"] is False
+    assert catalog["policy_boundary"]["filesystem_mutation_allowed"] is False
+    assert catalog["policy_boundary"]["permission_grant_allowed"] is False
+    assert catalog["preferences"]["composer_mode"] == "multiline"
+    assert catalog["preferences_persisted"] is False
+    assert catalog["backend_settings_exposed"] is False
+    assert catalog["authority_granting"] is False
+    assert catalog["process_started"] is False
+    assert catalog["filesystem_modified"] is False
+    assert catalog["permission_granting"] is False
+    assert catalog["persist_command"] == "harness session preferences <session-id> --project . --set key=value"
+    assert {setting["key"] for setting in catalog["settings"]} == {
+        "theme",
+        "terminal_font_size",
+        "keybinding_preset",
+        "composer_mode",
+    }
+    assert "theme=light" in settings_text
+    assert "composer_mode=multiline" in settings_text
+    assert "Policy: tui_settings_read_only" in settings_text
+    assert "Evidence: read_only_settings_metadata" in settings_text
+    assert "ctrl+p -> toggle_palette_focus" in settings_text
+    assert "composer_mode kind=choice scope=session default=multiline" in settings_text
+    assert "Filesystem modified: False" in settings_text
+    assert "Process started: False" in settings_text
+    assert "Permission granting: False" in settings_text
+    assert "Preferences persisted: False" in settings_text
+    assert "Backend settings exposed: False" in settings_text
     assert missing_filtered["panes"] == []
     assert missing_filtered["total_matches"] == 0
     assert render_filter_status(missing_filtered) == "Search: does-not-exist | Matches: 0 | Panes: 0"
@@ -886,6 +993,7 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
             "run_filtered": run_filtered,
             "daemon_filtered": daemon_filtered,
             "command_filtered": command_filtered,
+            "settings": settings,
         }
     )
     assert "api_key" not in serialized
@@ -902,6 +1010,7 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert palette["schema_version"] == "harness.tui_command_palette/v1"
     assert group_ids == [
         "orientation",
+        "ui_controls",
         "agent_authoring",
         "native_agents",
         "project_agents",
@@ -914,8 +1023,38 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
         "packaging_smoke",
     ]
     assert len(entry_ids) == len(set(entry_ids))
-    assert all(set(entry) >= {"id", "group_id", "title", "command", "description", "mutates_when_run", "safety_note"} for entry in palette["entries"])
+    assert all(set(entry) >= {"id", "group_id", "title", "command", "description", "mutates_when_run", "safety_note", "activation"} for entry in palette["entries"])
     assert all(entry["group_id"] in group_ids for entry in palette["entries"])
+    assert next(entry for entry in palette["entries"] if entry["id"] == "sessions.list")["activation"]["kind"] == "ui_action"
+    assert next(entry for entry in palette["entries"] if entry["id"] == "ui_controls.expand_all")["activation"]["kind"] == "ui_action"
+    assert next(entry for entry in palette["entries"] if entry["id"] == "ui_controls.settings")["activation"]["kind"] == "ui_action"
+    assert next(entry for entry in palette["entries"] if entry["id"] == "sessions.continue_last")["activation"]["kind"] == "manual_command"
+    safe_activation = next(entry for entry in palette["entries"] if entry["id"] == "sessions.list")["activation"]
+    manual_activation = next(entry for entry in palette["entries"] if entry["id"] == "sessions.continue_last")["activation"]
+    assert safe_activation["evidence_status"] == "ui_only_in_memory"
+    assert safe_activation["policy_boundary"]["kind"] == "safe_ui_activation"
+    assert safe_activation["policy_boundary"]["command_execution_allowed"] is False
+    assert safe_activation["policy_boundary"]["provider_call_allowed"] is False
+    assert safe_activation["policy_boundary"]["shell_allowed"] is False
+    assert safe_activation["policy_boundary"]["adapter_dispatch_allowed"] is False
+    assert safe_activation["policy_boundary"]["child_process_allowed"] is False
+    assert safe_activation["policy_boundary"]["filesystem_mutation_allowed"] is False
+    assert safe_activation["policy_boundary"]["permission_grant_allowed"] is False
+    assert safe_activation["policy_boundary"]["authority_grant_allowed"] is False
+    assert safe_activation["policy_boundary"]["session_message_allowed"] is False
+    assert safe_activation["blocked_reasons"] == []
+    assert safe_activation["provider_started"] is False
+    assert safe_activation["shell_started"] is False
+    assert safe_activation["adapter_started"] is False
+    assert safe_activation["child_process_started"] is False
+    assert safe_activation["authority_granting"] is False
+    assert safe_activation["session_message_created"] is False
+    assert manual_activation["evidence_status"] == "manual_preview_only"
+    assert manual_activation["blocked_reasons"] == ["manual_command_preview_only"]
+    assert manual_activation["provider_started"] is False
+    assert manual_activation["shell_started"] is False
+    assert manual_activation["adapter_started"] is False
+    assert manual_activation["child_process_started"] is False
 
     all_entries = filter_command_palette(palette, "")
     daemon_entries = filter_command_palette(palette, "daemon")
@@ -946,7 +1085,7 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert "artifact contents" not in serialized
 
 
-def test_tui_command_palette_panes_show_copy_only_command_details() -> None:
+def test_tui_command_palette_panes_show_safe_actions_and_manual_command_details() -> None:
     palette = build_command_palette()
     read_only_entries = filter_command_palette(palette, "execute-read-only")
     missing_entries = filter_command_palette(palette, "does-not-exist")
@@ -960,9 +1099,10 @@ def test_tui_command_palette_panes_show_copy_only_command_details() -> None:
         "command_palette_registered_adapters",
         "command_palette_selected",
     ]
-    assert "Copy-only command templates." in panes[0]["lines"]
+    assert "Safe UI actions activate in-process; command entries remain manual previews." in panes[0]["lines"]
     assert any("registered_adapters.execute_read_only" in line for line in panes[1]["lines"])
     selected_lines = "\n".join(panes[2]["lines"])
+    assert "Activation: manual_command" in selected_lines
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in selected_lines
     assert "Compatibility command for the bounded read-only adapter when manually run." in selected_lines
     assert "No matching command template." in missing_panes[-1]["lines"]
@@ -973,6 +1113,163 @@ def test_tui_command_palette_panes_show_copy_only_command_details() -> None:
     assert "base_url" not in serialized
     assert "subprocess" not in serialized
     assert "artifact contents" not in serialized
+
+
+def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
+    palette = build_command_palette()
+
+    sessions = activate_command_palette_entry(
+        palette,
+        "sessions.list",
+        {"focus_mode": "palette", "active_section_index": 0},
+    )
+    manual = activate_command_palette_entry(palette, "registered_adapters.execute_read_only")
+    missing = activate_command_palette_entry(palette, "does-not-exist")
+    toggle = activate_command_palette_entry(
+        palette,
+        "ui_controls.toggle_section",
+        {"active_section_index": 2, "collapsed_section_ids": set()},
+    )
+    expand = activate_command_palette_entry(
+        palette,
+        "ui_controls.expand_all",
+        {"active_section_index": 2, "collapsed_section_ids": {"queue_daemon"}},
+    )
+    clear = activate_command_palette_entry(
+        palette,
+        "ui_controls.clear_search",
+        {"focus_mode": "palette", "query": "sessions"},
+    )
+    settings = activate_command_palette_entry(
+        palette,
+        "ui_controls.settings",
+        {"focus_mode": "palette", "active_section_index": 0},
+    )
+    select_build = activate_command_palette_entry(
+        palette,
+        "native_agents.select_build",
+        {"selected_agent_id": "plan", "focus_mode": "dashboard"},
+    )
+    select_plan = activate_command_palette_entry(
+        palette,
+        "native_agents.select_plan",
+        {"selected_agent_id": "build", "focus_mode": "dashboard"},
+    )
+
+    assert sessions["schema_version"] == "harness.tui_palette_activation/v1"
+    assert sessions["ok"] is True
+    assert sessions["activation_kind"] == "ui_action"
+    assert sessions["ui_action_applied"] is True
+    assert sessions["view_state"]["focus_mode"] == "dashboard"
+    assert sessions["view_state"]["active_section_id"] == "sessions"
+    assert sessions["evidence_status"] == "ui_focus_in_memory"
+    assert sessions["policy_boundary"]["kind"] == "safe_ui_activation"
+    assert sessions["policy_boundary"]["command_execution_allowed"] is False
+    assert sessions["policy_boundary"]["provider_call_allowed"] is False
+    assert sessions["policy_boundary"]["shell_allowed"] is False
+    assert sessions["policy_boundary"]["adapter_dispatch_allowed"] is False
+    assert sessions["policy_boundary"]["child_process_allowed"] is False
+    assert sessions["policy_boundary"]["filesystem_mutation_allowed"] is False
+    assert sessions["policy_boundary"]["permission_grant_allowed"] is False
+    assert sessions["policy_boundary"]["authority_grant_allowed"] is False
+    assert sessions["policy_boundary"]["session_message_allowed"] is False
+    assert sessions["blocked_reasons"] == []
+    assert sessions["local_state_changes"] == {
+        "changed_fields": ["focus_mode", "active_section_id", "active_section_index"],
+        "creates_message": False,
+        "starts_request": False,
+        "executes_command": False,
+        "mutates_filesystem": False,
+        "grants_permission": False,
+    }
+    assert sessions["request_started"] is False
+    assert sessions["command_started"] is False
+    assert sessions["provider_started"] is False
+    assert sessions["shell_started"] is False
+    assert sessions["adapter_started"] is False
+    assert sessions["child_process_started"] is False
+    assert sessions["process_started"] is False
+    assert sessions["filesystem_modified"] is False
+    assert sessions["permission_granting"] is False
+    assert sessions["authority_granting"] is False
+    assert sessions["session_message_created"] is False
+
+    assert manual["ok"] is False
+    assert manual["activation_kind"] == "manual_command"
+    assert manual["ui_action_applied"] is False
+    assert manual["evidence_status"] == "manual_preview_only"
+    assert manual["policy_boundary"]["kind"] == "safe_ui_activation"
+    assert manual["blocked_reasons"] == ["manual_command_preview_only"]
+    assert manual["request_started"] is False
+    assert manual["command_started"] is False
+    assert manual["provider_started"] is False
+    assert manual["shell_started"] is False
+    assert manual["adapter_started"] is False
+    assert manual["child_process_started"] is False
+    assert manual["process_started"] is False
+    assert manual["filesystem_modified"] is False
+    assert manual["permission_granting"] is False
+    assert manual["authority_granting"] is False
+    assert manual["session_message_created"] is False
+
+    assert missing["ok"] is False
+    assert missing["activation_kind"] == "missing"
+    assert missing["evidence_status"] == "missing_entry"
+    assert missing["blocked_reasons"] == ["palette_entry_not_found"]
+    assert missing["request_started"] is False
+    assert missing["command_started"] is False
+    assert missing["provider_started"] is False
+    assert missing["shell_started"] is False
+    assert missing["adapter_started"] is False
+    assert missing["child_process_started"] is False
+    assert missing["process_started"] is False
+    assert missing["filesystem_modified"] is False
+    assert missing["permission_granting"] is False
+    assert missing["authority_granting"] is False
+    assert missing["session_message_created"] is False
+    assert toggle["ok"] is True
+    assert toggle["evidence_status"] == "ui_section_toggle_in_memory"
+    assert toggle["view_state"]["active_section_id"] == "queue_daemon"
+    assert toggle["view_state"]["collapsed_section_ids"] == ["queue_daemon"]
+    assert toggle["local_state_changes"]["changed_fields"] == ["active_section_id", "collapsed_section_ids"]
+    assert toggle["local_state_changes"]["creates_message"] is False
+    assert toggle["request_started"] is False
+    assert toggle["command_started"] is False
+    assert toggle["filesystem_modified"] is False
+    assert toggle["permission_granting"] is False
+    assert expand["ok"] is True
+    assert expand["evidence_status"] == "ui_sections_expanded_in_memory"
+    assert expand["view_state"]["collapsed_section_ids"] == []
+    assert expand["local_state_changes"]["changed_fields"] == ["collapsed_section_ids"]
+    assert expand["request_started"] is False
+    assert expand["command_started"] is False
+    assert expand["filesystem_modified"] is False
+    assert expand["permission_granting"] is False
+    assert clear["ok"] is True
+    assert clear["evidence_status"] == "ui_search_cleared_in_memory"
+    assert clear["view_state"]["focus_mode"] == "dashboard"
+    assert clear["view_state"]["query"] == ""
+    assert clear["local_state_changes"]["changed_fields"] == ["focus_mode", "query"]
+    assert clear["request_started"] is False
+    assert clear["command_started"] is False
+    assert clear["filesystem_modified"] is False
+    assert clear["permission_granting"] is False
+    assert settings["ok"] is True
+    assert settings["evidence_status"] == "ui_focus_in_memory"
+    assert settings["view_state"]["focus_mode"] == "dashboard"
+    assert settings["view_state"]["active_section_id"] == "settings"
+    assert select_build["ok"] is True
+    assert select_build["evidence_status"] == "ui_agent_selected_in_memory"
+    assert select_build["view_state"]["selected_agent_id"] == "build"
+    assert select_build["local_state_changes"]["changed_fields"] == ["selected_agent_id"]
+    assert select_build["request_started"] is False
+    assert select_build["command_started"] is False
+    assert select_build["provider_started"] is False
+    assert select_build["filesystem_modified"] is False
+    assert select_build["permission_granting"] is False
+    assert select_build["authority_granting"] is False
+    assert select_plan["ok"] is True
+    assert select_plan["view_state"]["selected_agent_id"] == "plan"
 
 
 def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
@@ -990,14 +1287,17 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "queue_daemon",
         "agents_specs",
         "runtime_evidence",
+        "settings",
         "command_palette",
         "safety",
     ]
     assert view["sections"][0]["pane_ids"] == ["overview", "guidance", "commands"]
     assert view["sections"][1]["pane_ids"] == ["sessions"]
     assert view["sections"][2]["pane_ids"] == ["tasks", "leases", "daemon"]
-    assert view["sections"][5]["pane_ids"][0] == "command_palette"
-    assert view["sections"][5]["pane_ids"][-1] == "command_palette_selected"
+    assert view["sections"][5]["pane_ids"] == ["settings"]
+    assert view["sections"][6]["pane_ids"][0] == "command_palette"
+    assert view["sections"][6]["pane_ids"][-1] == "command_palette_selected"
+    assert "command_palette_ui_controls" in view["sections"][6]["pane_ids"]
     assert view["pane_order"][:7] == ["overview", "guidance", "commands", "sessions", "tasks", "leases", "daemon"]
     assert view["pane_order"][-1] == "safety"
     assert view["empty_state"] is None
@@ -1007,7 +1307,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["search"]["dashboard_panes"] == len(panes)
     assert view["search"]["palette_matches"] == len(palette["entries"])
     assert render_view_status(view).startswith(
-        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 7 | Panes:"
+        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 8 | Panes:"
     )
     assert f"Palette commands: {len(palette['entries'])}" in render_view_status(view)
     assert {hint["key"] for hint in view["navigation_hints"]} == {
@@ -1020,7 +1320,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "shift+c",
         "ctrl+q",
         "enter",
-        "copy-only",
+        "safe-actions",
     }
 
     missing_view = build_tui_view_model(
@@ -1048,6 +1348,68 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     )
 
     serialized = json.dumps({"view": view, "missing": missing_view})
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+    assert "subprocess" not in serialized
+    assert "artifact contents" not in serialized
+
+
+def test_tui_terminal_tab_panel_uses_persisted_pty_events_without_live_process(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.append_store_event(
+        EventStreamType.SESSION,
+        "pty:pty_123",
+        "pty.created",
+        {"shell": "/bin/zsh", "title": "Dev shell", "cols": 80, "rows": 24},
+    )
+    store.append_store_event(
+        EventStreamType.SESSION,
+        "pty:pty_123",
+        "pty.output",
+        {"preview": "hello from terminal\n", "preview_bytes": 20},
+        artifact_refs=["art_pty_output"],
+    )
+
+    dashboard = build_tui_dashboard(tmp_path)
+    panes = build_tui_panes(dashboard)
+    terminal = next(pane for pane in panes if pane["id"] == "terminal")
+    view = build_tui_view_model(filter_tui_panes(panes, "terminal"), filter_command_palette(build_command_palette(), "terminal"))
+
+    assert dashboard["terminal_tabs"]["schema_version"] == "harness.tui_terminal_tabs/v1"
+    assert dashboard["terminal_tabs"]["tab_count"] == 1
+    assert dashboard["terminal_tabs"]["policy_boundary"]["kind"] == "tui_terminal_panel_projection"
+    assert dashboard["terminal_tabs"]["policy_boundary"]["source"] == "persisted_pty_events"
+    assert dashboard["terminal_tabs"]["policy_boundary"]["terminal_control_allowed"] is False
+    assert dashboard["terminal_tabs"]["policy_boundary"]["requires_append_only_events"] is True
+    assert "terminal_panel_projection_disabled" in dashboard["terminal_tabs"]["blocked_reasons"]
+    assert dashboard["terminal_tabs"]["source"] == "persisted_pty_events"
+    assert dashboard["terminal_tabs"]["terminal_control_supported"] is False
+    assert dashboard["terminal_tabs"]["websocket_supported"] is False
+    assert dashboard["terminal_tabs"]["process_started"] is False
+    assert dashboard["terminal_tabs"]["websocket_opened"] is False
+    assert dashboard["terminal_tabs"]["live_stream_read"] is False
+    assert dashboard["terminal_tabs"]["artifact_contents_included"] is False
+    assert dashboard["terminal_tabs"]["permission_granting"] is False
+    tab = dashboard["terminal_tabs"]["tabs"][0]
+    assert tab["policy_boundary"]["kind"] == "tui_terminal_tab_projection"
+    assert tab["policy_boundary"]["terminal_control_allowed"] is False
+    assert tab["policy_boundary"]["requires_append_only_events"] is True
+    assert tab["artifact_refs"] == ["art_pty_output"]
+    assert "terminal_panel_projection_disabled" in tab["blocked_reasons"]
+    assert tab["websocket_opened"] is False
+    assert terminal["title"] == "Terminal Tabs"
+    assert any("Policy: tui_terminal_panel_projection" in line for line in terminal["lines"])
+    assert any("Blocked:" in line and "terminal_panel_projection_disabled" in line for line in terminal["lines"])
+    assert any("pty_123 unavailable title=Dev shell" in line for line in terminal["lines"])
+    assert any("boundary=tui_terminal_tab_projection" in line for line in terminal["lines"])
+    assert any("preview: hello from terminal\\n" in line for line in terminal["lines"])
+    assert any("No terminal process" in line and "terminal control" in line for line in terminal["lines"])
+    assert "terminal" in view["pane_order"]
+    runtime_section = next(section for section in view["sections"] if section["id"] == "runtime_evidence")
+    assert "terminal" in runtime_section["pane_ids"]
+    serialized = json.dumps({"dashboard": dashboard, "terminal": terminal, "view": view})
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
@@ -1241,6 +1603,80 @@ def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirma
     assert not (tmp_path / ".harness").exists()
 
 
+def test_tui_right_panel_surfaces_latest_safe_ui_activation(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+    activation = activate_command_palette_entry(
+        palette,
+        "ui_controls.settings",
+        {"focus_mode": "palette", "active_section_index": 0},
+    )
+
+    model = build_right_panel_model(
+        dashboard,
+        {
+            "palette": palette,
+            "active_section_index": 1,
+            "collapsed_section_ids": set(),
+            "latest_palette_activation": activation,
+        },
+        "",
+        "dashboard",
+    )
+    rendered = render_right_panel(model)
+
+    assert model["active_section_id"] == "action"
+    assert "Latest UI action" in rendered
+    assert "Entry: ui_controls.settings" in rendered
+    assert "Status: succeeded" in rendered
+    assert "Kind: ui_action" in rendered
+    assert "Action: focus_section" in rendered
+    assert "Command started: False" in rendered
+    assert "Process started: False" in rendered
+    assert "Filesystem modified: False" in rendered
+    assert "Permission granting: False" in rendered
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_right_panel_sessions_surface_latest_persisted_ui_activation(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Session UI action")
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "tui.ui_activation.applied",
+        {
+            "source": "slash",
+            "entry_id": "ui_controls.settings",
+            "activation_kind": "ui_action",
+            "action": {"type": "focus_section", "section_id": "settings"},
+            "ui_action_applied": True,
+            "command_started": False,
+            "process_started": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        },
+        session_id=session.id,
+    )
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+
+    model = build_right_panel_model(
+        dashboard,
+        {"palette": palette, "active_section_index": 3, "collapsed_section_ids": set()},
+        "",
+        "dashboard",
+    )
+    rendered = render_right_panel(model)
+
+    assert model["active_section_id"] == "sessions"
+    assert dashboard["active_session"]["latest_ui_activation"]["entry_id"] == "ui_controls.settings"
+    assert "UI action: ui_controls.settings action=focus_section" in rendered
+    assert "UI flags: cmd=False proc=False fs=False perm=False" in rendered
+
+
 def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
     dashboard = build_tui_dashboard(tmp_path)
     palette = build_command_palette()
@@ -1308,12 +1744,12 @@ def test_tui_palette_focus_filters_palette_without_hiding_dashboard(tmp_path) ->
 
 def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) -> None:
     pytest.importorskip("textual")
-    from textual.widgets import Input, Static
+    from textual.widgets import Static, TextArea
 
     async def run_pilot() -> None:
         app = create_harness_app(tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:
-            prompt = app.query_one("#prompt", Input)
+            prompt = app.query_one("#prompt", TextArea)
             slash_status = app.query_one("#slash-status", Static)
             assert app.use_command_palette is False
 
@@ -1340,7 +1776,7 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             await pilot.pause()
             assert prompt.value == "/"
             assert "... 1 previous. Keep using arrows to navigate." in str(slash_status.content)
-            assert "[bold blue]/agent" in str(slash_status.content)
+            assert "[bold blue]/scaffold" in str(slash_status.content)
 
             await pilot.press("e", "x", "e")
             await pilot.pause()
@@ -1450,6 +1886,599 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
     asyncio.run(run_pilot())
 
 
+def test_tui_palette_enter_activates_safe_actions_without_chat_or_process(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            slash_status = app.query_one("#slash-status", Static)
+            initial_messages = len(app._messages)
+
+            await pilot.press("ctrl+p")
+            await pilot.press("s", "e", "s", "s", "i", "o", "n", "s")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert prompt.value == "sessions"
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            assert app._section_cursor_index == 1
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["entry_id"] == "sessions.list"
+            assert app._latest_palette_activation["source"] == "palette_enter"
+            assert app._latest_palette_activation["enter_consumed"] is True
+            assert app._latest_palette_activation["chat_submitted"] is False
+            assert app._latest_palette_activation["slash_suggestion_inserted"] is False
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["shell_started"] is False
+            assert app._latest_palette_activation["adapter_started"] is False
+            assert app._latest_palette_activation["child_process_started"] is False
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+            assert app._latest_palette_activation["authority_granting"] is False
+            assert app._latest_palette_activation["session_message_created"] is False
+
+            await pilot.press("ctrl+p")
+            await pilot.press("e", "x", "e", "c", "u", "t", "e", "-", "r", "e", "a", "d", "-", "o", "n", "l", "y")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert prompt.value == "execute-read-only"
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert app._section_cursor_index == 1
+            assert prompt.value == "execute-read-only"
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["entry_id"] == "registered_adapters.execute_read_only"
+            assert app._latest_palette_activation["activation_kind"] == "manual_command"
+            assert app._latest_palette_activation["ui_action_applied"] is False
+            assert app._latest_palette_activation["source"] == "palette_enter"
+            assert app._latest_palette_activation["enter_consumed"] is True
+            assert app._latest_palette_activation["chat_submitted"] is False
+            assert app._latest_palette_activation["slash_suggestion_inserted"] is False
+            assert app._latest_palette_activation["blocked_reasons"] == ["manual_command_preview_only"]
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["shell_started"] is False
+            assert app._latest_palette_activation["adapter_started"] is False
+            assert app._latest_palette_activation["child_process_started"] is False
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+            assert app._latest_palette_activation["authority_granting"] is False
+            assert app._latest_palette_activation["session_message_created"] is False
+            assert "Manual preview only:" in str(slash_status.content)
+            assert "harness daemon execute-read-only" in str(slash_status.content)
+
+            await pilot.press("escape")
+            await pilot.press("d", "o", "e", "s", "-", "n", "o", "t", "-", "e", "x", "i", "s", "t")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert prompt.value == "does-not-exist"
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["activation_kind"] == "missing"
+            assert app._latest_palette_activation["blocked_reasons"] == ["palette_entry_not_found"]
+            assert app._latest_palette_activation["enter_consumed"] is True
+            assert app._latest_palette_activation["chat_submitted"] is False
+            assert app._latest_palette_activation["slash_suggestion_inserted"] is False
+            assert app._latest_palette_activation["process_started"] is False
+            assert "No matching palette action." in str(slash_status.content)
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "README.md").write_text("attached context\n", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Composer session", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+    message = store.append_session_message(session.id, "user", "Use attached context")
+    store.append_session_part(
+        session.id,
+        message.id,
+        "artifact_ref",
+        metadata={
+            "attachment_kind": "file_ref",
+            "path": "README.md",
+            "resolved_path": str(tmp_path / "README.md"),
+        },
+    )
+
+    def fake_handle_chat_input(request, project_root, chat_state, progress_callback=None):
+        assert request == "first line\nsecond line"
+        return {"ok": True, "kind": "fake", "title": "Assistant", "lines": ["done"]}
+
+    monkeypatch.setattr("harness.chat.handle_chat_input", fake_handle_chat_input)
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(120, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            composer_status = app.query_one("#composer-status", Static)
+            session_rail = app.query_one("#session-rail-content", Static)
+
+            assert "Composer: multiline" in str(composer_status.content)
+            assert f"Session: {session.id}" in str(composer_status.content)
+            assert "Agent: plan" in str(composer_status.content)
+            assert "Model: codex_cli/gpt-5.5" in str(composer_status.content)
+            assert "Attachments: 1" in str(composer_status.content)
+            assert "Context est:" in str(composer_status.content)
+            assert "Composer session" in str(session_rail.content)
+            assert 'Continue: harness "..." --continue' in str(session_rail.content)
+
+            prompt.value = "first line\nsecond line"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+            assert app._prompt_history == ["first line\nsecond line"]
+            assert prompt.value == ""
+
+            await pilot.pause(0.5)
+            assert app._request_in_flight is False
+            await pilot.press("ctrl+up")
+            await pilot.pause()
+            assert prompt.value == "first line\nsecond line"
+            await pilot.press("ctrl+down")
+            await pilot.pause()
+            assert prompt.value == "first line\nsecond line"
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            initial_messages = len(app._messages)
+
+            app._section_cursor_index = 2
+            await pilot.press("ctrl+p")
+            await pilot.press("t", "o", "g", "g", "l", "e", "-", "s", "e", "c", "t", "i", "o", "n")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert app._collapsed_section_ids == {"queue_daemon"}
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.toggle_section"
+            assert app._latest_palette_activation["evidence_status"] == "ui_section_toggle_in_memory"
+            assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == ["active_section_id", "collapsed_section_ids"]
+            assert app._latest_palette_activation["local_state_changes"]["creates_message"] is False
+            assert app._latest_palette_activation["local_state_changes"]["starts_request"] is False
+            assert app._latest_palette_activation["local_state_changes"]["executes_command"] is False
+            assert app._latest_palette_activation["request_started"] is False
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+
+            await pilot.press("e", "x", "p", "a", "n", "d", "-", "a", "l", "l")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert app._collapsed_section_ids == set()
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.expand_all"
+            assert app._latest_palette_activation["evidence_status"] == "ui_sections_expanded_in_memory"
+            assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == ["collapsed_section_ids"]
+            assert app._latest_palette_activation["request_started"] is False
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+
+            await pilot.press("f", "o", "c", "u", "s", "-", "d", "a", "s", "h", "b", "o", "a", "r", "d")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.dashboard_focus"
+            assert app._latest_palette_activation["evidence_status"] == "ui_focus_in_memory"
+            assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == ["focus_mode"]
+            assert app._latest_palette_activation["request_started"] is False
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+
+            await pilot.press("ctrl+p")
+            await pilot.press("s", "e", "t", "t", "i", "n", "g", "s")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            assert app._section_cursor_index == 5
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.settings"
+            assert app._latest_palette_activation["evidence_status"] == "ui_focus_in_memory"
+            assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == [
+                "focus_mode",
+                "active_section_id",
+                "active_section_index",
+            ]
+            assert app._latest_palette_activation["request_started"] is False
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_settings_slash_command_routes_to_safe_ui_action(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            slash_status = app.query_one("#slash-status", Static)
+            initial_messages = len(app._messages)
+
+            await pilot.press("/", "s", "e", "t", "t", "i", "n", "g", "s")
+            await pilot.pause()
+            assert prompt.value == "/settings"
+            assert "/settings" in str(slash_status.content)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            assert app._section_cursor_index == 5
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.settings"
+            assert app._latest_palette_activation["source"] == "slash"
+            assert app._latest_palette_activation["slash"] == "/settings"
+            assert app._latest_palette_activation["slash_consumed"] is True
+            assert app._latest_palette_activation["chat_submitted"] is False
+            assert app._latest_palette_activation["model_request_started"] is False
+            assert app._latest_palette_activation["slash_suggestion_inserted"] is False
+            assert app._latest_palette_activation["activation_kind"] == "ui_action"
+            assert app._latest_palette_activation["ui_action_applied"] is True
+            assert app._latest_palette_activation["evidence_status"] == "ui_focus_in_memory"
+            assert app._latest_palette_activation["policy_boundary"]["kind"] == "safe_ui_activation"
+            assert app._latest_palette_activation["policy_boundary"]["command_execution_allowed"] is False
+            assert app._latest_palette_activation["policy_boundary"]["provider_call_allowed"] is False
+            assert app._latest_palette_activation["policy_boundary"]["filesystem_mutation_allowed"] is False
+            assert app._latest_palette_activation["policy_boundary"]["permission_grant_allowed"] is False
+            assert app._latest_palette_activation["request_started"] is False
+            assert app._latest_palette_activation["command_started"] is False
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["shell_started"] is False
+            assert app._latest_palette_activation["adapter_started"] is False
+            assert app._latest_palette_activation["child_process_started"] is False
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+            assert app._latest_palette_activation["authority_granting"] is False
+            assert app._latest_palette_activation["session_message_created"] is False
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_safe_slash_activation_persists_session_event_when_active(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Activation session")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            initial_messages = len(app._messages)
+
+            await pilot.press("/", "s", "e", "t", "t", "i", "n", "g", "s")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app._section_cursor_index == 5
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["session_event_persisted"] is True
+            assert app._latest_palette_activation["session_id"] == session.id
+
+    asyncio.run(run_pilot())
+
+    events = SQLiteStore(tmp_path).list_session_store_events(session.id)
+    activation_events = [event for event in events if event.kind == "tui.ui_activation.applied"]
+    assert len(activation_events) == 1
+    payload = activation_events[0].payload
+    assert payload["source"] == "slash"
+    assert payload["entry_id"] == "ui_controls.settings"
+    assert payload["ui_action_applied"] is True
+    assert payload["command_started"] is False
+    assert payload["provider_started"] is False
+    assert payload["shell_started"] is False
+    assert payload["adapter_started"] is False
+    assert payload["child_process_started"] is False
+    assert payload["process_started"] is False
+    assert payload["filesystem_modified"] is False
+    assert payload["permission_granting"] is False
+    assert payload["authority_granting"] is False
+    assert payload["session_message_created"] is False
+    assert payload["evidence_status"] == "ui_only_persisted"
+    assert payload["policy_boundary"]["kind"] == "safe_ui_activation"
+    assert payload["policy_boundary"]["provider_call_allowed"] is False
+    assert payload["policy_boundary"]["shell_allowed"] is False
+    assert payload["policy_boundary"]["adapter_dispatch_allowed"] is False
+    assert payload["policy_boundary"]["child_process_allowed"] is False
+    assert payload["policy_boundary"]["session_message_allowed"] is False
+    assert payload["policy_boundary"]["authority_grant_allowed"] is False
+    assert payload["blocked_reasons"] == []
+
+
+def test_tui_safe_slash_commands_focus_dashboard_sections_without_chat(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            initial_messages = len(app._messages)
+
+            for slash, section_index, entry_id in [
+                ("/home", 0, "orientation.home"),
+                ("/sessions", 1, "sessions.list"),
+                ("/tasks", 2, "objectives_tasks.list_tasks"),
+                ("/runs", 4, "runtime_evidence.runs"),
+            ]:
+                prompt.value = ""
+                await pilot.press(*list(slash))
+                await pilot.pause()
+                assert prompt.value == slash
+
+                await pilot.press("enter")
+                await pilot.pause()
+                assert app._focus_mode == "dashboard"
+                assert app._section_cursor_index == section_index
+                assert prompt.value == ""
+                assert len(app._messages) == initial_messages
+                assert app._request_in_flight is False
+                assert app._latest_palette_activation["entry_id"] == entry_id
+                assert app._latest_palette_activation["source"] == "slash"
+                assert app._latest_palette_activation["slash"] == slash
+                assert app._latest_palette_activation["slash_consumed"] is True
+                assert app._latest_palette_activation["chat_submitted"] is False
+                assert app._latest_palette_activation["model_request_started"] is False
+                assert app._latest_palette_activation["slash_suggestion_inserted"] is False
+                assert app._latest_palette_activation["activation_kind"] == "ui_action"
+                assert app._latest_palette_activation["ui_action_applied"] is True
+                assert app._latest_palette_activation["evidence_status"] == "ui_focus_in_memory"
+                assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == [
+                    "focus_mode",
+                    "active_section_id",
+                    "active_section_index",
+                ]
+                assert app._latest_palette_activation["policy_boundary"]["kind"] == "safe_ui_activation"
+                assert app._latest_palette_activation["policy_boundary"]["command_execution_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["provider_call_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["filesystem_mutation_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["permission_grant_allowed"] is False
+                assert app._latest_palette_activation["request_started"] is False
+                assert app._latest_palette_activation["command_started"] is False
+                assert app._latest_palette_activation["provider_started"] is False
+                assert app._latest_palette_activation["shell_started"] is False
+                assert app._latest_palette_activation["adapter_started"] is False
+                assert app._latest_palette_activation["child_process_started"] is False
+                assert app._latest_palette_activation["process_started"] is False
+                assert app._latest_palette_activation["filesystem_modified"] is False
+                assert app._latest_palette_activation["permission_granting"] is False
+                assert app._latest_palette_activation["authority_granting"] is False
+                assert app._latest_palette_activation["session_message_created"] is False
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_safe_ui_control_slash_commands_mutate_only_local_state(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            initial_messages = len(app._messages)
+
+            def assert_safe_ui_control(slash: str, entry_id: str, changed_fields: list[str]) -> None:
+                assert app._latest_palette_activation["entry_id"] == entry_id
+                assert app._latest_palette_activation["source"] == "slash"
+                assert app._latest_palette_activation["slash"] == slash
+                assert app._latest_palette_activation["slash_consumed"] is True
+                assert app._latest_palette_activation["chat_submitted"] is False
+                assert app._latest_palette_activation["model_request_started"] is False
+                assert app._latest_palette_activation["slash_suggestion_inserted"] is False
+                assert app._latest_palette_activation["activation_kind"] == "ui_action"
+                assert app._latest_palette_activation["ui_action_applied"] is True
+                assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == changed_fields
+                assert app._latest_palette_activation["local_state_changes"]["creates_message"] is False
+                assert app._latest_palette_activation["local_state_changes"]["starts_request"] is False
+                assert app._latest_palette_activation["local_state_changes"]["executes_command"] is False
+                assert app._latest_palette_activation["local_state_changes"]["mutates_filesystem"] is False
+                assert app._latest_palette_activation["local_state_changes"]["grants_permission"] is False
+                assert app._latest_palette_activation["policy_boundary"]["kind"] == "safe_ui_activation"
+                assert app._latest_palette_activation["policy_boundary"]["command_execution_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["provider_call_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["shell_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["adapter_dispatch_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["child_process_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["filesystem_mutation_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["permission_grant_allowed"] is False
+                assert app._latest_palette_activation["policy_boundary"]["authority_grant_allowed"] is False
+                assert app._latest_palette_activation["request_started"] is False
+                assert app._latest_palette_activation["command_started"] is False
+                assert app._latest_palette_activation["provider_started"] is False
+                assert app._latest_palette_activation["shell_started"] is False
+                assert app._latest_palette_activation["adapter_started"] is False
+                assert app._latest_palette_activation["child_process_started"] is False
+                assert app._latest_palette_activation["process_started"] is False
+                assert app._latest_palette_activation["filesystem_modified"] is False
+                assert app._latest_palette_activation["permission_granting"] is False
+                assert app._latest_palette_activation["authority_granting"] is False
+                assert app._latest_palette_activation["session_message_created"] is False
+
+            await pilot.press("/", "p", "a", "l", "e", "t", "t", "e")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert_safe_ui_control("/palette", "ui_controls.palette_focus", ["focus_mode"])
+
+            await pilot.press("/", "d", "a", "s", "h", "b", "o", "a", "r", "d")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert_safe_ui_control("/dashboard", "ui_controls.dashboard_focus", ["focus_mode"])
+
+            await pilot.press("/", "t", "o", "g", "g", "l", "e", "-", "s", "e", "c", "t", "i", "o", "n")
+            await pilot.pause()
+            app._section_cursor_index = 2
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._collapsed_section_ids == {"queue_daemon"}
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert_safe_ui_control("/toggle-section", "ui_controls.toggle_section", ["active_section_id", "collapsed_section_ids"])
+
+            await pilot.press("/", "e", "x", "p", "a", "n", "d", "-", "a", "l", "l")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._collapsed_section_ids == set()
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert_safe_ui_control("/expand-all", "ui_controls.expand_all", ["collapsed_section_ids"])
+
+            await pilot.press("/", "c", "l", "e", "a", "r")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._focus_mode == "dashboard"
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            assert_safe_ui_control("/clear", "ui_controls.clear_search", ["focus_mode", "query"])
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_phase3_agent_selector_switches_build_and_plan_without_execution(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(120, 42)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            composer_status = app.query_one("#composer-status", Static)
+            initial_messages = len(app._messages)
+
+            await pilot.press("ctrl+p")
+            prompt.value = "select build agent"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app._selected_agent_id == "build"
+            assert app._latest_palette_activation["entry_id"] == "native_agents.select_build"
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+            assert app._request_in_flight is False
+            assert len(app._messages) == initial_messages
+            assert "Agent: build" in str(composer_status.content)
+
+            prompt.value = "select plan agent"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app._selected_agent_id == "plan"
+            assert app._latest_palette_activation["entry_id"] == "native_agents.select_plan"
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["shell_started"] is False
+            assert len(app._messages) == initial_messages
+            assert "Agent: plan" in str(composer_status.content)
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_safe_slash_activation_failure_does_not_crash(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+    import harness.tui as tui_module
+
+    def fail_activation(*_args, **_kwargs):
+        raise RuntimeError("simulated palette failure")
+
+    monkeypatch.setattr(tui_module, "activate_command_palette_entry", fail_activation)
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            slash_status = app.query_one("#slash-status", Static)
+            initial_messages = len(app._messages)
+
+            await pilot.press("/", "s", "e", "t", "t", "i", "n", "g", "s")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert app._latest_palette_activation["ok"] is False
+            assert app._latest_palette_activation["activation_kind"] == "slash_error"
+            assert app._latest_palette_activation["blocked_reasons"] == ["slash_activation_error"]
+            assert app._latest_palette_activation["slash"] == "/settings"
+            assert app._latest_palette_activation["slash_consumed"] is True
+            assert app._latest_palette_activation["chat_submitted"] is False
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+            assert "Slash command failed safely: simulated palette failure" in str(slash_status.content)
+            assert prompt.value == "/settings"
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+
+    asyncio.run(run_pilot())
+
+
 def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     palette = build_command_palette()
     slash_commands = build_slash_commands(palette)
@@ -1459,12 +2488,18 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     assert len(names) == len(set(names))
     assert {
         "home",
+        "clear",
+        "palette",
+        "dashboard",
+        "toggle-section",
+        "expand-all",
         "quickstart",
         "scaffold",
         "validate",
         "agents",
         "specs",
         "tasks",
+        "settings",
         "lease",
         "inspect-lease",
         "execute-read-only",
@@ -1488,9 +2523,31 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
             "command",
             "mutates_when_run",
             "safety_note",
+            "activation",
         }
         for command in slash_commands["commands"]
     )
+    settings = next(command for command in slash_commands["commands"] if command["name"] == "settings")
+    home = next(command for command in slash_commands["commands"] if command["name"] == "home")
+    sessions = next(command for command in slash_commands["commands"] if command["name"] == "sessions")
+    tasks = next(command for command in slash_commands["commands"] if command["name"] == "tasks")
+    runs = next(command for command in slash_commands["commands"] if command["name"] == "runs")
+    clear = next(command for command in slash_commands["commands"] if command["name"] == "clear")
+    palette_focus = next(command for command in slash_commands["commands"] if command["name"] == "palette")
+    dashboard_focus = next(command for command in slash_commands["commands"] if command["name"] == "dashboard")
+    toggle_section = next(command for command in slash_commands["commands"] if command["name"] == "toggle-section")
+    expand_all = next(command for command in slash_commands["commands"] if command["name"] == "expand-all")
+    assert settings["entry_id"] == "ui_controls.settings"
+    assert settings["activation"]["kind"] == "ui_action"
+    assert home["activation"]["kind"] == "ui_action"
+    assert sessions["activation"]["kind"] == "ui_action"
+    assert tasks["activation"]["kind"] == "ui_action"
+    assert runs["activation"]["kind"] == "ui_action"
+    assert clear["activation"]["kind"] == "ui_action"
+    assert palette_focus["activation"]["kind"] == "ui_action"
+    assert dashboard_focus["activation"]["kind"] == "ui_action"
+    assert toggle_section["activation"]["kind"] == "ui_action"
+    assert expand_all["activation"]["kind"] == "ui_action"
 
     read_only = filter_slash_commands(slash_commands, "/execute-read-only")
     task_matches = filter_slash_commands(slash_commands, "task")
@@ -1512,6 +2569,7 @@ def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
 
     all_suggestions = render_slash_command_suggestions(slash_commands, "/")
     execute_suggestions = render_slash_command_suggestions(slash_commands, "/execute")
+    settings_suggestions = render_slash_command_suggestions(slash_commands, "/settings")
     plain_text = render_slash_command_suggestions(slash_commands, "execute")
     missing = render_slash_command_suggestions(slash_commands, "/does-not-exist")
     selected_second = render_slash_command_suggestions(slash_commands, "/", selected_index=1)
@@ -1521,9 +2579,11 @@ def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
     assert "[bold cyan]" not in all_suggestions
     assert "[bold blue]/home" in selected_second
     assert "... 1 previous. Keep using arrows to navigate." in selected_after_first_page
-    assert "[bold blue]/agent" in selected_after_first_page
+    assert "[bold blue]/scaffold" in selected_after_first_page
     assert "Print the MVP agent command sequence without running it." in all_suggestions
     assert "/execute-read-only" in execute_suggestions
+    assert "/settings" in settings_suggestions
+    assert "Focus the read-only TUI settings catalog." in settings_suggestions
     assert "/home" not in execute_suggestions
     assert plain_text == ""
     assert "No slash commands match /does-not-exist" in missing
@@ -2172,6 +3232,8 @@ def test_cli_tools_unknown_id_returns_stable_json_error(tmp_path) -> None:
 
 def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "mcp-cache").mkdir()
+    (tmp_path / "mcp-cache" / "guide.md").write_text("# Guide\n\nCached only.\n", encoding="utf-8")
     config_path = tmp_path / ".harness" / "config.yaml"
     config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     config_data["mcp"] = {
@@ -2182,6 +3244,15 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
                 "enabled": True,
                 "command": ["mcp-docs", "--stdio"],
                 "description": "Local docs server",
+                "resources": {
+                    "guide": {
+                        "uri": "mcp://local_docs/guide",
+                        "path": "mcp-cache/guide.md",
+                        "enabled": True,
+                        "content_type": "text/markdown",
+                        "description": "Cached docs guide",
+                    }
+                },
             },
             "remote_tracker": {
                 "kind": "remote",
@@ -2194,27 +3265,76 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
     config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
 
     listed = runner.invoke(app, ["mcp", "list", "--project", str(tmp_path), "--output", "json"])
+    status = runner.invoke(app, ["mcp", "status", "--project", str(tmp_path), "--output", "json"])
     resources = runner.invoke(app, ["mcp", "resources", "--project", str(tmp_path), "--output", "json"])
+    resources_text = runner.invoke(app, ["mcp", "resources", "--project", str(tmp_path)])
     connect = runner.invoke(app, ["mcp", "connect", "remote_tracker", "--project", str(tmp_path), "--output", "json"])
 
     assert listed.exit_code == 0, listed.output
     list_payload = json.loads(listed.output)
+    assert status.exit_code == 0, status.output
+    assert json.loads(status.output) == list_payload
     assert list_payload["schema_version"] == "harness.mcp_status/v1"
     assert list_payload["enabled"] is True
     assert list_payload["connected"] is False
     assert list_payload["process_started"] is False
     assert list_payload["network_called"] is False
     assert list_payload["tool_registration_enabled"] is False
+    assert list_payload["tool_execution_supported"] is False
+    assert list_payload["policy_boundary"]["kind"] == "mcp_metadata_projection"
+    assert list_payload["blocked_reasons"] == [
+        "mcp_process_launch_disabled",
+        "mcp_network_connection_disabled",
+        "mcp_tool_execution_disabled",
+    ]
     assert [server["name"] for server in list_payload["servers"]] == ["local_docs", "remote_tracker"]
     assert list_payload["servers"][1]["requires_network"] is True
 
     assert resources.exit_code == 0, resources.output
     resources_payload = json.loads(resources.output)
     assert resources_payload["schema_version"] == "harness.mcp_resources/v1"
-    assert resources_payload["resources"] == []
+    assert resources_payload["resources"] == [
+        {
+            "name": "guide",
+            "server": "local_docs",
+            "uri": "mcp://local_docs/guide",
+            "enabled": True,
+            "cached": True,
+            "path": "mcp-cache/guide.md",
+            "content_type": "text/markdown",
+            "description": "Cached docs guide",
+            "contents_included": False,
+            "evidence_status": "metadata_only",
+            "resource_read_supported": False,
+            "session_tool_resource_read_supported": True,
+            "tool_execution_supported": False,
+            "requires_permission": True,
+            "policy_boundary": {
+                "kind": "mcp_cached_resource_metadata",
+                "server": "local_docs",
+                "process_launch_allowed": False,
+                "network_connection_allowed": False,
+                "tool_execution_allowed": False,
+                "session_tool_permission_required": True,
+                "contents_included": False,
+            },
+            "blocked_reasons": ["mcp_resource_read_requires_permission", "mcp_connection_disabled"],
+            "connected": False,
+            "process_started": False,
+            "network_called": False,
+            "permission_granting": False,
+        }
+    ]
+    assert resources_payload["resource_count"] == 1
     assert resources_payload["cached_only"] is True
+    assert resources_payload["contents_included"] is False
+    assert resources_payload["policy_boundary"]["kind"] == "mcp_resources_projection"
     assert resources_payload["network_called"] is False
     assert resources_payload["process_started"] is False
+    assert resources_text.exit_code == 0, resources_text.output
+    assert "mcp://local_docs/guide" in resources_text.output
+    assert "mcp-cache/guide.md" in resources_text.output
+    assert "MCP resources are cached-only" in resources_text.output
 
     assert connect.exit_code == 1
     connect_payload = json.loads(connect.output)
@@ -2225,12 +3345,21 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
     assert connect_payload["process_started"] is False
     assert connect_payload["network_called"] is False
     assert connect_payload["tool_registration_enabled"] is False
+    assert connect_payload["tool_execution_started"] is False
+    assert connect_payload["filesystem_modified"] is False
+    assert connect_payload["policy_boundary"]["kind"] == "mcp_action"
+    assert connect_payload["blocked_reasons"] == [
+        "mcp_action_disabled",
+        "mcp_process_launch_disabled",
+        "mcp_network_connection_disabled",
+    ]
     assert connect_payload["permission_granting"] is False
 
 
 def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     (tmp_path / "plugins" / "reviewer").mkdir(parents=True)
+    (tmp_path / "plugins" / "reviewer" / "plugin.json").write_text('{"name":"reviewer"}\n', encoding="utf-8")
     skill_dir = tmp_path / "skills" / "review"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text("# Review\n\nDo not load this body in diagnostics.\n", encoding="utf-8")
@@ -2242,8 +3371,11 @@ def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> N
             "reviewer": {
                 "enabled": True,
                 "path": "plugins/reviewer",
+                "spec": "./plugins/reviewer",
+                "entrypoint": "plugin.json",
                 "version": "0.1.0",
                 "description": "Project review plugin",
+                "options": {"mode": "audit"},
             }
         },
     }
@@ -2253,6 +3385,8 @@ def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> N
             "review": {
                 "enabled": True,
                 "path": "skills/review",
+                "spec": "./skills/review",
+                "version": "0.1.0",
                 "description": "Review skill",
             }
         },
@@ -2260,8 +3394,12 @@ def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> N
     config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
 
     plugins = runner.invoke(app, ["plugins", "list", "--project", str(tmp_path), "--output", "json"])
+    plugins_text = runner.invoke(app, ["plugins", "list", "--project", str(tmp_path)])
     skills = runner.invoke(app, ["skills", "list", "--project", str(tmp_path), "--output", "json"])
+    skills_text = runner.invoke(app, ["skills", "list", "--project", str(tmp_path)])
     install = runner.invoke(app, ["plugins", "install", "reviewer", "--project", str(tmp_path), "--output", "json"])
+    update = runner.invoke(app, ["plugins", "update", "reviewer", "--project", str(tmp_path), "--output", "json"])
+    remove = runner.invoke(app, ["plugins", "remove", "reviewer", "--project", str(tmp_path), "--output", "json"])
     load = runner.invoke(app, ["skills", "load", "review", "--project", str(tmp_path), "--output", "json"])
 
     assert plugins.exit_code == 0, plugins.output
@@ -2269,32 +3407,85 @@ def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> N
     assert plugins_payload["schema_version"] == "harness.plugins/v1"
     assert plugins_payload["runtime_loaded"] is False
     assert plugins_payload["tools_registered"] is False
+    assert plugins_payload["tool_execution_supported"] is False
+    assert plugins_payload["policy_boundary"]["kind"] == "plugin_catalog_metadata"
+    assert plugins_payload["blocked_reasons"] == [
+        "plugin_origin_review_required",
+        "plugin_runtime_load_disabled",
+        "plugin_tool_execution_disabled",
+    ]
+    assert plugins_payload["filesystem_modified"] is False
+    assert plugins_payload["network_called"] is False
     project_plugins = [plugin for plugin in plugins_payload["plugins"] if plugin["scope"] == "project"]
     assert len(project_plugins) == 1
     assert project_plugins[0]["name"] == "reviewer"
     assert project_plugins[0]["origin"] == "config"
+    assert project_plugins[0]["source_kind"] == "local"
+    assert project_plugins[0]["spec"] == "./plugins/reviewer"
+    assert project_plugins[0]["entrypoint"] == "plugin.json"
+    assert project_plugins[0]["manifest_path"] == "plugins/reviewer/plugin.json"
+    assert project_plugins[0]["manifest_exists"] is True
+    assert project_plugins[0]["options_configured"] is True
+    assert project_plugins[0]["option_keys"] == ["mode"]
+    assert project_plugins[0]["origin_review_required"] is True
+    assert project_plugins[0]["runtime_load_supported"] is False
+    assert project_plugins[0]["tool_execution_supported"] is False
+    assert project_plugins[0]["policy_boundary"]["kind"] == "plugin_metadata_projection"
+    assert project_plugins[0]["blocked_reasons"] == [
+        "plugin_origin_review_required",
+        "plugin_runtime_load_disabled",
+        "plugin_tool_execution_disabled",
+    ]
     assert project_plugins[0]["runtime_loaded"] is False
     assert project_plugins[0]["tools_registered"] is False
+    assert plugins_text.exit_code == 0, plugins_text.output
+    assert "./plugins/reviewer" in plugins_text.output
+    assert "plugins/reviewer/plugin.json" in plugins_text.output
 
     assert skills.exit_code == 0, skills.output
     skills_payload = json.loads(skills.output)
     assert skills_payload["schema_version"] == "harness.skills/v1"
     assert skills_payload["runtime_loaded"] is False
+    assert skills_payload["skill_body_loaded"] is False
     assert skills_payload["tool_registered"] is False
+    assert skills_payload["filesystem_modified"] is False
+    assert skills_payload["network_called"] is False
     project_skills = [skill for skill in skills_payload["skills"] if skill["scope"] == "project"]
     assert len(project_skills) == 1
     assert project_skills[0]["name"] == "review"
+    assert project_skills[0]["source_kind"] == "local"
+    assert project_skills[0]["spec"] == "./skills/review"
+    assert project_skills[0]["version"] == "0.1.0"
+    assert project_skills[0]["skill_file_path"] == "skills/review/SKILL.md"
     assert project_skills[0]["skill_file_exists"] is True
+    assert project_skills[0]["skill_body_loaded"] is False
     assert "Do not load this body" not in skills.output
+    assert skills_text.exit_code == 0, skills_text.output
+    assert "./skills/review" in skills_text.output
+    assert "skills/review/SKILL.md" in skills_text.output
+    assert "Do not load this body" not in skills_text.output
 
-    assert install.exit_code == 1
-    install_payload = json.loads(install.output)
-    assert install_payload["schema_version"] == "harness.plugin_action/v1"
-    assert install_payload["filesystem_modified"] is False
-    assert install_payload["network_called"] is False
-    assert install_payload["runtime_loaded"] is False
-    assert install_payload["tools_registered"] is False
-    assert install_payload["permission_granting"] is False
+    for result, action in [(install, "install"), (update, "update"), (remove, "remove")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.plugin_action/v1"
+        assert payload["action"] == action
+        assert payload["filesystem_modified"] is False
+        assert payload["network_called"] is False
+        assert payload["policy_boundary"]["kind"] == "plugin_action"
+        assert payload["policy_boundary"]["tool_execution_allowed"] is False
+        assert payload["blocked_reasons"] == [
+            "plugin_action_disabled",
+            "plugin_origin_review_required",
+            "plugin_runtime_load_disabled",
+        ]
+        assert payload["runtime_loaded"] is False
+        assert payload["tools_registered"] is False
+        assert payload["tool_execution_started"] is False
+        assert payload["install_supported"] is False
+        assert payload["update_supported"] is False
+        assert payload["remove_supported"] is False
+        assert payload["permission_granting"] is False
 
     assert load.exit_code == 1
     load_payload = json.loads(load.output)
@@ -2303,6 +3494,57 @@ def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> N
     assert load_payload["runtime_loaded"] is False
     assert load_payload["tool_registered"] is False
     assert load_payload["permission_granting"] is False
+
+
+def test_cli_extensions_status_summarizes_extensibility_without_side_effects(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "plugins" / "reviewer").mkdir(parents=True)
+    (tmp_path / "plugins" / "reviewer" / "plugin.json").write_text('{"name":"reviewer"}\n', encoding="utf-8")
+    skill_dir = tmp_path / "skills" / "review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("# Review\n\nDo not load through status.\n", encoding="utf-8")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["plugins"] = {
+        "enabled": True,
+        "project": {"reviewer": {"enabled": True, "path": "plugins/reviewer", "spec": "./plugins/reviewer"}},
+    }
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {"review": {"enabled": True, "path": "skills/review", "spec": "./skills/review"}},
+    }
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": True,
+        "search_enabled": False,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+
+    status = runner.invoke(app, ["extensions", "status", "--project", str(tmp_path), "--output", "json"])
+    text = runner.invoke(app, ["extensions", "status", "--project", str(tmp_path)])
+
+    assert status.exit_code == 0, status.output
+    payload = json.loads(status.output)
+    assert payload["schema_version"] == "harness.extensions_status/v1"
+    assert payload["plugins"]["plugin_count"] >= 1
+    assert payload["plugins"]["project_plugin_count"] == 1
+    assert payload["plugins"]["runtime_loaded"] is False
+    assert payload["plugins"]["tools_registered"] is False
+    assert payload["skills"]["skill_count"] >= 1
+    assert payload["skills"]["project_skill_count"] == 1
+    assert payload["skills"]["skill_body_loaded"] is False
+    assert payload["web_tools"]["decisions"]["web-fetch"] == "approval_required"
+    assert payload["web_tools"]["decisions"]["web-search"] == "denied"
+    assert payload["policy"]["permission_granting"] is False
+    assert payload["policy"]["network_called"] is False
+    assert payload["policy"]["filesystem_modified"] is False
+    assert "Do not load through status" not in status.output
+    assert text.exit_code == 0, text.output
+    assert "web-fetch:approval_required" in text.output
+    assert "Extensibility diagnostics are metadata-only" in text.output
+    assert "Do not load through status" not in text.output
 
 
 def test_cli_web_tools_project_policy_and_fail_closed_execution(tmp_path) -> None:
@@ -2367,7 +3609,9 @@ def test_cli_worktrees_list_and_lifecycle_fail_closed(tmp_path) -> None:
     subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
 
     listed = runner.invoke(app, ["worktrees", "list", "--project", str(tmp_path), "--output", "json"])
-    created = runner.invoke(app, ["worktrees", "create", "candidate", "--project", str(tmp_path), "--output", "json"])
+    created = runner.invoke(app, ["worktrees", "create", "candidate", "--branch", "HEAD", "--project", str(tmp_path), "--output", "json"])
+    removed = runner.invoke(app, ["worktrees", "remove", "candidate", "--project", str(tmp_path), "--output", "json"])
+    reset = runner.invoke(app, ["worktrees", "reset", "candidate", "--branch", "main", "--project", str(tmp_path), "--output", "json"])
 
     assert listed.exit_code == 0, listed.output
     list_payload = json.loads(listed.output)
@@ -2379,14 +3623,79 @@ def test_cli_worktrees_list_and_lifecycle_fail_closed(tmp_path) -> None:
     assert list_payload["worktrees"][0]["path"] == str(tmp_path)
     assert list_payload["worktrees"][0]["is_current"] is True
 
-    assert created.exit_code == 1
+    for result, action in [(created, "create"), (removed, "remove"), (reset, "reset")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.worktree_action/v1"
+        assert payload["action"] == action
+        assert payload["plan"]["schema_version"] == "harness.worktree_plan/v1"
+        assert payload["plan"]["managed_path"] == ".harness/worktrees/candidate"
+        assert payload["plan"]["valid_target"] is True
+        assert payload["plan"]["execution_supported"] is False
+        assert payload["plan"]["mutation_supported"] is False
+        assert payload["plan"]["approval_required"] is True
+        assert payload["plan"]["required_approval"] == "managed_worktree_mutation"
+        assert payload["plan"]["policy_boundary"]["kind"] == "managed_worktree"
+        assert payload["plan"]["policy_boundary"]["managed_root"] == ".harness/worktrees"
+        assert payload["plan"]["blocked_reasons"] == ["worktree_mutation_disabled"]
+        assert payload["plan"]["executed"] is False
+        assert payload["execution_supported"] is False
+        assert payload["mutation_supported"] is False
+        assert payload["approval_required"] is True
+        assert payload["required_approval"] == "managed_worktree_mutation"
+        assert payload["policy_boundary"]["kind"] == "managed_worktree"
+        assert payload["blocked_reasons"] == ["worktree_mutation_disabled"]
+        assert payload["git_mutation_started"] is False
+        assert payload["filesystem_modified"] is False
+        assert payload["worktree_created"] is False
+        assert payload["worktree_removed"] is False
+        assert payload["worktree_reset"] is False
+        assert payload["process_started"] is False
+        assert payload["permission_granting"] is False
     create_payload = json.loads(created.output)
-    assert create_payload["schema_version"] == "harness.worktree_action/v1"
-    assert create_payload["action"] == "create"
-    assert create_payload["git_mutation_started"] is False
-    assert create_payload["filesystem_modified"] is False
-    assert create_payload["permission_granting"] is False
+    assert create_payload["plan"]["steps"][0]["command"] == [
+        "git",
+        "worktree",
+        "add",
+        "--detach",
+        ".harness/worktrees/candidate",
+        "HEAD",
+    ]
+    assert [step["name"] for step in json.loads(removed.output)["plan"]["steps"]] == ["remove_worktree"]
+    assert [step["name"] for step in json.loads(reset.output)["plan"]["steps"]] == ["fetch_default_branch", "reset_worktree"]
     assert not (tmp_path / "candidate").exists()
+    assert not (tmp_path / ".harness" / "worktrees" / "candidate").exists()
+
+    outside = runner.invoke(
+        app,
+        [
+            "worktrees",
+            "create",
+            f"../outside-{tmp_path.name}",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert outside.exit_code == 1
+    outside_payload = json.loads(outside.output)
+    assert outside_payload["plan"]["valid_target"] is False
+    assert outside_payload["plan"]["managed_path"] is None
+    assert outside_payload["plan"]["steps"] == []
+    assert outside_payload["plan"]["blocked_reasons"] == [
+        "target_must_be_managed_worktree_name",
+        "worktree_mutation_disabled",
+    ]
+    assert outside_payload["git_mutation_started"] is False
+    assert outside_payload["filesystem_modified"] is False
+    assert outside_payload["process_started"] is False
+    assert not (tmp_path.parent / f"outside-{tmp_path.name}").exists()
+
+    text = runner.invoke(app, ["worktrees", "create", "candidate", "--project", str(tmp_path)])
+    assert text.exit_code == 1
+    assert ".harness/worktrees/candidate" in text.output
+    assert "executed=false" in text.output
 
 
 def test_cli_session_diff_lists_artifact_preview_without_mutation(tmp_path) -> None:
@@ -2420,10 +3729,67 @@ def test_cli_session_diff_lists_artifact_preview_without_mutation(tmp_path) -> N
     assert "Revert, unrevert, and selected hunk apply are not enabled" in text.output
 
 
+def test_cli_session_snapshots_list_message_run_diff_links_without_revert(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Snapshot session")
+    run = store.create_run("Diff run", "codex_isolated_edit", session_id=session.id)
+    message = store.append_session_message(session.id, "assistant", "Changed app.py", run_id=run.id)
+    diff_path = store.runs_dir / run.id / "isolated_unified_diff.patch"
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_text("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@\n-old\n+new\n", encoding="utf-8")
+    artifact = store.register_artifact(run.id, "isolated_unified_diff", diff_path, session_id=session.id)
+
+    result = runner.invoke(app, ["session", "snapshots", session.id, "--project", str(tmp_path), "--output", "json"])
+    filtered = runner.invoke(
+        app,
+        ["session", "snapshots", session.id, "--message", message.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    text = runner.invoke(app, ["session", "snapshots", session.id, "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.session_snapshots/v1"
+    assert payload["snapshot_count"] == 1
+    assert payload["derived_snapshot_count"] == 1
+    snapshot = payload["snapshots"][0]
+    assert snapshot["source"] == "derived_from_message_run_artifacts"
+    assert snapshot["message_id"] == message.id
+    assert snapshot["run_ids"] == [run.id]
+    assert artifact.id in snapshot["artifact_ids"]
+    assert snapshot["changed_paths"] == ["app.py"]
+    assert snapshot["mutation_reversibility"] == "not_reversible_metadata_only"
+    assert snapshot["evidence_contract"]["contents_included"] is False
+    assert snapshot["evidence_contract"]["requires_sha256"] is True
+    assert payload["policy_boundary"]["kind"] == "snapshot_metadata_projection"
+    assert payload["policy_boundary"]["active_workspace_mutation_allowed"] is False
+    assert snapshot["revert_supported"] is False
+    assert snapshot["unrevert_supported"] is False
+    assert snapshot["selected_hunk_apply_supported"] is False
+    assert snapshot["mutation_started"] is False
+    assert snapshot["filesystem_modified"] is False
+    assert json.loads(filtered.output)["snapshots"] == payload["snapshots"]
+    assert text.exit_code == 0, text.output
+    assert "app.py" in text.output
+    assert "Snapshot metadata is read-only" in text.output
+
+
 def test_cli_session_revert_unrevert_and_apply_hunk_fail_closed(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
     session = store.create_session(title="Mutation session")
+    run = store.create_run("Diff run", "codex_isolated_edit", session_id=session.id)
+    message = store.append_session_message(session.id, "assistant", "Changed app.py", run_id=run.id)
+    diff_path = store.runs_dir / run.id / "isolated_unified_diff.patch"
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_text("--- a/app.py\n+++ b/app.py\n@@\n-old\n+new\n", encoding="utf-8")
+    artifact = store.register_artifact(run.id, "isolated_unified_diff", diff_path, session_id=session.id)
+
+    readiness = runner.invoke(
+        app,
+        ["session", "revert-readiness", session.id, "--message", message.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    readiness_text = runner.invoke(app, ["session", "revert-readiness", session.id, "--project", str(tmp_path)])
 
     revert = runner.invoke(
         app,
@@ -2461,6 +3827,24 @@ def test_cli_session_revert_unrevert_and_apply_hunk_fail_closed(tmp_path) -> Non
         assert payload["filesystem_modified"] is False
         assert payload["permission_granting"] is False
     assert json.loads(apply_hunk.output)["hunk_id"] == "hunk_1"
+    assert readiness.exit_code == 0, readiness.output
+    readiness_payload = json.loads(readiness.output)
+    assert readiness_payload["schema_version"] == "harness.session_revert_readiness/v1"
+    assert readiness_payload["ready"] is False
+    assert readiness_payload["mutation_reversibility"] == "not_reversible_readiness_only"
+    assert readiness_payload["policy_boundary"]["kind"] == "session_revert_readiness"
+    assert readiness_payload["policy_boundary"]["requires_verification_artifact"] is True
+    assert readiness_payload["message_id"] == message.id
+    assert readiness_payload["diff_artifact_ids"] == [artifact.id]
+    assert readiness_payload["changed_paths"] == ["app.py"]
+    assert readiness_payload["revert_supported"] is False
+    assert readiness_payload["filesystem_modified"] is False
+    assert readiness_payload["permission_granting"] is False
+    assert "snapshot_restore_not_implemented" in {blocker["code"] for blocker in readiness_payload["blockers"]}
+    assert "snapshot_restore_not_implemented" in readiness_payload["blocked_reasons"]
+    assert readiness_text.exit_code == 0, readiness_text.output
+    assert "Blockers:" in readiness_text.output
+    assert "active_revert_policy_missing" in readiness_text.output
 
 
 def test_cli_pty_projection_and_lifecycle_fail_closed(tmp_path) -> None:
@@ -2468,6 +3852,8 @@ def test_cli_pty_projection_and_lifecycle_fail_closed(tmp_path) -> None:
 
     listed = runner.invoke(app, ["pty", "list", "--project", str(tmp_path), "--output", "json"])
     shells = runner.invoke(app, ["pty", "shells", "--project", str(tmp_path), "--output", "json"])
+    restoration = runner.invoke(app, ["pty", "restoration", "--project", str(tmp_path), "--output", "json"])
+    tabs = runner.invoke(app, ["pty", "tabs", "--project", str(tmp_path), "--output", "json"])
     created = runner.invoke(
         app,
         ["pty", "create", "--command", "bash", "--project", str(tmp_path), "--output", "json"],
@@ -2486,15 +3872,51 @@ def test_cli_pty_projection_and_lifecycle_fail_closed(tmp_path) -> None:
     listed_payload = json.loads(listed.output)
     assert listed_payload["schema_version"] == "harness.pty_sessions/v1"
     assert listed_payload["sessions"] == []
+    assert listed_payload["approval_required"] is True
+    assert listed_payload["required_approval"] == "managed_pty_control"
+    assert listed_payload["policy_boundary"]["kind"] == "shell_pty_deferred"
+    assert listed_payload["policy_boundary"]["shell_execution_allowed"] is False
+    assert listed_payload["policy_boundary"]["managed_pty_allowed"] is False
+    assert listed_payload["policy_boundary"]["model_auto_run_allowed"] is False
+    assert listed_payload["blocked_reasons"] == ["shell_execution_disabled", "managed_pty_disabled", "model_auto_run_disabled"]
     assert listed_payload["process_started"] is False
+    assert listed_payload["websocket_opened"] is False
+    assert listed_payload["filesystem_modified"] is False
     assert listed_payload["permission_granting"] is False
 
     assert shells.exit_code == 0, shells.output
     shells_payload = json.loads(shells.output)
     assert shells_payload["schema_version"] == "harness.pty_shells/v1"
     assert shells_payload["probed"] is False
+    assert shells_payload["approval_required"] is True
+    assert shells_payload["required_approval"] == "managed_pty_control"
+    assert shells_payload["policy_boundary"]["kind"] == "shell_pty_deferred"
+    assert shells_payload["policy_boundary"]["shell_execution_allowed"] is False
+    assert shells_payload["policy_boundary"]["shell_probe_allowed"] is False
+    assert shells_payload["blocked_reasons"] == ["shell_execution_disabled", "shell_probe_disabled", "managed_pty_disabled", "model_auto_run_disabled"]
     assert shells_payload["process_started"] is False
+    assert shells_payload["filesystem_modified"] is False
     assert all(shell["acceptable"] is False for shell in shells_payload["shells"])
+    assert all(shell["blocked_reasons"] == ["shell_execution_disabled", "managed_pty_disabled"] for shell in shells_payload["shells"])
+    assert restoration.exit_code == 0, restoration.output
+    restoration_payload = json.loads(restoration.output)
+    assert restoration_payload["schema_version"] == "harness.pty_restoration_readiness/v1"
+    assert restoration_payload["ready"] is False
+    assert restoration_payload["event_count"] == 0
+    assert restoration_payload["process_started"] is False
+    assert restoration_payload["live_stream_read"] is False
+    assert restoration_payload["permission_granting"] is False
+    assert tabs.exit_code == 0, tabs.output
+    tabs_payload = json.loads(tabs.output)
+    assert tabs_payload["schema_version"] == "harness.pty_terminal_tabs/v1"
+    assert tabs_payload["tabs"] == []
+    assert tabs_payload["policy_boundary"]["kind"] == "pty_terminal_tabs_projection"
+    assert tabs_payload["policy_boundary"]["requires_append_only_events"] is True
+    assert tabs_payload["blocked_reasons"] == ["managed_pty_not_enabled", "terminal_tab_projection_disabled"]
+    assert tabs_payload["process_started"] is False
+    assert tabs_payload["websocket_opened"] is False
+    assert tabs_payload["live_stream_read"] is False
+    assert tabs_payload["permission_granting"] is False
 
     for result, action in [(created, "create"), (written, "write"), (resized, "resize"), (closed, "close")]:
         assert result.exit_code == 1
@@ -2502,13 +3924,202 @@ def test_cli_pty_projection_and_lifecycle_fail_closed(tmp_path) -> None:
         assert payload["schema_version"] == "harness.pty_action/v1"
         assert payload["ok"] is False
         assert payload["action"] == action
+        assert payload["plan"]["schema_version"] == "harness.pty_plan/v1"
+        assert payload["plan"]["executed"] is False
+        assert payload["plan"]["execution_supported"] is False
+        assert payload["plan"]["approval_required"] is True
+        assert payload["plan"]["required_approval"] == "managed_pty_control"
+        assert payload["plan"]["policy_boundary"]["kind"] == "managed_pty"
+        assert payload["plan"]["policy_boundary"]["process_start_allowed"] is False
+        assert payload["plan"]["policy_boundary"]["live_stream_allowed"] is False
+        assert payload["execution_supported"] is False
+        assert payload["approval_required"] is True
+        assert payload["required_approval"] == "managed_pty_control"
         assert payload["process_started"] is False
         assert payload["input_written"] is False
         assert payload["terminal_resized"] is False
         assert payload["terminal_closed"] is False
         assert payload["websocket_token_issued"] is False
+        assert payload["websocket_opened"] is False
+        assert payload["live_stream_read"] is False
+        assert payload["filesystem_modified"] is False
         assert payload["permission_granting"] is False
-    assert json.loads(written.output)["pty_id"] == "pty_123"
+    created_payload = json.loads(created.output)
+    written_payload = json.loads(written.output)
+    resized_payload = json.loads(resized.output)
+    closed_payload = json.loads(closed.output)
+    assert created_payload["plan"]["steps"][0]["name"] == "create_pty_process"
+    assert created_payload["plan"]["command"] == "bash"
+    assert created_payload["blocked_reasons"] == ["managed_pty_disabled", "pty_process_start_disabled"]
+    assert written_payload["pty_id"] == "pty_123"
+    assert written_payload["plan"]["steps"][0]["name"] == "write_terminal_input"
+    assert "terminal_input_write_disabled" in written_payload["blocked_reasons"]
+    assert resized_payload["plan"]["cols"] == 100
+    assert resized_payload["plan"]["rows"] == 30
+    assert "terminal_resize_disabled" in resized_payload["blocked_reasons"]
+    assert closed_payload["plan"]["steps"][0]["name"] == "terminate_pty_process"
+    assert "terminal_close_disabled" in closed_payload["blocked_reasons"]
+
+    text = runner.invoke(app, ["pty", "create", "--command", "bash", "--project", str(tmp_path)])
+    assert text.exit_code == 1
+    assert "create_pty_process" in text.output
+    assert "executed=false" in text.output
+    assert "policy_boundary" in text.output
+    assert "managed_pty_disabled" in text.output
+    assert "live_stream_read=false" in text.output
+    list_text = runner.invoke(app, ["pty", "list", "--project", str(tmp_path)])
+    shells_text = runner.invoke(app, ["pty", "shells", "--project", str(tmp_path)])
+    assert list_text.exit_code == 0, list_text.output
+    assert "shell_pty_deferred" in list_text.output
+    assert "model_auto_run_disabled" in list_text.output
+    assert shells_text.exit_code == 0, shells_text.output
+    assert "shell_pty_deferred" in shells_text.output
+    assert "shell_probe_disabled" in shells_text.output
+
+    store = SQLiteStore(tmp_path)
+    store.append_store_event(EventStreamType.SESSION, "pty:pty_123", "pty.created", {"shell": "/bin/zsh"})
+    store.append_store_event(
+        EventStreamType.SESSION,
+        "pty:pty_123",
+        "pty.output",
+        {"preview": "hello", "preview_bytes": 5},
+        artifact_refs=["art_pty_output"],
+    )
+    restore_text = runner.invoke(app, ["pty", "restoration", "--pty", "pty_123", "--project", str(tmp_path)])
+    tab_payload = runner.invoke(app, ["pty", "tabs", "--pty", "pty_123", "--project", str(tmp_path), "--output", "json"])
+    tab_text = runner.invoke(app, ["pty", "tabs", "--pty", "pty_123", "--project", str(tmp_path)])
+    assert restore_text.exit_code == 0, restore_text.output
+    assert "pty_restoration_readiness" in restore_text.output
+    assert "managed_pty_not_enabled" in restore_text.output
+    assert "missing_events" in restore_text.output
+    assert "PTY restoration readiness is diagnostic only" in restore_text.output
+    assert tab_payload.exit_code == 0, tab_payload.output
+    tab = json.loads(tab_payload.output)["tabs"][0]
+    assert tab["id"] == "pty_123"
+    assert tab["title"] == "/bin/zsh"
+    assert tab["scrollback_preview"] == "hello"
+    assert tab["restoration_ready"] is False
+    assert tab["policy_boundary"]["kind"] == "pty_terminal_tab_projection"
+    assert tab["policy_boundary"]["source"] == "persisted_pty_events"
+    assert tab["policy_boundary"]["terminal_control_allowed"] is False
+    assert tab["policy_boundary"]["requires_append_only_events"] is True
+    assert tab["policy_boundary"]["bounded_preview_only"] is True
+    assert "managed_pty_not_enabled" in tab["blocked_reasons"]
+    assert "terminal_tab_projection_disabled" in tab["blocked_reasons"]
+    assert "terminal_control_disabled" in tab["blocked_reasons"]
+    assert tab["process_started"] is False
+    assert tab["websocket_opened"] is False
+    assert tab_text.exit_code == 0, tab_text.output
+    assert "pty_123" in tab_text.output
+    assert "pty_terminal_tabs_projection" in tab_text.output
+    assert "terminal_tab_projection_disabled" in tab_text.output
+    assert "Terminal tab projection is diagnostic only" in tab_text.output
+
+
+def test_cli_dev_loop_status_summarizes_safe_phase_9_surface(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=tmp_path, check=True, capture_output=True)
+    (tmp_path / "app.py").write_text("print('one')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "app.py"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=tmp_path, check=True, capture_output=True)
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Dev loop")
+    run = store.create_run("Diff run", "codex_isolated_edit", session_id=session.id)
+    store.append_store_event(
+        EventStreamType.SESSION,
+        "pty:pty_dev",
+        "pty.created",
+        {"shell": "/bin/zsh", "title": "Dev shell"},
+    )
+    store.append_store_event(
+        EventStreamType.SESSION,
+        "pty:pty_dev",
+        "pty.output",
+        {"preview": "dev output", "preview_bytes": 10},
+        artifact_refs=["art_pty_output"],
+    )
+    diff_path = store.runs_dir / run.id / "isolated_unified_diff.patch"
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_text("--- a/app.py\n+++ b/app.py\n@@\n-one\n+two\n", encoding="utf-8")
+    store.register_artifact(run.id, "isolated_unified_diff", diff_path, session_id=session.id)
+
+    status = runner.invoke(
+        app,
+        ["dev-loop", "status", "--session", session.id, "--project", str(tmp_path), "--output", "json"],
+    )
+    text = runner.invoke(app, ["dev-loop", "status", "--session", session.id, "--project", str(tmp_path)])
+
+    assert status.exit_code == 0, status.output
+    payload = json.loads(status.output)
+    assert payload["schema_version"] == "harness.dev_loop_status/v1"
+    assert payload["policy_boundary"]["kind"] == "dev_loop_status_projection"
+    assert payload["policy_boundary"]["terminal_process_allowed"] is False
+    assert payload["policy_boundary"]["worktree_creation_allowed"] is False
+    assert payload["policy_boundary"]["active_workspace_revert_allowed"] is False
+    assert payload["policy_boundary"]["selected_hunk_apply_allowed"] is False
+    assert payload["policy_boundary"]["git_mutation_allowed"] is False
+    assert "worktree_mutation_disabled" in payload["blocked_reasons"]
+    assert "active_workspace_revert_disabled" in payload["blocked_reasons"]
+    assert payload["pty"]["managed_pty_supported"] is False
+    assert payload["pty"]["process_started"] is False
+    assert payload["terminal_tabs"]["tab_count"] == 1
+    assert payload["terminal_tabs"]["output_event_count"] == 1
+    assert payload["terminal_tabs"]["artifact_ref_count"] == 1
+    assert payload["terminal_tabs"]["terminal_tabs_supported"] is False
+    assert payload["terminal_tabs"]["policy_boundary"]["kind"] == "pty_terminal_tabs_projection"
+    assert payload["terminal_tabs"]["policy_boundary"]["source"] == "persisted_pty_events"
+    assert payload["terminal_tabs"]["policy_boundary"]["terminal_control_allowed"] is False
+    assert payload["terminal_tabs"]["policy_boundary"]["requires_append_only_events"] is True
+    assert "terminal_tab_projection_disabled" in payload["terminal_tabs"]["blocked_reasons"]
+    assert payload["terminal_tabs"]["source"] == "persisted_pty_events"
+    assert payload["terminal_tabs"]["terminal_control_supported"] is False
+    assert payload["terminal_tabs"]["websocket_supported"] is False
+    assert payload["terminal_tabs"]["process_started"] is False
+    assert payload["terminal_tabs"]["websocket_opened"] is False
+    assert payload["terminal_tabs"]["live_stream_read"] is False
+    assert payload["terminal_tabs"]["artifact_contents_included"] is False
+    assert payload["terminal_tabs"]["permission_granting"] is False
+    assert payload["worktrees"]["available"] is True
+    assert payload["worktrees"]["mutation_supported"] is False
+    assert payload["worktrees"]["creation_supported"] is False
+    assert payload["worktrees"]["reset_supported"] is False
+    assert payload["worktrees"]["remove_supported"] is False
+    assert payload["worktrees"]["blocked_reasons"] == ["worktree_mutation_disabled", "worktree_creation_disabled"]
+    assert payload["worktrees"]["policy_boundary"]["kind"] == "worktree_status_projection"
+    assert payload["worktrees"]["policy_boundary"]["git_mutation_allowed"] is False
+    assert payload["worktrees"]["filesystem_modified"] is False
+    assert payload["worktrees"]["git_mutation_started"] is False
+    assert payload["session"]["diff_artifact_count"] == 1
+    assert payload["session"]["changed_file_count"] >= 1
+    assert payload["session"]["local_snapshot_available"] is True
+    assert payload["session"]["revert_supported"] is False
+    assert payload["session"]["revert_readiness_ready"] is False
+    assert "active_revert_policy_missing" in payload["session"]["revert_blocked_reasons"]
+    assert payload["session"]["revert_policy_boundary"]["kind"] == "session_revert_readiness"
+    assert payload["session"]["snapshot_policy_boundary"]["kind"] == "snapshot_metadata_projection"
+    assert payload["session"]["filesystem_modified"] is False
+    assert payload["policy"]["terminal_process_started"] is False
+    assert payload["policy"]["terminal_websocket_opened"] is False
+    assert payload["policy"]["terminal_live_stream_read"] is False
+    assert payload["policy"]["terminal_artifact_contents_included"] is False
+    assert payload["policy"]["terminal_control_started"] is False
+    assert payload["policy"]["workspace_mutation_started"] is False
+    assert "worktree_mutation_disabled" in payload["policy"]["blocked_reasons"]
+    assert payload["policy"]["filesystem_modified"] is False
+    assert payload["permission_granting"] is False
+    assert text.exit_code == 0, text.output
+    assert "terminal_tabs" in text.output
+    assert "dev_loop_status_projection" in text.output
+    assert "worktree_mutation_disabled" in text.output
+    assert "tabs=1,output=1" in text.output
+    assert "terminal_policy" in text.output
+    assert "pty_terminal_tabs_projection" in text.output
+    assert "terminal_blockers" in text.output
+    assert "terminal_tab_projection_disabled" in text.output
+    assert "diffs=1,files=" in text.output
+    assert "Dev-loop diagnostics are metadata-only" in text.output
 
 
 def test_cli_pr_checkout_and_run_fail_closed_without_network_or_git_mutation(tmp_path) -> None:
@@ -2529,19 +4140,84 @@ def test_cli_pr_checkout_and_run_fail_closed_without_network_or_git_mutation(tmp
         assert payload["schema_version"] == "harness.pr_action/v1"
         assert payload["ok"] is False
         assert payload["action"] == action
+        assert payload["plan"]["schema_version"] == "harness.pr_checkout_plan/v1"
+        assert payload["plan"]["executed"] is False
+        assert payload["plan"]["execution_supported"] is False
+        assert payload["plan"]["approval_required"] is True
+        assert payload["plan"]["required_approval"] == "pr_checkout_or_run"
+        assert payload["plan"]["policy_boundary"]["kind"] == "pull_request_worktree"
+        assert payload["plan"]["policy_boundary"]["managed_root"] == ".harness/pr-worktrees"
+        assert payload["plan"]["policy_boundary"]["active_workspace_mutation_allowed"] is False
+        assert payload["execution_supported"] is False
+        assert payload["approval_required"] is True
+        assert payload["required_approval"] == "pr_checkout_or_run"
         assert payload["network_called"] is False
         assert payload["git_mutation_started"] is False
         assert payload["worktree_created"] is False
         assert payload["checkout_started"] is False
         assert payload["adapter_started"] is False
+        assert payload["process_started"] is False
+        assert payload["filesystem_modified"] is False
         assert payload["permission_granting"] is False
-    assert json.loads(checkout.output)["pr"] == "https://github.com/example/repo/pull/42"
-    assert json.loads(run.output)["adapter"] == "repo_planning"
+    checkout_payload = json.loads(checkout.output)
+    run_payload = json.loads(run.output)
+    assert checkout_payload["pr"] == "https://github.com/example/repo/pull/42"
+    assert checkout_payload["parsed"]["owner"] == "example"
+    assert checkout_payload["parsed"]["repo"] == "repo"
+    assert checkout_payload["parsed"]["number"] == 42
+    assert checkout_payload["plan"]["branch"] == "harness/pr-42"
+    assert checkout_payload["plan"]["worktree_path"] == ".harness/pr-worktrees/pr-42"
+    assert checkout_payload["plan"]["fetch_ref"] == "+refs/pull/42/head:refs/remotes/origin/pr/42"
+    assert [step["name"] for step in checkout_payload["plan"]["steps"]] == ["fetch_pr_head", "create_isolated_worktree"]
+    assert checkout_payload["plan"]["blocked_reasons"] == [
+        "network_fetch_disabled",
+        "git_mutation_disabled",
+        "worktree_creation_disabled",
+    ]
+    assert run_payload["adapter"] == "repo_planning"
+    assert run_payload["plan"]["requires_repo_resolution"] is True
+    assert run_payload["plan"]["blocked_reasons"] == [
+        "network_fetch_disabled",
+        "git_mutation_disabled",
+        "worktree_creation_disabled",
+        "adapter_execution_disabled",
+        "repo_resolution_required",
+    ]
+    assert [step["name"] for step in run_payload["plan"]["steps"]] == ["fetch_pr_head", "create_isolated_worktree", "run_adapter"]
+
+    text = runner.invoke(app, ["pr", "checkout", "example/repo#7", "--project", str(tmp_path)])
+    assert text.exit_code == 1
+    assert "harness/pr-7" in text.output
+    assert "executed=false" in text.output
+    assert "policy_boundary" in text.output
+    assert "network_called=false" in text.output
+
+    invalid = runner.invoke(app, ["pr", "checkout", "not a pr", "--project", str(tmp_path), "--output", "json"])
+    assert invalid.exit_code == 1
+    invalid_payload = json.loads(invalid.output)
+    assert invalid_payload["parsed"]["valid"] is False
+    assert invalid_payload["plan"]["steps"] == []
+    assert invalid_payload["plan"]["blocked_reasons"][:4] == [
+        "invalid_pr_ref",
+        "network_fetch_disabled",
+        "git_mutation_disabled",
+        "worktree_creation_disabled",
+    ]
+    assert invalid_payload["network_called"] is False
+    assert invalid_payload["git_mutation_started"] is False
+    assert invalid_payload["worktree_created"] is False
+    assert invalid_payload["process_started"] is False
+    assert invalid_payload["filesystem_modified"] is False
 
 
 def test_cli_distribution_status_version_check_and_actions_are_safe(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
     status = runner.invoke(app, ["distribution", "status", "--project", str(tmp_path), "--output", "json"])
+    packaging_smoke = runner.invoke(app, ["distribution", "packaging-smoke", "--project", str(tmp_path), "--output", "json"])
+    packaging_run = runner.invoke(app, ["distribution", "packaging-smoke-run", "--project", str(tmp_path), "--output", "json"])
     version_check = runner.invoke(app, ["distribution", "version-check", "--output", "json"])
+    desktop_status = runner.invoke(app, ["distribution", "desktop-status", "--output", "json"])
+    desktop_launch = runner.invoke(app, ["distribution", "desktop-launch", "--output", "json"])
     install = runner.invoke(app, ["distribution", "install", "--target", "user", "--output", "json"])
     upgrade = runner.invoke(app, ["distribution", "upgrade", "--version", "0.2.0", "--output", "json"])
     uninstall = runner.invoke(app, ["distribution", "uninstall", "--confirm", "harness", "--output", "json"])
@@ -2554,6 +4230,27 @@ def test_cli_distribution_status_version_check_and_actions_are_safe(tmp_path) ->
     assert status_payload["filesystem_modified"] is False
     assert status_payload["subprocess_started"] is False
     assert status_payload["permission_granting"] is False
+    assert packaging_smoke.exit_code == 0, packaging_smoke.output
+    packaging_payload = json.loads(packaging_smoke.output)
+    assert packaging_payload["schema_version"] == "harness.packaging_smoke/v1"
+    assert packaging_payload["pyproject_exists"] is True
+    assert packaging_payload["wheel_smoke_supported"] is True
+    assert packaging_payload["execution_supported"] is False
+    assert "cli_entrypoint" in packaging_payload["covers"]
+    assert packaging_payload["subprocess_started"] is False
+    assert packaging_payload["filesystem_modified"] is False
+    assert packaging_payload["network_called"] is False
+    assert packaging_payload["permission_granting"] is False
+    assert packaging_run.exit_code == 1
+    packaging_run_payload = json.loads(packaging_run.output)
+    assert packaging_run_payload["schema_version"] == "harness.packaging_smoke_action/v1"
+    assert packaging_run_payload["ok"] is False
+    assert packaging_run_payload["build_started"] is False
+    assert packaging_run_payload["install_started"] is False
+    assert packaging_run_payload["subprocess_started"] is False
+    assert packaging_run_payload["filesystem_modified"] is False
+    assert packaging_run_payload["network_called"] is False
+    assert packaging_run_payload["permission_granting"] is False
     assert version_check.exit_code == 0
     version_payload = json.loads(version_check.output)
     assert version_payload["schema_version"] == "harness.version_check/v1"
@@ -2562,6 +4259,23 @@ def test_cli_distribution_status_version_check_and_actions_are_safe(tmp_path) ->
     assert version_payload["network_called"] is False
     assert version_payload["subprocess_started"] is False
     assert version_payload["permission_granting"] is False
+    assert desktop_status.exit_code == 0, desktop_status.output
+    desktop_payload = json.loads(desktop_status.output)
+    assert desktop_payload["schema_version"] == "harness.desktop_status/v1"
+    assert desktop_payload["packaging_decision"] == "python_wheel_first"
+    assert desktop_payload["desktop_wrapper_supported"] is False
+    assert desktop_payload["launch_supported"] is False
+    assert desktop_payload["process_started"] is False
+    assert desktop_payload["permission_granting"] is False
+    assert desktop_launch.exit_code == 1
+    launch_payload = json.loads(desktop_launch.output)
+    assert launch_payload["schema_version"] == "harness.desktop_action/v1"
+    assert launch_payload["ok"] is False
+    assert launch_payload["desktop_app_launched"] is False
+    assert launch_payload["process_started"] is False
+    assert launch_payload["network_called"] is False
+    assert launch_payload["filesystem_modified"] is False
+    assert launch_payload["permission_granting"] is False
     for result, action in [(install, "install"), (upgrade, "upgrade"), (uninstall, "uninstall")]:
         assert result.exit_code == 1
         payload = json.loads(result.output)
@@ -2573,6 +4287,507 @@ def test_cli_distribution_status_version_check_and_actions_are_safe(tmp_path) ->
         assert payload["subprocess_started"] is False
         assert payload["package_manager_started"] is False
         assert payload["permission_granting"] is False
+
+
+def test_cli_settings_tui_and_session_preferences_are_audited(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Preferences session")
+
+    catalog = runner.invoke(app, ["settings", "tui", "--output", "json"])
+    before = runner.invoke(app, ["session", "preferences", session.id, "--project", str(tmp_path), "--output", "json"])
+    updated = runner.invoke(
+        app,
+        [
+            "session",
+            "preferences",
+            session.id,
+            "--set",
+            "theme=dark",
+            "--set",
+            "terminal_font_size=18",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    after_events = SQLiteStore(tmp_path).list_store_events("session", session.id)
+
+    assert catalog.exit_code == 0, catalog.output
+    catalog_payload = json.loads(catalog.output)
+    assert catalog_payload["schema_version"] == "harness.tui_settings/v1"
+    assert catalog_payload["source"] == "defaults"
+    assert catalog_payload["preference_source"] == "defaults"
+    assert catalog_payload["preferences_persisted"] is False
+    assert {setting["key"] for setting in catalog_payload["settings"]} >= {
+        "theme",
+        "terminal_font_size",
+        "keybinding_preset",
+        "composer_mode",
+    }
+    assert catalog_payload["filesystem_modified"] is False
+    assert catalog_payload["process_started"] is False
+    assert catalog_payload["permission_granting"] is False
+
+    assert before.exit_code == 0, before.output
+    before_payload = json.loads(before.output)
+    assert before_payload["schema_version"] == "harness.session_preferences/v1"
+    assert before_payload["settings"]["source"] == "active_session"
+    assert before_payload["settings"]["session_id"] == session.id
+    assert before_payload["settings"]["preference_source"] == "session_ui_preferences"
+    assert before_payload["settings"]["preferences_persisted"] is False
+    assert before_payload["settings"]["persist_command"] == f"harness session preferences {session.id} --project . --set key=value"
+    assert before_payload["preferences"]["theme"] == "light"
+    assert before_payload["updated"] is False
+
+    assert updated.exit_code == 0, updated.output
+    updated_payload = json.loads(updated.output)
+    assert updated_payload["updated"] is True
+    assert updated_payload["preferences"]["theme"] == "dark"
+    assert updated_payload["preferences"]["terminal_font_size"] == 18
+    assert updated_payload["settings"]["source"] == "active_session"
+    assert updated_payload["settings"]["session_id"] == session.id
+    assert updated_payload["settings"]["preferences"]["theme"] == "dark"
+    assert updated_payload["settings"]["preferences_persisted"] is False
+    assert updated_payload["settings"]["policy_boundary"]["preference_persistence_allowed"] is False
+    assert updated_payload["permission_granting"] is False
+    assert any(event.kind == "session.ui_preferences.updated" for event in after_events)
+    assert SQLiteStore(tmp_path).get_session(session.id).ui_preferences["theme"] == "dark"
+
+
+def test_cli_project_commands_are_listed_in_palette_and_slash_but_not_executed(tmp_path) -> None:
+    command_dir = tmp_path / ".harness" / "commands"
+    command_dir.mkdir(parents=True)
+    (command_dir / "changelog.md").write_text(
+        "---\n"
+        "title: Draft changelog\n"
+        "description: Prepare a changelog entry\n"
+        "---\n"
+        "Draft a changelog for {{range}}.\n",
+        encoding="utf-8",
+    )
+
+    listed = runner.invoke(app, ["commands", "list", "--project", str(tmp_path), "--output", "json"])
+    run = runner.invoke(app, ["commands", "run", "changelog", "--project", str(tmp_path), "--output", "json"])
+    catalog = build_command_catalog(tmp_path)
+    palette = build_command_palette(catalog["commands"])
+    slash_commands = build_slash_commands(palette, catalog["commands"])
+
+    assert listed.exit_code == 0, listed.output
+    payload = json.loads(listed.output)
+    assert payload["schema_version"] == "harness.commands/v1"
+    assert payload["execution_supported"] is False
+    assert payload["contents_included"] is False
+    assert payload["commands"][0]["name"] == "changelog"
+    assert payload["commands"][0]["slash"] == "/changelog"
+    assert payload["commands"][0]["template_variables"] == ["range"]
+
+    assert run.exit_code == 1
+    run_payload = json.loads(run.output)
+    assert run_payload["schema_version"] == "harness.command_action/v1"
+    assert run_payload["ok"] is False
+    assert run_payload["execution_started"] is False
+    assert run_payload["process_started"] is False
+    assert run_payload["network_called"] is False
+    assert run_payload["filesystem_modified"] is False
+    assert run_payload["permission_granting"] is False
+
+    assert any(group["id"] == "project_commands" for group in palette["groups"])
+    custom_entry = next(entry for entry in palette["entries"] if entry["id"] == "project_commands.changelog")
+    assert custom_entry["custom_command"] is True
+    custom_slash = next(command for command in slash_commands["commands"] if command["name"] == "changelog")
+    assert custom_slash["slash"] == "/changelog"
+    assert custom_slash["custom_command"] is True
+
+
+def test_cli_session_share_local_snapshot_and_hosted_fail_closed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="CLI share")
+    message = store.append_session_message(session.id, "user", "token sk-abcdefghijklmnopqrstuvwxyz")
+    store.append_session_part(session.id, message.id, "text", text="token sk-abcdefghijklmnopqrstuvwxyz")
+    run = store.create_run("share run", "phase_1a_test", status="succeeded", session_id=session.id)
+    artifact_path = store.initialize_run_artifacts(run.id)["final_report"]
+    artifact_path.write_text("artifact body should not be included\n", encoding="utf-8")
+    store.register_artifact(run.id, "final_report", artifact_path, session_id=session.id)
+
+    local = runner.invoke(app, ["session", "share", session.id, "--project", str(tmp_path), "--output", "json"])
+    hosted = runner.invoke(
+        app,
+        ["session", "share", session.id, "--hosted", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert local.exit_code == 0, local.output
+    payload = json.loads(local.output)
+    assert payload["schema_version"] == "harness.session_share/v1"
+    assert payload["share_mode"] == "local_snapshot"
+    assert payload["hosted_share_supported"] is False
+    assert payload["hosted_url"] is None
+    assert payload["artifact_files_included"] is False
+    assert payload["artifact_references"][0]["contents_included"] is False
+    assert payload["artifact_references"][0]["file_included"] is False
+    assert payload["network_called"] is False
+    assert payload["filesystem_modified"] is False
+    assert payload["permission_granting"] is False
+    assert payload["snapshot_sha256"]
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in local.output
+    assert "[REDACTED_SECRET]" in local.output
+    assert "artifact body should not be included" not in local.output
+
+    assert hosted.exit_code == 1
+    hosted_payload = json.loads(hosted.output)
+    assert hosted_payload["schema_version"] == "harness.session_share_action/v1"
+    assert hosted_payload["ok"] is False
+    assert hosted_payload["hosted_share_supported"] is False
+    assert hosted_payload["network_called"] is False
+    assert hosted_payload["filesystem_modified"] is False
+    assert hosted_payload["permission_granting"] is False
+
+
+def test_cli_workspaces_catalog_and_actions_are_metadata_only(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    listed = runner.invoke(app, ["workspaces", "list", "--project", str(tmp_path), "--output", "json"])
+    current = runner.invoke(app, ["workspaces", "current", "--project", str(tmp_path), "--output", "json"])
+    clients = runner.invoke(app, ["workspaces", "clients", "--project", str(tmp_path), "--output", "json"])
+    attach = runner.invoke(app, ["workspaces", "attach", "ws_other", "--project", str(tmp_path), "--output", "json"])
+    sync = runner.invoke(app, ["workspaces", "sync", "ws_other", "--project", str(tmp_path), "--output", "json"])
+    steal = runner.invoke(app, ["workspaces", "steal", "ws_other", "--client", "client_other", "--project", str(tmp_path), "--output", "json"])
+    dispose = runner.invoke(app, ["workspaces", "dispose", "ws_other", "--client", "client_other", "--project", str(tmp_path), "--output", "json"])
+
+    assert listed.exit_code == 0, listed.output
+    listed_payload = json.loads(listed.output)
+    assert listed_payload["schema_version"] == "harness.workspaces/v1"
+    assert listed_payload["registry_scope"] == "current_project_only"
+    assert listed_payload["global_registry_supported"] is False
+    assert listed_payload["remote_attach_supported"] is False
+    assert listed_payload["sync_supported"] is False
+    assert listed_payload["workspaces"][0]["path"] == str(tmp_path)
+    assert listed_payload["workspaces"][0]["initialized"] is True
+    assert listed_payload["network_called"] is False
+    assert listed_payload["filesystem_modified"] is False
+    assert listed_payload["process_started"] is False
+    assert listed_payload["permission_granting"] is False
+
+    assert current.exit_code == 0, current.output
+    current_payload = json.loads(current.output)
+    assert current_payload["schema_version"] == "harness.workspace/v1"
+    assert current_payload["workspace"]["id"] == listed_payload["current_workspace_id"]
+
+    assert clients.exit_code == 0, clients.output
+    clients_payload = json.loads(clients.output)
+    assert clients_payload["schema_version"] == "harness.workspace_clients/v1"
+    assert clients_payload["clients"] == []
+    assert clients_payload["client_registration_supported"] is False
+    assert clients_payload["conflict_detection_supported"] is False
+    assert clients_payload["steal_supported"] is False
+    assert clients_payload["dispose_supported"] is False
+    assert clients_payload["network_called"] is False
+    assert clients_payload["filesystem_modified"] is False
+    assert clients_payload["permission_granting"] is False
+
+    for result, action in [(attach, "attach"), (sync, "sync"), (steal, "steal"), (dispose, "dispose")]:
+        assert result.exit_code == 1
+        payload = json.loads(result.output)
+        assert payload["schema_version"] == "harness.workspace_action/v1"
+        assert payload["ok"] is False
+        assert payload["action"] == action
+        assert payload["network_called"] is False
+        assert payload["filesystem_modified"] is False
+        assert payload["process_started"] is False
+        assert payload["attached"] is False
+        assert payload["client_registered"] is False
+        assert payload["client_stolen"] is False
+        assert payload["disposed"] is False
+        assert payload["sync_started"] is False
+        assert payload["permission_granting"] is False
+
+
+def test_cli_session_replay_supports_cursor_without_execution(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Replay CLI")
+    message = store.append_session_message(session.id, "user", "Replay me")
+    store.append_session_part(session.id, message.id, "text", text="Replay me")
+
+    first = runner.invoke(
+        app,
+        ["session", "replay", session.id, "--limit", "1", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)
+    second = runner.invoke(
+        app,
+        [
+            "session",
+            "replay",
+            session.id,
+            "--after-seq",
+            str(first_payload["next_after_seq"]),
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert first_payload["schema_version"] == "harness.session_replay/v1"
+    assert first_payload["event_count"] == 1
+    assert first_payload["has_more"] is True
+    assert first_payload["next_after_seq"] == 1
+    assert first_payload["execution_started"] is False
+    assert first_payload["network_called"] is False
+    assert first_payload["filesystem_modified"] is False
+    assert first_payload["permission_granting"] is False
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)
+    assert second_payload["after_seq"] == first_payload["next_after_seq"]
+    assert second_payload["event_count"] >= 2
+    assert all(event["seq"] > first_payload["next_after_seq"] for event in second_payload["events"])
+    assert second_payload["source"] == "append_only_event_store"
+    assert second_payload["execution_started"] is False
+    assert second_payload["network_called"] is False
+    assert second_payload["permission_granting"] is False
+
+
+def test_cli_session_status_and_inspect_surface_latest_ui_activation_and_model_validation(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(
+        title="UI action CLI",
+        raw_model_ref="codex_cli/not-a-real-model",
+        provider_id="codex_cli",
+        model_id="not-a-real-model",
+    )
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "tui.ui_activation.applied",
+        {
+            "source": "slash",
+            "entry_id": "ui_controls.settings",
+            "activation_kind": "ui_action",
+            "action": {"type": "focus_section", "section_id": "settings"},
+            "ui_action_applied": True,
+            "command_started": False,
+            "process_started": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        },
+        session_id=session.id,
+    )
+
+    inspected = runner.invoke(app, ["session", "inspect", session.id, "--project", str(tmp_path), "--output", "json"])
+    status = runner.invoke(app, ["session", "status", session.id, "--project", str(tmp_path), "--output", "json"])
+    text = runner.invoke(app, ["session", "status", session.id, "--project", str(tmp_path)])
+
+    assert inspected.exit_code == 0, inspected.output
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["schema_version"] == "harness.session/v1"
+    assert inspected_payload["model_validation"]["raw_model_ref"] == "codex_cli/not-a-real-model"
+    assert inspected_payload["model_validation"]["executable"] is False
+    assert inspected_payload["model_validation"]["blocked_reasons"] == ["model_unknown"]
+    assert inspected_payload["model_validation"]["provider_execution_started"] is False
+    assert inspected_payload["model_validation"]["model_execution_started"] is False
+    assert inspected_payload["model_validation"]["hidden_provider_fallback"] is False
+    assert inspected_payload["model_validation"]["hidden_model_fallback"] is False
+    assert inspected_payload["model_validation"]["no_hidden_fallback"] is True
+    assert inspected_payload["model_validation"]["permission_granting"] is False
+    assert inspected_payload["model_validation"]["authority_granting"] is False
+    assert inspected_payload["latest_ui_activation"]["entry_id"] == "ui_controls.settings"
+    assert inspected_payload["latest_ui_activation"]["action_type"] == "focus_section"
+    assert inspected_payload["latest_ui_activation"]["evidence_status"] == "ui_only_persisted"
+    assert inspected_payload["latest_ui_activation"]["policy_boundary"]["kind"] == "safe_ui_activation"
+    assert inspected_payload["latest_ui_activation"]["policy_boundary"]["command_execution_allowed"] is False
+    assert inspected_payload["latest_ui_activation"]["blocked_reasons"] == []
+    assert inspected_payload["latest_ui_activation"]["command_started"] is False
+    assert inspected_payload["latest_ui_activation"]["process_started"] is False
+    assert inspected_payload["latest_ui_activation"]["filesystem_modified"] is False
+    assert inspected_payload["latest_ui_activation"]["permission_granting"] is False
+    assert inspected_payload["latest_ui_activation"]["authority_granting"] is False
+
+    assert status.exit_code == 0, status.output
+    status_payload = json.loads(status.output)
+    assert status_payload["schema_version"] == "harness.session_status/v1"
+    assert status_payload["model_validation"]["raw_model_ref"] == "codex_cli/not-a-real-model"
+    assert status_payload["model_validation"]["executable"] is False
+    assert status_payload["model_validation"]["blocked_reasons"] == ["model_unknown"]
+    assert status_payload["model_validation"]["provider_execution_started"] is False
+    assert status_payload["model_validation"]["hidden_model_fallback"] is False
+    assert status_payload["model_validation"]["no_hidden_fallback"] is True
+    assert status_payload["latest_ui_activation"]["entry_id"] == "ui_controls.settings"
+    assert status_payload["latest_ui_activation"]["authority_granting"] is False
+    assert status_payload["permission_granting"] is False
+
+    assert text.exit_code == 0, text.output
+    assert "Model: codex_cli/not-a-real-model" in text.output
+    assert "Model executable: False" in text.output
+    assert "Model blocked: model_unknown" in text.output
+    assert "No hidden fallback: True" in text.output
+    assert "Latest UI action: ui_controls.settings action=focus_section source=slash" in text.output
+    assert "UI action flags: command=False process=False filesystem=False permission=False authority=False" in text.output
+
+
+def test_cli_server_lifecycle_mdns_and_dispose_are_safe_contracts(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    lifecycle = runner.invoke(app, ["server", "lifecycle", "--project", str(tmp_path), "--output", "json"])
+    mdns = runner.invoke(app, ["server", "mdns", "--output", "json"])
+    dispose = runner.invoke(app, ["server", "dispose", "--output", "json"])
+
+    assert lifecycle.exit_code == 0, lifecycle.output
+    lifecycle_payload = json.loads(lifecycle.output)
+    assert lifecycle_payload["schema_version"] == "harness.local_server_lifecycle/v1"
+    assert lifecycle_payload["dispose_supported"] is False
+    assert lifecycle_payload["remote_attach_supported"] is True
+    assert lifecycle_payload["sse_supported"] is True
+    assert lifecycle_payload["websocket_supported"] is False
+    assert lifecycle_payload["mdns_supported"] is False
+    assert lifecycle_payload["process_stopped"] is False
+    assert lifecycle_payload["permission_granting"] is False
+
+    assert mdns.exit_code == 0, mdns.output
+    mdns_payload = json.loads(mdns.output)
+    assert mdns_payload["schema_version"] == "harness.local_server_mdns/v1"
+    assert mdns_payload["enabled"] is False
+    assert mdns_payload["advertised"] is False
+    assert mdns_payload["network_broadcast_started"] is False
+    assert mdns_payload["network_called"] is False
+    assert mdns_payload["permission_granting"] is False
+
+    assert dispose.exit_code == 1
+    dispose_payload = json.loads(dispose.output)
+    assert dispose_payload["schema_version"] == "harness.local_server_dispose/v1"
+    assert dispose_payload["ok"] is False
+    assert dispose_payload["dispose_supported"] is False
+    assert dispose_payload["process_stopped"] is False
+    assert dispose_payload["filesystem_modified"] is False
+    assert dispose_payload["permission_granting"] is False
+
+
+def test_cli_web_client_status_and_open_are_safe_contracts() -> None:
+    root_opened = runner.invoke(app, ["web", "--output", "json"])
+    status = runner.invoke(app, ["web", "client", "status", "--output", "json"])
+    opened = runner.invoke(app, ["web", "client", "open", "--output", "json"])
+
+    assert root_opened.exit_code == 1
+    root_payload = json.loads(root_opened.output)
+    assert root_payload["schema_version"] == "harness.web_client_action/v1"
+    assert root_payload["ok"] is False
+    assert root_payload["action"] == "open"
+    assert root_payload["browser_opened"] is False
+    assert root_payload["process_started"] is False
+    assert root_payload["network_called"] is False
+    assert root_payload["filesystem_modified"] is False
+    assert root_payload["permission_granting"] is False
+
+    assert status.exit_code == 0, status.output
+    status_payload = json.loads(status.output)
+    assert status_payload["schema_version"] == "harness.web_client/v1"
+    assert status_payload["client_url"] == "http://127.0.0.1:8765/web"
+    assert status_payload["client_available"] is False
+    assert status_payload["static_assets_served"] is False
+    assert status_payload["desktop_wrapper_available"] is False
+    assert status_payload["open_supported"] is False
+    assert status_payload["network_called"] is False
+    assert status_payload["browser_opened"] is False
+    assert status_payload["process_started"] is False
+    assert status_payload["permission_granting"] is False
+
+    assert opened.exit_code == 1
+    opened_payload = json.loads(opened.output)
+    assert opened_payload["schema_version"] == "harness.web_client_action/v1"
+    assert opened_payload["ok"] is False
+    assert opened_payload["action"] == "open"
+    assert opened_payload["browser_opened"] is False
+    assert opened_payload["process_started"] is False
+    assert opened_payload["network_called"] is False
+    assert opened_payload["filesystem_modified"] is False
+    assert opened_payload["permission_granting"] is False
+
+
+def test_cli_phase7_mentions_attachments_and_context_estimate_are_event_backed(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "src").mkdir()
+    (tmp_path / "README.md").write_text("readme body\n", encoding="utf-8")
+    (tmp_path / "src" / "app.py").write_text("print('hello')\n", encoding="utf-8")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["references"] = {
+        "guide": {"kind": "local", "path": "README.md", "description": "Local guide"},
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Phase 7 CLI")
+    referenced = store.create_session(title="Referenced")
+
+    mentions = runner.invoke(
+        app,
+        [
+            "session",
+            "mentions",
+            session.id,
+            f"Review @file:README.md with @directory:src and @reference:guide plus @session:{referenced.id}",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    attachments = runner.invoke(
+        app,
+        ["session", "attachments", session.id, "--file", "README.md", "--project", str(tmp_path), "--output", "json"],
+    )
+    estimate = runner.invoke(
+        app,
+        [
+            "session",
+            "context-estimate",
+            session.id,
+            "Review @file:README.md",
+            "--file",
+            "src/app.py",
+            "--budget-tokens",
+            "1000",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert mentions.exit_code == 0, mentions.output
+    mention_payload = json.loads(mentions.output)
+    assert mention_payload["schema_version"] == "harness.mention_resolution/v1"
+    assert [mention["kind"] for mention in mention_payload["mentions"]] == ["file", "directory", "reference", "session"]
+    assert mention_payload["contents_included"] is False
+    assert mention_payload["permission_granting"] is False
+    assert "readme body" not in mentions.output
+    assert "print('hello')" not in mentions.output
+
+    assert attachments.exit_code == 0, attachments.output
+    attachment_payload = json.loads(attachments.output)
+    assert attachment_payload["schema_version"] == "harness.attachment_preparation/v1"
+    assert attachment_payload["attachments"][0]["path"] == "README.md"
+    assert attachment_payload["attachments"][0]["accepted"] is True
+    assert attachment_payload["attachments"][0]["contents_included"] is False
+    assert attachment_payload["permission_granting"] is False
+
+    assert estimate.exit_code == 0, estimate.output
+    estimate_payload = json.loads(estimate.output)
+    assert estimate_payload["schema_version"] == "harness.context_estimate/v1"
+    assert estimate_payload["total_estimated_tokens"] > 0
+    assert estimate_payload["within_budget"] is True
+    assert {item["kind"] for item in estimate_payload["items"]} >= {"prompt", "mention:file", "attachment"}
+    assert estimate_payload["contents_included"] is False
+    assert estimate_payload["permission_granting"] is False
+
+    events = [event.kind for event in SQLiteStore(tmp_path).list_store_events(EventStreamType.SESSION, session.id)]
+    assert "session.mentions.resolved" in events
+    assert "session.attachments.prepared" in events
+    assert "session.context.estimated" in events
 
 
 def test_cli_runs_default_output_remains_text(tmp_path) -> None:
@@ -6048,6 +8263,54 @@ def test_cli_agents_scaffold_validate_and_preview_custom_bundle(tmp_path, monkey
     assert [parent["id"] for parent in preview_payload["parent_chain"]] == ["quant_research"]
     assert preview_payload["effective_agent"]["tool_policy"] == "read_only"
     assert preview_payload["workbench"]["id"] == "quant"
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_agents_generate_from_description_uses_safe_defaults(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    destination = tmp_path / "agents" / "review_planner"
+
+    generated = runner.invoke(
+        app,
+        [
+            "agents",
+            "generate",
+            "review_planner",
+            "--description",
+            "Review coding plans and produce concise read-only implementation guidance.",
+            "--output",
+            str(destination),
+            "--output-format",
+            "json",
+        ],
+    )
+
+    assert generated.exit_code == 0, generated.output
+    payload = json.loads(generated.output)
+    assert payload["schema_version"] == "harness.agent_generate/v1"
+    assert payload["ok"] is True
+    assert payload["generated_from_description"] is True
+    assert payload["provider_execution_started"] is False
+    assert payload["model_execution_started"] is False
+    assert payload["hidden_provider_fallback"] is False
+    assert payload["permission_granting"] is False
+    assert payload["authority_granting"] is False
+    assert payload["defaults"] == {
+        "kind": "specialist",
+        "model_profile": "codex_supervised",
+        "tool_policy": "read_only",
+        "memory_scope": "project",
+        "parent": None,
+    }
+    assert (destination / "agent.yaml").exists()
+    agent_yaml = yaml.safe_load((destination / "agent.yaml").read_text(encoding="utf-8"))
+    assert agent_yaml["agent"]["role"] == "Review coding plans and produce concise read-only implementation guidance."
+    assert agent_yaml["workbench_id"] == "coding"
+    assert agent_yaml["agent"]["tool_policy"] == "read_only"
+
+    validation = runner.invoke(app, ["agents", "validate", str(destination), "--output", "json"])
+    assert validation.exit_code == 0, validation.output
+    assert json.loads(validation.output)["ok"] is True
     assert not (tmp_path / ".harness").exists()
 
 

@@ -76,6 +76,20 @@ def test_session_spine_persists_messages_parts_events_and_archive_export(tmp_pat
         "session.message.appended",
         "session.part.appended",
     ]
+    created_event = events[0]
+    assert created_event.payload["raw_model_ref"] == "provider/model"
+    assert created_event.payload["provider_id"] is None
+    assert created_event.payload["model_id"] is None
+    assert created_event.payload["model_variant"] is None
+    assert created_event.payload["model_selection_source"] == "session_create"
+    assert created_event.payload["model_override_persisted"] is True
+    assert created_event.payload["provider_execution_started"] is False
+    assert created_event.payload["model_execution_started"] is False
+    assert created_event.payload["hidden_provider_fallback"] is False
+    assert created_event.payload["hidden_model_fallback"] is False
+    assert created_event.payload["no_hidden_fallback"] is True
+    assert created_event.payload["permission_granting"] is False
+    assert created_event.payload["authority_granting"] is False
     assert store.list_session_messages(session.id)[0].id == message.id
     assert store.list_session_parts(session.id)[0].id == part.id
     assert store.list_session_messages(session.id)[1].id == assistant.id
@@ -118,6 +132,7 @@ def test_session_fork_cli_creates_child_session(tmp_path) -> None:
             "json",
         ],
     )
+    children = runner.invoke(app, ["session", "children", parent.id, "--project", str(tmp_path), "--output", "json"])
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -126,6 +141,212 @@ def test_session_fork_cli_creates_child_session(tmp_path) -> None:
     assert child["forked_from_message_id"] == message.id
     assert child["title"] == "Child"
     assert "session.forked" in {event.kind for event in store.list_store_events(EventStreamType.SESSION, child["id"])}
+    assert children.exit_code == 0, children.output
+    children_payload = json.loads(children.output)
+    assert children_payload["schema_version"] == "harness.session_children/v1"
+    assert children_payload["session_id"] == parent.id
+    assert children_payload["child_session_ids"] == [child["id"]]
+    assert children_payload["children"][0]["parent_session_id"] == parent.id
+    assert children_payload["execution_started"] is False
+    assert children_payload["permission_granting"] is False
+
+
+def test_session_status_and_abort_are_append_only_metadata_contracts(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    parent = store.create_session(title="Abort parent")
+    child = store.fork_session(parent.id, title="Abort child")
+    message = store.append_session_message(parent.id, SessionMessageRole.USER, "Abort this")
+    store.append_session_part(parent.id, message.id, SessionPartKind.TEXT, text="Abort this")
+
+    before = runner.invoke(app, ["session", "status", parent.id, "--project", str(tmp_path), "--output", "json"])
+    aborted = runner.invoke(
+        app,
+        ["session", "abort", parent.id, "--reason", "operator stopped waiting", "--project", str(tmp_path), "--output", "json"],
+    )
+    after = runner.invoke(app, ["session", "status", parent.id, "--project", str(tmp_path), "--output", "json"])
+    tail = runner.invoke(app, ["events", parent.id, "--project", str(tmp_path)])
+
+    assert before.exit_code == 0, before.output
+    before_payload = json.loads(before.output)
+    assert before_payload["schema_version"] == "harness.session_status/v1"
+    assert before_payload["status"] == SessionStatus.ACTIVE.value
+    assert before_payload["message_count"] == 1
+    assert before_payload["child_session_ids"] == [child.id]
+    assert before_payload["terminal"] is False
+    assert before_payload["process_running"] is False
+    assert before_payload["permission_granting"] is False
+
+    assert aborted.exit_code == 0, aborted.output
+    abort_payload = json.loads(aborted.output)
+    assert abort_payload["schema_version"] == "harness.session_abort/v1"
+    assert abort_payload["session"]["status"] == SessionStatus.CANCELLED.value
+    assert abort_payload["process_stopped"] is False
+    assert abort_payload["run_cancelled"] is False
+    assert abort_payload["task_cancelled"] is False
+    assert abort_payload["permission_granting"] is False
+
+    assert after.exit_code == 0, after.output
+    after_payload = json.loads(after.output)
+    assert after_payload["status"] == SessionStatus.CANCELLED.value
+    assert after_payload["terminal"] is True
+    assert after_payload["event_count"] == before_payload["event_count"] + 1
+    assert tail.exit_code == 0, tail.output
+    assert "session.cancelled" in tail.output or "Session cancelled" in tail.output
+    events = store.list_session_store_events(parent.id)
+    assert [event.kind for event in events].count("session.cancelled") == 1
+
+
+def test_session_summary_and_token_rollup_are_mutable_projection_events(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Summary rollup")
+
+    summarized = runner.invoke(
+        app,
+        [
+            "session",
+            "summarize",
+            session.id,
+            "--summary",
+            "Investigated the failing parser path.",
+            "--input-tokens",
+            "120",
+            "--output-tokens",
+            "35",
+            "--reasoning-tokens",
+            "7",
+            "--cache-read-tokens",
+            "5",
+            "--cache-write-tokens",
+            "2",
+            "--estimated-cost-usd",
+            "0.0123",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    status = runner.invoke(app, ["session", "status", session.id, "--project", str(tmp_path), "--output", "json"])
+    tail = runner.invoke(app, ["events", session.id, "--project", str(tmp_path)])
+
+    assert summarized.exit_code == 0, summarized.output
+    payload = json.loads(summarized.output)
+    assert payload["schema_version"] == "harness.session_summary/v1"
+    assert payload["mutable_projection"] is True
+    assert payload["permission_granting"] is False
+    updated = payload["session"]
+    assert updated["summary"] == "Investigated the failing parser path."
+    assert updated["token_input"] == 120
+    assert updated["token_output"] == 35
+    assert updated["token_reasoning"] == 7
+    assert updated["token_cache_read"] == 5
+    assert updated["token_cache_write"] == 2
+    assert updated["estimated_cost_usd"] == "0.0123"
+    assert status.exit_code == 0, status.output
+    status_payload = json.loads(status.output)
+    assert status_payload["summary"] == "Investigated the failing parser path."
+    assert status_payload["token_input"] == 120
+    assert status_payload["estimated_cost_usd"] == "0.0123"
+    assert tail.exit_code == 0, tail.output
+    assert "session.summary_updated" in tail.output or "Summary updated" in tail.output
+    events = store.list_session_store_events(session.id)
+    assert [event.kind for event in events].count("session.summary_updated") == 1
+
+
+def test_session_message_retraction_and_part_correction_are_event_only(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Correction session")
+    message = store.append_session_message(session.id, SessionMessageRole.USER, "Original prompt")
+    part = store.append_session_part(session.id, message.id, SessionPartKind.TEXT, text="Original prompt")
+
+    retracted = runner.invoke(
+        app,
+        [
+            "session",
+            "retract-message",
+            session.id,
+            message.id,
+            "--reason",
+            "superseded",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    corrected = runner.invoke(
+        app,
+        [
+            "session",
+            "correct-part",
+            session.id,
+            part.id,
+            "--text",
+            "Corrected prompt",
+            "--reason",
+            "typo",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    transcript = runner.invoke(app, ["session", "transcript", session.id, "--project", str(tmp_path), "--format", "jsonl"])
+    tail = runner.invoke(app, ["events", session.id, "--project", str(tmp_path)])
+
+    assert retracted.exit_code == 0, retracted.output
+    retracted_payload = json.loads(retracted.output)
+    assert retracted_payload["schema_version"] == "harness.session_message_retraction/v1"
+    assert retracted_payload["message_mutated"] is False
+    assert retracted_payload["parts_mutated"] is False
+    assert retracted_payload["permission_granting"] is False
+    assert corrected.exit_code == 0, corrected.output
+    corrected_payload = json.loads(corrected.output)
+    assert corrected_payload["schema_version"] == "harness.session_part_correction/v1"
+    assert corrected_payload["part_mutated"] is False
+    assert corrected_payload["message_mutated"] is False
+    assert corrected_payload["permission_granting"] is False
+    assert transcript.exit_code == 0, transcript.output
+    transcript_payload = json.loads(transcript.output.splitlines()[0])
+    assert transcript_payload["message"]["content_preview"] == "Original prompt"
+    assert transcript_payload["parts"][0]["text"] == "Original prompt"
+    assert tail.exit_code == 0, tail.output
+    assert "Message retracted" in tail.output
+    assert "Part corrected" in tail.output
+    events = store.list_session_store_events(session.id)
+    assert [event.kind for event in events].count("session.message.retracted") == 1
+    assert [event.kind for event in events].count("session.part.corrected") == 1
+
+
+def test_session_changed_files_cli_summarizes_diff_artifacts_without_mutation(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Changed files")
+    run = store.create_run("Diff run", "codex_isolated_edit", session_id=session.id)
+    diff_path = store.runs_dir / run.id / "isolated_unified_diff.patch"
+    diff_path.parent.mkdir(parents=True, exist_ok=True)
+    diff_path.write_text("diff --git a/app.py b/app.py\n--- a/app.py\n+++ b/app.py\n@@\n-old\n+new\n", encoding="utf-8")
+    artifact = store.register_artifact(run.id, "isolated_unified_diff", diff_path, session_id=session.id)
+
+    result = runner.invoke(app, ["session", "changed-files", session.id, "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.session_changed_files/v1"
+    assert payload["session_id"] == session.id
+    assert payload["file_count"] == 1
+    assert payload["files"][0]["path"] == "app.py"
+    assert payload["files"][0]["sources"] == ["diff_artifact"]
+    assert payload["files"][0]["diff_artifact_ids"] == [artifact.id]
+    assert payload["files"][0]["contents_included"] is False
+    assert payload["contents_included"] is False
+    assert payload["mutation_started"] is False
+    assert payload["revert_supported"] is False
+    assert payload["selected_hunk_apply_supported"] is False
+    assert payload["permission_granting"] is False
 
 
 def test_session_tail_and_transcript_render_from_persisted_events(tmp_path) -> None:
@@ -139,6 +360,8 @@ def test_session_tail_and_transcript_render_from_persisted_events(tmp_path) -> N
 
     tail = runner.invoke(app, ["session", "tail", session.id, "--project", str(tmp_path)])
     tail_jsonl = runner.invoke(app, ["session", "tail", session.id, "--project", str(tmp_path), "--jsonl"])
+    generic_events = runner.invoke(app, ["events", session.id, "--project", str(tmp_path)])
+    generic_events_jsonl = runner.invoke(app, ["events", session.id, "--project", str(tmp_path), "--jsonl"])
     transcript = runner.invoke(app, ["session", "transcript", session.id, "--project", str(tmp_path)])
     transcript_jsonl = runner.invoke(
         app,
@@ -147,10 +370,14 @@ def test_session_tail_and_transcript_render_from_persisted_events(tmp_path) -> N
 
     assert tail.exit_code == 0, tail.output
     assert tail_jsonl.exit_code == 0, tail_jsonl.output
+    assert generic_events.exit_code == 0, generic_events.output
+    assert generic_events_jsonl.exit_code == 0, generic_events_jsonl.output
     assert transcript.exit_code == 0, transcript.output
     assert transcript_jsonl.exit_code == 0, transcript_jsonl.output
     assert "Session created" in tail.output
     assert "Message appended" in tail.output
+    assert generic_events.output == tail.output
+    assert generic_events_jsonl.output == tail_jsonl.output
     first_event = json.loads(tail_jsonl.output.splitlines()[0])
     assert first_event["schema_version"] == "harness.event/v2"
     assert "\x1b[" not in tail_jsonl.output
@@ -180,7 +407,7 @@ def test_foreground_prompt_creates_session_and_records_direct_run_messages(tmp_p
 
         def run_direct_agent(self, project_root, prompt, final_message_path, *, model=None, reasoning_effort=None):
             assert prompt == "change value"
-            assert model == "codex/gpt-test@fast"
+            assert model == "codex_cli/gpt-5.5"
             (Path(project_root) / "app.py").write_text("value = 2\n", encoding="utf-8")
             final_message_path.write_text("Changed the value.", encoding="utf-8")
             self.config.settings["last_codex_approval_mode"] = "on-request via --ask-for-approval"
@@ -206,7 +433,7 @@ def test_foreground_prompt_creates_session_and_records_direct_run_messages(tmp_p
             "--mode",
             "direct",
             "--model",
-            "codex/gpt-test@fast",
+            "codex_cli/gpt-5.5",
             "--file",
             "app.py",
             "--no-stream",
@@ -225,9 +452,28 @@ def test_foreground_prompt_creates_session_and_records_direct_run_messages(tmp_p
     assert payload["run_id"] == session.active_run_id
     assert session.title == "Direct session"
     assert session.agent_id == "build"
-    assert session.provider_id == "codex"
-    assert session.model_id == "gpt-test"
-    assert session.model_variant == "fast"
+    assert session.provider_id == "codex_cli"
+    assert session.model_id == "gpt-5.5"
+    assert session.model_variant is None
+    model_events = [event for event in store.list_session_store_events(session_id) if event.kind in {"session.created", "session.model_selected"}]
+    assert model_events[0].payload["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert model_events[0].payload["provider_id"] == "codex_cli"
+    assert model_events[0].payload["model_id"] == "gpt-5.5"
+    assert model_events[0].payload["model_variant"] is None
+    assert model_events[0].payload["model_selection_source"] == "session_create"
+    assert all(event.payload["no_hidden_fallback"] is True for event in model_events)
+    assert all(event.payload["provider_execution_started"] is False for event in model_events)
+    assert all(event.payload["model_execution_started"] is False for event in model_events)
+    assert all(event.payload["hidden_provider_fallback"] is False for event in model_events)
+    assert all(event.payload["hidden_model_fallback"] is False for event in model_events)
+    validation_events = [event for event in store.list_session_store_events(session_id) if event.kind == "session.model_validation"]
+    assert validation_events
+    assert validation_events[-1].payload["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert validation_events[-1].payload["executable"] is True
+    assert validation_events[-1].payload["known_catalog_entry"] is True
+    assert validation_events[-1].payload["provider_execution_started"] is False
+    assert validation_events[-1].payload["hidden_provider_fallback"] is False
+    assert validation_events[-1].payload["no_hidden_fallback"] is True
     assert [message.role for message in messages] == [SessionMessageRole.USER, SessionMessageRole.ASSISTANT]
     assert messages[1].mutation_reversibility == SessionMutationReversibility.NOT_REVERSIBLE_ACTIVE_WORKSPACE
     assert any(part.metadata.get("attachment_kind") == "file_ref" for part in parts)
@@ -239,6 +485,55 @@ def test_foreground_prompt_creates_session_and_records_direct_run_messages(tmp_p
     transcript = runner.invoke(app, ["session", "transcript", session_id, "--project", str(tmp_path)])
     assert transcript.exit_code == 0, transcript.output
     assert "artifact=" in transcript.output
+
+
+def test_foreground_prompt_unknown_model_fails_closed_after_session_persistence(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            raise AssertionError("backend must not be constructed after failed model validation")
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    result = runner.invoke(
+        app,
+        [
+            "change value",
+            "--project",
+            str(tmp_path),
+            "--mode",
+            "direct",
+            "--model",
+            "codex_cli/not-a-real-model",
+            "--no-stream",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["status"] == "model_validation_failed"
+    assert payload["run_id"] is None
+    assert payload["provider_execution_started"] is False
+    assert payload["model_execution_started"] is False
+    assert payload["hidden_provider_fallback"] is False
+    assert payload["hidden_model_fallback"] is False
+    assert payload["no_hidden_fallback"] is True
+    assert payload["model_validation"]["blocked_reasons"] == ["model_unknown"]
+    store = SQLiteStore(tmp_path)
+    session = store.get_session(payload["session_id"])
+    assert session.raw_model_ref == "codex_cli/not-a-real-model"
+    assert session.provider_id == "codex_cli"
+    assert session.model_id == "not-a-real-model"
+    assert session.active_run_id is None
+    events = store.list_session_store_events(session.id)
+    validation = [event for event in events if event.kind == "session.model_validation"][-1]
+    assert validation.payload["executable"] is False
+    assert validation.payload["provider_execution_started"] is False
+    assert validation.payload["blocked_reasons"] == ["model_unknown"]
+    assert any(part.metadata.get("status") == "model_validation_failed" for part in store.list_session_parts(session.id))
 
 
 def test_foreground_build_agent_creates_isolated_task_by_default(tmp_path, monkeypatch) -> None:
@@ -257,6 +552,8 @@ def test_foreground_build_agent_creates_isolated_task_by_default(tmp_path, monke
             str(tmp_path),
             "--agent",
             "build",
+            "--model",
+            "codex_cli/gpt-5.5",
             "--title",
             "Build safely",
             "--output",
@@ -277,13 +574,73 @@ def test_foreground_build_agent_creates_isolated_task_by_default(tmp_path, monke
     assert task["metadata"]["task_type"] == "codex_code_edit"
     assert task["metadata"]["direct_active_workspace"] is False
     assert task["required_approvals"] == ["hosted_provider_codex"]
-
     store = SQLiteStore(tmp_path)
+    validation = [event for event in store.list_session_store_events(session["id"]) if event.kind == "session.model_validation"][-1]
+    assert validation.payload["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert validation.payload["executable"] is True
+    assert validation.payload["known_catalog_entry"] is True
+    assert validation.payload["provider_execution_started"] is False
+    assert validation.payload["hidden_provider_fallback"] is False
+    assert validation.payload["no_hidden_fallback"] is True
     messages = store.list_session_messages(session["id"])
     assert [message.role for message in messages] == [SessionMessageRole.USER]
     event_kinds = [event.kind for event in store.list_session_store_events(session["id"])]
     assert "agent.selected" in event_kinds
     assert "run.blocked" in event_kinds
+
+
+def test_foreground_native_agent_unknown_model_fails_closed_before_task_creation(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class ExplodingCodexBackend:
+        def __init__(self, config):
+            raise AssertionError("native agent model validation must not construct Codex backend")
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", ExplodingCodexBackend)
+    result = runner.invoke(
+        app,
+        [
+            "change value",
+            "--project",
+            str(tmp_path),
+            "--agent",
+            "build",
+            "--model",
+            "codex_cli/not-a-real-model",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.native_agent_session/v1"
+    assert payload["ok"] is False
+    assert payload["status"] == "model_validation_failed"
+    assert payload["task"] is None
+    assert payload["model_validation"]["blocked_reasons"] == ["model_unknown"]
+    assert payload["provider_execution_started"] is False
+    assert payload["model_execution_started"] is False
+    assert payload["hidden_provider_fallback"] is False
+    assert payload["hidden_model_fallback"] is False
+    assert payload["no_hidden_fallback"] is True
+    store = SQLiteStore(tmp_path)
+    session = store.get_session(payload["session"]["id"])
+    assert session.raw_model_ref == "codex_cli/not-a-real-model"
+    assert session.provider_id == "codex_cli"
+    assert session.model_id == "not-a-real-model"
+    assert session.active_task_id is None
+    assert store.list_tasks() == []
+    validation = [event for event in store.list_session_store_events(session.id) if event.kind == "session.model_validation"][-1]
+    assert validation.payload["executable"] is False
+    assert validation.payload["provider_execution_started"] is False
+    assert validation.payload["blocked_reasons"] == ["model_unknown"]
+
+    messages = store.list_session_messages(session.id)
+    assert [message.role for message in messages] == [SessionMessageRole.USER]
+    event_kinds = [event.kind for event in store.list_session_store_events(session.id)]
+    assert "agent.selected" not in event_kinds
+    assert "run.blocked" not in event_kinds
 
 
 def test_foreground_plan_mention_creates_read_only_session_task(tmp_path, monkeypatch) -> None:
@@ -312,6 +669,55 @@ def test_foreground_plan_mention_creates_read_only_session_task(tmp_path, monkey
     store = SQLiteStore(tmp_path)
     messages = store.list_session_messages(session["id"])
     assert messages[0].content_preview == "inspect auth flow"
+
+
+def test_foreground_general_mention_creates_child_subagent_artifact_summary(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class ExplodingCodexBackend:
+        def __init__(self, config):
+            raise AssertionError("general subagent should not call Codex directly")
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", ExplodingCodexBackend)
+    result = runner.invoke(app, ["@general investigate auth flow", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    parent_session = payload["parent_session"]
+    child_session = payload["session"]
+    task = payload["task"]
+    run = payload["run"]
+    artifact = payload["artifact"]
+    assert payload["schema_version"] == "harness.native_agent_session/v1"
+    assert payload["subagent_branch"] is True
+    assert payload["provider_execution_started"] is False
+    assert payload["shell_started"] is False
+    assert payload["network_started"] is False
+    assert payload["active_repo_write"] == "forbidden"
+    assert child_session["parent_session_id"] == parent_session["id"]
+    assert child_session["forked_from_message_id"] is not None
+    assert child_session["agent_id"] == "general"
+    assert child_session["active_run_id"] == run["id"]
+    assert task["agent_id"] == "general"
+    assert task["metadata"]["execution_adapter"] == "session_read_tools"
+    assert task["metadata"]["active_repo_write"] == "forbidden"
+    assert task["metadata"]["external_network"] == "forbidden"
+    assert task["metadata"]["allowed_tools"] == ["read", "glob", "grep", "artifact-read"]
+    assert artifact["kind"] == "subagent_summary"
+    assert artifact["producer"] == "harness_native_agent_alias"
+    assert Path(artifact["path"]).exists()
+    assert "No shell, network, provider execution" in Path(artifact["path"]).read_text(encoding="utf-8")
+
+    store = SQLiteStore(tmp_path)
+    parent_events = [event.kind for event in store.list_session_store_events(parent_session["id"])]
+    child_events = [event.kind for event in store.list_session_store_events(child_session["id"])]
+    assert "subagent.spawned" in parent_events
+    assert "agent.selected" in child_events
+    assert "subagent.completed" in child_events
+    child_messages = store.list_session_messages(child_session["id"])
+    assert [message.role for message in child_messages] == [SessionMessageRole.USER, SessionMessageRole.ASSISTANT]
+    assistant_parts = store.list_session_parts(child_session["id"], message_id=child_messages[-1].id)
+    assert any(part.kind == SessionPartKind.ARTIFACT_REF for part in assistant_parts)
 
 
 def test_foreground_prompt_continue_uses_latest_session(tmp_path, monkeypatch) -> None:

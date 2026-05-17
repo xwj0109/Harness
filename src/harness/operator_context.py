@@ -9,8 +9,8 @@ from harness.capabilities import build_capability_catalog
 from harness.config import HARNESS_DIR, default_config, load_config
 from harness.execution import list_execution_adapter_descriptors
 from harness.memory.sqlite_store import SQLiteStore
-from harness.model_catalog import list_model_catalog, list_provider_catalog
-from harness.models import TaskStatus
+from harness.model_catalog import list_model_catalog, list_provider_catalog, validate_model_selection
+from harness.models import EventStreamType, SessionPartKind, TaskStatus
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
 from harness.security import sanitize_for_logging
@@ -80,6 +80,32 @@ def build_operator_context(project_root: Path) -> dict:
             "active_run_ids": [],
             "blocked_reasons": [],
             "tasks": [],
+        },
+        "terminal_tabs": {
+            "schema_version": "harness.tui_terminal_tabs/v1",
+            "tabs": [],
+            "tab_count": 0,
+            "terminal_tabs_supported": False,
+            "policy_boundary": {
+                "kind": "tui_terminal_panel_projection",
+                "source": "persisted_pty_events",
+                "process_start_allowed": False,
+                "websocket_allowed": False,
+                "live_stream_allowed": False,
+                "artifact_content_read_allowed": False,
+                "terminal_control_allowed": False,
+                "requires_append_only_events": True,
+                "bounded_preview_only": True,
+            },
+            "blocked_reasons": ["managed_pty_not_enabled", "terminal_panel_projection_disabled"],
+            "source": "persisted_pty_events",
+            "terminal_control_supported": False,
+            "websocket_supported": False,
+            "process_started": False,
+            "websocket_opened": False,
+            "live_stream_read": False,
+            "artifact_contents_included": False,
+            "permission_granting": False,
         },
         "registered_adapters": [
             descriptor.model_dump(mode="json")
@@ -154,6 +180,7 @@ def build_operator_context(project_root: Path) -> dict:
         breakers = store.list_adapter_breaker_states(
             [descriptor.id for descriptor in list_execution_adapter_descriptors()]
         )
+        terminal_tabs = _terminal_tabs_summary(store)
     except sqlite3.Error as exc:
         dashboard["initialized"] = False
         dashboard["state_error"] = {
@@ -243,12 +270,13 @@ def build_operator_context(project_root: Path) -> dict:
             "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
             "active_run_id": session.active_run_id,
             "active_task_id": session.active_task_id,
+            "ui_preferences": sanitize_for_logging(session.ui_preferences),
             "updated_at": session.updated_at.isoformat(),
         }
         for session in sessions
     ]
     if sessions:
-        dashboard["active_session"] = _session_preview(store, sessions[0].id)
+        dashboard["active_session"] = _session_preview(store, sessions[0].id, project_root)
     dashboard["model_catalog"] = {
         "schema_version": "harness.operator_model_catalog/v1",
         "providers": [
@@ -276,7 +304,7 @@ def build_operator_context(project_root: Path) -> dict:
             }
             for model in model_catalog
         ],
-        "active_model": _active_model_summary(sessions, model_catalog),
+        "active_model": _active_model_summary(cfg, sessions, model_catalog),
         "cache": catalog_cache,
         "permission_granting": False,
         "no_hidden_fallback": True,
@@ -298,6 +326,7 @@ def build_operator_context(project_root: Path) -> dict:
             for record in memory_records
         ],
     }
+    dashboard["terminal_tabs"] = terminal_tabs
     objective_for_progress = _objective_for_progress(objectives, tasks)
     if objective_for_progress is not None:
         try:
@@ -394,10 +423,11 @@ def build_operator_context(project_root: Path) -> dict:
     return dashboard
 
 
-def _session_preview(store: SQLiteStore, session_id: str) -> dict:
+def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) -> dict:
     session = store.get_session(session_id)
     timeline_events = list_session_timeline(store, session_id, limit=8)
     transcript_entries = list_session_transcript(store, session_id)[-4:]
+    latest_ui_activation = next((event for event in reversed(timeline_events) if event.kind == "tui.ui_activation.applied"), None)
     return {
         "schema_version": "harness.session_preview/v1",
         "id": session.id,
@@ -409,36 +439,218 @@ def _session_preview(store: SQLiteStore, session_id: str) -> dict:
         "model_variant": sanitize_for_logging(session.model_variant),
         "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
         "active_run_id": session.active_run_id,
+        "ui_preferences": sanitize_for_logging(session.ui_preferences),
+        "latest_ui_activation": _ui_activation_preview(latest_ui_activation) if latest_ui_activation else None,
+        "composer_context": _session_composer_context(store, session_id, project_root),
         "timeline": [render_timeline_event(event) for event in timeline_events],
         "transcript": [render_transcript_entry(entry) for entry in transcript_entries],
     }
 
 
-def _active_model_summary(sessions: list, model_catalog: list) -> dict | None:
+def _session_composer_context(store: SQLiteStore, session_id: str, project_root: Path) -> dict:
+    attachments: list[dict] = []
+    for part in store.list_session_parts(session_id):
+        if part.kind != SessionPartKind.ARTIFACT_REF:
+            continue
+        metadata = part.metadata or {}
+        if metadata.get("attachment_kind") != "file_ref":
+            continue
+        requested_path = str(metadata.get("path") or "")
+        resolved_path = Path(str(metadata.get("resolved_path") or ""))
+        size_bytes = 0
+        if resolved_path.is_file():
+            try:
+                size_bytes = resolved_path.stat().st_size
+            except OSError:
+                size_bytes = 0
+        attachments.append(
+            {
+                "path": sanitize_for_logging(requested_path),
+                "resolved_inside_project": _is_relative_to_project(project_root, resolved_path),
+                "size_bytes": size_bytes,
+                "estimated_tokens": _estimate_tokens_for_bytes(size_bytes),
+                "contents_included": False,
+            }
+        )
+    total_bytes = sum(int(item["size_bytes"]) for item in attachments)
+    return {
+        "schema_version": "harness.tui_composer_context/v1",
+        "attachment_count": len(attachments),
+        "attachments": attachments,
+        "total_attachment_bytes": total_bytes,
+        "total_estimated_tokens": _estimate_tokens_for_bytes(total_bytes),
+        "contents_included": False,
+        "process_started": False,
+        "filesystem_modified": False,
+        "permission_granting": False,
+    }
+
+
+def _estimate_tokens_for_bytes(size_bytes: int) -> int:
+    return max(1, (size_bytes + 3) // 4) if size_bytes else 0
+
+
+def _is_relative_to_project(project_root: Path, path: Path) -> bool:
+    try:
+        path.resolve().relative_to(project_root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _ui_activation_preview(event) -> dict:
+    payload = event.payload or {}
+    action = payload.get("action") or {}
+    return {
+        "seq": event.seq,
+        "entry_id": sanitize_for_logging(payload.get("entry_id")),
+        "source": sanitize_for_logging(payload.get("source")),
+        "action_type": sanitize_for_logging(action.get("type")),
+        "command_started": bool(payload.get("command_started")),
+        "process_started": bool(payload.get("process_started")),
+        "filesystem_modified": bool(payload.get("filesystem_modified")),
+        "permission_granting": bool(payload.get("permission_granting")),
+        "authority_granting": bool(payload.get("authority_granting")),
+    }
+
+
+def _terminal_tabs_summary(store: SQLiteStore) -> dict:
+    stream_ids: list[str] = []
+    with store.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT stream_id
+            FROM event_store
+            WHERE stream_type = ? AND stream_id LIKE 'pty:%'
+            ORDER BY stream_id ASC
+            LIMIT 10
+            """,
+            (EventStreamType.SESSION.value,),
+        ).fetchall()
+    stream_ids = [str(row["stream_id"]) for row in rows]
+    tabs = [_terminal_tab_from_events(store, stream_id.removeprefix("pty:")) for stream_id in stream_ids]
+    blocked_reasons: list[str] = []
+    for tab in tabs:
+        for reason in tab["blocked_reasons"]:
+            if reason not in blocked_reasons:
+                blocked_reasons.append(reason)
+    if not blocked_reasons:
+        blocked_reasons = ["managed_pty_not_enabled", "terminal_panel_projection_disabled"]
+    return {
+        "schema_version": "harness.tui_terminal_tabs/v1",
+        "tabs": tabs,
+        "tab_count": len(tabs),
+        "terminal_tabs_supported": False,
+        "policy_boundary": {
+            "kind": "tui_terminal_panel_projection",
+            "source": "persisted_pty_events",
+            "process_start_allowed": False,
+            "websocket_allowed": False,
+            "live_stream_allowed": False,
+            "artifact_content_read_allowed": False,
+            "terminal_control_allowed": False,
+            "requires_append_only_events": True,
+            "bounded_preview_only": True,
+        },
+        "blocked_reasons": blocked_reasons,
+        "source": "persisted_pty_events",
+        "terminal_control_supported": False,
+        "websocket_supported": False,
+        "process_started": False,
+        "websocket_opened": False,
+        "live_stream_read": False,
+        "artifact_contents_included": False,
+        "permission_granting": False,
+    }
+
+
+def _terminal_tab_from_events(store: SQLiteStore, pty_id: str) -> dict:
+    events = store.list_store_events(EventStreamType.SESSION, f"pty:{pty_id}")
+    created = next((event for event in events if event.kind == "pty.created"), None)
+    updated = [event for event in events if event.kind == "pty.updated"]
+    exited = next((event for event in reversed(events) if event.kind in {"pty.exited", "pty.deleted"}), None)
+    output_events = [event for event in events if event.kind in {"pty.output", "pty.output.artifact"}]
+    preview = "".join(str(event.payload.get("preview") or "") for event in output_events)
+    if len(preview) > 16 * 1024:
+        preview = preview[-16 * 1024:]
+    latest_size = updated[-1].payload if updated else {}
+    initial = created.payload if created else {}
+    artifact_refs = sorted({ref for event in output_events for ref in event.artifact_refs})
+    blocked_reasons = [
+        "managed_pty_not_enabled",
+        "terminal_output_restoration_not_enabled",
+        "terminal_panel_projection_disabled",
+        "terminal_control_disabled",
+    ]
+    if "pty.created" not in {event.kind for event in events} or not any(event.kind in {"pty.exited", "pty.deleted"} for event in events):
+        blocked_reasons.append("missing_required_pty_events")
+    return {
+        "id": pty_id,
+        "title": sanitize_for_logging(initial.get("title") or initial.get("command") or initial.get("shell") or pty_id),
+        "status": "exited" if exited else "unavailable",
+        "shell": sanitize_for_logging(initial.get("shell")),
+        "command": sanitize_for_logging(initial.get("command")),
+        "cwd": sanitize_for_logging(initial.get("cwd")),
+        "cols": latest_size.get("cols") or initial.get("cols"),
+        "rows": latest_size.get("rows") or initial.get("rows"),
+        "event_count": len(events),
+        "output_event_count": len(output_events),
+        "artifact_ref_count": len(artifact_refs),
+        "artifact_refs": artifact_refs,
+        "scrollback_preview": sanitize_for_logging(preview),
+        "restoration_ready": False,
+        "policy_boundary": {
+            "kind": "tui_terminal_tab_projection",
+            "source": "persisted_pty_events",
+            "process_start_allowed": False,
+            "websocket_allowed": False,
+            "live_stream_allowed": False,
+            "artifact_content_read_allowed": False,
+            "terminal_control_allowed": False,
+            "requires_append_only_events": True,
+            "bounded_preview_only": True,
+        },
+        "blocked_reasons": blocked_reasons,
+        "source": "persisted_pty_events",
+        "terminal_control_supported": False,
+        "websocket_supported": False,
+        "process_started": False,
+        "websocket_opened": False,
+        "live_stream_read": False,
+        "artifact_contents_included": False,
+        "permission_granting": False,
+    }
+
+
+def _active_model_summary(cfg, sessions: list, model_catalog: list) -> dict | None:
     if not sessions:
         return None
     latest = sessions[0]
     raw_ref = latest.raw_model_ref
-    provider_id = latest.provider_id
-    model_id = latest.model_id
-    matched = None
-    for model in model_catalog:
-        if raw_ref and model.raw_model_ref == raw_ref:
-            matched = model
-            break
-        if provider_id and model_id and model.provider_id == provider_id and model.model_id == model_id:
-            matched = model
-            break
+    validation = validate_model_selection(cfg, raw_ref) if raw_ref else None
+    matched = validation.matched_model if validation else None
     return {
         "session_id": latest.id,
         "raw_model_ref": sanitize_for_logging(raw_ref),
-        "provider_id": sanitize_for_logging(provider_id or (matched.provider_id if matched else None)),
-        "model_id": sanitize_for_logging(model_id or (matched.model_id if matched else None)),
+        "provider_id": sanitize_for_logging(latest.provider_id or (matched.provider_id if matched else None)),
+        "model_id": sanitize_for_logging(latest.model_id or (matched.model_id if matched else None)),
         "model_variant": sanitize_for_logging(latest.model_variant),
         "known_catalog_entry": matched is not None,
+        "executable": validation.executable if validation else None,
+        "provider_known": validation.provider_known if validation else None,
+        "provider_enabled": validation.provider_enabled if validation else None,
+        "blocked_reasons": validation.blocked_reasons if validation else [],
+        "validation": validation.model_dump(mode="json") if validation else None,
         "model_profile_id": sanitize_for_logging(matched.model_profile_id if matched else None),
         "tool_support": matched.tool_support if matched else None,
         "context_limit": matched.context_limit if matched else None,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "permission_granting": False,
+        "authority_granting": False,
         "no_hidden_fallback": True,
     }
 

@@ -92,12 +92,17 @@ def _event_label(kind: str) -> str:
     labels = {
         "session.created": "Session created",
         "session.archived": "Session archived",
+        "session.cancelled": "Session cancelled",
         "session.forked": "Session forked",
         "session.message.appended": "Message appended",
         "session.part.appended": "Part appended",
+        "session.message.retracted": "Message retracted",
+        "session.part.corrected": "Part corrected",
         "session.snapshot.recorded": "Snapshot recorded",
+        "tui.ui_activation.applied": "UI action applied",
         "session.model_selected": "Model selected",
         "session.title_updated": "Title updated",
+        "session.summary_updated": "Summary updated",
         "run.started": "Run started",
         "run.progress": "Run progress",
         "model.message_delta": "Model update",
@@ -135,6 +140,10 @@ def _event_detail(event: StoredEventRecord) -> str:
             return f"{kind} #{ordinal}"
         if kind:
             return str(kind)
+    if event.kind == "session.message.retracted":
+        return str(payload.get("message_id") or "")
+    if event.kind == "session.part.corrected":
+        return str(payload.get("part_id") or "")
     if event.kind == "session.model_selected":
         return str(payload.get("raw_model_ref") or payload.get("model_id") or "")
     if event.kind == "session.forked":
@@ -144,6 +153,18 @@ def _event_detail(event: StoredEventRecord) -> str:
         snapshot_kind = payload.get("snapshot_kind") or "snapshot"
         reversible = payload.get("reversible")
         return f"{snapshot_kind} {snapshot_id} reversible={reversible}"
+    if event.kind == "tui.ui_activation.applied":
+        entry_id = payload.get("entry_id") or "unknown"
+        action = payload.get("action") or {}
+        action_type = action.get("type") or "unknown"
+        flags = (
+            f"command_started={payload.get('command_started', False)} "
+            f"process_started={payload.get('process_started', False)} "
+            f"filesystem_modified={payload.get('filesystem_modified', False)} "
+            f"permission_granting={payload.get('permission_granting', False)} "
+            f"authority_granting={payload.get('authority_granting', False)}"
+        )
+        return f"{entry_id} action={action_type} source={payload.get('source') or 'unknown'} {flags}"
     summary = payload.get("summary")
     if summary:
         return str(sanitize_for_logging(summary))[:160]

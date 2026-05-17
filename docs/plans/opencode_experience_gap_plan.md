@@ -490,6 +490,7 @@ Deliverables:
 - Preserve existing Codex CLI backend as one provider/backend option.
 - Add model selector and model metadata to the TUI.
 - Enforce explicit failure on unavailable provider/model selections; do not silently fall back to another provider, model, billing boundary, hosted route, or local route.
+- Persist session creation/model-selection events with raw provider/model/variant fields and explicit no-hidden-fallback evidence before any provider execution.
 
 Acceptance:
 
@@ -497,6 +498,9 @@ Acceptance:
 - Model list shows context limit, tool support, reasoning support, modalities, and cost when known.
 - Provider credentials status never prints secrets.
 - Model override behavior is deterministic and auditable in session events.
+- Initial session model events record that model refs are persisted metadata only, with no provider/model execution, fallback, permission grant, or authority grant.
+- Local-server session create, prompt append, async prompt, OpenCode-compatible prompt, and session model update routes validate accepted model refs through the shared catalog validator, append `session.model_validation`, and return explicit no-execution/no-hidden-fallback evidence for future web/desktop clients.
+- `harness session model <session-id> <provider/model>` provides an operator-facing session model switch that persists `session.model_selected`, appends shared `session.model_validation`, fails visibly for unavailable models, and is surfaced from the TUI model pane as the explicit command path.
 
 ### Phase 6 - Headless Local Server
 
@@ -519,6 +523,15 @@ Acceptance:
 - `curl` can create a session, send a prompt, and stream events with auth.
 - OpenAPI output is checked in tests.
 
+Completion checkpoint:
+
+- `harness serve` exposes the local HTTP server with generated bearer-token auth, CORS headers, `/health`, `/openapi.json`, typed session/message/event/provider/model/permission/artifact/config/file/agent projections, and OpenCode-compatible route aliases where they help future clients.
+- Persisted session and global events are streamable through SSE (`/sessions/{session_id}/events/stream`, `/event`, and `/global/event`); WebSocket support remains explicitly unsupported and reported in lifecycle evidence.
+- `harness attach` performs a read-only remote attach probe against `/health`, `/sessions`, and `/openapi.json` without granting permissions or reading project files outside the server contract.
+- `harness web` and `harness web client open` now expose the web-launcher boundary as a fail-closed contract until static web assets exist; they do not open a browser, start a process, call the network, mutate files, or grant authority.
+- Lifecycle, dispose, and mDNS routes/CLI commands are present as local-only projections or fail-closed placeholders; mDNS advertisement is not started.
+- Phase 6 verification is covered by `tests/test_local_server.py`, `test_cli_web_client_status_and_open_are_safe_contracts`, and `test_cli_server_lifecycle_mdns_and_dispose_are_safe_contracts`.
+
 ### Phase 7 - File, Reference, Attachment, LSP, And Formatter UX
 
 Goal: make context selection feel fast and code-aware.
@@ -529,14 +542,25 @@ Deliverables:
 - Add `@file`, `@directory`, `@reference`, and `@session` mentions.
 - Add attachment support for CLI/TUI with size/type policy.
 - Add named local/git references.
-- Add opt-in LSP manager and diagnostics/symbol tools.
+- Add opt-in LSP manager and diagnostics/symbol tools; initial projections remain read-only/static and expose the deferred process-backed LSP boundary.
 - Add formatter config and optional format-on-accepted-edit.
 
 Acceptance:
 
 - Composer can attach a file and show context byte/token estimate.
-- LSP diagnostics can be shown in TUI and used by a read-only tool.
+- LSP diagnostics can be shown in TUI and used by a read-only tool only after the process-backed LSP policy is explicit; current projections expose configured servers and static symbols without server launch.
 - Mention resolution is persisted in session events.
+
+Completion checkpoint:
+
+- File finder/content/status endpoints are available through the local server as metadata/redacted projections (`/files`, `/files/content`, `/files/status`, `/find`, `/find/file`, `/find/symbol`, and OpenCode-compatible `/file/*` aliases) without loading excluded or secret paths into unredacted output.
+- `@file`, `@directory`, `@reference`, and `@session` mentions resolve through `/sessions/{session_id}/mentions/resolve` and `harness session mentions`; every resolution appends `session.mentions.resolved` with metadata-only, redacted, non-authority evidence.
+- Attachment preparation is available through `/sessions/{session_id}/attachments` and `harness session attachments --file ...`; it enforces project/exclude/secret boundaries, size limits, image metadata limits, overflow flags, and appends `session.attachments.prepared` without including file contents.
+- Context estimates are available through `/sessions/{session_id}/context/estimate` and `harness session context-estimate`; prompt bytes, mention metadata, attachment metadata, optional instruction metadata, token estimates, and budget checks append `session.context.estimated`.
+- The foreground composer path records `--file` references as session attachment parts, and the TUI composer status now shows active-session attachment count plus aggregate context-token estimate from persisted metadata.
+- Named local/git references are configured through `references` config and projected through `/references`; local references remain metadata-only and git references report network requirements without cloning or fetching.
+- LSP and formatter surfaces are present as read-only projections (`/lsp`, `/lsp/diagnostics`, `/symbols`, `/find/symbol`, `/formatter`, `/formatters`) and session tools (`lsp-diagnostics`, `lsp-symbols`) with process-backed LSP and formatter execution explicitly disabled until policy enables it.
+- Phase 7 verification is covered by local-server mention/reference/LSP/formatter tests, CLI mention/attachment/context-estimate tests, and TUI composer attachment estimate coverage.
 
 ### Phase 8 - MCP, Plugins, Skills, And Web Tools
 
@@ -545,17 +569,31 @@ Goal: add extensibility with auditability.
 Deliverables:
 
 - Add MCP config for local and remote servers.
-- Add `harness mcp list|add|auth|logout|connect|disconnect|resources`.
+- Add `harness mcp list|status|resources` as safe metadata projections with explicit policy boundaries, with `add|auth|logout|connect|disconnect` fail-closed until process-backed MCP is explicitly enabled.
 - Register MCP tools/resources through the same session tool registry.
-- Add project/global plugin discovery and install/update/remove.
-- Add skill discovery and skill-load tool.
-- Add web fetch/search tools behind explicit network policy.
+- Add project/global plugin discovery as metadata-only diagnostics with origin, scope, spec, manifest, option-key visibility, policy boundaries, and blocker codes; keep install/update/remove fail-closed until plugin loading policy is explicit.
+- Add skill discovery metadata and a permission-gated `skill-load` tool that persists loaded skill content plus metadata artifacts before injecting local instruction text.
+- Add web fetch/search tools behind explicit network policy. `web-fetch` executes after explicit approval and persists response content plus metadata artifacts before display; `web-search` executes after explicit approval only when a project search endpoint is configured, and persists result plus metadata artifacts before display.
+- Add `harness extensions status` and `/extensions/status` as a coherent read-only audit surface for MCP, plugins, skills, and web policy.
 
 Acceptance:
 
-- MCP tool calls produce the same permission/evidence records as built-ins.
+- MCP tool calls produce the same permission/evidence records as built-ins once enabled; current projections expose blocker codes and keep tool execution disabled.
 - Network tools are denied or approval-required unless policy enables them.
-- Plugin origin and scope are visible in diagnostics.
+- Plugin origin, scope, origin-review requirement, and disabled runtime/tool boundaries are visible in diagnostics.
+- Extensibility diagnostics never start MCP processes, load plugin code, load skill bodies, mutate plugin files, grant permissions, or call the network.
+
+Completion checkpoint:
+
+- MCP configuration supports local command and remote URL metadata plus cached resources. `harness mcp list|status|resources`, `/mcp`, `/mcp/status`, and `/mcp/resources` expose configured servers/resources, cached-only evidence, permission requirements, and blocker codes without process launch, OAuth, credential writes, network connection, tool registration, tool execution, or permission grants.
+- MCP lifecycle actions (`add`, `auth`, `logout`, `connect`, `disconnect`, and server route equivalents) are fail-closed action contracts with explicit disabled process/network/OAuth/credential/tool flags.
+- MCP resource reads are registered in the session tool registry as `mcp-resource`; cached resource reads require explicit permission, persist content and metadata artifacts, and still do not start MCP processes or call the network.
+- Plugin discovery surfaces project/global metadata through `harness plugins list` and `/plugins`, including origin, scope, source kind, spec, manifest path, option-key visibility, origin-review requirement, disabled runtime/tool boundaries, and blocker codes. `install|update|remove` remain fail-closed with false filesystem/network/runtime/tool flags.
+- Skill discovery surfaces project/global metadata through `harness skills list`, `/skills`, and `/skill` without loading skill bodies. The permission-gated `skill-load` session tool persists skill content plus metadata artifacts before returning instruction text; it does not register plugin tools, call the network, or mutate project files.
+- Web fetch/search are registered session tools behind external-network permission. `web-fetch` executes only after explicit approval and allowed-domain validation, persists response content plus metadata artifacts, sanitizes script content, and records network evidence. `web-search` executes only after explicit approval, configured endpoint validation, domain-filter validation, and persists results plus metadata artifacts.
+- `harness web tools` and `/web/tools` remain metadata-only policy projections and now explicitly distinguish route non-execution from permission-gated session-tool execution support.
+- `harness extensions status` and `/extensions/status` aggregate MCP, plugin, skill, and web policy without starting processes, loading runtime code, loading skill bodies, mutating files, granting permissions, or calling the network.
+- Phase 8 verification is covered by session-tool tests for `skill-load`, `web-fetch`, `web-search`, and `mcp-resource`; CLI smoke for MCP/plugins/skills/extensions; and local-server tests for MCP/plugin/skill/web/extensibility projections.
 
 ### Phase 9 - PTY, Worktrees, Snapshots, And Revert
 
@@ -569,12 +607,42 @@ Deliverables:
 - Add per-message snapshots.
 - Add session diff, revert, unrevert, and selected hunk apply.
 - Add PR checkout/run helper.
+- Add `harness dev-loop status` and `/dev-loop/status` as a read-only status surface for PTY, worktrees, local snapshots, and revert readiness.
+- Add per-message snapshot metadata projections linking messages, runs, diff artifacts, changed files, evidence contracts, and non-reversibility state before enabling revert.
+- Add PR checkout/run plan projections that parse GitHub PR references and show the intended fetch/worktree/adapter sequence with explicit blocker codes and policy boundaries, without network calls or git mutation.
+- Add worktree create/remove/reset plan projections that mirror OpenCode's worktree API shape while accepting only managed worktree names and keeping every filesystem and git mutation disabled.
+- Add session/message revert readiness contracts that explain blockers, required evidence, policy boundaries, and non-reversibility state before enabling OpenCode-style revert/unrevert.
+- Add PTY action plan projections for create, write, resize, connect-token, connect, and close/remove before terminal process management is enabled.
+- Add PTY restoration readiness projections that define the append-only event/artifact contract for restoring terminal tabs from persisted scrollback.
+- Add terminal tab projections that map persisted PTY events/restoration readiness into TUI/server tab models without live PTY processes.
+- Surface terminal tab projections in the TUI dashboard as a disabled/read-only terminal panel sourced only from persisted PTY events.
+- Add terminal tab/restoration counts to the dev-loop aggregate status surface.
 
 Acceptance:
 
 - A session can run with a terminal open beside the assistant timeline.
 - File effects from a message can be reverted through CLI/TUI.
+- Initial Phase 9 diagnostics expose readiness and fail-closed controls without starting terminal processes, creating worktrees, applying hunks, reverting files, or mutating git state.
+- Per-message snapshots are inspectable with artifact evidence metadata and explicitly non-reversible until active revert policy and apply-back boundaries are implemented.
 - Worktree operations are visible and policy-gated.
+- PR checkout/run intent is inspectable as a plan with approval and blocker codes before any fetch, checkout, worktree creation, or adapter execution is allowed.
+- Worktree create/remove/reset intent is inspectable as a managed-path plan before leases and cleanup policy allow any git worktree mutation.
+- Revert readiness is inspectable for a session or message and explicitly reports blocker codes, required evidence, policy boundary, and why file mutation remains disabled.
+- PTY action intent is inspectable as a plan before any terminal process, websocket token, input write, resize, or close operation can occur.
+- Terminal output restoration readiness is inspectable before any live PTY stream or terminal tab restoration is enabled.
+- Terminal tabs are inspectable as persisted-event projections before managed PTY panels are enabled in the TUI.
+- The TUI can show terminal tab metadata and bounded scrollback previews without starting PTYs, websockets, or artifact reads.
+- Dev-loop status reports terminal tab counts and restoration evidence without live terminal activity.
+
+Completion checkpoint:
+
+- Managed PTY surfaces are present as diagnostic contracts through `harness pty list|shells|create|write|resize|close|restoration|tabs` and `/pty`, `/pty/sessions`, `/pty/shells`, `/pty/restoration`, `/pty/tabs`, and `/pty/{id}` action/projection routes. They expose shell selection, action plans, connect-token/connect blockers, policy boundaries, and false process/websocket/live-stream/input/resize/close/filesystem/permission flags without starting terminal processes.
+- Terminal output restoration is modeled through append-only `pty.*` session events plus artifact references. `harness pty restoration`, `/pty/restoration`, `/pty/{id}/restoration`, `harness pty tabs`, `/pty/tabs`, `/pty/{id}/tab`, and TUI dashboard panes project bounded scrollback previews and restoration readiness without reading artifact contents or opening live streams.
+- Worktree list/create/remove/reset surfaces are available through `harness worktrees list|create|remove|reset` and `/worktrees`, `/worktrees/create`, `/worktrees/remove`, `/worktrees/reset`. Create/remove/reset return managed `.harness/worktrees/<name>` plans with target validation, blocker codes, approval requirements, and false git/filesystem/process mutation flags.
+- Session diff, changed-file, snapshot, revert-readiness, revert, unrevert, and selected-hunk apply surfaces are available through CLI and local-server routes. Snapshot projections link messages, runs, diff artifacts, changed paths, evidence contracts, and non-reversibility state; revert/unrevert/apply-hunk remain fail-closed until active revert policy, apply-back boundaries, and required evidence are implemented.
+- PR checkout/run helpers are available through `harness pr checkout|run` and `/pr/checkout|run`; they parse GitHub PR references into fetch, isolated worktree, and adapter-run plans with explicit blocker codes and false network/git/worktree/adapter/process/filesystem flags.
+- `harness dev-loop status` and `/dev-loop/status` aggregate PTY, terminal-tab, worktree, local snapshot, diff, changed-file, and revert-readiness status with top-level policy boundaries. The aggregate includes terminal tab/output/artifact counts and never starts PTYs, websockets, worktree operations, file revert, unrevert, selected-hunk apply, git mutation, or permission grants.
+- Phase 9 verification is covered by local-server tests for worktrees, session snapshots/revert readiness, PTY projections/restoration, dev-loop status, and PR helpers; CLI smoke tests for the same surfaces; and TUI tests for persisted terminal-tab panels.
 
 ### Phase 10 - Distribution, Desktop, And Polish
 
@@ -587,12 +655,53 @@ Deliverables:
 - Decide packaging path: Python wheel only, standalone binary, or desktop wrapper.
 - Add desktop/web roadmap only after the local server is stable.
 - Improve command palette, themes, keybindings, and settings.
+- Add safe in-process command palette activation for UI navigation while keeping command-backed entries as manual previews.
+- Wire palette Enter handling in the live TUI so safe UI actions apply immediately and command-backed entries remain non-executing previews.
+- Expand safe palette activation to local UI controls such as clear search, dashboard/palette focus, current-section collapse/expand, and expand all.
+- Add a read-only TUI settings pane reachable from the safe palette action set.
+- Make the TUI settings pane session-aware by rendering active-session preferences when a session is active.
+- Add a `/settings` slash shortcut that routes to the same safe settings focus action instead of chat execution.
+- Generalize safe slash activation for UI-only aliases such as `/home`, `/sessions`, `/tasks`, and `/runs`.
+- Add safe slash aliases for local UI controls: `/clear`, `/palette`, `/dashboard`, `/toggle-section`, and `/expand-all`.
+- Surface the latest safe UI activation as a structured right-panel diagnostic.
+- Persist safe TUI activation diagnostics into the active session event stream when a session is active.
+- Render persisted TUI activation events in the session timeline as UI-only evidence.
+- Surface the latest persisted UI activation in active-session dashboard and right-panel session rows.
+- Surface the latest persisted UI activation in CLI session inspect/status output.
+- Surface the latest persisted UI activation in local-server session projections for future web/desktop clients.
 
 Acceptance:
 
 - A new user can install and start the app with one documented path.
 - Existing local development install still works.
 - Packaging smoke covers the new CLI/server/session paths.
+- Command palette activation can change TUI focus/section state without starting providers, shells, adapters, subprocesses, filesystem mutation, or permission grants.
+- Live TUI palette focus consumes Enter for palette activation instead of sending a chat prompt or inserting slash-command suggestions.
+- UI-control palette actions mutate only in-memory TUI state and never create session messages, start chat requests, or call CLI commands.
+- TUI settings are inspectable in the dashboard/palette flow without persisting preference changes or exposing backend secrets.
+- Active-session TUI preferences are visible in the settings pane, while preference persistence remains limited to explicit session preference commands.
+- Safe slash shortcuts can activate UI-only actions such as settings focus without creating chat messages or starting model requests.
+- UI-only slash aliases focus dashboard sections through the same palette activation contract, while command-backed aliases remain templates.
+- UI-control slash aliases update only local TUI focus, query, or collapse state and never submit chat or execute commands.
+- Safe UI activations are inspectable after execution with command/process/filesystem/permission flags.
+- Safe UI activations with an active session append replayable `tui.ui_activation.applied` events without granting authority.
+- Session timeline replay shows safe UI activation evidence with explicit false side-effect flags.
+- Active-session context shows the latest replayable UI action and side-effect flags without opening the full timeline.
+- CLI session inspection shows the same latest UI action evidence outside the TUI.
+- Local-server session routes expose latest UI activation evidence without executing UI actions, starting processes, mutating files, or granting authority.
+
+Completion checkpoint:
+
+- Distribution diagnostics are present through `harness distribution status`, `/distribution/status`, and the documented README/smoke-checklist wheel path. The chosen packaging path is `python_wheel_first`; local editable install remains documented, and status output reports CLI/server/session coverage without network calls, subprocesses, filesystem mutation, or permission grants.
+- Install, upgrade, uninstall, version-check, packaging-smoke, packaging-smoke-run, desktop-status, and desktop-launch surfaces exist as explicit CLI/API contracts. Mutating distribution and desktop actions remain fail-closed with false package-manager/subprocess/network/filesystem/desktop-launch/permission flags until release policy is implemented.
+- Packaging smoke projections cover the CLI entry point, server OpenAPI, session CLI, local diagnostics, and packaged assets as an inspectable plan. The optional smoke-run action is intentionally disabled by default and does not build, install, write artifacts, call the network, or start subprocesses.
+- Command palette entries are grouped, searchable, and classified as either safe in-process UI actions or manual command previews. Safe actions update only local TUI state; command-backed entries expose the command and blocker codes without executing CLI commands, providers, shells, adapters, child processes, filesystem mutation, permission grants, authority grants, or session messages.
+- Live TUI palette Enter handling consumes Enter for safe, manual-preview, and missing-entry cases. Safe actions apply immediately to focus, selected agent, search, collapsed sections, and settings focus; manual-preview and missing-entry outcomes remain non-executing diagnostics.
+- TUI settings are exposed through `harness settings tui`, `/settings/tui`, the read-only settings pane, and `harness session preferences`. Active-session preferences are visible in the settings pane, while persistence remains limited to the explicit session preference command and records `session.ui_preferences.updated`.
+- Safe slash aliases `/settings`, `/home`, `/sessions`, `/tasks`, `/runs`, `/clear`, `/palette`, `/dashboard`, `/toggle-section`, and `/expand-all` route through the same safe palette activation contract. They mutate only local TUI state, never submit chat, start model requests, insert slash suggestions, execute commands, mutate files, grant permissions, grant authority, or create session messages.
+- Safe UI activations are recorded as structured live TUI diagnostics and, when a session is active, append replayable `tui.ui_activation.applied` events with policy boundary, evidence status, and explicit false side-effect flags. Session timeline replay, dashboard/right-panel context, CLI `session inspect/status`, and local-server session/status projections surface the latest UI activation as passive evidence for future web/desktop clients.
+- Project and OpenCode-compatible command discovery is available through `harness commands list`, `/commands`, `/command`, palette entries, and slash suggestions. `commands run` and session command execution remain fail-closed until command execution policy exists.
+- Phase 10 verification is covered by CLI smoke tests for distribution/settings/commands/session UI activation, local-server tests for distribution/desktop/settings/commands/session projections, TUI tests for palette/slash/settings activation, and session timeline replay tests for persisted UI-only evidence.
 
 ## Implementation Order
 
@@ -914,15 +1023,42 @@ Map OpenCode-style tools into Harness authority categories:
 
 | OpenCode-like capability | Initial Harness status | Policy |
 | --- | --- | --- |
-| read/glob/grep | implement early | read-only, auto-allowed inside project, guarded outside project |
-| todo/question | implement early | session-local, no repo mutation |
-| patch/apply diff | partial existing | approval or explicit action path |
-| direct edit/write | defer | requires interactive permission and blocked path checks |
-| shell/PTY | defer | approval-required, no model auto-run by default |
-| web fetch/search | defer | external network approval-required |
-| LSP diagnostics | defer after session spine | read-only once configured |
-| MCP tools | defer | same policy envelope as built-ins |
-| repo clone/overview | defer | managed external cache, network approval |
+| read/glob/grep | complete for current section | `read`, `glob`, and `grep` are first-class session tools that auto-allow inside the project boundary, deny secret/outside paths, require permission for context-excluded paths, persist permission and output events, and replay with explicit local-only/read-only evidence plus false process/network/shell/filesystem/git/permission-grant/authority flags |
+| todo/question | complete for current section | `todo` and `question` persist session-local transcript parts and append-only events with explicit local-only/session-state evidence, redaction, and false repository/filesystem/process/network/git/permission-grant/authority flags |
+| patch/apply diff | complete for current section | `patch` validates unified diffs and persists patch plus plan artifacts only after explicit active-repo-write permission; artifacts replay the deferred apply-back/snapshot boundary with false apply/filesystem/active-repo/git/permission-grant/authority flags; active workspace mutation remains disabled in the session-tool path |
+| direct edit/write | complete for current section | `direct-write` validates targets with blocked-path, secret-path, context-exclude, and active-repo boundary checks; requires interactive active-repo-write permission; persists proposed content and plan artifacts with policy boundaries and false mutation/apply/git/write flags; and never writes to the active workspace in the session-tool path |
+| shell/PTY | complete for current section | shell and managed PTY routes remain deferred and approval-required by default; `harness pty list|shells`, `/pty`, `/pty/sessions`, `/pty/shells`, and `/pty/{id}` expose policy boundaries and blocker codes while keeping shell execution, shell probing, model auto-run, PTY process start, websockets, terminal control, filesystem mutation, and permission grants disabled |
+| PTY/worktree/revert status | complete for current section | `harness dev-loop status` and `/dev-loop/status` summarize PTY, worktree, local snapshot, diff, and revert readiness with top-level policy boundaries and blocker codes while keeping terminal processes/websockets/live streams, worktree creation/removal/reset, active-workspace revert/unrevert, selected-hunk apply, filesystem mutation, git mutation, and permission grants disabled |
+| PTY action planning | complete for current section | `harness pty create|write|resize|close` and `/pty` action routes return planned terminal operations with approval/policy boundaries and blocker codes while keeping process start, input write, resize, close, websocket token issuance, live stream reads, and filesystem mutation disabled |
+| PTY restoration readiness | complete for current section | `harness pty restoration` and `/pty/restoration` report append-only event/artifact evidence, policy boundaries, and blocker codes needed to restore terminal output while keeping live stream reads, artifact content reads, and terminal restoration disabled |
+| PTY terminal tabs | complete for current section | `harness pty tabs`, `/pty/tabs`, and `/pty/{id}/tab` project terminal-tab metadata, bounded scrollback previews, policy boundaries, and blocker codes from persisted PTY events while keeping PTY process start, websockets, live stream reads, artifact content reads, terminal control, and permission grants disabled |
+| TUI terminal panel | complete for current section | `build_tui_dashboard`/`build_tui_panes` surface persisted PTY tab metadata, bounded previews, policy boundaries, and blocker codes as a disabled terminal panel without starting PTYs, websockets, live streams, artifact reads, terminal control, or permission grants |
+| dev-loop terminal aggregate | complete for current section | `/dev-loop/status` and `harness dev-loop status` include terminal tab/output/artifact counts plus policy boundaries and blocker codes while keeping PTY process start, websockets, live streams, artifact content reads, terminal control, workspace mutation, and permission grants disabled |
+| TUI command palette activation | complete for current section | safe palette entries apply only in-process UI navigation state with explicit policy boundaries and false provider/shell/adapter/subprocess/filesystem/permission/authority/session-message flags, while command-backed entries remain manual previews with blocker codes |
+| live TUI palette Enter handling | complete for current section | palette focus consumes Enter for safe, manual-preview, and missing-entry outcomes; safe UI actions apply through the palette contract, while manual and missing entries stay in palette focus with no chat submission, slash suggestion insertion, provider/shell/adapter/child-process start, filesystem mutation, permission grant, authority grant, or session message creation |
+| TUI UI-control palette actions | complete for current section | palette entries for clear search, focus changes, current-section toggle, settings focus, and expand-all return action-specific in-memory evidence and changed-state fields while creating no messages, starting no requests, executing no commands, mutating no files, granting no permissions, and granting no authority |
+| TUI settings pane | complete for current section | the read-only settings pane renders theme, terminal-font, keybinding, and composer-mode metadata plus policy/evidence fields through safe palette focus without persisting preferences, starting processes, mutating files, granting permissions, granting authority, or exposing backend settings |
+| session-aware TUI settings | complete for current section | the settings pane and session preferences projection label active-session `ui_preferences` as their source, show the explicit `harness session preferences --set` persistence path, and keep palette/settings access read-only with no preference persistence, process start, filesystem mutation, backend exposure, permission grant, or authority grant |
+| safe slash settings shortcut | complete for current section | `/settings` maps to the safe settings focus action with slash-consumed evidence and does not create chat messages, start model requests, execute commands, start providers/shells/adapters/child processes, mutate files, grant permissions, grant authority, or persist preferences |
+| generalized safe slash UI aliases | complete for current section | `/home`, `/sessions`, `/tasks`, and `/runs` activate read-only dashboard focus actions through the safe slash/palette contract without creating chat messages, starting model requests, executing commands, starting providers/shells/adapters/child processes, mutating files, granting permissions, or granting authority |
+| safe slash UI-control aliases | complete for current section | `/clear`, `/palette`, `/dashboard`, `/toggle-section`, and `/expand-all` reuse safe palette UI actions, report changed local-state fields, and update only local TUI state without submitting chat, starting model requests, executing commands, starting providers/shells/adapters/child processes, mutating files, granting permissions, granting authority, or creating session messages |
+| TUI activation diagnostics | complete for current section | the latest safe palette/slash UI activation is stored in live TUI state and rendered in the right panel with command/process/filesystem/permission flags as UI-only evidence |
+| persisted TUI activation events | complete for current section | safe palette/slash UI activations append `tui.ui_activation.applied` to the active session event stream when present, with evidence status, policy boundary, command/process/filesystem/permission flags, and no authority grant |
+| TUI activation timeline replay | complete for current section | session timeline rendering labels `tui.ui_activation.applied` as UI-only evidence and shows command/process/filesystem/permission/authority flags for replay |
+| active-session UI activation context | complete for current section | dashboard session pane and right-panel session rows surface the latest persisted UI action with command/process/filesystem/permission/authority flags as passive context |
+| CLI UI activation context | complete for current section | `harness session inspect/status` include the latest persisted UI activation with evidence status, policy boundary, command/process/filesystem/permission/authority flags, and no authority grant for non-TUI operators |
+| local-server UI activation context | complete for current section | `/sessions/{id}` and `/sessions/{id}/status` include the latest persisted UI activation with evidence status, policy boundary, command/process/filesystem/permission/authority flags as passive API context for future web/desktop clients |
+| worktree create/remove/reset | complete for current section | `harness worktrees create|remove|reset` and `/worktrees/create|remove|reset` return planned git worktree operations with managed `.harness/worktrees/<name>` paths, explicit approval/policy boundaries, invalid-target blockers, and false process/filesystem/git mutation flags |
+| per-message snapshots | complete for current section | `harness session snapshots` and `/sessions/{id}/snapshots` expose explicit and derived message/run/diff/changed-file snapshot metadata, artifact evidence fields, non-reversibility state, and policy boundaries while keeping revert, unrevert, and hunk apply disabled |
+| revert readiness | complete for current section | `harness session revert-readiness` and `/sessions/{id}/revert-readiness` explain snapshot/diff/changed-file evidence, blocker codes, required evidence, non-reversibility state, and approval/apply-back policy boundaries without reverting files |
+| PR checkout/run helper | complete for current section | `harness pr checkout|run` and `/pr/checkout|run` parse PR references and return a planned fetch/worktree/adapter sequence with explicit approval/policy boundaries, invalid-ref blockers, and false network/process/filesystem/git/worktree/adapter flags |
+| web fetch/search | complete for current section | `web-fetch` and configured-endpoint `web-search` execute only after explicit approval with persisted result/content and metadata artifacts |
+| LSP diagnostics/symbols | complete for current section | `/lsp/diagnostics`, `/lsp`, `/symbols`, and `/find/symbol` expose configured LSP metadata, static symbol scan counts, policy boundaries, and deferred process-backed LSP blockers without starting servers, collecting live diagnostics, or including source bodies |
+| MCP resources/tools | complete for current section | `harness mcp list|status|resources` and `/mcp/status|/mcp/resources` expose configured server/resource metadata, cached-only evidence boundaries, permission requirements, and MCP action blockers while keeping process launch, network connection, OAuth, credential writes, tool registration, and tool execution disabled |
+| plugin discovery/tools | complete for current section | `harness plugins list` and `/plugins` expose project/global plugin metadata, origin review requirements, manifest visibility, policy boundaries, and plugin-tool blockers without loading code or registering tools; install/update/remove remain fail-closed with false filesystem/network/runtime/tool flags |
+| skill discovery/load | complete for current section | project/global skill metadata is visible without loading bodies; `skill-load` is permission-gated and persists skill content plus metadata artifacts before session injection |
+| extensions status | complete for current section | `harness extensions status` and `/extensions/status` summarize MCP, plugin, skill, and web policy without loading code, starting processes, mutating files, granting permissions, or calling the network |
+| repo clone/overview | complete for current section | project-local and managed-cache `repo-overview` are implemented, and `repo-clone` executes only after approval into `.harness/external_repositories`; future hardening can expand refresh/fetch policy and cache maintenance |
 
 Phase 0 output should include this mapping in code comments or tests only where it affects executable policy. The planning doc is the main design source.
 
@@ -1223,6 +1359,12 @@ Acceptance checks:
 - Existing CLI smoke still passes.
 - Existing run/objective/task tests do not need updates except where dashboard output now includes sessions.
 
+Phase 1 completion checkpoint:
+
+- Versioned migration files live under `src/harness/memory/migrations/`, with `schema_migrations` checksum validation, ordered application, idempotency checks, and fail-closed handling for unknown future migrations.
+- Store initialization validates migration integrity before replaying the additive schema repair pass, so older or partially initialized `.harness` databases can recreate missing `IF NOT EXISTS` tables without silently accepting migration drift.
+- Dedicated Phase 1 tests cover migration order/idempotency/checksum/future-version behavior, event-store replay, session model JSON round-trips, session store CRUD/fork/archive/delete, and session CLI list/get/fork/export/delete-as-archive.
+
 ## Phase 2 Detailed Plan - Live Timeline
 
 Phase 2 should make sessions visible as live, replayable timelines.
@@ -1303,6 +1445,47 @@ Acceptance checks:
 - Tail output matches persisted events.
 - TUI can open with sessions in an initialized and uninitialized project.
 
+Phase 2 completion checkpoint:
+
+- Session timeline rendering and JSONL transcript output replay from persisted SQLite event/message records after restart, with redaction and no ANSI in JSONL.
+- Event-store appends now reserve stream sequence numbers inside an immediate write transaction, with concurrent append coverage proving unique monotonic per-stream ordering.
+- CLI session `tail`, `replay`, and `transcript --format jsonl` operate from persisted events and transcript parts rather than volatile callbacks.
+- The TUI primary surface now has a read-only left session rail, central timeline/chat transcript, right operator context panel, and a bounded multiline composer.
+- The composer status line shows the active session, active agent, active model, submit key, and explicit `--continue` command path; prompt history is available through keyboard navigation without starting providers or mutating files.
+- Phase 2 TUI tests assert sessions appear without provider execution and the multiline composer can submit and recall prompts while preserving safe slash/palette behavior.
+
+Phase 3 completion checkpoint:
+
+- Native foreground aliases `build`, `plan`, `general`, and `explore` are available through `--agent` and prompt `@agent` mention parsing.
+- `build` creates a session-linked isolated Codex edit task by default, requires the hosted-boundary approval path, and does not imply active-workspace reversibility or direct mode.
+- `plan` creates a read-only session tool-loop task with read/glob/grep/artifact-read only, no active repository writes, and no external network.
+- `general` and `explore` create child session branches linked to the parent message, task, run, and registered artifact-backed markdown summary without starting shell, network, provider execution, or active edits.
+- The TUI exposes safe in-process build/plan selection actions in the command palette; selecting an agent updates composer state only and preserves the no command/provider/shell/filesystem/permission side-effect flags.
+- `harness agents generate` creates a validated Harness agent bundle from a natural-language description using explicit safe defaults and no provider/model fallback.
+
+Phase 4 completion checkpoint:
+
+- `harness session tools` exposes registered descriptors for read, glob, grep, artifact-read, policy-explain, todo, question, patch, managed-action, docker-test, direct-write, shell, web-fetch, web-search, MCP, MCP resource, plugin tool, skill-load, PTY, repo-overview, and repo-clone.
+- Phase 4A tools persist session events, run events, transcript tool parts, redacted previews, and artifact overflow evidence before display; read/glob/grep enforce project boundaries, context excludes, and secret-path filters.
+- Todo and question tools persist session-local transcript parts and append-only `todo.updated`, `question.requested`, and `question.resolved` style evidence without repository mutation, shell, network, MCP, or authority grants.
+- Permission requests and replies are durable, scoped, expiring, revocable records; pending requests can unblock a subsequent tool call when explicitly resolved by the operator.
+- Large outputs keep a bounded transcript preview and store full output as artifacts with checksum, byte size, producer, content metadata, redaction state, run link, and session link.
+- Patch, direct-write, and docker-test are permission-gated prototypes that persist validation/plan artifacts after approval but do not apply patches, write active files, mutate git, or run Docker.
+- Shell, PTY, managed-action, plugin-tool, and MCP tool execution remain disabled or fail-closed by default with denied/pending permission evidence and replayable tool events.
+- Web fetch/search and repo-clone require explicit external-network permission before execution and persist metadata/content artifacts; denied configuration, domain, credential, or policy checks leave replayable denied evidence without network calls.
+- Cached MCP resources and skill-load use the same permission envelope and artifact evidence; MCP process launch, network connection, plugin code loading, and tool registration remain disabled.
+
+Phase 5 completion checkpoint:
+
+- Provider/model catalog entries are projected from local config and built-in model profiles without starting providers, refreshing remote model lists, reading secret values, writing credentials, granting authority, or falling back across providers/models.
+- `harness providers list|status|login|logout` exists; list/status expose credential status and sanitized settings previews, while login/logout fail closed until credential-writing policy is explicit.
+- `harness models list --provider --verbose` exposes raw model refs, source, profile, tool support, context limit, reasoning support, modalities, and cost when known; `--refresh` fails closed instead of calling providers implicitly.
+- Custom OpenAI-compatible providers declared in `.harness/config.yaml` are cataloged as explicit provider/model refs and validate through the same no-hidden-fallback path without leaking API keys or arbitrary settings.
+- Provider/model catalog cache rows persist sanitized provider/model payloads in SQLite with source/count metadata and no credential-bearing settings.
+- Session records persist `raw_model_ref`, `provider_id`, `model_id`, and `model_variant`; `harness session model` appends `session.model_selected` plus shared `session.model_validation` evidence and fails visibly for unavailable model refs.
+- CLI foreground aliases and local-server session create/prompt/update routes validate supplied model refs before execution and append metadata-only `session.model_validation` events with false provider/model/network/permission/authority/fallback flags.
+- TUI model catalog rows show provider/model counts, active model executability, blocked reasons, no-hidden-fallback status, and the explicit `harness session model <session-id> <provider/model> --project .` switch command.
+
 ## Implementation Backlog IDs
 
 Use these IDs when cutting implementation tasks.
@@ -1337,6 +1520,15 @@ Phase 2:
 - `OC-2.4`: Bridge direct Codex live summaries into session events.
 - `OC-2.5`: Add TUI session timeline layout.
 - `OC-2.6`: Add redaction, no-ANSI JSONL, and replay tests.
+
+Phase 3:
+
+- `OC-3.1`: Add native build/plan/general/explore aliases and `@agent` mention parsing.
+- `OC-3.2`: Map build to isolated Codex edit by default and keep direct active workspace mode explicit.
+- `OC-3.3`: Map plan to read-only session-local tools with active edits denied.
+- `OC-3.4`: Represent general/explore subagents as child session branches with linked tasks/runs and artifact-backed summaries.
+- `OC-3.5`: Add safe TUI build/plan agent selection with no execution side effects.
+- `OC-3.6`: Add `harness agents generate` for description-to-agent-bundle scaffolding.
 
 Phase 4A:
 

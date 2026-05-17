@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import threading
 from datetime import timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yaml
 from typer.testing import CliRunner
 
 from harness.cli.main import app
@@ -20,13 +24,47 @@ from harness.session_tools import (
 runner = CliRunner()
 
 
+class _FetchHandler(BaseHTTPRequestHandler):
+    body = b""
+    content_type = "text/plain; charset=utf-8"
+
+    def do_GET(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", self.content_type)
+        self.send_header("Content-Length", str(len(self.body)))
+        self.end_headers()
+        self.wfile.write(self.body)
+
+    def log_message(self, format: str, *args: object) -> None:
+        return
+
+
+def _start_fetch_server(body: bytes, content_type: str) -> tuple[ThreadingHTTPServer, str]:
+    class Handler(_FetchHandler):
+        pass
+
+    Handler.body = body
+    Handler.content_type = content_type
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_port}/page"
+
+
+def _run_git_for_test(cwd, args: list[str]) -> None:
+    result = subprocess.run(["git", *args], cwd=cwd, check=False, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr or result.stdout
+
+
 def test_phase_4a_session_tool_descriptors_are_low_risk_and_plan_safe() -> None:
     descriptors = default_session_tool_descriptors()
     by_id = {descriptor.id: descriptor for descriptor in descriptors}
     phase_4a_enabled = [
         descriptor
         for descriptor in descriptors
-        if descriptor.enabled and descriptor.side_effect in {SessionToolSideEffect.NONE, SessionToolSideEffect.SESSION_LOCAL}
+        if descriptor.enabled
+        and descriptor.permission_required is False
+        and descriptor.side_effect in {SessionToolSideEffect.NONE, SessionToolSideEffect.SESSION_LOCAL}
     ]
 
     assert {descriptor.id for descriptor in phase_4a_enabled} == {
@@ -34,7 +72,10 @@ def test_phase_4a_session_tool_descriptors_are_low_risk_and_plan_safe() -> None:
         "glob",
         "grep",
         "artifact-read",
+        "lsp-diagnostics",
+        "lsp-symbols",
         "policy-explain",
+        "repo-overview",
         "todo",
         "question",
     }
@@ -49,8 +90,33 @@ def test_phase_4a_session_tool_descriptors_are_low_risk_and_plan_safe() -> None:
     )
 
     assert by_id["read"].input_schema["required"] == ["path"]
+    assert by_id["read"].side_effect == SessionToolSideEffect.NONE
+    assert by_id["read"].boundary_kind == SessionPermissionBoundaryKind.LOCAL_ONLY
+    assert by_id["read"].permission_required is False
+    assert by_id["glob"].side_effect == SessionToolSideEffect.NONE
+    assert by_id["glob"].boundary_kind == SessionPermissionBoundaryKind.LOCAL_ONLY
+    assert by_id["glob"].permission_required is False
+    assert by_id["grep"].side_effect == SessionToolSideEffect.NONE
+    assert by_id["grep"].boundary_kind == SessionPermissionBoundaryKind.LOCAL_ONLY
+    assert by_id["grep"].permission_required is False
     assert by_id["todo"].side_effect == SessionToolSideEffect.SESSION_LOCAL
+    assert by_id["todo"].boundary_kind == SessionPermissionBoundaryKind.LOCAL_ONLY
+    assert by_id["todo"].permission_required is False
     assert by_id["question"].side_effect == SessionToolSideEffect.SESSION_LOCAL
+    assert by_id["question"].boundary_kind == SessionPermissionBoundaryKind.LOCAL_ONLY
+    assert by_id["question"].permission_required is False
+    assert by_id["lsp-diagnostics"].enabled is True
+    assert by_id["lsp-diagnostics"].permission_required is False
+    assert by_id["lsp-diagnostics"].allowed_in_plan_agent is True
+    assert by_id["lsp-symbols"].enabled is True
+    assert by_id["lsp-symbols"].permission_required is False
+    assert by_id["lsp-symbols"].allowed_in_plan_agent is True
+    assert by_id["repo-overview"].enabled is True
+    assert by_id["repo-overview"].permission_required is False
+    assert by_id["repo-overview"].allowed_in_plan_agent is True
+    assert by_id["skill-load"].enabled is True
+    assert by_id["skill-load"].permission_required is True
+    assert by_id["skill-load"].allowed_in_plan_agent is False
 
 
 def test_phase_4b_descriptors_are_disabled_and_permission_required() -> None:
@@ -59,14 +125,9 @@ def test_phase_4b_descriptors_are_disabled_and_permission_required() -> None:
     disabled_high_risk_ids = {
         "managed-action",
         "shell",
-        "web-fetch",
-        "web-search",
         "mcp",
-        "mcp-resource",
         "plugin-tool",
-        "skill-load",
         "pty",
-        "repo-clone",
     }
 
     assert disabled_high_risk_ids | {"patch", "direct-write", "docker-test"} <= set(by_id)
@@ -82,21 +143,39 @@ def test_phase_4b_descriptors_are_disabled_and_permission_required() -> None:
     assert by_id["patch"].permission_required is True
     assert by_id["patch"].side_effect == SessionToolSideEffect.MUTATION
     assert by_id["patch"].boundary_kind == SessionPermissionBoundaryKind.ACTIVE_REPO_WRITE
+    assert "does not apply changes to the active workspace" in " ".join(by_id["patch"].safety_notes)
+    assert "apply-back" in " ".join(by_id["patch"].safety_notes)
     assert by_id["direct-write"].enabled is True
     assert by_id["direct-write"].permission_required is True
     assert by_id["direct-write"].side_effect == SessionToolSideEffect.MUTATION
     assert by_id["direct-write"].boundary_kind == SessionPermissionBoundaryKind.ACTIVE_REPO_WRITE
+    assert "does not write to the active workspace" in " ".join(by_id["direct-write"].safety_notes)
+    assert "active workspace mutation" in " ".join(by_id["direct-write"].safety_notes)
     assert by_id["docker-test"].enabled is True
     assert by_id["docker-test"].permission_required is True
     assert by_id["docker-test"].side_effect == SessionToolSideEffect.EXECUTION
     assert by_id["docker-test"].boundary_kind == SessionPermissionBoundaryKind.SHELL
+    assert by_id["web-fetch"].enabled is True
+    assert by_id["web-fetch"].permission_required is True
+    assert by_id["web-fetch"].side_effect == SessionToolSideEffect.NETWORK
+    assert by_id["web-fetch"].boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+    assert by_id["web-search"].enabled is True
+    assert by_id["web-search"].permission_required is True
+    assert by_id["web-search"].side_effect == SessionToolSideEffect.NETWORK
+    assert by_id["web-search"].boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+    assert by_id["repo-clone"].enabled is True
+    assert by_id["repo-clone"].permission_required is True
+    assert by_id["repo-clone"].side_effect == SessionToolSideEffect.NETWORK
+    assert by_id["repo-clone"].boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
     assert by_id["pty"].boundary_kind == SessionPermissionBoundaryKind.PTY
     assert by_id["mcp"].boundary_kind == SessionPermissionBoundaryKind.MCP
     assert by_id["mcp-resource"].boundary_kind == SessionPermissionBoundaryKind.MCP
-    assert by_id["web-fetch"].boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
-    assert by_id["web-search"].boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+    assert by_id["mcp-resource"].enabled is True
+    assert by_id["mcp-resource"].permission_required is True
+    assert by_id["mcp-resource"].side_effect == SessionToolSideEffect.NONE
     assert by_id["plugin-tool"].permission_key == "tool.plugin.execution"
     assert by_id["skill-load"].side_effect == SessionToolSideEffect.SESSION_LOCAL
+    assert by_id["skill-load"].enabled is True
     assert by_id["skill-load"].permission_required is True
 
 
@@ -137,17 +216,21 @@ def test_session_tools_cli_lists_descriptor_metadata_without_grants(tmp_path) ->
         "glob",
         "grep",
         "artifact-read",
+        "lsp-diagnostics",
+        "lsp-symbols",
         "policy-explain",
+        "repo-overview",
         "todo",
         "question",
     }
     assert any(tool["id"] == "shell" and tool["enabled"] is False for tool in payload["tools"])
-    assert any(tool["id"] == "web-search" and tool["enabled"] is False for tool in payload["tools"])
-    assert any(tool["id"] == "mcp-resource" and tool["enabled"] is False for tool in payload["tools"])
+    assert any(tool["id"] == "web-search" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
+    assert any(tool["id"] == "mcp-resource" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert any(tool["id"] == "plugin-tool" and tool["enabled"] is False for tool in payload["tools"])
-    assert any(tool["id"] == "skill-load" and tool["enabled"] is False for tool in payload["tools"])
+    assert any(tool["id"] == "skill-load" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert shell_payload["tools"][0]["id"] == "shell"
     assert shell_payload["tools"][0]["enabled"] is False
+    assert any(tool["id"] == "web-fetch" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert "Descriptors are documentation and validation metadata, not permission grants." in inspect_one.output
     assert "artifact-read" in inspect_one.output
 
@@ -219,6 +302,36 @@ def test_session_todo_and_question_cli_persist_transcript_parts_and_events(tmp_p
     assert "[question]" in transcript.output
     assert "Todo updated" in tail.output
     assert "Question requested" in tail.output
+    reloaded = SQLiteStore(tmp_path)
+    events = reloaded.list_session_store_events(session.id)
+    todo_event = [event for event in events if event.kind == "todo.updated"][-1]
+    question_event = [event for event in events if event.kind == "question.requested"][-1]
+    for event, tool_id in ((todo_event, "todo"), (question_event, "question")):
+        assert event.payload["policy_boundary"] == {
+            "kind": "session_local_state",
+            "boundary_kind": "local_only",
+            "source": f"session_{tool_id}",
+        }
+        assert event.payload["tool_id"] == tool_id
+        assert event.payload["session_local"] is True
+        assert event.payload["repository_files_modified"] is False
+        assert event.payload["filesystem_modified"] is False
+        assert event.payload["active_repo_modified"] is False
+        assert event.payload["git_mutation_started"] is False
+        assert event.payload["process_started"] is False
+        assert event.payload["network_accessed"] is False
+        assert event.payload["permission_granting"] is False
+        assert event.payload["authority_granting"] is False
+        assert event.payload["blocked_reasons"] == []
+    parts = reloaded.list_session_parts(session.id)
+    todo_part = [part for part in parts if part.kind.value == "todo_update"][-1]
+    question_part = [part for part in parts if part.kind.value == "question"][-1]
+    assert todo_part.metadata["tool_id"] == "todo"
+    assert todo_part.metadata["session_local"] is True
+    assert todo_part.metadata["filesystem_modified"] is False
+    assert question_part.metadata["tool_id"] == "question"
+    assert question_part.metadata["session_local"] is True
+    assert question_part.metadata["permission_granting"] is False
 
 
 def test_disabled_phase_4b_tool_records_denied_evidence_without_execution(tmp_path) -> None:
@@ -350,6 +463,36 @@ def test_patch_tool_requires_permission_then_persists_plan_artifacts_without_app
     plan_payload = json.loads(plan.path.read_text(encoding="utf-8"))
     assert plan_payload["applied"] is False
     assert plan_payload["files"] == ["app.py"]
+    assert plan_payload["policy_boundary"] == {
+        "kind": "patch_apply_back_deferred",
+        "boundary_kind": "active_repo_write",
+        "source": "session_tool_patch_plan",
+    }
+    assert plan_payload["approval_required"] is True
+    assert plan_payload["required_approval"] == "active_repo_write"
+    assert plan_payload["apply_back_required"] is True
+    assert plan_payload["snapshot_required"] is True
+    assert plan_payload["apply_supported"] is False
+    assert plan_payload["patch_apply_supported"] is False
+    assert plan_payload["applies_to_active_workspace"] is False
+    assert plan_payload["file_written"] is False
+    assert plan_payload["filesystem_modified"] is False
+    assert plan_payload["active_repo_modified"] is False
+    assert plan_payload["git_mutation_started"] is False
+    assert plan_payload["permission_granting"] is False
+    assert plan_payload["authority_granting"] is False
+    assert plan_payload["blocked_reasons"] == [
+        "patch_apply_disabled",
+        "requires_interactive_permission",
+        "requires_snapshot_apply_back",
+    ]
+    assert plan.metadata["policy_boundary"] == plan_payload["policy_boundary"]
+    assert plan.metadata["apply_back_required"] is True
+    assert plan.metadata["filesystem_modified"] is False
+    patch_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_patch")
+    assert patch_artifact.metadata["files"] == ["app.py"]
+    assert patch_artifact.metadata["applies_to_active_workspace"] is False
+    assert patch_artifact.metadata["git_mutation_started"] is False
 
 
 def test_direct_write_tool_requires_permission_then_persists_plan_artifacts_without_writing(tmp_path) -> None:
@@ -428,6 +571,36 @@ def test_direct_write_tool_requires_permission_then_persists_plan_artifacts_with
     plan_payload = json.loads(plan.path.read_text(encoding="utf-8"))
     assert plan_payload["applied"] is False
     assert plan_payload["target"] == "notes.txt"
+    assert plan_payload["policy_boundary"] == {
+        "kind": "direct_write_deferred",
+        "boundary_kind": "active_repo_write",
+        "source": "session_tool_direct_write_plan",
+    }
+    assert plan_payload["approval_required"] is True
+    assert plan_payload["required_approval"] == "active_repo_write"
+    assert plan_payload["blocked_path_checks"] is True
+    assert plan_payload["write_supported"] is False
+    assert plan_payload["direct_write_supported"] is False
+    assert plan_payload["apply_supported"] is False
+    assert plan_payload["file_written"] is False
+    assert plan_payload["filesystem_modified"] is False
+    assert plan_payload["active_repo_modified"] is False
+    assert plan_payload["git_mutation_started"] is False
+    assert plan_payload["permission_granting"] is False
+    assert plan_payload["blocked_reasons"] == [
+        "direct_write_apply_disabled",
+        "requires_interactive_permission",
+        "blocked_path_checks_required",
+    ]
+    assert plan.metadata["policy_boundary"] == plan_payload["policy_boundary"]
+    assert plan.metadata["blocked_path_checks"] is True
+    assert plan.metadata["filesystem_modified"] is False
+    assert plan.metadata["active_repo_modified"] is False
+    content_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_direct_write_content")
+    assert content_artifact.metadata["target"] == "notes.txt"
+    assert content_artifact.metadata["file_written"] is False
+    assert content_artifact.metadata["filesystem_modified"] is False
+    assert content_artifact.metadata["policy_boundary"] == plan_payload["policy_boundary"]
 
 
 def test_direct_write_tool_denies_blocked_path_without_creating_file(tmp_path) -> None:
@@ -457,7 +630,19 @@ def test_direct_write_tool_denies_blocked_path_without_creating_file(tmp_path) -
     assert payload["error_type"] == "permission_denied"
     assert payload["permission_id"]
     assert not (tmp_path / ".harness" / "config.json").exists()
-    assert SQLiteStore(tmp_path).list_session_permissions(session.id)[0].status == SessionPermissionStatus.DENIED
+    permissions = SQLiteStore(tmp_path).list_session_permissions(session.id)
+    assert permissions[0].status == SessionPermissionStatus.DENIED
+    assert permissions[0].normalized_action == "write"
+    assert permissions[0].normalized_target_pattern == ".harness/config.json"
+    assert permissions[0].boundary_kind == SessionPermissionBoundaryKind.ACTIVE_REPO_WRITE
+    assert permissions[0].policy_reasons == ["Blocked write path: .harness/config.json"]
+    events = SQLiteStore(tmp_path).list_session_store_events(session.id)
+    permission_checked = [event for event in events if event.kind == "permission.checked"][-1]
+    assert permission_checked.payload["decision"] == "deny"
+    assert permission_checked.payload["action"] == "write"
+    assert permission_checked.payload["target"] == ".harness/config.json"
+    assert permission_checked.payload["boundary_kind"] == "active_repo_write"
+    assert permission_checked.payload["reasons"] == ["Blocked write path: .harness/config.json"]
 
 
 def test_docker_test_tool_requires_permission_then_persists_plan_without_execution(tmp_path) -> None:
@@ -567,6 +752,913 @@ def test_docker_test_tool_denies_shell_string_command(tmp_path) -> None:
     assert SQLiteStore(tmp_path).list_session_permissions(session.id)[0].status == SessionPermissionStatus.DENIED
 
 
+def test_skill_load_tool_requires_permission_then_loads_configured_project_skill(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    skill_dir = tmp_path / "skills" / "reviewer"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "# Reviewer\n\nUse project-local review workflow.\n",
+        encoding="utf-8",
+    )
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {
+            "reviewer": {
+                "path": "skills/reviewer",
+                "spec": "./skills/reviewer",
+                "version": "0.1.0",
+                "enabled": True,
+                "description": "Project review skill",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Skill load")
+
+    first = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "skill-load",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"skill": "reviewer"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)["result"]
+    assert first_payload["ok"] is False
+    assert first_payload["error_type"] == "permission_required"
+    assert first_payload["permission_id"]
+    pending = SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"])
+    assert pending.status == SessionPermissionStatus.PENDING
+    assert pending.tool_id == "skill-load"
+    assert pending.normalized_target_pattern == "reviewer"
+
+    allowed = runner.invoke(
+        app,
+        [
+            "session",
+            "permission",
+            session.id,
+            "--project",
+            str(tmp_path),
+            "--resolve",
+            first_payload["permission_id"],
+            "--decision",
+            "allowed",
+            "--output",
+            "json",
+        ],
+    )
+    second = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "skill-load",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"skill": "reviewer"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)["result"]
+    assert second_payload["ok"] is True
+    assert '<skill_content name="reviewer">' in second_payload["preview"]
+    assert "Use project-local review workflow." in second_payload["preview"]
+    assert "Content artifact:" in second_payload["preview"]
+    assert "Metadata artifact:" in second_payload["preview"]
+    assert "No plugin tools were registered" in second_payload["preview"]
+    assert SQLiteStore(tmp_path).get_run(second_payload["run_id"]).session_id == session.id
+    artifacts = SQLiteStore(tmp_path).list_artifacts(second_payload["run_id"])
+    content_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_skill_load_content")
+    metadata_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_skill_load_metadata")
+    metadata = json.loads(metadata_artifact.path.read_text(encoding="utf-8"))
+    assert content_artifact.path.read_text(encoding="utf-8").startswith("# Reviewer")
+    assert metadata["schema_version"] == "harness.session_tool_skill_load/v1"
+    assert metadata["skill"] == "reviewer"
+    assert metadata["description"] == "Project review skill"
+    assert metadata["version"] == "0.1.0"
+    assert metadata["path"] == "skills/reviewer"
+    assert metadata["skill_file_path"] == "skills/reviewer/SKILL.md"
+    assert metadata["content_artifact_id"] == content_artifact.id
+    assert metadata["runtime_loaded"] is False
+    assert metadata["tool_registered"] is False
+    assert metadata["plugin_tools_registered"] is False
+    assert metadata["network_called"] is False
+    assert metadata["filesystem_modified"] is False
+
+
+def test_web_fetch_tool_requires_permission_then_fetches_and_persists_response_artifacts(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    server, url = _start_fetch_server(
+        b"<html><body><h1>Harness Docs</h1><p>Fetched content.</p><script>secret()</script></body></html>",
+        "text/html; charset=utf-8",
+    )
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": True,
+        "search_enabled": False,
+        "approval_required": True,
+        "allowed_domains": ["127.0.0.1"],
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Web fetch")
+    arguments = {"url": url, "format": "markdown", "timeout": 5}
+
+    try:
+        first = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "web-fetch",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+
+        assert first.exit_code == 0, first.output
+        first_payload = json.loads(first.output)["result"]
+        assert first_payload["ok"] is False
+        assert first_payload["error_type"] == "permission_required"
+        assert first_payload["permission_id"]
+        pending = SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"])
+        assert pending.status == SessionPermissionStatus.PENDING
+        assert pending.tool_id == "web-fetch"
+        assert pending.boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+        assert pending.normalized_target_pattern.startswith("http://127.0.0.1:")
+
+        allowed = runner.invoke(
+            app,
+            [
+                "session",
+                "permission",
+                session.id,
+                "--project",
+                str(tmp_path),
+                "--resolve",
+                first_payload["permission_id"],
+                "--decision",
+                "allowed",
+                "--output",
+                "json",
+            ],
+        )
+        second = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "web-fetch",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)["result"]
+    assert second_payload["ok"] is True
+    assert "Web fetch executed." in second_payload["preview"]
+    assert "Harness Docs" in second_payload["preview"]
+    assert "Fetched content." in second_payload["preview"]
+    assert "secret()" not in second_payload["preview"]
+    artifacts = SQLiteStore(tmp_path).list_artifacts(second_payload["run_id"])
+    content_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_web_fetch_content")
+    metadata_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_web_fetch_metadata")
+    content = content_artifact.path.read_text(encoding="utf-8")
+    metadata = json.loads(metadata_artifact.path.read_text(encoding="utf-8"))
+    assert "Harness Docs" in content
+    assert "Fetched content." in content
+    assert "secret()" not in content
+    assert metadata["schema_version"] == "harness.session_tool_web_fetch_plan/v1"
+    assert metadata["url"] == url
+    assert metadata["requires_network"] is True
+    assert metadata["network_called"] is True
+    assert metadata["fetch_executed"] is True
+    assert metadata["status_code"] == 200
+    assert metadata["content_artifact_id"] == content_artifact.id
+
+
+def test_web_fetch_tool_denies_disallowed_domain_without_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": True,
+        "search_enabled": False,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    session = SQLiteStore(tmp_path).create_session(title="Web fetch denied")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "web-fetch",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"url": "https://example.org/page"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "Web fetch host is not allowed" in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+
+
+def test_mcp_resource_tool_requires_permission_then_reads_cached_resource_without_process_or_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    resource_path = tmp_path / "mcp-cache" / "guide.md"
+    resource_path.parent.mkdir()
+    resource_path.write_text("# Cached Guide\n\nUse the audited path.\n", encoding="utf-8")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["mcp"] = {
+        "enabled": True,
+        "servers": {
+            "docs": {
+                "kind": "local",
+                "enabled": True,
+                "command": ["mcp-docs", "--stdio"],
+                "resources": {
+                    "guide": {
+                        "uri": "mcp://docs/guide",
+                        "path": "mcp-cache/guide.md",
+                        "enabled": True,
+                        "content_type": "text/markdown",
+                        "description": "Cached docs guide",
+                    }
+                },
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="MCP resource")
+    arguments = {"server": "docs", "uri": "mcp://docs/guide"}
+
+    first = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "mcp-resource",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)["result"]
+    assert first_payload["ok"] is False
+    assert first_payload["error_type"] == "permission_required"
+    assert first_payload["permission_id"]
+    pending = SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"])
+    assert pending.status == SessionPermissionStatus.PENDING
+    assert pending.tool_id == "mcp-resource"
+    assert pending.boundary_kind == SessionPermissionBoundaryKind.MCP
+    assert pending.normalized_target_pattern == "docs:mcp://docs/guide"
+
+    allowed = runner.invoke(
+        app,
+        [
+            "session",
+            "permission",
+            session.id,
+            "--project",
+            str(tmp_path),
+            "--resolve",
+            first_payload["permission_id"],
+            "--decision",
+            "allowed",
+            "--output",
+            "json",
+        ],
+    )
+    second = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "mcp-resource",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)["result"]
+    assert second_payload["ok"] is True
+    assert "MCP resource read from cache." in second_payload["preview"]
+    assert "Cached Guide" in second_payload["preview"]
+    artifacts = SQLiteStore(tmp_path).list_artifacts(second_payload["run_id"])
+    content_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_mcp_resource_content")
+    metadata_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_mcp_resource_metadata")
+    metadata = json.loads(metadata_artifact.path.read_text(encoding="utf-8"))
+    assert content_artifact.path.read_text(encoding="utf-8").startswith("# Cached Guide")
+    assert metadata["schema_version"] == "harness.session_tool_mcp_resource/v1"
+    assert metadata["server"] == "docs"
+    assert metadata["uri"] == "mcp://docs/guide"
+    assert metadata["content_artifact_id"] == content_artifact.id
+    assert metadata["cached_only"] is True
+    assert metadata["process_started"] is False
+    assert metadata["network_called"] is False
+
+
+def test_mcp_resource_tool_denies_unconfigured_resource_without_process_or_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    session = SQLiteStore(tmp_path).create_session(title="MCP resource denied")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "mcp-resource",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"server": "missing", "uri": "mcp://missing/resource"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "Configured MCP server not found" in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.tool_id == "mcp-resource"
+
+
+def test_web_search_tool_requires_permission_then_executes_configured_endpoint_and_persists_artifacts(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    server, endpoint = _start_fetch_server(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "title": "Harness permissions",
+                        "url": "https://docs.example.com/permissions",
+                        "snippet": "Session permissions are auditable.",
+                    }
+                ]
+            }
+        ).encode("utf-8"),
+        "application/json; charset=utf-8",
+    )
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": False,
+        "search_enabled": True,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+        "search_endpoint_url": endpoint,
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Web search")
+    arguments = {
+        "query": "Harness session permissions 2026",
+        "num_results": 6,
+        "search_type": "fast",
+        "livecrawl": "fallback",
+        "context_max_characters": 12000,
+        "allowed_domains": ["docs.example.com"],
+    }
+
+    try:
+        first = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "web-search",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+
+        assert first.exit_code == 0, first.output
+        first_payload = json.loads(first.output)["result"]
+        assert first_payload["ok"] is False
+        assert first_payload["error_type"] == "permission_required"
+        assert first_payload["permission_id"]
+        pending = SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"])
+        assert pending.status == SessionPermissionStatus.PENDING
+        assert pending.tool_id == "web-search"
+        assert pending.boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+        assert pending.normalized_target_pattern == "Harness session permissions 2026"
+
+        allowed = runner.invoke(
+            app,
+            [
+                "session",
+                "permission",
+                session.id,
+                "--project",
+                str(tmp_path),
+                "--resolve",
+                first_payload["permission_id"],
+                "--decision",
+                "allowed",
+                "--output",
+                "json",
+            ],
+        )
+        second = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "web-search",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)["result"]
+    assert second_payload["ok"] is True
+    assert "Web search executed." in second_payload["preview"]
+    assert "Harness permissions" in second_payload["preview"]
+    artifacts = SQLiteStore(tmp_path).list_artifacts(second_payload["run_id"])
+    results_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_web_search_results")
+    metadata_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_web_search_metadata")
+    results = results_artifact.path.read_text(encoding="utf-8")
+    metadata = json.loads(metadata_artifact.path.read_text(encoding="utf-8"))
+    assert "Harness permissions" in results
+    assert metadata["schema_version"] == "harness.session_tool_web_search_plan/v1"
+    assert metadata["query"] == "Harness session permissions 2026"
+    assert metadata["num_results"] == 6
+    assert metadata["search_type"] == "fast"
+    assert metadata["allowed_domains"] == ["docs.example.com"]
+    assert metadata["requires_network"] is True
+    assert metadata["network_called"] is True
+    assert metadata["search_executed"] is True
+    assert metadata["results_artifact_id"] == results_artifact.id
+
+
+def test_web_search_tool_denies_unapproved_domain_filter_without_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": False,
+        "search_enabled": True,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+        "search_endpoint_url": "http://127.0.0.1:9/search",
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    session = SQLiteStore(tmp_path).create_session(title="Web search denied")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "web-search",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"query": "Harness docs", "allowed_domains": ["example.org"]}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "requested domain filter includes domains not allowed" in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+
+
+def test_repo_overview_tool_summarizes_project_local_repository_without_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "package.json").write_text(
+        json.dumps({"main": "src/index.js", "bin": {"harness-demo": "bin/demo.js"}, "exports": {".": "./src/index.js"}}),
+        encoding="utf-8",
+    )
+    (tmp_path / "package-lock.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "index.js").write_text("console.log('demo')\n", encoding="utf-8")
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "large.js").write_text("ignored\n", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Repo overview")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-overview",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"path": ".", "depth": 2}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is True
+    assert payload["permission_id"] is None
+    assert "Ecosystems: Node.js, Python" in payload["preview"]
+    assert "Package manager: npm" in payload["preview"]
+    assert "Dependency files: package.json, package-lock.json, pyproject.toml" in payload["preview"]
+    assert "main: src/index.js" in payload["preview"]
+    assert "file: src/index.js" in payload["preview"]
+    assert "src/" in payload["preview"]
+    assert "node_modules" not in payload["preview"]
+    assert '"network_called": false' in payload["preview"]
+
+
+def test_repo_overview_tool_denies_external_repository_mode_until_cached(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    session = SQLiteStore(tmp_path).create_session(title="External repo overview")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-overview",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"repository": "anomalyco/opencode"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "not_found"
+    assert "Repository is not in the managed cache" in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.tool_id == "repo-overview"
+
+
+def test_repo_overview_tool_summarizes_cached_external_repository_without_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    cached = tmp_path / ".harness" / "external_repositories" / "github.com__anomalyco__opencode"
+    cached.mkdir(parents=True)
+    _run_git_for_test(cached, ["init"])
+    _run_git_for_test(cached, ["config", "user.email", "test@example.com"])
+    _run_git_for_test(cached, ["config", "user.name", "Test User"])
+    (cached / "package.json").write_text(json.dumps({"main": "src/index.js"}), encoding="utf-8")
+    (cached / "src").mkdir()
+    (cached / "src" / "index.js").write_text("export function run() { return 'cached body'; }\n", encoding="utf-8")
+    _run_git_for_test(cached, ["add", "package.json", "src/index.js"])
+    _run_git_for_test(cached, ["commit", "-m", "cached"])
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Cached repo overview")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-overview",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"repository": "anomalyco/opencode", "depth": 2}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is True
+    assert payload["permission_id"] is None
+    assert "Repository: github.com/anomalyco/opencode" in payload["preview"]
+    assert "Ecosystems: Node.js" in payload["preview"]
+    assert "main: src/index.js" in payload["preview"]
+    assert '"external_cache_used": true' in payload["preview"]
+    assert '"network_called": false' in payload["preview"]
+    assert "cached body" not in payload["preview"]
+
+
+def test_repo_clone_tool_requires_permission_then_clones_into_managed_cache_and_persists_metadata(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    source = tmp_path / "source-repo"
+    source.mkdir()
+    _run_git_for_test(source, ["init"])
+    _run_git_for_test(source, ["config", "user.email", "test@example.com"])
+    _run_git_for_test(source, ["config", "user.name", "Test User"])
+    (source / "README.md").write_text("# External repo\n", encoding="utf-8")
+    _run_git_for_test(source, ["add", "README.md"])
+    _run_git_for_test(source, ["commit", "-m", "initial"])
+    remote = source.resolve().as_uri()
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Repo clone")
+    arguments = {"repository": remote, "refresh": False}
+
+    first = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-clone",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)["result"]
+    assert first_payload["ok"] is False
+    assert first_payload["error_type"] == "permission_required"
+    assert first_payload["permission_id"]
+    pending = SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"])
+    assert pending.status == SessionPermissionStatus.PENDING
+    assert pending.tool_id == "repo-clone"
+    assert pending.boundary_kind == SessionPermissionBoundaryKind.EXTERNAL_NETWORK
+    assert pending.normalized_target_pattern == "local/file/source-repo"
+
+    allowed = runner.invoke(
+        app,
+        [
+            "session",
+            "permission",
+            session.id,
+            "--project",
+            str(tmp_path),
+            "--resolve",
+            first_payload["permission_id"],
+            "--decision",
+            "allowed",
+            "--output",
+            "json",
+        ],
+    )
+    second = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-clone",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)["result"]
+    assert second_payload["ok"] is True
+    assert "Repository ready." in second_payload["preview"]
+    assert "local/file/source-repo" in second_payload["preview"]
+    assert "Status: cloned" in second_payload["preview"]
+    cache_path = tmp_path / ".harness" / "external_repositories" / "local__file__source-repo"
+    assert (cache_path / ".git").exists()
+    assert (cache_path / "README.md").read_text(encoding="utf-8") == "# External repo\n"
+    artifacts = SQLiteStore(tmp_path).list_artifacts(second_payload["run_id"])
+    metadata_artifact = next(artifact for artifact in artifacts if artifact.kind == "session_tool_repo_clone_metadata")
+    metadata = json.loads(metadata_artifact.path.read_text(encoding="utf-8"))
+    assert metadata["schema_version"] == "harness.session_tool_repo_clone_plan/v1"
+    assert metadata["repository"] == "local/file/source-repo"
+    assert metadata["remote"] == remote
+    assert metadata["refresh"] is False
+    assert metadata["requires_network"] is True
+    assert metadata["network_called"] is True
+    assert metadata["clone_executed"] is True
+    assert metadata["external_cache_used"] is True
+    assert metadata["status"] == "cloned"
+    assert metadata["head"]
+
+
+def test_repo_clone_tool_denies_credential_url_without_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    session = SQLiteStore(tmp_path).create_session(title="Repo clone denied")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-clone",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"repository": "https://token@github.com/anomalyco/opencode.git"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "must not include credentials" in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.tool_id == "repo-clone"
+
+
+def test_lsp_diagnostics_tool_projects_config_without_starting_processes_or_reading_contents(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "app.py").write_text("def build_plan():\n    return 'body must not leak'\n", encoding="utf-8")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["lsp"] = {
+        "enabled": True,
+        "servers": {
+            "python": {
+                "enabled": True,
+                "command": ["pyright-langserver", "--stdio"],
+                "file_extensions": [".py"],
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="LSP diagnostics")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "lsp-diagnostics",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"path": "app.py"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is True
+    assert payload["permission_id"] is None
+    assert "LSP enabled: true" in payload["preview"]
+    assert "Matching servers: python" in payload["preview"]
+    assert "Process started: false" in payload["preview"]
+    assert "Diagnostics: none" in payload["preview"]
+    assert '"contents_included": false' in payload["preview"]
+    assert '"process_started": false' in payload["preview"]
+    assert "body must not leak" not in payload["preview"]
+
+
+def test_lsp_symbols_tool_lists_static_symbols_without_starting_processes_or_reading_bodies(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "app.py").write_text(
+        "class Builder:\n    pass\n\n"
+        "def build_plan():\n    return 'body must not leak'\n\n"
+        "def skip_me():\n    return None\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "ui.ts").write_text(
+        "export function renderPlan() { return 'secret body'; }\n"
+        "const helper = () => true;\n",
+        encoding="utf-8",
+    )
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="LSP symbols")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "lsp-symbols",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"query": "plan", "limit": 10}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is True
+    assert payload["permission_id"] is None
+    assert "Source: static_scan" in payload["preview"]
+    assert "function build_plan app.py:4:5" in payload["preview"]
+    assert "function renderPlan ui.ts:1:17" in payload["preview"]
+    assert "skip_me" not in payload["preview"]
+    assert "body must not leak" not in payload["preview"]
+    assert "secret body" not in payload["preview"]
+    assert '"contents_included": false' in payload["preview"]
+    assert '"process_started": false' in payload["preview"]
+
+
 def test_session_todo_rejects_invalid_status(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     session = SQLiteStore(tmp_path).create_session(title="Invalid")
@@ -672,6 +1764,43 @@ def test_session_permission_request_and_resolution_are_persisted_with_expiry(tmp
     assert "Permission resolved" in tail.output
     assert raw_secret not in tail.output
 
+    second = SQLiteStore(tmp_path).request_session_permission(
+        session.id,
+        tool_id="shell",
+        normalized_action="run",
+        normalized_target_pattern="pytest",
+        boundary_kind=SessionPermissionBoundaryKind.SHELL,
+        risk="medium",
+        scope=SessionPermissionScope.ONCE,
+    )
+    replied = runner.invoke(
+        app,
+        [
+            "session",
+            "permission",
+            session.id,
+            "--project",
+            str(tmp_path),
+            "--resolve",
+            second.id,
+            "--reply",
+            "once",
+            "--reason",
+            "operator approved once",
+            "--output",
+            "json",
+        ],
+    )
+
+    assert replied.exit_code == 0, replied.output
+    reply_payload = json.loads(replied.output)
+    assert reply_payload["schema_version"] == "harness.session_permission_reply/v1"
+    assert reply_payload["decision"] == SessionPermissionStatus.ALLOWED.value
+    assert reply_payload["permission"]["status"] == SessionPermissionStatus.ALLOWED.value
+    assert reply_payload["permission"]["scope"] == SessionPermissionScope.ONCE.value
+    assert reply_payload["scope_broadened"] is False
+    assert reply_payload["execution_started"] is False
+
 
 def test_session_permission_session_scope_caps_at_24_hours(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
@@ -761,6 +1890,35 @@ def test_session_read_grep_and_glob_tools_persist_events_and_transcript(tmp_path
     assert "Tool finished" in tail.output
     assert "alpha = 1" in transcript.output
     assert SQLiteStore(tmp_path).get_run(json.loads(read_result.output)["result"]["run_id"]).session_id == session.id
+    events = SQLiteStore(tmp_path).list_session_store_events(session.id)
+    output_events = [event for event in events if event.kind == "tool_call.output" and event.payload.get("tool_id") in {"read", "grep", "glob"}]
+    by_tool = {event.payload["tool_id"]: event.payload for event in output_events}
+    for tool_id in ("read", "grep", "glob"):
+        payload = by_tool[tool_id]
+        assert payload["policy_boundary"] == {
+            "kind": "project_read_only",
+            "boundary_kind": "local_only",
+            "source": "session_tool_read_glob_grep",
+        }
+        assert payload["project_boundary_enforced"] is True
+        assert payload["context_excludes_enforced"] is True
+        assert payload["secret_path_filtering"] is True
+        assert payload["read_only"] is True
+        assert payload["process_started"] is False
+        assert payload["network_accessed"] is False
+        assert payload["shell_execution_started"] is False
+        assert payload["filesystem_modified"] is False
+        assert payload["active_repo_modified"] is False
+        assert payload["git_mutation_started"] is False
+        assert payload["permission_granting"] is False
+        assert payload["authority_granting"] is False
+        assert payload["blocked_reasons"] == []
+    parts = SQLiteStore(tmp_path).list_session_parts(session.id)
+    read_parts = [part for part in parts if part.metadata.get("tool_id") in {"read", "grep", "glob"}]
+    assert {part.metadata["tool_id"] for part in read_parts} == {"read", "grep", "glob"}
+    assert all(part.metadata["read_only"] is True for part in read_parts)
+    assert all(part.metadata["filesystem_modified"] is False for part in read_parts)
+    assert all(part.metadata["permission_granting"] is False for part in read_parts)
 
 
 def test_session_read_tool_denies_secret_or_outside_path_with_permission_evidence(tmp_path) -> None:
@@ -796,6 +1954,11 @@ def test_session_read_tool_denies_secret_or_outside_path_with_permission_evidenc
     assert "Permission resolved" in tail.output
     assert "Permission checked" in tail.output
     assert "Tool output" in tail.output
+    checked = [event for event in SQLiteStore(tmp_path).list_session_store_events(session.id) if event.kind == "permission.checked"][-1]
+    assert checked.payload["decision"] == "deny"
+    assert checked.payload["action"] == "read"
+    assert checked.payload["target"] == ".env"
+    assert checked.payload["boundary_kind"] == "local_only"
 
 
 def test_session_tool_permission_decision_is_path_sensitive(tmp_path) -> None:
