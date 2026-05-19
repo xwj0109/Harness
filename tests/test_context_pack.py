@@ -35,6 +35,16 @@ def test_context_pack_includes_readme_tree_diff_without_initializing(tmp_path) -
     payload = manifest.to_payload()
     assert payload["role_summary"]["pinned"] >= 4
     assert payload["role_summary"]["retrieved"] >= 3
+    summary = payload["context_summary"]
+    assert payload["context_snapshot"] == summary
+    assert summary["selected_block_count"] == len(manifest.blocks)
+    assert summary["role_counts"] == payload["role_summary"]
+    assert summary["token_budget"]["used_input_tokens"] == manifest.budget_report.used_input_tokens
+    assert summary["token_budget"]["max_input_tokens"] == manifest.budget_report.max_input_tokens
+    assert summary["blocked_path_count"] == len(manifest.blocked_paths)
+    assert summary["provenance_count"] == len(payload["context_provenance"])
+    assert {"harness policy", "registry", "repo tree", "repo file"} <= set(summary["source_categories"])
+    assert len(summary["selected_sources"]) == len(manifest.blocks)
     assert {block["role"] for block in payload["blocks"]} >= {"pinned", "retrieved"}
     assert payload["context_provenance"]
     assert payload["untrusted_context_warnings"]
@@ -69,6 +79,10 @@ def test_context_pack_includes_harness_domain_summary(tmp_path) -> None:
     assert "sandbox_profiles" in blocks
     assert blocks["security_policy_summary"].role == "pinned"
     assert blocks["sandbox_profiles"].role == "pinned"
+    policy = json.loads(blocks["security_policy_summary"].content)
+    assert policy["schema_version"] == "harness.security_policy_summary/v1"
+    assert "active_repo_write" in policy["policy_keys"]
+    assert "missing_approval" in policy["blocked_state_codes"]
 
 
 def test_context_pack_obeys_excludes_and_blocks_secret_paths(tmp_path) -> None:
@@ -154,6 +168,10 @@ def test_context_pack_truncates_oversized_block_by_token_budget(tmp_path) -> Non
     assert first.token_estimate <= manifest.budget_report.max_input_tokens
     assert "[TRUNCATED: context budget]" in first.content
     assert "context_block_truncated:harness_vocabulary" in manifest.warnings
+    summary = manifest.to_payload()["context_summary"]
+    assert summary["selected_block_count"] == 1
+    assert summary["truncated_block_ids"] == ["harness_vocabulary"]
+    assert summary["warning_codes"] == manifest.warnings
 
 
 def test_context_pack_adds_pinned_request_context_when_supplied(tmp_path) -> None:

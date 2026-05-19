@@ -2,6 +2,37 @@
 
 Local-first custom agent harness.
 
+## Project Foundations And Development Principles
+
+Harness is a local-first, agentic coding and operator harness for real development work. Its product direction is inspired by the fast operator flow of tools such as Codex CLI, OpenCode, and Pi, but Harness should not clone any single system. Its differentiator is a local-first control plane with explicit policy, durable evidence, bounded execution, and inspectable recovery paths.
+
+The primary product experience should be session-first and task-completing: understand the user goal, gather relevant context, plan when useful, execute through governed tools and adapters, verify the result, persist evidence, and return a concise final outcome.
+
+The future development direction is autonomous within pre-authorized policy scopes by product default. Harness should not rely on repeated runtime confirmation prompts as the normal safety mechanism. Human control should move into configuration, static policy, scoped credentials, capability grants, budgets, leases, runtime controls, and audit review. During normal operation, Harness should either proceed automatically within policy or fail closed with durable evidence.
+
+This does not mean models, agents, memories, sessions, prompts, artifacts, or generated text can grant themselves new authority. Authority comes only from static policy, explicit local configuration, scoped runtime capability records, and trusted Harness code paths.
+
+Harness should preserve and extend its four security planes:
+
+- Policy and authority boundaries.
+- Runtime controls, leases, budgets, and breakers.
+- Sandbox, workspace, and evidence boundaries.
+- Context, provenance, integrity, and detection.
+
+Development should prioritize working loops that are inspectable and resumable: session timelines, append-only events, immutable artifacts, linked tasks and runs, test evidence, summaries, policy decisions, and recovery paths.
+
+Current implemented behavior remains documented in [SECURITY.md](SECURITY.md), [docs/operator_guide.md](docs/operator_guide.md), and [docs/command_catalog.md](docs/command_catalog.md). This section is the north-star product principle for future development, not a claim that all autonomous behavior already exists.
+
+### Development Defaults
+
+- Default to local-first execution and local evidence.
+- Default to autonomous completion for policy-allowed work.
+- Default to fail-closed for unknown, ambiguous, destructive, secret-touching, networked, hosted, authority-expanding, or irreversible behavior.
+- Prefer sandboxing, leases, budgets, manifests, typed capabilities, and deterministic policy over ad hoc prompts.
+- Preserve no hidden provider fallback, no paid fallback, no secret exposure, and no ambient shell, network, or tool authority.
+- Make every user-visible action traceable to persisted session, run, task, artifact, or policy evidence.
+- Build UX around fast agentic flow, not command-catalog ceremony, while keeping the control plane auditable.
+
 The v1.8 release is **Local Agent App Readiness**: local infrastructure, declarative agent structure, manual queue control, evidence inspection, local daemon control-plane readiness, registered execution dispatch, a unified chat/TUI operator app, bounded registered adapters, read-only operator TUI polish, and OpenClaw-style local app surfaces without broadening execution authority:
 
 - CLI scaffolding.

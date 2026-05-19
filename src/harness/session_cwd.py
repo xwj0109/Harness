@@ -11,6 +11,7 @@ from harness.security import is_secret_path
 
 
 DEFAULT_SESSION_CWD = "."
+SESSION_CWD_REPAIR_HINT = 'Run: harness doctor --repair to reset invalid session cwd values to "."'
 
 
 class CwdResolutionError(ValueError):
@@ -20,6 +21,25 @@ class CwdResolutionError(ValueError):
         self.action = action
         self.target = target
         self.error_type = error_type
+
+
+def cwd_recovery_message(exc: CwdResolutionError) -> str:
+    if exc.error_type == "path_security":
+        return (
+            f"The session cwd escapes the active project: {exc.target}. "
+            f"{SESSION_CWD_REPAIR_HINT}"
+        )
+    if exc.error_type == "secret_path":
+        return (
+            f"The session cwd points at a secret-like path: {exc.target}. "
+            f"{SESSION_CWD_REPAIR_HINT}"
+        )
+    if exc.error_type in {"missing", "not_directory"}:
+        return (
+            f"The session cwd is invalid: {exc.message}. "
+            f"{SESSION_CWD_REPAIR_HINT}"
+        )
+    return f"The session cwd could not be resolved: {exc.message}. {SESSION_CWD_REPAIR_HINT}"
 
 
 class SessionCwd(BaseModel):

@@ -13,9 +13,10 @@ from harness.approvals import ApprovalStore
 from harness.backends.codex_cli import CodexRunResult
 from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
 from harness.config import default_config
-from harness.models import BackendStatus, BillingMode, DataBoundary, EventStreamType, ExecutionLocation
-from harness.cli.main import app
+from harness.models import BackendStatus, BillingMode, DataBoundary, EventStreamType, ExecutionLocation, SessionStatus
+from harness.cli.main import SUPPORTED_EXECUTION_TASK_METADATA, app
 from harness.memory.sqlite_store import SQLiteStore
+from harness.operator_context import build_session_pane_projection
 from harness.tui import (
     THEME_DIALOG_ENTRIES,
     activate_command_palette_entry,
@@ -43,9 +44,11 @@ from harness.tui import (
     render_functionality_table_dialog,
     render_palette_status,
     render_right_panel,
+    render_right_panel_detail,
     render_right_panel_status,
     render_slash_command_suggestions,
     render_view_status,
+    _render_session_rail,
 )
 from harness.command_catalog import build_command_catalog
 
@@ -479,7 +482,13 @@ def test_chat_model_path_emits_codex_like_progress_for_arbitrary_prompt(tmp_path
     assert contents[:3] == ["Turn started", "Ran intent routing", "- intent: unsupported"]
     assert "Explored" in contents
     assert any(item.startswith("- Project:") for item in contents)
-    assert any(item.startswith("- Context blocks:") for item in contents)
+    assert any(item.startswith("- Context:") for item in contents)
+    assert any(item.startswith("- Sources:") for item in contents)
+    assert any(item.startswith("- Budget:") for item in contents)
+    assert "context_summary" in response["context_manifest"]
+    assert response["context_manifest"]["context_summary"]["selected_block_count"] == len(
+        response["context_manifest"]["blocks"]
+    )
     assert "Ran model turn" in contents
     assert "model answer" in contents
     assert response["lines"] == ["model answer"]
@@ -860,11 +869,11 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "Transcript:" in rendered
     assert "Inspect the active session" in rendered
     right_panel = render_right_panel(build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard"))
-    assert "Timeline:" in right_panel
-    assert "Transcript: user " in right_panel
-    assert "Known model: False" in right_panel
-    assert "Model executable: False" in right_panel
-    assert "Model blocked: provider_unknown, model_unknown" in right_panel
+    assert "Latest:" in right_panel
+    assert "Last message: user " in right_panel
+    assert "Known:" not in right_panel
+    assert "Executable:" not in right_panel
+    assert "Blocked: provider unknown, model unknown" in right_panel
     assert "Fallback: explicit failure only" in right_panel
     assert "harness daemon status --project" in rendered
     serialized = json.dumps(dashboard)
@@ -1119,7 +1128,7 @@ def test_tui_opencode_leader_key_lists_models_without_palette_focus(tmp_path) ->
             await pilot.press("ctrl+x")
             await pilot.pause()
             assert app.leader_key_active is True
-            assert "Leader: m Models." in str(slash_status.content)
+            assert "Leader: m Models, s Sessions." in str(slash_status.content)
             assert app._focus_mode == "dashboard"
             assert "Commands" in str(dialog.content)
             assert "Suggested" in str(dialog.content)
@@ -1204,16 +1213,14 @@ def test_tui_command_table_search_activates_safe_ui_function(tmp_path) -> None:
             prompt = app.query_one("#prompt", TextArea)
             dialog = app.query_one("#dialog-panel", Static)
 
-            await pilot.press("ctrl+x")
+            await pilot.press("ctrl+p")
             for char in "settings":
                 await pilot.press(char)
             await pilot.pause()
 
             assert app.leader_key_active is False
-            assert app._dialog_kind == "commands"
-            assert app._dialog_query == "settings"
-            assert "settings" in str(dialog.content)
-            assert "ui-only" in str(dialog.content)
+            assert app._focus_mode == "palette"
+            assert prompt.value == "settings"
 
             await pilot.press("enter")
             await pilot.pause()
@@ -1288,11 +1295,12 @@ def test_tui_theme_switching_is_safe_ui_only(tmp_path) -> None:
             assert app.has_class("-dark-mode") is False
             assert app._latest_palette_activation["entry_id"] == "ui_controls.theme_light"
 
-            await pilot.press("ctrl+x")
+            await pilot.press("ctrl+p")
             for char in "switch theme":
                 await pilot.press(char)
             await pilot.pause()
-            assert "Switch theme" in str(dialog.content)
+            assert app._focus_mode == "palette"
+            assert prompt.value == "switch theme"
             await pilot.press("enter")
             await pilot.pause()
             assert app._dialog_kind == "themes"
@@ -1650,12 +1658,12 @@ def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
     toggle = activate_command_palette_entry(
         palette,
         "ui_controls.toggle_section",
-        {"active_section_index": 2, "collapsed_section_ids": set()},
+        {"active_section_index": 4, "collapsed_section_ids": set()},
     )
     expand = activate_command_palette_entry(
         palette,
         "ui_controls.expand_all",
-        {"active_section_index": 2, "collapsed_section_ids": {"queue_daemon"}},
+        {"active_section_index": 4, "collapsed_section_ids": {"queue_daemon"}},
     )
     clear = activate_command_palette_entry(
         palette,
@@ -1751,8 +1759,8 @@ def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
     assert missing["session_message_created"] is False
     assert toggle["ok"] is True
     assert toggle["evidence_status"] == "ui_section_toggle_in_memory"
-    assert toggle["view_state"]["active_section_id"] == "queue_daemon"
-    assert toggle["view_state"]["collapsed_section_ids"] == ["queue_daemon"]
+    assert toggle["view_state"]["active_section_id"] == "queue"
+    assert toggle["view_state"]["collapsed_section_ids"] == ["queue"]
     assert toggle["local_state_changes"]["changed_fields"] == ["active_section_id", "collapsed_section_ids"]
     assert toggle["local_state_changes"]["creates_message"] is False
     assert toggle["request_started"] is False
@@ -1779,7 +1787,8 @@ def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
     assert settings["ok"] is True
     assert settings["evidence_status"] == "ui_focus_in_memory"
     assert settings["view_state"]["focus_mode"] == "dashboard"
-    assert settings["view_state"]["active_section_id"] == "settings"
+    assert settings["view_state"]["active_section_id"] == "project"
+    assert settings["view_state"]["requested_section_id"] == "settings"
     assert select_build["ok"] is True
     assert select_build["evidence_status"] == "ui_agent_selected_in_memory"
     assert select_build["view_state"]["selected_agent_id"] == "build"
@@ -2003,32 +2012,33 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
 
     assert model["schema_version"] == "harness.tui_right_panel/v1"
     assert [section["id"] for section in model["sections"]] == [
-        "assistant",
         "action",
-        "project",
-        "sessions",
         "now",
+        "sessions",
+        "progress",
         "queue",
         "recent",
         "adapters",
-        "progress",
+        "project",
+        "assistant",
         "next",
     ]
-    assert model["active_section_id"] == "assistant"
+    assert model["active_section_id"] == "action"
+    assert model["active_signal"] == "setup_needed"
     assert model["summary"]["initialized"] is False
-    assert "Assistant" in rendered
+    assert "Action" in rendered
+    assert "State:" in rendered
+    assert "needs setup" in rendered
     assert "Model: codex_cli" in rendered
-    assert "Side effects: action contracts" in rendered
-    assert "No pending action." in rendered
+    assert "Safety: action contracts" in rendered
     assert "No sessions yet." in rendered
     assert "/init" in rendered
     assert "summarize this repo" in rendered
-    assert "State:" not in rendered
     assert "Panes:" not in rendered
     assert "IDs:" not in rendered
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" not in rendered
     assert "no_openai_api_usage" not in rendered
-    assert render_right_panel_status(model) == "Context | assistant | ready"
+    assert render_right_panel_status(model) == "Context | live | needs setup | 0 ready / 0 running / 0 blocked | ready"
     assert not (tmp_path / ".harness").exists()
 
 
@@ -2045,11 +2055,12 @@ def test_tui_right_panel_surfaces_repo_planning_adapter_and_guidance(tmp_path) -
     model = build_right_panel_model(dashboard, {"palette": palette}, "repo_planning", "dashboard")
     rendered = render_right_panel(model)
 
-    assert "repo_planning -> repo_planning" in rendered
-    assert "harness daemon run-once --project . --output json" in render_right_panel(
+    assert "Add repo planning task" in rendered
+    assert dashboard["live_activity"]["active_signal"] == "ready"
+    assert "Lease the next planning task" in render_right_panel(
         build_right_panel_model(dashboard, {"palette": palette}, "", "dashboard")
     )
-    assert "harness daemon execute <lease_id> --project . --output json" in render_right_panel(
+    assert "Dispatch the lease after review" in render_right_panel(
         build_right_panel_model(dashboard, {"palette": palette}, "", "dashboard")
     )
 
@@ -2062,7 +2073,8 @@ def test_tui_right_panel_surfaces_assistant_context_and_pending_action(tmp_path)
         dashboard,
         {
             "palette": palette,
-            "active_section_index": 1,
+            "active_section_id": "action",
+            "active_section_index": 0,
             "collapsed_section_ids": set(),
             "chat_mode": "normal",
             "pending_action_contract": {
@@ -2088,9 +2100,10 @@ def test_tui_right_panel_surfaces_assistant_context_and_pending_action(tmp_path)
     assert model["active_section_id"] == "action"
     assert "Tools: read_file" in rendered
     assert "Context: harness_state, repo_tree" in rendered
+    assert "State: needs confirmation" in rendered
     assert "Pending: Create Harness objective: improve chat" in rendered
-    assert "Tool: create_objective" in rendered
-    assert "Risk: control_plane_write" in rendered
+    assert "Tool: create objective" in rendered
+    assert "Risk: control plane write" in rendered
     assert "Confirm: yes or /confirm" in rendered
     assert not (tmp_path / ".harness").exists()
 
@@ -2103,7 +2116,8 @@ def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirma
         dashboard,
         {
             "palette": palette,
-            "active_section_index": 1,
+            "active_section_id": "action",
+            "active_section_index": 0,
             "collapsed_section_ids": set(),
             "chat_mode": "normal",
             "latest_response": {
@@ -2121,7 +2135,7 @@ def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirma
     assert model["active_section_id"] == "action"
     assert "Latest action" in rendered
     assert "Status: succeeded" in rendered
-    assert "Run: run_managed123" in rendered
+    assert "run_managed123" not in rendered
     assert "Report: final_report.md" in rendered
     assert "Confirm: yes or /confirm" not in rendered
     assert not (tmp_path / ".harness").exists()
@@ -2140,7 +2154,8 @@ def test_tui_right_panel_surfaces_latest_safe_ui_activation(tmp_path) -> None:
         dashboard,
         {
             "palette": palette,
-            "active_section_index": 1,
+            "active_section_id": "action",
+            "active_section_index": 0,
             "collapsed_section_ids": set(),
             "latest_palette_activation": activation,
         },
@@ -2150,15 +2165,11 @@ def test_tui_right_panel_surfaces_latest_safe_ui_activation(tmp_path) -> None:
     rendered = render_right_panel(model)
 
     assert model["active_section_id"] == "action"
-    assert "Latest UI action" in rendered
-    assert "Entry: ui_controls.settings" in rendered
+    assert "State: UI updated" in rendered
+    assert "Action: UI Controls Settings" in rendered
     assert "Status: succeeded" in rendered
-    assert "Kind: ui_action" in rendered
-    assert "Action: focus_section" in rendered
-    assert "Command started: False" in rendered
-    assert "Process started: False" in rendered
-    assert "Filesystem modified: False" in rendered
-    assert "Permission granting: False" in rendered
+    assert "Kind: focus section" in rendered
+    assert "Flags:" not in rendered
     assert not (tmp_path / ".harness").exists()
 
 
@@ -2189,7 +2200,7 @@ def test_tui_right_panel_sessions_surface_latest_persisted_ui_activation(tmp_pat
 
     model = build_right_panel_model(
         dashboard,
-        {"palette": palette, "active_section_index": 3, "collapsed_section_ids": set()},
+        {"palette": palette, "active_section_id": "sessions", "active_section_index": 2, "collapsed_section_ids": set()},
         "",
         "dashboard",
     )
@@ -2197,8 +2208,8 @@ def test_tui_right_panel_sessions_surface_latest_persisted_ui_activation(tmp_pat
 
     assert model["active_section_id"] == "sessions"
     assert dashboard["active_session"]["latest_ui_activation"]["entry_id"] == "ui_controls.settings"
-    assert "UI action: ui_controls.settings action=focus_section" in rendered
-    assert "UI flags: cmd=False proc=False fs=False perm=False" in rendered
+    assert "UI: UI Controls Settings" in rendered
+    assert "UI flags:" not in rendered
 
 
 def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
@@ -2218,7 +2229,170 @@ def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in render_right_panel(palette_focus)
     assert render_right_panel_status(palette_focus).startswith("Context | palette | 1 commands")
     assert missing["empty_state"]["message"] == "No matches. Try /help, tasks, runs, adapters."
-    assert render_right_panel(missing) == "No matches. Try /help, tasks, runs, adapters."
+    assert "No matches. Try /help, tasks, runs, adapters." in render_right_panel(missing)
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_tui_right_panel_attention_prioritizes_pending_permission_over_ready_work(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Permission session")
+    store.create_task(
+        title="Ready task",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    permission = store.request_session_permission(
+        session.id,
+        tool_id="shell",
+        normalized_action="run",
+        normalized_target_pattern="pytest tests",
+        boundary_kind="shell",
+        risk="high",
+    )
+
+    dashboard = build_tui_dashboard(tmp_path, selected_session_id=session.id)
+    model = build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard")
+    rendered = render_right_panel(model)
+
+    assert dashboard["live_activity"]["active_signal"] == "approval_required"
+    assert dashboard["live_activity"]["pending_permissions"][0]["id"] == permission.id
+    assert dashboard["live_activity"]["counts"]["ready"] == 1
+    assert model["active_signal"] == "approval_required"
+    assert "State: approval needed" in rendered
+    assert "Permission: shell run" in rendered
+    assert "Target: pytest tests" in rendered
+    assert "Ready: 1" not in rendered.split("[bold steel_blue1]  Now[/bold steel_blue1]", 1)[0]
+    assert dashboard["live_activity"]["policy_boundary"]["process_started"] is False
+    assert dashboard["live_activity"]["policy_boundary"]["filesystem_modified"] is False
+    assert dashboard["live_activity"]["policy_boundary"]["permission_granting"] is False
+
+
+def test_tui_right_panel_attention_surfaces_active_lease_before_idle(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Lease this",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    leased = store.select_next_task_for_lease("test-owner")
+    lease = leased["lease"]
+
+    dashboard = build_tui_dashboard(tmp_path)
+    model = build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard")
+    rendered = render_right_panel(model)
+
+    assert task.id == lease.task_id
+    assert dashboard["live_activity"]["active_signal"] == "running"
+    assert model["active_signal"] == "running"
+    assert "State: running" in rendered
+    assert "Work: Lease this" in rendered
+    assert lease.id not in rendered
+    assert task.id not in rendered
+
+
+def test_tui_right_panel_blocked_progress_shows_stable_code_and_inspect_command(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    objective = store.create_objective("Blocked objective")
+    task = store.create_task(
+        title="Bad adapter",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "missing_adapter", "task_type": "unknown"},
+    )
+
+    dashboard = build_tui_dashboard(tmp_path)
+    model = build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard")
+    rendered = render_right_panel(model)
+
+    assert dashboard["live_activity"]["active_signal"] == "blocked"
+    assert model["active_signal"] == "blocked"
+    assert "Blocker: unknown_adapter" in rendered
+    assert "Work: Bad adapter" in rendered
+    assert task.id not in rendered
+    assert "inspect progress details" in rendered
+
+
+def test_tui_live_activity_projection_selected_session_todos_events_artifacts_and_escape(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="[bold]x[/bold]", agent_id="plan")
+    message = store.append_session_message(session.id, "user", "inspect selected live state")
+    store.append_session_part(session.id, message.id, "text", text="inspect selected live state")
+    todo = store.append_session_todo(session.id, "[bold]todo[/bold]", status="in_progress", priority=3)
+    permission = store.request_session_permission(
+        session.id,
+        tool_id="read",
+        normalized_action="open",
+        normalized_target_pattern="[bold]file[/bold]",
+        boundary_kind="local_only",
+        risk="medium",
+    )
+    run = store.create_run("artifact run", "phase_1a_test", session_id=session.id)
+    artifact_path = tmp_path / "result.txt"
+    artifact_path.write_text("artifact summary", encoding="utf-8")
+    artifact = store.register_artifact(run.id, "summary", artifact_path, session_id=session.id)
+    other = store.create_session(title="Most recent")
+
+    dashboard = build_tui_dashboard(tmp_path, selected_session_id=session.id)
+    model = build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard")
+    rendered = render_right_panel(model)
+    detail = render_right_panel_detail(model, "sessions")
+
+    assert other.id != session.id
+    assert dashboard["active_session"]["id"] == session.id
+    assert dashboard["model_catalog"]["active_model"]["session_id"] == session.id
+    assert dashboard["live_activity"]["schema_version"] == "harness.tui_live_activity/v1"
+    assert dashboard["live_activity"]["pending_permissions"][0]["id"] == permission.id
+    assert dashboard["live_activity"]["open_todos"][0]["id"] == todo.id
+    assert any(event["kind"] == "todo.updated" for event in dashboard["live_activity"]["latest_events"])
+    assert dashboard["live_activity"]["recent_artifacts"][0]["id"] == artifact.id
+    assert dashboard["live_activity"]["counts"]["pending_permissions"] == 1
+    assert dashboard["live_activity"]["counts"]["open_todos"] == 1
+    assert dashboard["live_activity"]["counts"]["recent_artifacts"] == 1
+    assert "Active: \\[bold]x\\[/bold]" in rendered
+    assert "Target: \\[bold]file\\[/bold]" in rendered
+    assert "[bold]x[/bold]" not in detail.split("Active:", 1)[-1].splitlines()[0]
+    boundary = dashboard["live_activity"]["policy_boundary"]
+    assert boundary["process_started"] is False
+    assert boundary["filesystem_modified"] is False
+    assert boundary["provider_execution_started"] is False
+    assert boundary["model_execution_started"] is False
+    assert boundary["shell_started"] is False
+    assert boundary["docker_started"] is False
+    assert boundary["permission_granting"] is False
+    assert "No command, provider, shell, Docker, adapter, filesystem, or permission action is started" in detail
+
+
+def test_tui_right_panel_active_section_id_collapse_and_detail_are_ui_only(tmp_path) -> None:
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette()
+    settings = activate_command_palette_entry(
+        palette,
+        "ui_controls.settings",
+        {"focus_mode": "palette", "active_section_index": 0, "collapsed_section_ids": set()},
+    )
+    focused = build_right_panel_model(dashboard, {**settings["view_state"], "palette": palette}, "", "dashboard")
+    collapsed = build_right_panel_model(
+        dashboard,
+        {"palette": palette, "active_section_id": "queue", "collapsed_section_ids": {"queue_daemon"}},
+        "",
+        "dashboard",
+    )
+    detail = render_right_panel_detail(focused)
+
+    assert settings["view_state"]["active_section_id"] == "project"
+    assert settings["view_state"]["requested_section_id"] == "settings"
+    assert focused["active_section_id"] == "project"
+    queue = next(section for section in collapsed["sections"] if section["id"] == "queue")
+    assert queue["collapsed"] is True
+    assert collapsed["collapsed_section_ids"] == ["queue"]
+    assert "Project detail" in detail
+    assert "Read-only persisted Harness projection" in detail
+    assert "process=False" in detail
+    assert settings["process_started"] is False
+    assert settings["filesystem_modified"] is False
+    assert settings["permission_granting"] is False
+    assert settings["authority_granting"] is False
     assert not (tmp_path / ".harness").exists()
 
 
@@ -2430,7 +2604,7 @@ def test_tui_palette_enter_activates_safe_actions_without_chat_or_process(tmp_pa
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
-            assert app._section_cursor_index == 1
+            assert app._section_cursor_index == 2
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2459,7 +2633,7 @@ def test_tui_palette_enter_activates_safe_actions_without_chat_or_process(tmp_pa
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "palette"
-            assert app._section_cursor_index == 1
+            assert app._section_cursor_index == 2
             assert prompt.value == "execute-read-only"
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2536,7 +2710,7 @@ def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkey
         async with app.run_test(size=(120, 44)) as pilot:
             prompt = app.query_one("#prompt", TextArea)
             composer_status = app.query_one("#composer-status", Static)
-            session_rail = app.query_one("#session-rail-content", Static)
+            session_detail = app.query_one("#session-pane-detail", Static)
 
             assert "Models: /models or ctrl+x m" in str(composer_status.content)
             assert "Select: /model <number|name>" in str(composer_status.content)
@@ -2545,8 +2719,8 @@ def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkey
             assert "Current model: codex_cli/gpt-5.5" in str(composer_status.content)
             assert "Attachments: 1" in str(composer_status.content)
             assert "Context est:" in str(composer_status.content)
-            assert "Composer session" in str(session_rail.content)
-            assert 'Continue: harness "..." --continue' in str(session_rail.content)
+            assert "Composer session" in str(session_detail.content)
+            assert session.id not in str(session_detail.content)
 
             for char in "first line":
                 await pilot.press(char)
@@ -2573,6 +2747,36 @@ def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkey
     asyncio.run(run_pilot())
 
 
+def test_tui_composer_ctrl_m_enter_alias_submits_chat(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    seen_requests: list[str] = []
+
+    def fake_handle_chat_input(request, project_root, chat_state, progress_callback=None):
+        seen_requests.append(request)
+        return {"ok": True, "kind": "fake", "title": "Assistant", "lines": ["done"]}
+
+    monkeypatch.setattr("harness.chat.handle_chat_input", fake_handle_chat_input)
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+
+            for char in "hello":
+                await pilot.press(char)
+            await pilot.press("ctrl+m")
+            await pilot.pause(0.5)
+
+            assert seen_requests == ["hello"]
+            assert app._prompt_history == ["hello"]
+            assert prompt.value == ""
+            assert app._request_in_flight is False
+
+    asyncio.run(run_pilot())
+
+
 def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
     pytest.importorskip("textual")
     from textual.widgets import TextArea
@@ -2583,14 +2787,15 @@ def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
             prompt = app.query_one("#prompt", TextArea)
             initial_messages = len(app._messages)
 
-            app._section_cursor_index = 2
+            app._active_section_id = "queue"
+            app._section_cursor_index = 4
             await pilot.press("ctrl+p")
             await pilot.press("t", "o", "g", "g", "l", "e", "-", "s", "e", "c", "t", "i", "o", "n")
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "palette"
-            assert app._collapsed_section_ids == {"queue_daemon"}
+            assert app._collapsed_section_ids == {"queue"}
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2643,7 +2848,7 @@ def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
-            assert app._section_cursor_index == 5
+            assert app._section_cursor_index == 7
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2681,7 +2886,7 @@ def test_tui_settings_slash_command_routes_to_safe_ui_action(tmp_path) -> None:
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
-            assert app._section_cursor_index == 5
+            assert app._section_cursor_index == 7
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2715,6 +2920,211 @@ def test_tui_settings_slash_command_routes_to_safe_ui_action(tmp_path) -> None:
     asyncio.run(run_pilot())
 
 
+def test_tui_session_rail_uses_topic_titles_and_in_memory_navigation(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import ListView, Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    first = store.create_session(title="Harness chat", agent_id="plan")
+    first_message = store.append_session_message(first.id, "user", "make the session rail easier to navigate")
+    store.append_session_part(first.id, first_message.id, "text", text="make the session rail easier to navigate")
+    second = store.create_session(title="Harness chat", agent_id="build")
+    second_message = store.append_session_message(second.id, "user", "summarize local model selection work")
+    store.append_session_part(second.id, second_message.id, "text", text="summarize local model selection work")
+
+    dashboard = build_tui_dashboard(tmp_path)
+    rail = _render_session_rail(dashboard, selected_index=1)
+
+    assert dashboard["recent_sessions"][0]["display_title"] == "Summarize local model selection work"
+    assert dashboard["recent_sessions"][1]["display_title"] == "Make the session rail easier to navigate"
+    assert "Summarize local model select" in rail
+    assert "Make the session rail easier" in rail
+    assert f" {first.id} " not in rail
+    assert "Selected: Make the session rail easier to navigate" in rail
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(120, 44)) as pilot:
+            session_detail = app.query_one("#session-pane-detail", Static)
+            session_list = app.query_one("#session-list", ListView)
+            prompt = app.query_one("#prompt", TextArea)
+            assert "Summarize local model selection work" in str(session_detail.content)
+            assert second.id not in str(session_detail.content)
+
+            app.action_session_next()
+            await pilot.pause()
+            assert app._chat_state.session_id == first.id
+            assert "Make the session rail easier to navigate" in str(session_detail.content)
+            assert first.id not in str(session_detail.content)
+
+            app.action_session_previous()
+            await pilot.pause()
+            assert app._chat_state.session_id == second.id
+            assert "Summarize local model selection work" in str(session_detail.content)
+            assert second.id not in str(session_detail.content)
+
+            await pilot.press("ctrl+right")
+            await pilot.pause()
+            assert app._chat_state.session_id == first.id
+            assert "Make the session rail easier to navigate" in str(session_detail.content)
+            assert first.id not in str(session_detail.content)
+
+            await pilot.press("ctrl+x", "s")
+            await pilot.pause()
+            assert app._left_pane_focused is True
+            assert session_list.has_focus
+
+            await pilot.press("/")
+            for char in "summarize":
+                await pilot.press(char)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._session_query == "summarize"
+            assert app._selected_session_id == second.id
+
+            await pilot.press("n")
+            await pilot.pause()
+            assert app._chat_state.session_id is not None
+            created_session_id = app._chat_state.session_id
+            assert store.get_session(created_session_id).title == "New session"
+
+            await pilot.press("e")
+            for char in "renamed session":
+                await pilot.press(char)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert store.get_session(created_session_id).title == "renamed session"
+
+            await pilot.press("g", "down", "enter")
+            await pilot.pause()
+            assert store.get_session(created_session_id).agent_id == "plan"
+
+            app.action_fork_selected_session()
+            await pilot.pause()
+            forked_session_id = app._selected_session_id
+            assert store.get_session(forked_session_id).parent_session_id == created_session_id
+            app._selected_session_id = created_session_id
+            app._chat_state.session_id = created_session_id
+            app._render_current_view()
+            await pilot.pause()
+
+            await pilot.press("a")
+            await pilot.pause()
+            assert store.get_session(created_session_id).status.value == "archived"
+
+            app._session_filter = "archived"
+            app._selected_session_id = created_session_id
+            app._render_current_view()
+            await pilot.pause()
+            await pilot.press("r")
+            await pilot.pause()
+            assert store.get_session(created_session_id).status.value == "active"
+
+            await pilot.press("d")
+            await pilot.pause()
+            assert app._dialog_kind == "session_delete"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._dialog_visible is False
+            assert store.get_session(app._selected_session_id).status.value == "active"
+
+            purged_session_id = app._selected_session_id
+            await pilot.press("d")
+            for char in "DELETE":
+                await pilot.press(char)
+            await pilot.press("enter")
+            await pilot.pause()
+            try:
+                store.get_session(purged_session_id)
+            except KeyError:
+                pass
+            else:
+                raise AssertionError("confirmed hard delete should purge the selected session")
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_session_pane_projection_filters_and_counts(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    active = store.create_session(title="Harness chat", agent_id="plan")
+    active_message = store.append_session_message(active.id, "user", "inspect dynamic session pane")
+    store.append_session_part(active.id, active_message.id, "text", text="inspect dynamic session pane")
+    running = store.create_session(title="Run session", status=SessionStatus.RUNNING)
+    waiting = store.create_session(title="Wait session", status=SessionStatus.WAITING_APPROVAL)
+    archived = store.archive_session(store.create_session(title="Archived session").id)
+
+    projection = build_session_pane_projection(tmp_path, selected_session_id=active.id, status_filter="open", query="dynamic")
+    running_projection = build_session_pane_projection(tmp_path, status_filter="running")
+    archived_projection = build_session_pane_projection(tmp_path, status_filter="archived")
+
+    assert projection["schema_version"] == "harness.session_pane/v1"
+    assert projection["counts"]["total"] == 4
+    assert projection["counts"]["open"] == 3
+    assert projection["counts"]["running"] == 2
+    assert projection["counts"]["waiting_approval"] == 1
+    assert projection["counts"]["archived"] == 1
+    assert projection["counts"]["filtered"] == 1
+    assert projection["sessions"][0]["id"] == active.id
+    assert projection["sessions"][0]["display_title"] == "Inspect dynamic session pane"
+    assert projection["sessions"][0]["message_count"] == 1
+    assert projection["sessions"][0]["can_archive"] is True
+    assert {session["id"] for session in running_projection["sessions"]} == {running.id, waiting.id}
+    assert all(session["can_abort"] is True for session in running_projection["sessions"])
+    assert archived_projection["sessions"][0]["id"] == archived.id
+    assert archived_projection["sessions"][0]["can_restore"] is True
+
+
+def test_cli_sessions_restore_and_purge_session_only(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="CLI purge")
+    message = store.append_session_message(session.id, "user", "delete this")
+    store.append_session_part(session.id, message.id, "text", text="delete this")
+    run = store.create_run("cli linked run", "test", session_id=session.id)
+    task = store.create_task("cli linked task", session_id=session.id)
+
+    archived = runner.invoke(app, ["sessions", "delete", session.id, "--project", str(tmp_path), "--output", "json"])
+    restored = runner.invoke(app, ["sessions", "restore", session.id, "--project", str(tmp_path), "--output", "json"])
+    blocked = runner.invoke(app, ["sessions", "purge", session.id, "--project", str(tmp_path), "--output", "json"])
+    assert archived.exit_code == 0, archived.output
+    assert json.loads(archived.output)["behavior"] == "archive"
+    assert restored.exit_code == 0, restored.output
+    assert json.loads(restored.output)["session"]["status"] == "active"
+    assert blocked.exit_code == 1
+    assert json.loads(blocked.output)["hard_deleted"] is False
+    assert store.get_session(session.id).status == SessionStatus.ACTIVE
+
+    purged = runner.invoke(
+        app,
+        [
+            "sessions",
+            "purge",
+            session.id,
+            "--confirm",
+            session.id,
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert purged.exit_code == 0, purged.output
+    purge_payload = json.loads(purged.output)
+    assert purge_payload["hard_deleted"] is True
+    assert purge_payload["deletion_counts"]["session_rows"] == 1
+    assert store.get_run(run.id).session_id is None
+    assert store.get_task(task.id).session_id is None
+    try:
+        store.get_session(session.id)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("purged session should not remain")
+
+
 def test_tui_safe_slash_activation_persists_session_event_when_active(tmp_path) -> None:
     pytest.importorskip("textual")
     from textual.widgets import TextArea
@@ -2734,7 +3144,7 @@ def test_tui_safe_slash_activation_persists_session_event_when_active(tmp_path) 
             await pilot.press("enter")
             await pilot.pause()
 
-            assert app._section_cursor_index == 5
+            assert app._section_cursor_index == 7
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2782,10 +3192,10 @@ def test_tui_safe_slash_commands_focus_dashboard_sections_without_chat(tmp_path)
             initial_messages = len(app._messages)
 
             for slash, section_index, entry_id in [
-                ("/home", 0, "orientation.home"),
-                ("/sessions", 1, "sessions.list"),
-                ("/tasks", 2, "objectives_tasks.list_tasks"),
-                ("/runs", 4, "runtime_evidence.runs"),
+                ("/home", 7, "orientation.home"),
+                ("/sessions", 2, "sessions.list"),
+                ("/tasks", 4, "objectives_tasks.list_tasks"),
+                ("/runs", 5, "runtime_evidence.runs"),
             ]:
                 prompt.value = ""
                 await pilot.press(*list(slash))
@@ -2902,10 +3312,11 @@ def test_tui_safe_ui_control_slash_commands_mutate_only_local_state(tmp_path) ->
 
             await pilot.press("/", "t", "o", "g", "g", "l", "e", "-", "s", "e", "c", "t", "i", "o", "n")
             await pilot.pause()
-            app._section_cursor_index = 2
+            app._active_section_id = "queue"
+            app._section_cursor_index = 4
             await pilot.press("enter")
             await pilot.pause()
-            assert app._collapsed_section_ids == {"queue_daemon"}
+            assert app._collapsed_section_ids == {"queue"}
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert_safe_ui_control("/toggle-section", "ui_controls.toggle_section", ["active_section_id", "collapsed_section_ids"])
@@ -7506,8 +7917,43 @@ def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) 
     assert payload["errors"] == [
         "Unsupported execution metadata: supported pairs are "
         "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
-        "codex_isolated_edit/codex_code_edit, and repo_planning/repo_planning"
+        "codex_isolated_edit/codex_code_edit, repo_planning/repo_planning, "
+        "session_read_tools/session_plan, session_read_tools/session_read_only_research, "
+        "and session_read_tools/session_operator"
     ]
+
+
+@pytest.mark.parametrize(("execution_adapter", "task_type"), SUPPORTED_EXECUTION_TASK_METADATA)
+def test_cli_tasks_add_accepts_supported_execution_adapter_metadata(
+    tmp_path,
+    execution_adapter: str,
+    task_type: str,
+) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            f"Supported {execution_adapter} {task_type}",
+            "--execution-adapter",
+            execution_adapter,
+            "--task-type",
+            task_type,
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert payload["task"]["metadata"]["execution_adapter"] == execution_adapter
+    assert payload["task"]["metadata"]["task_type"] == task_type
 
 
 def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:
@@ -7685,6 +8131,51 @@ def test_cli_doctor_supports_json_output_without_sensitive_backend_settings(tmp_
     assert "base_url" not in serialized
     assert "api_key" not in serialized
     assert "api_key_env" not in serialized
+
+
+def test_cli_doctor_reports_unwritable_artifact_directory(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    class FakeCodexBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    class FakeLocalBackend:
+        def __init__(self, config):
+            self.config = config
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=self.config.capabilities,
+            )
+
+    monkeypatch.setattr("harness.cli.main.CodexCliBackend", FakeCodexBackend)
+    monkeypatch.setattr("harness.cli.main.LocalOpenAICompatibleBackend", FakeLocalBackend)
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+    runs_dir = tmp_path / ".harness" / "runs"
+    runs_dir.chmod(0o500)
+    try:
+        result = runner.invoke(app, ["doctor", "--project", str(tmp_path), "--output", "json"])
+    finally:
+        runs_dir.chmod(0o700)
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    check = next(item for item in payload["checks"] if item["id"] == "artifact_directory")
+    assert check["status"] == "fail"
+    assert check["message"] == "Harness artifact directory is not writable."
+    assert check["details"]["issues"][0]["path"] == str(runs_dir)
+    assert check["details"]["issues"][0]["error"] == "not_writable"
+    assert "Traceback" not in result.output
 
 
 def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, monkeypatch) -> None:

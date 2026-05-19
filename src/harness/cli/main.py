@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -110,7 +112,13 @@ from harness.local_server import (
     generate_server_token,
     serve_local_http,
 )
-from harness.memory.sqlite_store import SQLiteStore
+from harness.memory.sqlite_store import (
+    REQUIRED_SESSION_SCHEMA_TABLES,
+    SCHEMA_MIGRATIONS,
+    SESSION_SCHEMA_REPAIR_MESSAGE,
+    SQLiteStore,
+    is_missing_session_schema_error,
+)
 from harness.model_catalog import catalog_projection_evidence, list_model_catalog, list_provider_catalog, validate_model_selection
 from harness.models import (
     EventStreamType,
@@ -162,6 +170,7 @@ from harness.session_timeline import (
 )
 from harness.session_replay import build_session_replay_projection
 from harness.session_share import build_local_session_share_snapshot, hosted_share_unsupported
+from harness.session_cwd import CwdResolutionError, CwdResolver, cwd_recovery_message, session_cwd_from_metadata
 from harness.session_tools import default_session_tool_descriptors, execute_session_tool, get_session_tool_descriptor
 from harness.spec_loader import (
     SpecBundleError,
@@ -482,8 +491,7 @@ def chat(
         return
     autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
     if (project_root / HARNESS_DIR / "harness.sqlite").exists():
-        store = SQLiteStore(project_root)
-        store.initialize()
+        store = SQLiteStore.open_initialized(project_root)
         session = store.create_session(metadata={"entrypoint": "chat"})
         append_session_event(
             project_root,
@@ -528,11 +536,35 @@ def context_inspect(
     if output == OutputFormat.JSON:
         _emit_json(payload)
         return
-    typer.echo(f"Context blocks: {len(payload['blocks'])}")
-    typer.echo(f"Roles: {payload.get('role_summary')}")
-    typer.echo(f"Budget: {payload.get('budget_report', {}).get('used_input_tokens')} tokens used")
-    if payload.get("warnings"):
-        typer.echo(f"Warnings: {', '.join(payload['warnings'])}")
+    summary = payload.get("context_summary", {})
+    role_counts = summary.get("role_counts") or payload.get("role_summary") or {}
+    selected_count = int(summary.get("selected_block_count") or len(payload["blocks"]))
+    role_parts = [f"{int(role_counts.get(role) or 0)} {role}" for role in ("pinned", "retrieved", "derived") if int(role_counts.get(role) or 0)]
+    context_line = f"Context: {selected_count} selected {'block' if selected_count == 1 else 'blocks'}"
+    if role_parts:
+        context_line += ", " + ", ".join(role_parts)
+    typer.echo(context_line)
+    if summary.get("source_categories"):
+        typer.echo(f"Sources: {', '.join(summary['source_categories'])}")
+    token_budget = summary.get("token_budget") or payload.get("budget_report", {})
+    if token_budget.get("used_input_tokens") is not None and token_budget.get("max_input_tokens") is not None:
+        typer.echo(f"Budget: {int(token_budget['used_input_tokens']):,} / {int(token_budget['max_input_tokens']):,} tokens")
+    if summary.get("retriever") or summary.get("selected_chunk_count"):
+        typer.echo(f"Retrieval: {summary.get('retriever') or 'none'}, {int(summary.get('selected_chunk_count') or 0)} selected chunks")
+    if summary.get("blocked_path_count"):
+        typer.echo(f"Blocked paths: {summary['blocked_path_count']}")
+    warnings = summary.get("warning_codes") or payload.get("warnings") or []
+    if warnings:
+        typer.echo(f"Warnings: {', '.join(warnings)}")
+    selected_sources = list(summary.get("selected_sources") or [])
+    if selected_sources:
+        typer.echo("Selected sources:")
+        for item in selected_sources[:12]:
+            status = ",".join(item.get("status") or []) or "selected"
+            typer.echo(
+                f"- {item.get('kind')} {item.get('source')} "
+                f"role={item.get('role')} tokens={item.get('token_estimate')} status={status}"
+            )
 
 
 @context_app.command("estimate")
@@ -975,9 +1007,13 @@ def doctor(
         bool,
         typer.Option("--release", help="Run release-readiness checks without backend/provider preflight."),
     ] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair", help="Run SQLite migrations and additive schema repair before checking state."),
+    ] = False,
 ) -> None:
     project_root = resolve_project_root(project)
-    result = _doctor_result(project_root, release=release)
+    result = _doctor_result(project_root, release=release, repair=repair)
     if output == OutputFormat.JSON:
         _emit_json(result)
     else:
@@ -2412,6 +2448,27 @@ def sessions_archive(
     typer.echo(f"Archived session {session.id}.")
 
 
+@sessions_app.command("restore")
+def sessions_restore(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.restore_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {"schema_version": "harness.session_restore/v1", "ok": True, "session": session.model_dump(mode="json")}
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Restored session {session.id}.")
+
+
 @sessions_app.command("delete")
 def sessions_delete(
     session_id: str,
@@ -2436,7 +2493,56 @@ def sessions_delete(
     if output == OutputFormat.JSON:
         _emit_json(payload)
         return
-    typer.echo(f"Archived session {session.id}. Hard purge is not implemented for audit evidence.")
+    typer.echo(f"Archived session {session.id}. Use `harness sessions purge {session.id} --confirm {session.id}` for session-only hard delete.")
+
+
+@sessions_app.command("purge")
+def sessions_purge(
+    session_id: str,
+    confirm: Annotated[str | None, typer.Option("--confirm", help="Required exact session id confirmation.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    if confirm != session_id:
+        payload = {
+            "schema_version": "harness.session_purge/v1",
+            "ok": False,
+            "hard_deleted": False,
+            "error": "Hard delete requires --confirm <session_id>.",
+            "session_id": session_id,
+            "process_started": False,
+            "permission_granting": False,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(payload["error"])
+        raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    try:
+        counts = store.hard_delete_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.session_purge/v1",
+        "ok": True,
+        "hard_deleted": True,
+        "session_id": session_id,
+        "behavior": "session_only_hard_delete",
+        "deletion_counts": counts,
+        "runs_deleted": 0,
+        "tasks_deleted": 0,
+        "artifacts_deleted": 0,
+        "process_started": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Hard deleted session {session_id}. Linked runs, tasks, and artifacts were retained.")
 
 
 @sessions_app.command("fork")
@@ -2939,9 +3045,22 @@ def sessions_tool(
         arguments = json.loads(input_json)
         if not isinstance(arguments, dict):
             raise ValueError("--input-json must decode to a JSON object.")
-        result = execute_session_tool(SQLiteStore(project_root), project_root, session_id, tool_id, arguments)
+        result = execute_session_tool(
+            SQLiteStore.open_initialized(project_root),
+            project_root,
+            session_id,
+            tool_id,
+            arguments,
+        )
+    except CwdResolutionError as exc:
+        _emit_session_error(cwd_recovery_message(exc), output)
+        raise typer.Exit(code=1) from exc
     except (KeyError, ValueError, json.JSONDecodeError) as exc:
         _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    except sqlite3.Error as exc:
+        message = SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)
+        _emit_session_error(message, output)
         raise typer.Exit(code=1) from exc
     payload = {
         "schema_version": "harness.session_tool_execution/v1",
@@ -7752,20 +7871,31 @@ def _resolve_memory_scope_id(
     raise ValueError(f"Unsupported memory scope: {scope.value}")
 
 
+SUPPORTED_EXECUTION_TASK_METADATA: tuple[tuple[str, str], ...] = (
+    ("dry_run", "phase_1a_test"),
+    ("read_only_summary", "read_only_repo_summary"),
+    ("codex_isolated_edit", "codex_code_edit"),
+    ("repo_planning", "repo_planning"),
+    ("session_read_tools", "session_plan"),
+    ("session_read_tools", "session_read_only_research"),
+    ("session_read_tools", "session_operator"),
+)
+
+
+def _supported_execution_task_metadata_message() -> str:
+    pairs = [f"{execution_adapter}/{task_type}" for execution_adapter, task_type in SUPPORTED_EXECUTION_TASK_METADATA]
+    if len(pairs) == 1:
+        return pairs[0]
+    return f"{', '.join(pairs[:-1])}, and {pairs[-1]}"
+
+
 def _execution_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:
     if execution_adapter is None and task_type is None:
         return {}
-    supported = {
-        ("dry_run", "phase_1a_test"),
-        ("read_only_summary", "read_only_repo_summary"),
-        ("codex_isolated_edit", "codex_code_edit"),
-        ("repo_planning", "repo_planning"),
-    }
-    if (execution_adapter, task_type) not in supported:
+    if (execution_adapter, task_type) not in SUPPORTED_EXECUTION_TASK_METADATA:
         raise ValueError(
             "Unsupported execution metadata: supported pairs are "
-            "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
-            "codex_isolated_edit/codex_code_edit, and repo_planning/repo_planning"
+            f"{_supported_execution_task_metadata_message()}"
         )
     return {"execution_adapter": execution_adapter or "", "task_type": task_type or ""}
 
@@ -8368,7 +8498,7 @@ def _quickstart_agent_result(project_root: Path) -> dict:
     }
 
 
-def _doctor_result(project_root: Path, *, release: bool = False) -> dict:
+def _doctor_result(project_root: Path, *, release: bool = False, repair: bool = False) -> dict:
     checks: list[dict] = []
     harness_dir = project_root / HARNESS_DIR
     config = None
@@ -8380,6 +8510,14 @@ def _doctor_result(project_root: Path, *, release: bool = False) -> dict:
         "Harness SQLite state exists." if (harness_dir / "harness.sqlite").exists() else "Project is not initialized.",
         {"path": str(harness_dir / "harness.sqlite")},
     )
+    _doctor_session_schema(checks, project_root, repair=repair)
+    _doctor_schema_current(checks, project_root)
+    _doctor_required_table_groups(checks, project_root)
+    _doctor_artifact_directory(checks, project_root, repair=repair)
+    _doctor_tool_registry(checks)
+    _doctor_shell_config(checks)
+    _doctor_session_permission_tables(checks, project_root)
+    _doctor_session_status_projection(checks, project_root, repair=repair)
 
     try:
         config = load_config(project_root)
@@ -8399,6 +8537,9 @@ def _doctor_result(project_root: Path, *, release: bool = False) -> dict:
             "Harness config loaded.",
             {"path": str(harness_dir / "config.yaml")},
         )
+
+    if config is not None:
+        _doctor_session_cwds(checks, project_root, config, repair=repair)
 
     required_ignores = [".harness/runs/", ".harness/harness.sqlite", ".harness/approvals.yaml", ".harness/tmp/"]
     gitignore_path = project_root / ".gitignore"
@@ -8430,6 +8571,7 @@ def _doctor_result(project_root: Path, *, release: bool = False) -> dict:
         "schema_version": "harness.doctor/v1",
         "project_root": str(project_root),
         "mode": "release" if release else "standard",
+        "repair": repair,
         "version": __version__,
         "ok": all(check["status"] != "fail" for check in checks),
         "checks": checks,
@@ -8438,6 +8580,518 @@ def _doctor_result(project_root: Path, *, release: bool = False) -> dict:
 
 def _add_check(checks: list[dict], check_id: str, status: str, message: str, details: dict | None = None) -> None:
     checks.append({"id": check_id, "status": status, "message": message, "details": details or {}})
+
+
+def _doctor_session_schema(checks: list[dict], project_root: Path, *, repair: bool) -> None:
+    store = SQLiteStore(project_root)
+    if not store.db_path.exists():
+        _add_check(
+            checks,
+            "session_schema",
+            "warn",
+            "Harness session database does not exist yet.",
+            {"path": str(store.db_path), "repairable": False, "repair_attempted": False},
+        )
+        return
+
+    try:
+        before = store.inspect_required_session_schema()
+    except sqlite3.Error as exc:
+        message = (
+            SESSION_SCHEMA_REPAIR_MESSAGE
+            if is_missing_session_schema_error(exc)
+            else "Harness session schema could not be inspected."
+        )
+        _add_check(
+            checks,
+            "session_schema",
+            "fail",
+            message,
+            {"path": str(store.db_path), "repairable": True, "repair_attempted": False},
+        )
+        return
+
+    repair_attempted = False
+    repair_error: str | None = None
+    if repair:
+        repair_attempted = True
+        try:
+            store.initialize()
+        except Exception as exc:
+            repair_error = (
+                SESSION_SCHEMA_REPAIR_MESSAGE
+                if is_missing_session_schema_error(exc)
+                else f"{type(exc).__name__}: {exc}"
+            )
+
+    try:
+        after = store.inspect_required_session_schema()
+    except sqlite3.Error as exc:
+        message = (
+            SESSION_SCHEMA_REPAIR_MESSAGE
+            if is_missing_session_schema_error(exc)
+            else "Harness session schema could not be inspected."
+        )
+        _add_check(
+            checks,
+            "session_schema",
+            "fail",
+            message,
+            {
+                "path": str(store.db_path),
+                "repairable": True,
+                "repair_attempted": repair_attempted,
+                "missing_tables_before": before["missing_tables"],
+            },
+        )
+        return
+
+    details = {
+        "path": str(store.db_path),
+        "required_tables": after["required_tables"],
+        "present_tables": after["present_tables"],
+        "missing_tables": after["missing_tables"],
+        "missing_tables_before": before["missing_tables"],
+        "repairable": bool(after["missing_tables"]),
+        "repair_attempted": repair_attempted,
+    }
+    if repair_error is not None:
+        details["repair_error"] = repair_error
+        _add_check(checks, "session_schema", "fail", "Harness session schema repair failed.", details)
+        return
+    if after["missing_tables"]:
+        _add_check(checks, "session_schema", "fail", SESSION_SCHEMA_REPAIR_MESSAGE, details)
+        return
+    if repair_attempted and before["missing_tables"]:
+        _add_check(checks, "session_schema", "pass", "Harness session schema repaired.", details)
+        return
+    _add_check(checks, "session_schema", "pass", "Harness session/event tables are present.", details)
+
+
+def _doctor_schema_current(checks: list[dict], project_root: Path) -> None:
+    store = SQLiteStore(project_root)
+    state = _inspect_schema_migration_state(store.db_path)
+    if not state["db_exists"]:
+        _add_check(
+            checks,
+            "schema_current",
+            "warn",
+            "Harness database does not exist yet; schema migration check skipped.",
+            state,
+        )
+        return
+    if state["current"]:
+        _add_check(checks, "schema_current", "pass", "Harness schema migrations are current.", state)
+        return
+    _add_check(
+        checks,
+        "schema_current",
+        "fail",
+        "Harness schema migrations are not current. Run: harness doctor --repair",
+        state,
+    )
+
+
+def _inspect_schema_migration_state(db_path: Path) -> dict:
+    expected = _expected_schema_migration_checksums()
+    if not db_path.exists():
+        return {
+            "db_exists": False,
+            "schema_migrations_table": False,
+            "expected_migrations": list(expected),
+            "applied_migrations": [],
+            "missing_migrations": list(expected),
+            "unknown_migrations": [],
+            "checksum_mismatches": [],
+            "current": False,
+            "repairable": False,
+        }
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+            ).fetchone() is not None
+            if not has_table:
+                return {
+                    "db_exists": True,
+                    "schema_migrations_table": False,
+                    "expected_migrations": list(expected),
+                    "applied_migrations": [],
+                    "missing_migrations": list(expected),
+                    "unknown_migrations": [],
+                    "checksum_mismatches": [],
+                    "current": False,
+                    "repairable": True,
+                }
+            rows = conn.execute("SELECT id, checksum FROM schema_migrations ORDER BY id ASC").fetchall()
+    except sqlite3.Error as exc:
+        return {
+            "db_exists": True,
+            "schema_migrations_table": None,
+            "expected_migrations": list(expected),
+            "applied_migrations": [],
+            "missing_migrations": list(expected),
+            "unknown_migrations": [],
+            "checksum_mismatches": [],
+            "current": False,
+            "repairable": True,
+            "error": SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc),
+        }
+    applied = {str(row["id"]): str(row["checksum"]) for row in rows}
+    missing = [migration_id for migration_id in expected if migration_id not in applied]
+    unknown = sorted(migration_id for migration_id in applied if migration_id not in expected)
+    mismatches = [
+        {"id": migration_id, "expected": checksum, "actual": applied[migration_id]}
+        for migration_id, checksum in expected.items()
+        if migration_id in applied and applied[migration_id] != checksum
+    ]
+    return {
+        "db_exists": True,
+        "schema_migrations_table": True,
+        "expected_migrations": list(expected),
+        "applied_migrations": list(applied),
+        "missing_migrations": missing,
+        "unknown_migrations": unknown,
+        "checksum_mismatches": mismatches,
+        "current": not missing and not unknown and not mismatches,
+        "repairable": bool(missing) and not unknown and not mismatches,
+    }
+
+
+def _expected_schema_migration_checksums() -> dict[str, str]:
+    migrations_dir = Path(__file__).resolve().parents[1] / "memory" / "migrations"
+    expected: dict[str, str] = {}
+    for migration_id, filename, _description in SCHEMA_MIGRATIONS:
+        text = (migrations_dir / filename).read_text(encoding="utf-8")
+        expected[migration_id] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return expected
+
+
+def _doctor_required_table_groups(checks: list[dict], project_root: Path) -> None:
+    store = SQLiteStore(project_root)
+    schema = store.inspect_required_session_schema()
+    session_tables = ["sessions", "session_messages", "session_parts"]
+    event_tables = ["events", "event_store", "artifacts"]
+    _add_required_table_check(checks, "required_session_tables", "Required session tables are present.", schema, session_tables)
+    _add_required_table_check(checks, "required_event_tables", "Required event/evidence tables are present.", schema, event_tables)
+
+
+def _add_required_table_check(
+    checks: list[dict],
+    check_id: str,
+    pass_message: str,
+    schema: dict,
+    required: list[str],
+) -> None:
+    missing = [table for table in required if table in schema.get("missing_tables", [])]
+    status = "pass" if not missing and schema.get("db_exists") else "warn" if not schema.get("db_exists") else "fail"
+    if status == "pass":
+        message = pass_message
+    elif status == "warn":
+        message = "Harness database does not exist yet; table check skipped."
+    else:
+        message = f"Missing required table(s): {', '.join(missing)}. Run: harness doctor --repair"
+    _add_check(
+        checks,
+        check_id,
+        status,
+        message,
+        {
+            "required_tables": required,
+            "missing_tables": missing,
+            "repairable": bool(missing),
+        },
+    )
+
+
+def _doctor_session_cwds(checks: list[dict], project_root: Path, config, *, repair: bool) -> None:
+    store = SQLiteStore(project_root)
+    if not store.db_path.exists():
+        _add_check(
+            checks,
+            "session_cwd",
+            "warn",
+            "Harness database does not exist yet; session cwd check skipped.",
+            {"repair_attempted": False},
+        )
+        return
+    schema = store.inspect_required_session_schema()
+    if "sessions" in schema.get("missing_tables", []) or "event_store" in schema.get("missing_tables", []):
+        _add_check(
+            checks,
+            "session_cwd",
+            "warn",
+            "Session cwd check skipped until session schema is repaired.",
+            {"missing_tables": schema.get("missing_tables", []), "repair_attempted": False},
+        )
+        return
+    try:
+        sessions = store.list_sessions()
+    except sqlite3.Error as exc:
+        _add_check(
+            checks,
+            "session_cwd",
+            "fail",
+            "Session cwd state could not be inspected. Run: harness doctor --repair",
+            {"error": SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)},
+        )
+        return
+    resolver = CwdResolver(project_root=project_root, context_excludes=config.context_excludes)
+    invalid = []
+    for session in sessions:
+        cwd = session_cwd_from_metadata(session.metadata)
+        try:
+            resolver.current(cwd, allow_excluded=True)
+        except CwdResolutionError as exc:
+            invalid.append(
+                {
+                    "session_id": session.id,
+                    "cwd": cwd,
+                    "error_type": exc.error_type,
+                    "message": cwd_recovery_message(exc),
+                }
+            )
+    repaired: list[str] = []
+    repair_errors: list[dict] = []
+    if repair and invalid:
+        for item in invalid:
+            try:
+                session = store.get_session(item["session_id"])
+                store.update_session_cwd(
+                    session.id,
+                    project_root=str(project_root),
+                    old_cwd=str(item["cwd"]),
+                    new_cwd=".",
+                    requested_path=".",
+                    resolved_abs_path=str(project_root),
+                    actor="doctor",
+                    tool_call_id="doctor_repair",
+                )
+                repaired.append(session.id)
+            except Exception as exc:
+                repair_errors.append({"session_id": item["session_id"], "error": str(exc)})
+    after_invalid = []
+    if repair and invalid and not repair_errors:
+        for session in store.list_sessions():
+            cwd = session_cwd_from_metadata(session.metadata)
+            try:
+                resolver.current(cwd, allow_excluded=True)
+            except CwdResolutionError as exc:
+                after_invalid.append(
+                    {
+                        "session_id": session.id,
+                        "cwd": cwd,
+                        "error_type": exc.error_type,
+                        "message": cwd_recovery_message(exc),
+                    }
+                )
+    else:
+        after_invalid = invalid
+    details = {
+        "session_count": len(sessions),
+        "invalid": after_invalid,
+        "invalid_before": invalid,
+        "repaired_session_ids": repaired,
+        "repair_attempted": bool(repair and invalid),
+        "repair_errors": repair_errors,
+        "repair_action": 'reset cwd to "."',
+    }
+    if repair_errors:
+        _add_check(checks, "session_cwd", "fail", "Invalid session cwd repair failed.", details)
+    elif after_invalid:
+        _add_check(
+            checks,
+            "session_cwd",
+            "fail",
+            'One or more sessions have invalid cwd. Run: harness doctor --repair to reset them to "."',
+            details,
+        )
+    elif repaired:
+        _add_check(checks, "session_cwd", "pass", 'Invalid session cwd repaired to ".".', details)
+    else:
+        _add_check(checks, "session_cwd", "pass", "Persisted session cwd values are valid.", details)
+
+
+def _doctor_tool_registry(checks: list[dict]) -> None:
+    issues: list[str] = []
+    try:
+        descriptors = default_session_tool_descriptors()
+    except Exception as exc:
+        _add_check(checks, "tool_registry", "fail", "Session tool registry could not be loaded.", {"error": str(exc)})
+        return
+    ids = [descriptor.id for descriptor in descriptors]
+    duplicates = sorted({tool_id for tool_id in ids if ids.count(tool_id) > 1})
+    if duplicates:
+        issues.append("duplicate tool ids: " + ", ".join(duplicates))
+    for descriptor in descriptors:
+        try:
+            loaded = get_session_tool_descriptor(descriptor.id)
+        except KeyError:
+            issues.append(f"descriptor lookup failed: {descriptor.id}")
+            continue
+        if loaded.id != descriptor.id:
+            issues.append(f"descriptor lookup mismatch: {descriptor.id}")
+        if not isinstance(descriptor.input_schema, dict) or not isinstance(descriptor.output_schema, dict):
+            issues.append(f"descriptor schema missing: {descriptor.id}")
+    _add_check(
+        checks,
+        "tool_registry",
+        "pass" if not issues else "fail",
+        "Session tool registry is valid." if not issues else "Session tool registry has invalid descriptors.",
+        {"tool_count": len(descriptors), "issues": issues},
+    )
+
+
+def _doctor_shell_config(checks: list[dict]) -> None:
+    shell = Path("/bin/sh")
+    ok = shell.exists() and os.access(shell, os.X_OK)
+    _add_check(
+        checks,
+        "shell_config",
+        "pass" if ok else "fail",
+        "Default session shell is executable." if ok else "Default session shell is unavailable; configure a valid absolute shell path.",
+        {"default_shell": str(shell), "exists": shell.exists(), "executable": os.access(shell, os.X_OK)},
+    )
+
+
+def _doctor_artifact_directory(checks: list[dict], project_root: Path, *, repair: bool) -> None:
+    harness_dir = project_root / HARNESS_DIR
+    db_path = harness_dir / "harness.sqlite"
+    runs_dir = harness_dir / "runs"
+    tmp_dir = harness_dir / "tmp"
+    if not db_path.exists() and not harness_dir.exists():
+        _add_check(
+            checks,
+            "artifact_directory",
+            "warn",
+            "Project is not initialized; artifact directory check skipped.",
+            {"paths": [str(runs_dir), str(tmp_dir)], "repair_attempted": False},
+        )
+        return
+    repaired: list[str] = []
+    if repair and db_path.exists():
+        for path in (runs_dir, tmp_dir):
+            if not path.exists():
+                path.mkdir(parents=True, exist_ok=True)
+                repaired.append(str(path))
+    issues = [_artifact_directory_issue(path) for path in (runs_dir, tmp_dir)]
+    issues = [issue for issue in issues if issue is not None]
+    details = {"paths": [str(runs_dir), str(tmp_dir)], "issues": issues, "repaired_paths": repaired, "repair_attempted": repair}
+    if issues:
+        _add_check(
+            checks,
+            "artifact_directory",
+            "fail",
+            "Harness artifact directory is not writable.",
+            details,
+        )
+    elif repaired:
+        _add_check(checks, "artifact_directory", "pass", "Harness artifact directories were recreated.", details)
+    else:
+        _add_check(checks, "artifact_directory", "pass", "Harness artifact directories are writable.", details)
+
+
+def _artifact_directory_issue(path: Path) -> dict | None:
+    if not path.exists():
+        return {"path": str(path), "error": "missing", "repairable": True}
+    if not path.is_dir():
+        return {"path": str(path), "error": "not_directory", "repairable": False}
+    mode = path.stat().st_mode
+    has_write_bit = bool(mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+    if not has_write_bit or not os.access(path, os.W_OK):
+        return {"path": str(path), "error": "not_writable", "repairable": False}
+    return None
+
+
+def _doctor_session_permission_tables(checks: list[dict], project_root: Path) -> None:
+    store = SQLiteStore(project_root)
+    schema = store.inspect_required_session_schema()
+    if not schema.get("db_exists"):
+        _add_check(
+            checks,
+            "session_permission_tables",
+            "warn",
+            "Harness database does not exist yet; permission table check skipped.",
+            {"required_table": "session_permissions"},
+        )
+        return
+    if "session_permissions" in schema.get("missing_tables", []):
+        _add_check(
+            checks,
+            "session_permission_tables",
+            "fail",
+            "Session permission table is missing. Run: harness doctor --repair",
+            {"required_table": "session_permissions", "missing_tables": ["session_permissions"], "repairable": True},
+        )
+        return
+    required_columns = {
+        "id",
+        "session_id",
+        "run_id",
+        "tool_id",
+        "normalized_action",
+        "normalized_target_pattern",
+        "boundary_kind",
+        "risk",
+        "status",
+        "scope",
+        "source",
+        "policy_reasons_json",
+        "requested_at",
+        "resolved_at",
+        "expires_at",
+    }
+    with sqlite3.connect(store.db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(session_permissions)").fetchall()
+    columns = {str(row[1]) for row in rows}
+    missing_columns = sorted(required_columns - columns)
+    _add_check(
+        checks,
+        "session_permission_tables",
+        "pass" if not missing_columns else "fail",
+        "Session permission table is valid." if not missing_columns else "Session permission table is missing required columns. Run: harness doctor --repair",
+        {
+            "required_table": "session_permissions",
+            "required_columns": sorted(required_columns),
+            "missing_columns": missing_columns,
+            "repairable": bool(missing_columns),
+        },
+    )
+
+
+def _doctor_session_status_projection(checks: list[dict], project_root: Path, *, repair: bool) -> None:
+    store = SQLiteStore(project_root)
+    schema = store.inspect_required_session_schema()
+    if not schema.get("db_exists") or "sessions" in schema.get("missing_tables", []) or "runs" in schema.get("missing_tables", []):
+        _add_check(
+            checks,
+            "session_status_projection",
+            "warn",
+            "Session status projection check skipped until runtime tables exist.",
+            {"materialized": False, "repair_attempted": False},
+        )
+        return
+    try:
+        sessions = store.list_sessions()
+        runs = {run.id for run in store.list_runs()}
+    except sqlite3.Error as exc:
+        _add_check(
+            checks,
+            "session_status_projection",
+            "fail",
+            "Session status projection could not be inspected. Run: harness doctor --repair",
+            {"error": SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)},
+        )
+        return
+    stale = [session.id for session in sessions if session.active_run_id and session.active_run_id not in runs]
+    _add_check(
+        checks,
+        "session_status_projection",
+        "pass" if not stale else "warn",
+        "Session status projection is derived on read; no rebuild required." if not stale else "Some sessions reference missing active runs; derived status remains available.",
+        {"materialized": False, "stale_active_run_session_ids": stale, "repair_attempted": repair, "manual_action_required": bool(stale)},
+    )
 
 
 def _doctor_backend_descriptors(checks: list[dict], config) -> None:

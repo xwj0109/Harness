@@ -5,9 +5,11 @@ import hashlib
 import mimetypes
 import re
 import secrets
+import sqlite3
 import subprocess
 import struct
 import sys
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -17,7 +19,11 @@ from urllib.parse import parse_qs, urlparse
 from harness import __version__
 from harness.command_catalog import build_command_catalog, command_action_unsupported
 from harness.config import load_config
-from harness.memory.sqlite_store import SQLiteStore
+from harness.memory.sqlite_store import (
+    SESSION_SCHEMA_REPAIR_MESSAGE,
+    SQLiteStore,
+    is_missing_session_schema_error,
+)
 from harness.model_catalog import catalog_projection_evidence, list_model_catalog, list_provider_catalog, validate_model_selection
 from harness.models import (
     EventStreamType,
@@ -28,12 +34,19 @@ from harness.models import (
     SessionPermissionStatus,
     SessionStatus,
 )
+from harness.operator_loop import session_operator_status_projection
 from harness.paths import is_excluded_relative, relative_to_project, resolve_project_root, resolve_under_project
 from harness.security import assert_not_secret_path, is_secret_path, redact_secret_text, sanitize_for_logging
-from harness.session_cwd import session_cwd_payload
+from harness.session_cwd import CwdResolutionError, cwd_recovery_message, session_cwd_payload
 from harness.session_replay import build_session_replay_projection
 from harness.session_share import build_local_session_share_snapshot, hosted_share_unsupported
-from harness.session_tools import execute_session_tool
+from harness.session_tools import (
+    build_session_approval_card,
+    execute_session_tool,
+    pending_session_tool_call_from_permission,
+    persist_session_tool_denial,
+)
+from harness.task_operator_bridge import apply_operator_task_permission_resolution
 from harness.tui import build_tui_settings_catalog
 from harness.workspace_catalog import build_workspace_catalog, build_workspace_clients_projection, workspace_action_unsupported
 
@@ -327,7 +340,7 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             "/api/session": {"get": {"summary": "OpenCode v2-compatible session list projection", "security": bearer, "responses": _json_response()}},
             "/api/session/{session_id}/prompt": {
                 "post": {
-                    "summary": "OpenCode v2-compatible prompt persistence without provider execution",
+                    "summary": "OpenCode v2-compatible append-only prompt persistence without operator/provider execution",
                     "security": bearer,
                     "parameters": [_path_param("session_id")],
                     "responses": _json_response(status="201"),
@@ -536,6 +549,14 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                     "responses": _json_response(status="202"),
                 }
             },
+            "/sessions/{session_id}/prompt": {
+                "post": {
+                    "summary": "Run a natural-language prompt through the shared Harness operator loop",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(status="200"),
+                }
+            },
             "/sessions/{session_id}/command": {
                 "post": {
                     "summary": "OpenCode-compatible fail-closed placeholder for session slash command execution",
@@ -605,6 +626,14 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                     "summary": "OpenCode-compatible alias for replying to a pending permission request",
                     "security": bearer,
                     "parameters": [_path_param("session_id"), _path_param("permission_id")],
+                    "responses": _json_response(status="200"),
+                }
+            },
+            "/sessions/{session_id}/approval/{approval_id}": {
+                "post": {
+                    "summary": "Approve, deny, or resume a pending Harness session approval",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id"), _path_param("approval_id")],
                     "responses": _json_response(status="200"),
                 }
             },
@@ -812,6 +841,7 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             try:
                 normalized_path = _normalize_opencode_session_path(parsed.path)
                 if normalized_path.startswith("/sessions/") and normalized_path.endswith("/events/stream"):
+                    _ensure_session_schema_ready(store)
                     self._write_sse(build_session_sse_stream(store, normalized_path))
                     return
                 if normalized_path in {"/event", "/global/event"}:
@@ -832,6 +862,11 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             except ValueError as exc:
                 self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+            except sqlite3.Error as exc:
+                if is_missing_session_schema_error(exc):
+                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                raise
             if payload is None:
                 self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -859,6 +894,11 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             except ValueError as exc:
                 self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+            except sqlite3.Error as exc:
+                if is_missing_session_schema_error(exc):
+                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                raise
             if payload is None:
                 self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -886,6 +926,11 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             except ValueError as exc:
                 self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+            except sqlite3.Error as exc:
+                if is_missing_session_schema_error(exc):
+                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                raise
             if payload is None:
                 self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -905,6 +950,11 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             except ValueError as exc:
                 self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+            except sqlite3.Error as exc:
+                if is_missing_session_schema_error(exc):
+                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                raise
             if payload is None:
                 self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -923,6 +973,11 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             except ValueError as exc:
                 self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
                 return
+            except sqlite3.Error as exc:
+                if is_missing_session_schema_error(exc):
+                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                raise
             if payload is None:
                 self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
                 return
@@ -988,6 +1043,8 @@ def _route_get(
 ) -> dict[str, Any] | None:
     path = _normalize_opencode_session_path(path)
     query = query or {}
+    if _uses_session_schema(path):
+        _ensure_session_schema_ready(store)
     if path == "/health":
         return {
             "schema_version": LOCAL_SERVER_SCHEMA_VERSION,
@@ -1262,8 +1319,8 @@ def _route_get(
                 "schema_version": "harness.session_permissions/v1",
                 "ok": True,
                 "session_id": parts[1],
-                "permissions": [permission.model_dump(mode="json") for permission in permissions],
-                "snapshot": _session_permission_snapshot_payload(parts[1], permissions),
+                "permissions": _session_permission_payloads(store, permissions),
+                "snapshot": _session_permission_snapshot_payload(parts[1], permissions, store=store),
                 "permission_granting": False,
             }
         if len(parts) == 4 and parts[2] == "permissions" and parts[3] == "snapshot":
@@ -1272,7 +1329,7 @@ def _route_get(
             return {
                 "schema_version": "harness.session_permission_snapshot/v1",
                 "ok": True,
-                **_session_permission_snapshot_payload(parts[1], permissions),
+                **_session_permission_snapshot_payload(parts[1], permissions, store=store),
                 "permission_granting": False,
             }
         if len(parts) == 3 and parts[2] in {"todos", "todo"}:
@@ -1336,6 +1393,8 @@ def _route_post(
     port: int,
 ) -> dict[str, Any] | None:
     path = _normalize_opencode_session_path(path)
+    if _uses_session_schema(path):
+        _ensure_session_schema_ready(store)
     if path == "/sessions":
         prompt = _optional_body_text(body, "prompt")
         title = _optional_body_text(body, "title") or _title_from_prompt(prompt) or "Server session"
@@ -1421,6 +1480,8 @@ def _route_post(
                 "schema_version": "harness.api_session_prompt/v1",
                 "ok": True,
                 "session_id": session_id,
+                "mode": "append_only",
+                "assistant_execution": False,
                 "model_validation": model_validation,
                 **_append_server_user_message(store, session_id, content, agent_id=agent_id),
                 "assistant_response_started": False,
@@ -1551,6 +1612,19 @@ def _route_post(
                 "authority_granting": False,
                 "no_hidden_fallback": True,
             }
+        if len(parts) == 3 and parts[2] == "prompt":
+            session_id = parts[1]
+            store.get_session(session_id)
+            content = _message_content_from_body(body)
+            if not content:
+                raise ValueError("Missing required prompt content.")
+            return _session_prompt_operator_response(
+                store,
+                project_root,
+                session_id,
+                content,
+                debug=_optional_body_bool(body, "debug"),
+            )
         if len(parts) == 3 and parts[2] == "command":
             session_id = parts[1]
             store.get_session(session_id)
@@ -1672,6 +1746,18 @@ def _route_post(
             session_id = parts[1]
             permission_id = parts[3]
             return _reply_to_session_permission(store, session_id, permission_id, body)
+        if len(parts) in {4, 5} and parts[2] == "approval":
+            session_id = parts[1]
+            permission_id = parts[3]
+            action = parts[4] if len(parts) == 5 else _optional_body_text(body, "action")
+            return _reply_to_session_permission(
+                store,
+                session_id,
+                permission_id,
+                _approval_reply_body(body, action),
+                project_root=project_root,
+                resume=True,
+            )
         if len(parts) == 4 and parts[2] == "mentions" and parts[3] == "resolve":
             session_id = parts[1]
             store.get_session(session_id)
@@ -1829,8 +1915,29 @@ def _route_post(
     return None
 
 
+def _uses_session_schema(path: str) -> bool:
+    return (
+        path == "/sessions"
+        or path.startswith("/sessions/")
+        or path == "/api/session"
+        or path.startswith("/api/session/")
+        or path == "/permission"
+        or path.startswith("/permission/")
+        or path == "/question"
+        or path.startswith("/question/")
+    )
+
+
+def _ensure_session_schema_ready(store: SQLiteStore) -> None:
+    if not store.db_path.exists():
+        raise ValueError(f"Project is not initialized: {store.project_root}")
+    store.initialize()
+
+
 def _route_patch(path: str, *, body: dict[str, Any], store: SQLiteStore, cfg: Any | None = None) -> dict[str, Any] | None:
     path = _normalize_opencode_session_path(path)
+    if _uses_session_schema(path):
+        _ensure_session_schema_ready(store)
     if path == "/config":
         return _config_update_unsupported(body)
     if path.startswith("/project/"):
@@ -1911,6 +2018,8 @@ def _route_patch(path: str, *, body: dict[str, Any], store: SQLiteStore, cfg: An
 
 def _route_delete(path: str, *, store: SQLiteStore) -> dict[str, Any] | None:
     path = _normalize_opencode_session_path(path)
+    if _uses_session_schema(path):
+        _ensure_session_schema_ready(store)
     if path.startswith("/auth/"):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 2:
@@ -2004,6 +2113,99 @@ def _append_server_user_message(
         "message": message.model_dump(mode="json"),
         "part": part.model_dump(mode="json"),
     }
+
+
+def _session_prompt_operator_response(
+    store: SQLiteStore,
+    project_root: Path,
+    session_id: str,
+    prompt: str,
+    *,
+    debug: bool = False,
+) -> dict[str, Any]:
+    from harness.chat import ChatSessionState, handle_chat_input
+
+    before_event_ids = {event.id for event in store.list_session_store_events(session_id)}
+    state = ChatSessionState(session_id=session_id, active_project_root=str(project_root))
+    try:
+        chat_response = handle_chat_input(prompt, project_root, state)
+    except Exception as exc:  # pragma: no cover - debug payload is asserted through direct helper tests.
+        message = SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else "The operator prompt failed before completion."
+        chat_response = {
+            "kind": "operator_prompt_failed",
+            "title": "Prompt Failed",
+            "ok": False,
+            "lines": [message],
+        }
+        if debug:
+            chat_response["debug"] = {
+                "exception_type": type(exc).__name__,
+                "exception": str(sanitize_for_logging(str(exc))),
+                "traceback": traceback.format_exc(),
+            }
+    events = [event for event in store.list_session_store_events(session_id) if event.id not in before_event_ids]
+    status = _session_status_projection(store, session_id)
+    payload = {
+        "schema_version": "harness.session_prompt_response/v1",
+        "ok": bool(chat_response.get("ok")),
+        "session_id": session_id,
+        "kind": chat_response.get("kind"),
+        "title": chat_response.get("title") or chat_response.get("kind") or "Assistant",
+        "lines": [str(sanitize_for_logging(line)) for line in (chat_response.get("lines") or [])],
+        "operator_status": chat_response.get("operator_status") or status.get("operator"),
+        "permission_required": chat_response.get("kind") == "session_tool_permission_required",
+        "permission_id": chat_response.get("permission_id"),
+        "approval_card": chat_response.get("approval_card"),
+        "tool_results": _prompt_tool_result_summaries(chat_response),
+        "event_sequence": [event.kind for event in events],
+        "event_count": len(events),
+        "model_execution_started": bool(chat_response.get("native_tool_loop")),
+        "provider_execution_started": False,
+        "execution_started": bool(chat_response.get("ok")) and any(event.kind == "tool_call.output" for event in events),
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if debug:
+        payload["debug"] = {
+            "chat_response": sanitize_for_logging(chat_response),
+            "events": [event.model_dump(mode="json") for event in events],
+        }
+    return payload
+
+
+def _prompt_tool_result_summaries(chat_response: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(chat_response.get("tool_results"), list):
+        return [
+            {
+                "tool": item.get("tool"),
+                "ok": bool(item.get("ok")),
+                "error_type": item.get("error_type"),
+            }
+            for item in chat_response["tool_results"]
+            if isinstance(item, dict)
+        ]
+    result = chat_response.get("result")
+    if isinstance(result, dict) and result.get("tool_id"):
+        return [
+            {
+                "tool": result.get("tool_id"),
+                "ok": bool(result.get("ok")),
+                "error_type": result.get("error_type"),
+            }
+        ]
+    return []
+
+
+def _approval_reply_body(body: dict[str, Any], action: str | None) -> dict[str, Any]:
+    reply = (_optional_body_text(body, "reply") or "").strip().lower()
+    decision = (_optional_body_text(body, "decision") or "").strip().lower()
+    if reply or decision:
+        return body
+    normalized = (action or "resume").strip().lower()
+    mapped_reply = "once" if normalized in {"approve", "approved", "allow", "allowed", "resume"} else normalized
+    if mapped_reply in {"deny", "denied"}:
+        mapped_reply = "reject"
+    return {**body, "reply": mapped_reply}
 
 
 def _message_content_from_body(body: dict[str, Any]) -> str | None:
@@ -2804,6 +3006,13 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
         "message_count": len(messages),
         "event_count": len(events),
         "cwd": cwd,
+        "operator": session_operator_status_projection(
+            store,
+            session.id,
+            project_root=store.project_root,
+            cwd=str(cwd.get("cwd") or "."),
+            active_tools=_operator_active_tools(),
+        ),
         "child_session_ids": [child.id for child in children],
         "latest_ui_activation": _latest_session_ui_activation(store, session.id),
         "terminal": session.status
@@ -2811,6 +3020,12 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
         "process_running": False,
         "permission_granting": False,
     }
+
+
+def _operator_active_tools() -> list[str]:
+    from harness.session_tools import default_session_tool_descriptors
+
+    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
 
 
 def _latest_session_ui_activation(store: SQLiteStore, session_id: str) -> dict[str, Any] | None:
@@ -2981,28 +3196,65 @@ def _global_permission_queue_projection(store: SQLiteStore) -> dict[str, Any]:
     return {
         "schema_version": "harness.global_permissions/v1",
         "ok": True,
-        "permissions": [permission.model_dump(mode="json") for permission in permissions],
+        "permissions": _session_permission_payloads(store, permissions),
+        "approval_cards": _approval_cards_for_permissions(store, permissions),
         "pending_count": len(permissions),
         "execution_started": False,
         "permission_granting": False,
     }
 
 
-def _session_permission_snapshot_payload(session_id: str, permissions: list[Any]) -> dict[str, Any]:
+def _session_permission_payloads(store: SQLiteStore, permissions: list[Any]) -> list[dict[str, Any]]:
+    payloads = []
+    for permission in permissions:
+        payload = permission.model_dump(mode="json")
+        try:
+            payload["approval_card"] = build_session_approval_card(store, permission.session_id, permission.id)
+        except Exception:
+            payload["approval_card"] = None
+        payloads.append(payload)
+    return payloads
+
+
+def _approval_cards_for_permissions(store: SQLiteStore, permissions: list[Any]) -> list[dict[str, Any]]:
+    cards = []
+    for permission in permissions:
+        try:
+            cards.append(build_session_approval_card(store, permission.session_id, permission.id))
+        except Exception:
+            continue
+    return cards
+
+
+def _session_permission_snapshot_payload(
+    session_id: str,
+    permissions: list[Any],
+    *,
+    store: SQLiteStore | None = None,
+) -> dict[str, Any]:
     counts = {status.value: 0 for status in SessionPermissionStatus}
     pending_ids: list[str] = []
+    approval_cards: list[dict[str, Any]] = []
     for permission in permissions:
         status = permission.status.value
         counts[status] = counts.get(status, 0) + 1
         if permission.status == SessionPermissionStatus.PENDING:
             pending_ids.append(permission.id)
+            if store is not None:
+                try:
+                    approval_cards.append(build_session_approval_card(store, session_id, permission.id))
+                except Exception:
+                    pass
     return {
         "session_id": session_id,
         "counts": counts,
         "pending_permission_ids": pending_ids,
+        "approval_cards": approval_cards,
+        "pending_approval_cards": approval_cards,
         "pending_count": len(pending_ids),
         "blocked_on_permission": bool(pending_ids),
         "reply_route": "/sessions/{session_id}/permissions/{permission_id}/reply",
+        "approval_route": "/sessions/{session_id}/approval/{approval_id}",
         "execution_started": False,
     }
 
@@ -3012,11 +3264,15 @@ def _reply_to_session_permission(
     session_id: str,
     permission_id: str,
     body: dict[str, Any],
+    *,
+    project_root: Path | None = None,
+    resume: bool = False,
 ) -> dict[str, Any]:
     store.get_session(session_id)
     existing = store.get_session_permission(permission_id)
     if existing.session_id != session_id:
         raise ValueError(f"Permission {permission_id} does not belong to session {session_id}.")
+    approval_card = build_session_approval_card(store, session_id, permission_id)
     reply = _optional_body_text(body, "reply") or _optional_body_text(body, "response")
     decision = _optional_body_text(body, "decision") or _optional_body_text(body, "status")
     status = _permission_reply_status(reply, decision)
@@ -3027,8 +3283,49 @@ def _reply_to_session_permission(
         source=SessionPermissionSource.USER,
         reason=reason,
     )
+    denial = None
+    model_visible_error = None
+    pending_tool_call = None
+    resumed_result = None
+    task_operator_resume = None
+    resume_skipped_reason = None
+    if status == SessionPermissionStatus.DENIED:
+        denial = persist_session_tool_denial(store, session_id, permission_id, feedback=reason)
+        model_visible_error = denial.get("model_visible_error")
+        if project_root is not None:
+            task_operator_resume = apply_operator_task_permission_resolution(
+                project_root,
+                session_id,
+                permission_id,
+                status=status,
+                feedback=reason,
+            )
+    elif status == SessionPermissionStatus.ALLOWED and resume:
+        pending_tool_call = pending_session_tool_call_from_permission(store, session_id, permission_id)
+        if pending_tool_call is None:
+            resume_skipped_reason = "No persisted pending tool call evidence was found for this approval."
+        elif project_root is None:
+            resume_skipped_reason = "No project root was available to resume the pending tool call."
+        else:
+            resumed = execute_session_tool(
+                store,
+                project_root,
+                session_id,
+                str(pending_tool_call.get("tool_id") or ""),
+                dict(pending_tool_call.get("arguments") or {}),
+            )
+            resumed_result = resumed.model_dump(mode="json")
+            permission = store.get_session_permission(permission_id)
+            task_operator_resume = apply_operator_task_permission_resolution(
+                project_root,
+                session_id,
+                permission_id,
+                status=status,
+                resumed_result=resumed_result,
+            )
     permissions = store.list_session_permissions(session_id)
-    snapshot = _session_permission_snapshot_payload(session_id, permissions)
+    snapshot = _session_permission_snapshot_payload(session_id, permissions, store=store)
+    tool_execution_started = bool(resumed_result and resumed_result.get("ok"))
     return {
         "schema_version": "harness.session_permission_reply/v1",
         "ok": True,
@@ -3037,9 +3334,16 @@ def _reply_to_session_permission(
         "reply": reply,
         "decision": status.value,
         "permission": permission.model_dump(mode="json"),
+        "approval_card": approval_card,
+        "pending_tool_call": pending_tool_call,
+        "resumed_result": resumed_result,
+        "task_operator_resume": task_operator_resume,
+        "resume_skipped_reason": resume_skipped_reason,
+        "denial": denial,
+        "model_visible_error": model_visible_error,
         "snapshot": snapshot,
-        "execution_started": False,
-        "tool_execution_started": False,
+        "execution_started": tool_execution_started,
+        "tool_execution_started": tool_execution_started,
         "scope_broadened": False,
         "permission_granting": status == SessionPermissionStatus.ALLOWED,
     }
@@ -4410,6 +4714,20 @@ def _optional_body_int(body: dict[str, Any], key: str) -> int | None:
     return parsed
 
 
+def _optional_body_bool(body: dict[str, Any], key: str) -> bool:
+    value = body.get(key)
+    if value is None or value == "":
+        return False
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean body field: {key}")
+
+
 def _optional_body_text_list(body: dict[str, Any], key: str) -> list[str]:
     value = body.get(key)
     if value is None:
@@ -5293,6 +5611,9 @@ def _extensibility_status_projection(project_root: Path, cfg) -> dict[str, Any]:
 
 
 def _web_tool_policy_projection(cfg) -> dict[str, Any]:
+    search_provider = getattr(cfg.web_tools, "search_provider", "configured_http")
+    search_endpoint_configured = bool(getattr(cfg.web_tools, "search_endpoint_url", None))
+    search_backend_configured = bool(search_provider != "configured_http" or search_endpoint_configured)
     tools = [
         _web_tool_projection(
             "web-fetch",
@@ -5313,6 +5634,9 @@ def _web_tool_policy_projection(cfg) -> dict[str, Any]:
         "enabled": bool(cfg.web_tools.enabled),
         "tools": tools,
         "allowed_domains": list(cfg.web_tools.allowed_domains),
+        "search_provider": search_provider,
+        "search_endpoint_configured": search_endpoint_configured,
+        "search_backend_configured": search_backend_configured,
         "network_called": False,
         "execution_supported": False,
         "session_tool_execution_supported": True,
@@ -5333,6 +5657,16 @@ def _web_tool_projection(tool_id: str, *, enabled: bool, description: str, cfg) 
         "decision": decision,
         "approval_required": bool(enabled and cfg.web_tools.approval_required),
         "allowed_domains": list(cfg.web_tools.allowed_domains),
+        "search_provider": getattr(cfg.web_tools, "search_provider", "configured_http") if tool_id == "web-search" else None,
+        "search_endpoint_configured": bool(getattr(cfg.web_tools, "search_endpoint_url", None)) if tool_id == "web-search" else None,
+        "search_backend_configured": (
+            bool(
+                getattr(cfg.web_tools, "search_provider", "configured_http") != "configured_http"
+                or getattr(cfg.web_tools, "search_endpoint_url", None)
+            )
+            if tool_id == "web-search"
+            else None
+        ),
         "network_called": False,
         "execution_supported": False,
         "session_tool_execution_supported": True,
@@ -5988,8 +6322,42 @@ def _session_tool_execution_response(
     tool_id: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    result = execute_session_tool(store, project_root, session_id, tool_id, arguments)
+    try:
+        result = execute_session_tool(store, project_root, session_id, tool_id, arguments)
+    except CwdResolutionError as exc:
+        return {
+            "schema_version": "harness.session_shell_action/v1" if tool_id == "shell" else "harness.session_tool_execution_response/v1",
+            "ok": False,
+            "session_id": session_id,
+            "tool_id": tool_id,
+            "lifecycle": "direct_tool_execution",
+            "save_point_emitted": False,
+            "error": cwd_recovery_message(exc),
+            "error_type": "invalid_cwd",
+            "recovery": {"repair_command": "harness doctor --repair", "reset_cwd": "."},
+            "permission_required": False,
+            "permission_id": None,
+            "approval_card": None,
+            "process_started": False,
+            "command_executed": False,
+            "tool_execution_started": False,
+            "provider_execution_started": False,
+            "execution_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
     session = store.get_session(session_id)
+    approval_card = None
+    if result.permission_id:
+        try:
+            approval_card = build_session_approval_card(
+                store,
+                session_id,
+                result.permission_id,
+                fallback_arguments=arguments,
+            )
+        except Exception:
+            approval_card = None
     try:
         cwd = session_cwd_payload(project_root, session.metadata, load_config(project_root).context_excludes)
     except Exception:
@@ -5999,10 +6367,13 @@ def _session_tool_execution_response(
         "ok": result.ok,
         "session_id": session_id,
         "tool_id": result.tool_id,
+        "lifecycle": "direct_tool_execution",
+        "save_point_emitted": False,
         "result": result.model_dump(mode="json"),
         "cwd": cwd,
         "permission_required": result.error_type == "permission_required",
         "permission_id": result.permission_id,
+        "approval_card": approval_card,
         "process_started": result.tool_id == "shell" and result.ok,
         "command_executed": result.tool_id == "shell" and result.ok,
         "tool_execution_started": result.ok,

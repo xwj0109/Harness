@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import subprocess
 import struct
+import sys
 import threading
 import zlib
 from urllib.error import HTTPError
@@ -12,6 +14,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from harness.chat import ChatSessionState, handle_chat_input
 from harness.cli.main import app
 from harness.config import load_config
 from harness.local_server import (
@@ -27,9 +30,24 @@ from harness.local_server import (
 )
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import EventStreamType, SessionPermissionBoundaryKind, SessionPermissionScope, SessionPermissionStatus
+from harness.operator_loop import create_turn_state_from_session, persist_turn_finished, persist_turn_started
+from harness.operator_models import HarnessAgentPhase
 
 
 runner = CliRunner()
+
+
+def _operator_prompt_event_kinds(store: SQLiteStore, session_id: str) -> list[str]:
+    relevant = {
+        "operator.turn.started",
+        "tool_call.started",
+        "harness.tool_call.before",
+        "permission.checked",
+        "tool_call.output",
+        "tool_call.finished",
+        "harness.tool_call.after",
+    }
+    return [event.kind for event in store.list_session_store_events(session_id) if event.kind in relevant]
 
 
 def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
@@ -240,6 +258,7 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
     assert "delete" in spec["paths"]["/pty/{pty_id}"]
     assert "get" in spec["paths"]["/api/session/{session_id}/message"]
     assert "post" in spec["paths"]["/api/session/{session_id}/prompt"]
+    assert "append-only prompt persistence" in spec["paths"]["/api/session/{session_id}/prompt"]["post"]["summary"]
     assert spec["paths"]["/session"]["x-harness-alias-for"] == "/sessions"
     assert "patch" in spec["paths"]["/sessions/{session_id}"]
     assert "delete" in spec["paths"]["/sessions/{session_id}"]
@@ -1094,6 +1113,8 @@ def test_local_server_post_persists_session_prompt_without_execution(tmp_path) -
     assert v2_sessions["schema_version"] == "harness.api_sessions/v1"
     assert any(item["id"] == session_id for item in v2_sessions["items"])
     assert v2_prompt["schema_version"] == "harness.api_session_prompt/v1"
+    assert v2_prompt["mode"] == "append_only"
+    assert v2_prompt["assistant_execution"] is False
     assert v2_prompt["part"]["text"] == "V2 prompt\n\nPersist only"
     assert v2_prompt["execution_started"] is False
     assert v2_prompt["provider_execution_started"] is False
@@ -1186,6 +1207,8 @@ def test_local_server_model_refs_validate_without_hidden_fallback(tmp_path) -> N
     assert created["model_validation"]["blocked_reasons"] == ["model_unknown"]
     assert created["model_validation"]["hidden_model_fallback"] is False
     assert prompted["ok"] is True
+    assert prompted["mode"] == "append_only"
+    assert prompted["assistant_execution"] is False
     assert prompted["execution_started"] is False
     assert prompted["model_validation"]["raw_model_ref"] == "codex_cli/not-a-real-model"
     assert prompted["model_validation"]["executable"] is False
@@ -2732,6 +2755,9 @@ def test_local_server_control_config_project_and_session_shell_routes_fail_close
     assert shell["schema_version"] == "harness.session_shell_action/v1"
     assert shell["permission_required"] is True
     assert shell["permission_id"]
+    assert shell["approval_card"]["tool_id"] == "shell"
+    assert shell["approval_card"]["command"] == "echo should-not-run"
+    assert shell["approval_card"]["cwd"] == "."
     assert shell["result"]["error_type"] == "permission_required"
     assert shell["process_started"] is False
     assert shell["command_executed"] is False
@@ -2780,10 +2806,213 @@ def test_local_server_session_tool_route_uses_gateway_and_exposes_cwd(tmp_path) 
 
     assert cd["schema_version"] == "harness.session_tool_execution_response/v1"
     assert cd["ok"] is True
+    assert cd["lifecycle"] == "direct_tool_execution"
+    assert cd["save_point_emitted"] is False
     assert cd["cwd"]["cwd"] == "src"
     assert read["ok"] is True
+    assert read["lifecycle"] == "direct_tool_execution"
+    assert read["save_point_emitted"] is False
     assert read["result"]["preview"] == "alpha\n"
     assert status["cwd"]["cwd"] == "src"
+    assert status["operator"]["phase"] == "idle"
+    assert status["operator"]["project_root"] == str(tmp_path.resolve())
+    assert status["operator"]["cwd"] == "src"
+    assert "pwd" in status["operator"]["active_tools"]
+    event_kinds = [event.kind for event in store.list_session_store_events(session.id)]
+    assert "tool_call.started" in event_kinds
+    assert "operator.turn.started" not in event_kinds
+    assert "harness.save_point" not in event_kinds
+
+
+def test_local_server_session_tool_invalid_cwd_returns_recovery_payload(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Invalid cwd", metadata={"cwd": "missing-dir"})
+
+    response = _route_post(
+        f"/sessions/{session.id}/tool",
+        body={"tool_id": "pwd", "arguments": {}},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert response["schema_version"] == "harness.session_tool_execution_response/v1"
+    assert response["ok"] is False
+    assert response["result"]["error_type"] == "invalid_cwd"
+    serialized = json.dumps(response)
+    assert "harness doctor --repair" in serialized
+    assert "Traceback" not in serialized
+    assert "no such table" not in serialized.lower()
+
+
+def test_local_server_session_prompt_uses_chat_operator_loop_event_sequence(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    chat_session = store.create_session(title="Chat prompt")
+    server_session = store.create_session(title="Server prompt")
+    shell_session = store.create_session(title="Server prompt shell approval")
+
+    chat_response = handle_chat_input(
+        "pwd",
+        tmp_path,
+        ChatSessionState(session_id=chat_session.id, active_project_root=str(tmp_path)),
+    )
+    server_response = _route_post(
+        f"/sessions/{server_session.id}/prompt",
+        body={"prompt": "pwd"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    debug_response = _route_post(
+        f"/sessions/{server_session.id}/prompt",
+        body={"prompt": "pwd", "debug": True},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    shell_prompt = _route_post(
+        f"/sessions/{shell_session.id}/prompt",
+        body={"prompt": "run the session tool tests"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert chat_response["kind"] == "session_tool_result"
+    assert server_response["schema_version"] == "harness.session_prompt_response/v1"
+    assert server_response["kind"] == chat_response["kind"]
+    assert server_response["lines"] == chat_response["lines"]
+    assert server_response["operator_status"]["phase"] == "idle"
+    assert server_response["operator_status"]["cwd"] == "."
+    assert server_response["tool_results"] == [{"tool": "pwd", "ok": True, "error_type": None}]
+    chat_event_kinds = _operator_prompt_event_kinds(store, chat_session.id)
+    assert _operator_prompt_event_kinds(store, server_session.id)[: len(chat_event_kinds)] == chat_event_kinds
+    normal_json = json.dumps(server_response)
+    assert "harness.tool_result/v1" not in normal_json
+    assert "Traceback" not in normal_json
+    assert "no such table" not in normal_json.lower()
+    assert "debug" not in server_response
+    assert debug_response["debug"]["events"]
+    assert debug_response["debug"]["chat_response"]["kind"] == "session_tool_result"
+    assert shell_prompt["permission_required"] is True
+    assert shell_prompt["permission_id"]
+    assert shell_prompt["approval_card"]["command"] == "python3 -m pytest tests/test_session_tools.py -q"
+    assert shell_prompt["execution_started"] is False
+    assert shell_prompt["operator_status"]["phase"] == "waiting_approval"
+
+
+def test_local_server_status_projection_reports_persisted_active_turn(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Persisted status turn")
+    turn_state = create_turn_state_from_session(
+        project_root=tmp_path,
+        session=session,
+        model_profile_id="codex_cli",
+        backend_id="codex_cli",
+        agent_id="operator",
+        workbench_id=None,
+        active_tools=["pwd"],
+    )
+
+    persist_turn_started(store, turn_state, prompt="pwd")
+    active = _route_get(
+        f"/sessions/{session.id}/status",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    persist_turn_finished(store, turn_state)
+    finished = _route_get(
+        f"/sessions/{session.id}/status",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert active["operator"]["phase"] == HarnessAgentPhase.TURN.value
+    assert active["operator"]["turn_id"] == turn_state.turn_id
+    assert active["operator"]["current_turn"]["turn_id"] == turn_state.turn_id
+    assert finished["operator"]["phase"] == HarnessAgentPhase.IDLE.value
+
+
+def test_local_server_api_session_prompt_is_append_only_compatibility_route(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Compatibility prompt")
+
+    response = _route_post(
+        f"/api/session/{session.id}/prompt",
+        body={"prompt": "pwd"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert response["schema_version"] == "harness.api_session_prompt/v1"
+    assert response["mode"] == "append_only"
+    assert response["assistant_execution"] is False
+    assert response["execution_started"] is False
+    assert response["model_execution_started"] is False
+    assert response["provider_execution_started"] is False
+    assert response["no_hidden_fallback"] is True
+    assert response["part"]["text"] == "pwd"
+    assert _operator_prompt_event_kinds(store, session.id) == []
+
+
+def test_local_server_session_routes_initialize_before_session_tool_execution(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "src").mkdir()
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DROP TABLE IF EXISTS sessions")
+
+    created = _route_post(
+        "/sessions",
+        body={"title": "Migrated server session"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    session_id = created["session"]["id"]
+    result = _route_post(
+        f"/sessions/{session_id}/tool",
+        body={"tool_id": "cd", "arguments": {"path": "src", "actor": "operator"}},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert created["ok"] is True
+    assert result["ok"] is True
+    assert result["cwd"]["cwd"] == "src"
+    assert "no such table" not in json.dumps(created).lower()
+    assert "no such table" not in json.dumps(result).lower()
 
 
 def test_local_server_project_sync_and_experimental_workspace_actions_fail_closed(tmp_path) -> None:
@@ -3477,6 +3706,24 @@ def test_local_server_replies_to_permission_request_with_persisted_event(tmp_pat
         host="127.0.0.1",
         port=8765,
     )
+    approval_alias = store.request_session_permission(
+        session.id,
+        tool_id="shell",
+        normalized_action="run",
+        normalized_target_pattern="pytest -q",
+        boundary_kind=SessionPermissionBoundaryKind.SHELL,
+        risk="medium",
+        scope=SessionPermissionScope.ONCE,
+    )
+    approved_alias = _route_post(
+        f"/sessions/{session.id}/approval/{approval_alias.id}",
+        body={"action": "approve", "message": "operator approved approval alias"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
     snapshot = _route_get(
         f"/sessions/{session.id}/permissions/snapshot",
         project_root=tmp_path,
@@ -3511,15 +3758,97 @@ def test_local_server_replies_to_permission_request_with_persisted_event(tmp_pat
     assert replied_alias["decision"] == SessionPermissionStatus.DENIED.value
     assert replied_alias["permission"]["status"] == SessionPermissionStatus.DENIED.value
     assert replied_alias["permission_granting"] is False
+    assert approved_alias["schema_version"] == "harness.session_permission_reply/v1"
+    assert approved_alias["decision"] == SessionPermissionStatus.ALLOWED.value
+    assert approved_alias["tool_execution_started"] is False
     assert snapshot["pending_count"] == 0
-    assert snapshot["counts"][SessionPermissionStatus.ALLOWED.value] == 1
+    assert snapshot["counts"][SessionPermissionStatus.ALLOWED.value] == 2
     assert snapshot["counts"][SessionPermissionStatus.DENIED.value] == 1
     resolved_permissions = [
         event["payload"]["permission_id"]
         for event in events["events"]
         if event["kind"] == "permission.resolved"
     ]
-    assert resolved_permissions == [permission.id, permission_alias.id]
+    assert resolved_permissions == [permission.id, permission_alias.id, approval_alias.id]
+
+
+def test_local_server_approval_resume_executes_once_and_denial_records_feedback(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Approval resume")
+    command = f"{sys.executable} -c \"print('resumed once')\""
+    body = {"command": command, "timeout_seconds": 30, "shell_executable": "/bin/sh"}
+
+    pending = _route_post(
+        f"/sessions/{session.id}/shell",
+        body=body,
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    approved = _route_post(
+        f"/sessions/{session.id}/approval/{pending['permission_id']}",
+        body={"action": "approve", "message": "operator approved once"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    repeated = _route_post(
+        f"/sessions/{session.id}/shell",
+        body=body,
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert pending["permission_required"] is True
+    assert pending["process_started"] is False
+    assert pending["approval_card"]["command"] == command
+    assert approved["decision"] == SessionPermissionStatus.ALLOWED.value
+    assert approved["tool_execution_started"] is True
+    assert approved["execution_started"] is True
+    assert approved["resumed_result"]["ok"] is True
+    assert "Shell command executed." in approved["resumed_result"]["preview"]
+    assert "resumed once" in approved["resumed_result"]["preview"]
+    assert store.get_session_permission(pending["permission_id"]).status == SessionPermissionStatus.EXPIRED
+    assert repeated["permission_required"] is True
+    assert repeated["permission_id"] != pending["permission_id"]
+    assert repeated["process_started"] is False
+
+    deny_pending = _route_post(
+        f"/sessions/{session.id}/shell",
+        body={"command": "echo denied", "timeout_seconds": 30},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    denied = _route_post(
+        f"/sessions/{session.id}/approval/{deny_pending['permission_id']}",
+        body={"action": "deny", "message": "needs a narrower command"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert denied["decision"] == SessionPermissionStatus.DENIED.value
+    assert denied["tool_execution_started"] is False
+    assert denied["denial"]["feedback"] == "needs a narrower command"
+    assert "needs a narrower command" in denied["model_visible_error"]
+    events = store.list_session_store_events(session.id)
+    denial_event = next(event for event in events if event.kind == "harness.approval.denied")
+    assert denial_event.payload["permission_id"] == deny_pending["permission_id"]
+    assert denial_event.payload["feedback"] == "needs a narrower command"
 
 
 def test_local_server_lists_named_references_and_resolves_reference_mentions(tmp_path) -> None:

@@ -5,12 +5,24 @@ import time
 from pathlib import Path
 
 from harness.config import load_config
-from harness.memory.sqlite_store import SQLiteStore
+from harness.memory.sqlite_store import (
+    SESSION_SCHEMA_REPAIR_MESSAGE,
+    SQLiteStore,
+    is_missing_session_schema_error,
+)
 from harness.model_catalog import parse_model_ref, validate_model_selection
-from harness.operator_context import build_tui_dashboard
+from harness.operator_context import build_session_pane_projection, build_tui_dashboard
 from harness.procedure_renderer import render_procedure_event
 from rich.markup import escape
+from textual.markup import MarkupError
 
+
+SESSION_PREVIOUS_KEYS = {"alt+up", "option+up", "meta+up", "ctrl+left", "ctrl+pageup"}
+SESSION_NEXT_KEYS = {"alt+down", "option+down", "meta+down", "ctrl+right", "ctrl+pagedown"}
+SESSION_DELETE_KEYS = {"ctrl+d"}
+ENTER_KEYS = {"enter", "numpad_enter", "ctrl+j", "ctrl+m"}
+SHIFT_ENTER_KEYS = {"shift+enter", "shift+numpad_enter"}
+SESSION_PANE_FILTERS = ("open", "running", "archived", "all")
 
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
@@ -477,25 +489,34 @@ TUI_NAVIGATION_HINTS = [
     {"key": "c", "label": "Collapse"},
     {"key": "shift+c", "label": "Expand"},
     {"key": "ctrl+q", "label": "Quit"},
-    {"key": "enter", "label": "Send"},
+    {"key": "enter", "label": "Details/Send"},
     {"key": "shift+enter", "label": "New line"},
     {"key": "safe-actions", "label": "UI-only actions"},
 ]
 
 TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
 RIGHT_PANEL_SECTION_IDS = (
-    "assistant",
     "action",
-    "project",
-    "sessions",
     "now",
+    "sessions",
+    "progress",
     "queue",
     "recent",
     "adapters",
-    "progress",
+    "project",
+    "assistant",
     "next",
     "commands",
 )
+RIGHT_PANEL_SECTION_ALIASES = {
+    "project_overview": "project",
+    "queue_daemon": "queue",
+    "runtime_evidence": "recent",
+    "agents_specs": "adapters",
+    "settings": "project",
+    "command_palette": "commands",
+    "safety": "next",
+}
 
 SLASH_COMMAND_ALIASES = {
     "help": "orientation.quickstart_agent",
@@ -738,8 +759,8 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
             "lines": (
                 [
                     (
-                        f"{session['id']} {session['status']} "
-                        f"{session.get('title') or session.get('intent') or 'untitled'} "
+                        f"{session['status']} "
+                        f"{session.get('display_title') or session.get('title') or session.get('intent') or 'untitled'} "
                         f"cwd={session.get('cwd') or '.'} "
                         f"model={session.get('raw_model_ref') or 'default'} "
                         f"run={session.get('active_run_id') or 'none'}"
@@ -1156,24 +1177,29 @@ def activate_command_palette_entry(
             "view_state": dict(view_state or {}),
         }
     state = dict(view_state or {})
-    collapsed = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+    collapsed = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids")))
     action = dict(activation.get("action") or {})
     if action.get("type") == "focus_section":
+        resolved_section_id = _right_panel_resolve_section_id(action.get("section_id"))
         state["focus_mode"] = action.get("focus_mode") or "dashboard"
-        state["active_section_id"] = action.get("section_id")
-        state["active_section_index"] = _section_index(action.get("section_id"))
+        state["active_section_id"] = resolved_section_id
+        state["requested_section_id"] = action.get("section_id")
+        state["active_section_index"] = _right_panel_section_index(resolved_section_id)
     elif action.get("type") == "clear_search":
         state["focus_mode"] = action.get("focus_mode") or "dashboard"
         state["query"] = ""
     elif action.get("type") == "set_focus_mode":
         state["focus_mode"] = action.get("focus_mode") or "dashboard"
     elif action.get("type") == "toggle_section":
-        section_id = _section_id_at_index(state.get("active_section_index"))
+        section_id = _right_panel_resolve_section_id(state.get("active_section_id"))
+        if not state.get("active_section_id"):
+            section_id = _right_panel_section_id_at_index(state.get("active_section_index"))
         if section_id in collapsed:
             collapsed.remove(section_id)
         else:
             collapsed.add(section_id)
         state["active_section_id"] = section_id
+        state["active_section_index"] = _right_panel_section_index(section_id)
         state["collapsed_section_ids"] = sorted(collapsed)
     elif action.get("type") == "expand_all":
         collapsed.clear()
@@ -1237,6 +1263,29 @@ def _section_index(section_id: object) -> int:
         if section["id"] == section_id:
             return index
     return 0
+
+
+def _right_panel_resolve_section_id(section_id: object) -> str:
+    value = str(section_id or "").strip()
+    value = RIGHT_PANEL_SECTION_ALIASES.get(value, value)
+    return value if value in RIGHT_PANEL_SECTION_IDS else "action"
+
+
+def _right_panel_section_index(section_id: object) -> int:
+    resolved = _right_panel_resolve_section_id(section_id)
+    try:
+        return list(RIGHT_PANEL_SECTION_IDS).index(resolved)
+    except ValueError:
+        return 0
+
+
+def _right_panel_section_id_at_index(index: object) -> str:
+    try:
+        value = int(index or 0)
+    except (TypeError, ValueError):
+        value = 0
+    sections = list(RIGHT_PANEL_SECTION_IDS)
+    return sections[value % len(sections)]
 
 
 def _section_id_at_index(index: object) -> str:
@@ -1459,11 +1508,7 @@ def build_right_panel_model(
     state = view_state or {}
     mode = focus_mode if focus_mode in TUI_FOCUS_MODES else "dashboard"
     normalized_query = query.strip().casefold()
-    collapsed_ids = {
-        str(section_id)
-        for section_id in state.get("collapsed_section_ids", set())
-        if str(section_id) in RIGHT_PANEL_SECTION_IDS
-    }
+    collapsed_ids = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids", set())))
     palette = state.get("palette") or build_command_palette()
     sections = _right_panel_base_sections(dashboard, state)
     command_matches = _right_panel_command_rows(palette, query, mode=mode)
@@ -1479,8 +1524,17 @@ def build_right_panel_model(
     for section in sections:
         section["collapsed"] = section["id"] in collapsed_ids
         section["match_count"] = len(section.get("rows", []))
-    active_index = int(state.get("active_section_index", 0) or 0)
-    active_section_id = sections[active_index % len(sections)]["id"] if sections else None
+    requested_active_id = state.get("active_section_id")
+    active_section_id = _right_panel_resolve_section_id(requested_active_id) if requested_active_id else None
+    if active_section_id and not any(section["id"] == active_section_id for section in sections):
+        active_section_id = None
+    if not active_section_id:
+        try:
+            active_index = int(state.get("active_section_index", 0) or 0)
+        except (TypeError, ValueError):
+            active_index = 0
+        active_section_id = sections[active_index % len(sections)]["id"] if sections else None
+    active_index = next((index for index, section in enumerate(sections) if section["id"] == active_section_id), 0)
     empty_state = None
     if not sections:
         empty_state = {
@@ -1488,6 +1542,9 @@ def build_right_panel_model(
             "message": "No matches. Try /help, tasks, runs, adapters.",
             "query": query.strip(),
         }
+    live_activity = dashboard.get("live_activity") or {}
+    live_signal = "responding" if state.get("request_in_flight") else live_activity.get("active_signal") or "idle"
+    live_counts = live_activity.get("counts") or {}
     return {
         "schema_version": "harness.tui_right_panel/v1",
         "ok": True,
@@ -1495,6 +1552,8 @@ def build_right_panel_model(
         "query": query.strip(),
         "sections": sections,
         "active_section_id": active_section_id,
+        "active_section_index": active_index,
+        "active_signal": live_signal,
         "collapsed_section_ids": sorted(collapsed_ids),
         "empty_state": empty_state,
         "summary": {
@@ -1503,7 +1562,13 @@ def build_right_panel_model(
             "active_leases": dashboard["summary"]["active_leases"],
             "recent_runs": dashboard["summary"]["recent_runs"],
             "registered_adapters": len(dashboard.get("registered_adapters", [])),
+            "active_signal": live_signal,
+            "ready": live_counts.get("ready", 0),
+            "running": live_counts.get("running", 0),
+            "blocked": live_counts.get("blocked", 0),
+            "waiting_approval": live_counts.get("waiting_approval", 0),
         },
+        "live_activity": live_activity,
         "search": {
             "context_matches": sum(section.get("match_count", 0) for section in sections),
             "command_matches": len(command_matches),
@@ -1513,30 +1578,19 @@ def build_right_panel_model(
 
 
 def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
-    summary = dashboard["summary"]
     active_orchestrator = state.get("active_orchestrator") or "coding_orchestrator"
     chat_mode = state.get("chat_mode") or "normal"
     branch = dashboard.get("branch") or "unknown"
     sections = [
         {
-            "id": "assistant",
-            "title": "Assistant",
-            "rows": _right_panel_assistant_rows(dashboard, state),
-        },
-        {
             "id": "action",
             "title": "Action",
-            "rows": _right_panel_action_rows(state),
+            "rows": _right_panel_action_rows(dashboard, state),
         },
         {
-            "id": "project",
-            "title": "Project",
-            "rows": [
-                f"{'Ready' if dashboard.get('initialized') else 'Setup needed'} | {Path(dashboard['project_root']).name}",
-                f"Branch: {branch}",
-                f"Mode: {chat_mode}",
-                f"Orchestrator: {active_orchestrator}",
-            ],
+            "id": "now",
+            "title": "Now",
+            "rows": _right_panel_now_rows(dashboard, state),
         },
         {
             "id": "sessions",
@@ -1544,9 +1598,9 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
             "rows": _right_panel_session_rows(dashboard, state),
         },
         {
-            "id": "now",
-            "title": "Now",
-            "rows": _right_panel_now_rows(dashboard),
+            "id": "progress",
+            "title": "Progress",
+            "rows": _right_panel_progress_rows(dashboard),
         },
         {
             "id": "queue",
@@ -1564,9 +1618,20 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
             "rows": _right_panel_adapter_rows(dashboard),
         },
         {
-            "id": "progress",
-            "title": "Progress",
-            "rows": _right_panel_progress_rows(dashboard),
+            "id": "project",
+            "title": "Project",
+            "rows": [
+                f"State: {'ready' if dashboard.get('initialized') else 'needs setup'}",
+                f"Root: {Path(dashboard['project_root']).name}",
+                f"Branch: {branch}",
+                f"Mode: {_status_label(chat_mode)}",
+                f"Operator: {_humanize_identifier(active_orchestrator)}",
+            ],
+        },
+        {
+            "id": "assistant",
+            "title": "Assistant",
+            "rows": _right_panel_assistant_rows(dashboard, state),
         },
         {
             "id": "next",
@@ -1575,6 +1640,114 @@ def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
         },
     ]
     return sections
+
+
+def _first_line(value: object, *, limit: int = 96) -> str:
+    text = str(value or "").splitlines()[0].strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _humanize_identifier(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "unknown"
+    text = re.sub(r"[_./-]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or "unknown"
+
+
+def _title_case_identifier(value: object) -> str:
+    words = []
+    for word in _humanize_identifier(value).split():
+        lowered = word.casefold()
+        if lowered == "ui":
+            words.append("UI")
+        elif lowered == "tui":
+            words.append("TUI")
+        else:
+            words.append(word.title())
+    return " ".join(words)
+
+
+def _status_label(value: object) -> str:
+    labels = {
+        "setup_needed": "needs setup",
+        "approval_required": "approval needed",
+        "waiting_approval": "needs approval",
+        "pending_contract": "needs confirmation",
+        "ui_action": "UI updated",
+        "in_flight": "running",
+    }
+    raw = str(value or "idle").strip()
+    return labels.get(raw, _humanize_identifier(raw))
+
+
+def _session_title(session: dict) -> str:
+    return str(
+        session.get("display_title")
+        or session.get("title")
+        or session.get("intent")
+        or "Untitled session"
+    )
+
+
+def _task_title_by_id(dashboard: dict) -> dict[str, str]:
+    return {
+        str(task.get("id")): str(task.get("title") or "Untitled task")
+        for task in dashboard.get("tasks", [])
+        if task.get("id")
+    }
+
+
+def _task_title(dashboard: dict, task_id: object, *, fallback: str = "selected task") -> str:
+    if not task_id:
+        return fallback
+    return _task_title_by_id(dashboard).get(str(task_id), fallback)
+
+
+def _clean_event_summary(value: object) -> str:
+    text = _first_line(value, limit=88)
+    text = re.sub(r"^\d+\s+", "", text).strip()
+    text = re.sub(
+        r"\s*\([^)]*\b(?:artifact|lease|msg|perm|run|sess|task|todo)_[^)]+\)",
+        "",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:artifact|lease|msg|perm|run|sess|task|todo)_[A-Za-z0-9_./-]+",
+        "item",
+        text,
+    )
+    return text or "no events"
+
+
+def _right_panel_active_signal(dashboard: dict, state: dict) -> str:
+    if state.get("request_in_flight"):
+        return "responding"
+    return str((dashboard.get("live_activity") or {}).get("active_signal") or "idle")
+
+
+def _approval_command(active_session: dict) -> str | None:
+    operator = active_session.get("operator") or {}
+    card = operator.get("approval_card") if isinstance(operator.get("approval_card"), dict) else {}
+    command = card.get("command") or card.get("operation")
+    return str(command) if command else None
+
+
+def _first_blocker(progress: dict) -> tuple[str | None, str | None]:
+    for task in progress.get("tasks", []) or []:
+        blocked = task.get("blocked_state_explanations") or []
+        if blocked:
+            return str(blocked[0].get("code") or "blocked"), str(task.get("task_id") or "")
+        reasons = task.get("blocked_reasons") or []
+        if reasons:
+            return str(reasons[0]), str(task.get("task_id") or "")
+    reasons = progress.get("blocked_reasons") or []
+    if reasons:
+        return str(reasons[0]), None
+    return None, None
 
 
 def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
@@ -1590,18 +1763,15 @@ def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
     )
     rows = [
         f"Model: {model_label}",
-        f"Provider: {active_model.get('provider_id') or 'default'}",
-        f"Known model: {active_model.get('known_catalog_entry') if active_model else 'n/a'}",
-        f"Model executable: {active_model.get('executable') if active_model else 'n/a'}",
-        f"Mode: {state.get('chat_mode') or chat_cfg.get('mode') or 'normal'}",
-        "Read tools: autonomous",
-        "Side effects: action contracts",
+        f"Provider: {_humanize_identifier(active_model.get('provider_id') or 'default')}",
+        f"Mode: {_status_label(state.get('chat_mode') or chat_cfg.get('mode') or 'normal')}",
+        "Safety: action contracts",
+        "Fallback: explicit failure only",
     ]
     if active_model.get("blocked_reasons"):
-        rows.append("Model blocked: " + ", ".join(active_model["blocked_reasons"]))
+        rows.append("Blocked: " + ", ".join(_humanize_identifier(reason) for reason in active_model["blocked_reasons"]))
     if model_catalog.get("models"):
         rows.append(f"Catalog models: {len(model_catalog['models'])}")
-    rows.append("Fallback: explicit failure only")
     latest_response = state.get("latest_response") or {}
     tool_results = latest_response.get("tool_results") or []
     if tool_results:
@@ -1613,47 +1783,55 @@ def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
     return rows
 
 
-def _right_panel_action_rows(state: dict) -> list[str]:
+def _right_panel_action_rows(dashboard: dict, state: dict) -> list[str]:
+    live_activity = dashboard.get("live_activity") or {}
+    active_session = dashboard.get("active_session") or {}
+    progress = dashboard.get("progress") or {}
+    signal = _right_panel_active_signal(dashboard, state)
     contract = state.get("pending_action_contract")
     if contract:
         return [
+            "State: needs confirmation",
             f"Pending: {contract.get('summary')}",
-            f"Tool: {contract.get('tool')}",
-            f"Risk: {contract.get('risk')}",
+            f"Tool: {_humanize_identifier(contract.get('tool'))}",
+            f"Risk: {_humanize_identifier(contract.get('risk'))}",
             "Confirm: yes or /confirm",
             "Cancel: no",
         ]
+    pending_permissions = live_activity.get("pending_permissions") or []
+    if pending_permissions:
+        permission = pending_permissions[-1]
+        rows = [
+            "State: approval needed",
+            f"Permission: {_humanize_identifier(permission.get('tool_id'))} {_humanize_identifier(permission.get('action'))}",
+            f"Target: {_first_line(permission.get('target'), limit=72)}",
+            f"Risk: {_humanize_identifier(permission.get('risk') or 'unknown')}",
+        ]
+        command = _approval_command(active_session)
+        rows.append(f"Next: {command or 'approve or decline in chat'}")
+        return rows
     latest_activation = state.get("latest_palette_activation") or {}
     if latest_activation:
         rows = [
-            "Latest UI action",
-            f"Entry: {latest_activation.get('entry_id') or 'unknown'}",
+            "State: UI updated",
+            f"Action: {_title_case_identifier(latest_activation.get('entry_id') or 'unknown')}",
             f"Status: {'succeeded' if latest_activation.get('ok') else 'failed'}",
-            f"Kind: {latest_activation.get('activation_kind') or 'unknown'}",
         ]
         action = latest_activation.get("action") or {}
         if action:
-            rows.append(f"Action: {action.get('type') or 'unknown'}")
+            rows.append(f"Kind: {_humanize_identifier(action.get('type') or latest_activation.get('activation_kind') or 'unknown')}")
         if latest_activation.get("raw_model_ref"):
             rows.append(f"Model: {latest_activation.get('raw_model_ref')}")
         if "session_model_selected" in latest_activation:
             rows.append(f"Model selected: {latest_activation.get('session_model_selected')}")
         if latest_activation.get("model_validation"):
             validation = latest_activation["model_validation"]
-            rows.append(f"Model executable: {validation.get('executable')}")
             if validation.get("blocked_reasons"):
-                rows.append("Model blocked: " + ", ".join(validation["blocked_reasons"]))
-        rows.extend(
-            [
-                f"Command started: {latest_activation.get('command_started', False)}",
-                f"Process started: {latest_activation.get('process_started', False)}",
-                f"Filesystem modified: {latest_activation.get('filesystem_modified', False)}",
-                f"Harness state modified: {latest_activation.get('harness_state_modified', False)}",
-                f"Permission granting: {latest_activation.get('permission_granting', False)}",
-            ]
-        )
+                rows.append("Blocked: " + ", ".join(_humanize_identifier(reason) for reason in validation["blocked_reasons"]))
+        if "harness_state_modified" in latest_activation:
+            rows.append(f"Saved: {latest_activation.get('harness_state_modified', False)}")
         if "session_event_persisted" in latest_activation:
-            rows.append(f"Session event persisted: {latest_activation.get('session_event_persisted')}")
+            rows.append(f"Recorded: {latest_activation.get('session_event_persisted')}")
         return rows
     latest_response = state.get("latest_response") or {}
     if latest_response.get("kind") == "self_managed_local_action":
@@ -1661,86 +1839,116 @@ def _right_panel_action_rows(state: dict) -> list[str]:
         if not report_path and isinstance(latest_response.get("extra"), dict):
             report_path = latest_response["extra"].get("report_path")
         rows = ["Latest action", f"Status: {'succeeded' if latest_response.get('ok') else 'failed'}"]
-        run_id = latest_response.get("run_id") or latest_response.get("extra", {}).get("run_id")
-        if run_id:
-            rows.append(f"Run: {run_id}")
         if report_path:
             rows.append(f"Report: {Path(str(report_path)).name}")
         return rows
-    latest = []
-    if state.get("latest_task_id"):
-        latest.append(f"Task: {state['latest_task_id']}")
-    if state.get("latest_lease_id"):
-        latest.append(f"Lease: {state['latest_lease_id']}")
-    if state.get("latest_run_id"):
-        latest.append(f"Run: {state['latest_run_id']}")
-    if latest:
-        return latest
-    return ["No pending action.", "Ask naturally or request an action."]
-
-
-def _right_panel_now_rows(dashboard: dict) -> list[str]:
     if dashboard.get("active_leases"):
         lease = dashboard["active_leases"][0]
-        return [f"Running: {lease['task_id']}", f"Lease: {lease['id']}"]
-    waiting = dashboard["task_status_counts"].get("waiting_approval", 0)
-    if waiting:
-        return [f"Needs approval: {waiting} task{'s' if waiting != 1 else ''}"]
-    ready = dashboard["task_status_counts"].get("ready", 0)
-    if ready:
-        return [f"Ready: {ready} task{'s' if ready != 1 else ''}", "Action: /run or lease next"]
-    if dashboard.get("recent_runs"):
-        run = dashboard["recent_runs"][0]
-        return [f"Latest run: {run['status']}", run["id"]]
-    return ["Idle", "Ask Harness what to do next."]
+        return [
+            "State: running",
+            f"Work: {_task_title(dashboard, lease.get('task_id'))}",
+            "Next: open details or dispatch from the command palette",
+        ]
+    blocker, blocked_task_id = _first_blocker(progress)
+    if signal == "blocked" and blocker:
+        rows = ["State: blocked", f"Blocker: {blocker}"]
+        if blocked_task_id:
+            rows.append(f"Work: {_task_title(dashboard, blocked_task_id)}")
+        rows.append("Next: inspect progress details")
+        return rows
+    if signal == "ready":
+        ready = (live_activity.get("counts") or {}).get("ready", 0)
+        return ["State: ready", f"Ready: {ready}", "Next: lease the next task"]
+    if signal == "setup_needed":
+        return ["State: needs setup", "Next: /init", "Then: summarize this repo"]
+    latest = []
+    if state.get("latest_task_id"):
+        latest.append("Task: updated")
+    if state.get("latest_lease_id"):
+        latest.append("Lease: active")
+    if state.get("latest_run_id"):
+        latest.append("Run: recorded")
+    if latest:
+        return latest
+    return [f"State: {_status_label(signal)}", "Pending: none", "Next: ask Harness or inspect progress"]
+
+
+def _right_panel_now_rows(dashboard: dict, state: dict) -> list[str]:
+    live_activity = dashboard.get("live_activity") or {}
+    active_session = dashboard.get("active_session") or {}
+    operator = active_session.get("operator") or {}
+    cwd = active_session.get("cwd")
+    if isinstance(cwd, dict):
+        cwd = cwd.get("cwd")
+    model_catalog = dashboard.get("model_catalog") or {}
+    active_model = model_catalog.get("active_model") or {}
+    session_label = _session_title(active_session) if active_session else "none"
+    counts = live_activity.get("counts") or {}
+    rows = [
+        f"State: {_status_label(_right_panel_active_signal(dashboard, state))}",
+        f"Operator: {_status_label(operator.get('phase') or 'idle')}",
+        f"Request: {'running' if state.get('request_in_flight') else 'idle'}",
+        f"Session: {session_label}",
+        f"cwd: {cwd or '.'}",
+        f"Model: {active_model.get('raw_model_ref') or active_session.get('raw_model_ref') or 'default'}",
+        f"Queue: {counts.get('ready', 0)} ready / {counts.get('running', 0)} running / {counts.get('blocked', 0)} blocked",
+    ]
+    rows.append(
+        "Open: "
+        f"{counts.get('pending_permissions', 0)} approvals, "
+        f"{counts.get('open_todos', 0)} todos, "
+        f"{counts.get('recent_artifacts', 0)} artifacts"
+    )
+    if dashboard.get("active_leases"):
+        lease = dashboard["active_leases"][0]
+        rows.append(f"Work: {_task_title(dashboard, lease.get('task_id'))}")
+    return rows
 
 
 def _right_panel_session_rows(dashboard: dict, state: dict) -> list[str]:
     sessions = dashboard.get("recent_sessions") or []
     active_session = dashboard.get("active_session") or {}
-    active_session_id = state.get("active_session_id")
+    live_activity = dashboard.get("live_activity") or {}
     rows = []
-    if active_session_id:
-        rows.append(f"Active: {active_session_id}")
-    if sessions:
-        latest = sessions[0]
-        rows.append(
-            f"Latest: {latest['status']} | {latest.get('title') or latest.get('intent') or latest['id']}"
-        )
+    if active_session or sessions:
+        latest = active_session or sessions[0]
+        rows.append(f"Active: {_session_title(latest)}")
+        rows.append(f"Status: {_status_label(latest.get('status') or 'unknown')}")
         if latest.get("raw_model_ref"):
             rows.append(f"Model: {latest['raw_model_ref']}")
         model_catalog = dashboard.get("model_catalog") or {}
         active_model = model_catalog.get("active_model") or {}
-        if active_model:
-            rows.append(f"Known model: {active_model.get('known_catalog_entry')}")
-            if active_model.get("provider_id"):
-                rows.append(f"Provider: {active_model['provider_id']}")
         if latest.get("agent_id"):
-            rows.append(f"Agent: {latest['agent_id']}")
+            rows.append(f"Agent: {_humanize_identifier(latest['agent_id'])}")
+        operator = active_session.get("operator") or {}
+        if operator:
+            rows.append(f"Operator: {_status_label(operator.get('phase') or 'idle')}")
+            if operator.get("waiting_approval_id"):
+                rows.append("Waiting: approval")
+                command = _approval_command(active_session)
+                if command:
+                    rows.append(f"Approval: {command}")
+        rows.append(
+            "Open: "
+            f"todos={len(live_activity.get('open_todos') or [])} "
+            f"permissions={len(live_activity.get('pending_permissions') or [])}"
+        )
+        if active_model:
+            rows.append(f"Provider: {_humanize_identifier(active_model.get('provider_id') or 'default')}")
         timeline = active_session.get("timeline") or []
         if timeline:
-            rows.append(f"Timeline: {timeline[-1]}")
+            rows.append(f"Latest: {_clean_event_summary(timeline[-1])}")
         activation = active_session.get("latest_ui_activation") or {}
         if activation:
-            rows.append(
-                f"UI action: {activation.get('entry_id') or 'unknown'} "
-                f"action={activation.get('action_type') or 'unknown'}"
-            )
-            rows.append(
-                "UI flags: "
-                f"cmd={activation.get('command_started', False)} "
-                f"proc={activation.get('process_started', False)} "
-                f"fs={activation.get('filesystem_modified', False)} "
-                f"perm={activation.get('permission_granting', False)}"
-            )
+            rows.append(f"UI: {_title_case_identifier(activation.get('entry_id') or 'unknown')}")
         transcript = active_session.get("transcript") or []
         if transcript:
             first_line = str(transcript[-1]).splitlines()[0]
-            rows.append(f"Transcript: {first_line}")
-        rows.append(f"Continue: harness \"continue this work\" --project . --continue")
+            rows.append(f"Last message: {first_line}")
+        rows.append("Continue: ask \"continue this work\"")
         return rows
     rows.append("No sessions yet.")
-    rows.append("Start: harness \"prompt\" --project .")
+    rows.append("Start: type a prompt")
     return rows
 
 
@@ -2175,54 +2383,79 @@ def _right_panel_queue_rows(dashboard: dict) -> list[str]:
         "failed": "Failed",
         "succeeded": "Done",
     }
+    counts = dashboard.get("task_status_counts") or {}
+    live_counts = (dashboard.get("live_activity") or {}).get("counts") or {}
     rows = [
-        f"{label}: {dashboard['task_status_counts'].get(status, 0)}"
+        f"{label}: {counts.get(status, 0)}"
         for status, label in labels.items()
-        if dashboard["task_status_counts"].get(status, 0)
+        if counts.get(status, 0)
     ]
     if not rows:
         rows = ["No queued tasks."]
     rows.append(
         "Total: "
-        f"{dashboard['summary']['tasks_total']} | "
-        f"Objectives: {dashboard['summary']['objectives']} | "
-        f"Leases: {dashboard['summary']['active_leases']}"
+        f"{dashboard['summary']['tasks_total']} tasks, "
+        f"{dashboard['summary']['objectives']} objectives, "
+        f"{dashboard['summary']['active_leases']} active"
     )
     return rows
 
 
 def _right_panel_recent_rows(dashboard: dict) -> list[str]:
+    live_activity = dashboard.get("live_activity") or {}
     rows = []
+    for event in (live_activity.get("latest_events") or [])[-3:]:
+        rows.append(f"Event: {_clean_event_summary(event.get('line'))}")
     if dashboard.get("recent_sessions"):
         session = dashboard["recent_sessions"][0]
-        rows.append(f"Session: {session['status']} | cwd={session.get('cwd') or '.'} | {session.get('title') or session.get('intent') or session['id']}")
+        rows.append(f"Session: {_status_label(session['status'])} | {_session_title(session)}")
     if dashboard.get("tasks"):
         task = dashboard["tasks"][0]
-        rows.append(f"Task: {task['status']} | {task['title']}")
+        rows.append(f"Task: {_status_label(task['status'])} | {task['title']}")
     if dashboard.get("recent_runs"):
         run = dashboard["recent_runs"][0]
-        rows.append(f"Run: {run['status']} | {run.get('task_type') or 'unknown'}")
-    return rows or ["No recent task or run."]
+        rows.append(f"Run: {_status_label(run['status'])} | {_humanize_identifier(run.get('task_type') or 'unknown')}")
+    artifacts = live_activity.get("recent_artifacts") or []
+    if artifacts:
+        artifact = artifacts[0]
+        rows.append(
+            f"Artifact: {_humanize_identifier(artifact.get('kind'))} | "
+            f"{Path(str(artifact.get('path') or 'artifact')).name} | "
+            f"{_humanize_identifier(artifact.get('evidence_status'))}"
+        )
+    return rows[:7] or ["No recent task, run, or event."]
 
 
 def _right_panel_adapter_rows(dashboard: dict) -> list[str]:
     capabilities = dashboard.get("capabilities", {}).get("capabilities", [])
     if capabilities:
-        rows = []
-        for capability in capabilities[:6]:
-            task_types = ", ".join(capability.get("supported_task_types", [])) or "no task types"
-            readiness = capability.get("readiness") or "unknown"
-            blocked = capability.get("blocked_state_explanations") or []
-            blocked_label = f" | {blocked[0].get('code')}" if blocked else ""
-            rows.append(f"{capability['id']} -> {task_types} | {readiness}{blocked_label}")
+        ready = [
+            _title_case_identifier(capability.get("id"))
+            for capability in capabilities
+            if str(capability.get("readiness") or "").casefold() in {"ready", "available"}
+        ]
+        blocked = [
+            _title_case_identifier(capability.get("id"))
+            for capability in capabilities
+            if capability.get("blocked_state_explanations")
+        ]
+        rows = [f"Available: {len(capabilities)}"]
+        if ready:
+            rows.append("Ready: " + ", ".join(ready[:3]))
+        if blocked:
+            rows.append("Blocked: " + ", ".join(blocked[:3]))
+        breakers = (dashboard.get("runtime_controls") or {}).get("breakers") or []
+        open_breakers = [breaker for breaker in breakers if breaker.get("state") not in {None, "closed"}]
+        if open_breakers:
+            rows.append(f"Breakers: {len(open_breakers)} open")
         return rows
     adapters = dashboard.get("registered_adapters", [])
     if not adapters:
         return ["No registered adapters."]
     rows = []
     for adapter in adapters[:6]:
-        task_types = ", ".join(adapter.get("supported_task_types", [])) or "no task types"
-        rows.append(f"{adapter['id']} -> {task_types}")
+        task_types = ", ".join(_humanize_identifier(item) for item in adapter.get("supported_task_types", [])) or "no task types"
+        rows.append(f"{_title_case_identifier(adapter.get('id'))}: {task_types}")
     return rows
 
 
@@ -2230,24 +2463,23 @@ def _right_panel_progress_rows(dashboard: dict) -> list[str]:
     progress = dashboard.get("progress") or {}
     objective_id = progress.get("objective_id")
     if not objective_id:
-        return ["No objective selected."]
+        return ["Mode: idle", "Objective: none", "Next: create or select an objective"]
     rows = [
-        f"{progress.get('mode') or 'idle'} | {objective_id}",
+        f"Mode: {_status_label(progress.get('mode') or 'idle')}",
+        f"Objective: {progress.get('objective_title') or 'selected objective'}",
     ]
     if progress.get("active_lease_ids"):
-        rows.append(f"Lease: {progress['active_lease_ids'][0]}")
+        rows.append("Lease: active")
     if progress.get("active_run_ids"):
-        rows.append(f"Run: {progress['active_run_ids'][0]}")
+        rows.append("Run: active")
     for task in progress.get("tasks", [])[:3]:
-        label = f"{task.get('status') or 'unknown'} | {task.get('title') or task.get('task_id')}"
+        label = f"{_status_label(task.get('status') or 'unknown')} | {task.get('title') or 'Untitled task'}"
         blocked = task.get("blocked_state_explanations") or []
         if blocked:
             label += f" | {blocked[0].get('code')}"
-        if task.get("lease_id"):
-            label += f" | {task['lease_id']}"
         rows.append(label)
     if progress.get("next_action"):
-        rows.append(f"Next: {progress['next_action']}")
+        rows.append("Next: inspect progress details")
     return rows
 
 
@@ -2255,10 +2487,9 @@ def _right_panel_next_rows(dashboard: dict) -> list[str]:
     if not dashboard.get("initialized"):
         return ["/init", "Then try: summarize this repo"]
     if dashboard.get("active_leases"):
-        lease_id = dashboard["active_leases"][0]["id"]
         return [
-            f"harness daemon inspect-lease {lease_id} --project . --output json",
-            f"harness daemon execute {lease_id} --project . --output json",
+            "Open details for the active lease",
+            "Dispatch from the command palette when ready",
         ]
     if dashboard["task_status_counts"].get("ready", 0):
         ready_repo_planning = any(
@@ -2267,14 +2498,14 @@ def _right_panel_next_rows(dashboard: dict) -> list[str]:
         )
         if ready_repo_planning:
             return [
-                "harness daemon run-once --project . --output json",
-                "then dispatch with: harness daemon execute <lease_id> --project . --output json",
+                "Lease the next planning task",
+                "Dispatch the lease after review",
             ]
-        return ["lease the next task", "run the registered adapter"]
+        return ["Lease the next task", "Inspect or execute the lease"]
     return [
         "summarize this repo",
         "create dry run task",
-        'harness tasks add --title "Plan repo change" --execution-adapter repo_planning --task-type repo_planning --project . --output json',
+        "open the command palette for templates",
     ]
 
 
@@ -2307,37 +2538,96 @@ def _filter_right_panel_sections(sections: list[dict], normalized_query: str) ->
 
 def render_right_panel(model: dict) -> str:
     if model.get("empty_state"):
-        return model["empty_state"]["message"]
+        return escape(str(model["empty_state"]["message"]))
     lines = []
     active_id = model.get("active_section_id")
     for section in model["sections"]:
-        marker = "> " if section["id"] == active_id else "  "
+        marker = ">" if section["id"] == active_id else " "
         collapsed = section.get("collapsed", False)
-        lines.append(f"{marker}{section['title']}")
+        if section["id"] == active_id:
+            lines.append(f"[bold reverse]{escape(marker + ' ' + str(section['title']))}[/bold reverse]")
+        else:
+            lines.append(f"[bold steel_blue1]{escape(marker + ' ' + str(section['title']))}[/bold steel_blue1]")
         if collapsed:
-            lines.append("  hidden")
+            lines.append("  [dim]- hidden[/dim]")
             lines.append("")
             continue
         for row in section.get("rows", []):
-            lines.append(f"  {row}")
+            lines.append(_render_right_panel_row(str(row)))
         lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _render_right_panel_row(row: str) -> str:
+    label, sep, value = row.partition(":")
+    if sep and 1 <= len(label) <= 28 and re.match(r"^[A-Za-z0-9 _./-]+$", label):
+        return f"  [dim]-[/dim] [bold]{escape(label)}: {escape(value.strip())}[/bold]"
+    return f"  [dim]-[/dim] {escape(row)}"
+
+
+def render_right_panel_detail(model: dict, section_id: str | None = None) -> str:
+    if model.get("empty_state"):
+        return escape(str(model["empty_state"]["message"]))
+    active_id = _right_panel_resolve_section_id(section_id or model.get("active_section_id"))
+    section = next((item for item in model.get("sections", []) if item.get("id") == active_id), None)
+    if section is None:
+        section = (model.get("sections") or [{}])[0]
+    title = str(section.get("title") or "Context")
+    lines = [
+        f"[bold deep_sky_blue1]{escape(title)} detail[/bold deep_sky_blue1]",
+        "[dim]Read-only persisted Harness projection. No command, provider, shell, Docker, adapter, filesystem, or permission action is started.[/dim]",
+        "",
+        f"[bold]Signal:[/bold] {escape(str(model.get('active_signal') or 'idle'))}",
+        f"[bold]Mode:[/bold] {escape(str(model.get('mode') or 'dashboard'))}",
+        f"[bold]Query:[/bold] {escape(str(model.get('query') or 'ready'))}",
+        "",
+    ]
+    for row in section.get("rows", []):
+        lines.append(_render_right_panel_row(str(row)))
+    policy = (model.get("live_activity") or {}).get("policy_boundary") or {}
+    if policy:
+        lines.extend(
+            [
+                "",
+                "[bold]Boundary:[/bold] read-only",
+                f"  [dim]-[/dim] process={escape(str(policy.get('process_started', False)))} "
+                f"fs={escape(str(policy.get('filesystem_modified', False)))} "
+                f"shell={escape(str(policy.get('shell_started', False)))} "
+                f"docker={escape(str(policy.get('docker_started', False)))} "
+                f"perm={escape(str(policy.get('permission_granting', False)))}",
+            ]
+        )
     return "\n".join(lines).strip()
 
 
 def render_right_panel_status(model: dict) -> str:
     mode = model.get("mode", "dashboard")
     query = model.get("query") or "ready"
-    active = model.get("active_section_id") or "none"
+    signal = model.get("active_signal") or (model.get("summary") or {}).get("active_signal") or "idle"
+    summary = model.get("summary") or {}
+    counts = f"{summary.get('ready', 0)} ready / {summary.get('running', 0)} running / {summary.get('blocked', 0)} blocked"
     if mode == "palette":
-        return f"Context | palette | {model['search']['command_matches']} commands | {query}"
-    return f"Context | {active} | {query}"
+        return f"Context | palette | {model['search']['command_matches']} commands | {_status_label(signal)} | {query}"
+    return f"Context | live | {_status_label(signal)} | {counts} | {query}"
 
 
 def build_codex_mode_model(project_root: Path, run_id: str | None = None) -> dict:
     store = SQLiteStore(project_root)
+    if not store.db_path.exists():
+        return {
+            "schema_version": "harness.tui_codex_mode/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "run_id": run_id,
+            "status": "unavailable",
+            "error": "Project is not initialized.",
+            "panes": _empty_codex_panes("Project is not initialized."),
+            "controls": _codex_controls(None),
+        }
     selected_run = None
     runs = []
     try:
+        store.initialize()
         runs = store.list_runs()
         selected_run = store.get_run(run_id) if run_id else (runs[0] if runs else None)
     except Exception as exc:
@@ -2877,6 +3167,13 @@ def render_codex_like_transcript(
     return "\n".join(lines).strip()
 
 
+def _update_markup_static(widget, markup: str) -> None:
+    try:
+        widget.update(markup)
+    except MarkupError:
+        widget.update(escape(markup))
+
+
 def _render_codex_like_message(message: dict, *, separator_width: int) -> str:
     role = message.get("role")
     title = str(message.get("title") or "").strip()
@@ -3097,6 +3394,17 @@ def normalize_tui_collapsed_sections(collapsed_section_ids: set[str] | list[str]
     return sorted(str(section_id) for section_id in collapsed_section_ids if str(section_id) in valid_section_ids)
 
 
+def normalize_right_panel_collapsed_sections(collapsed_section_ids: set[str] | list[str] | tuple[str, ...] | None) -> list[str]:
+    if not collapsed_section_ids:
+        return []
+    normalized = []
+    for section_id in collapsed_section_ids:
+        resolved = _right_panel_resolve_section_id(section_id)
+        if resolved in RIGHT_PANEL_SECTION_IDS and resolved not in normalized:
+            normalized.append(resolved)
+    return sorted(normalized)
+
+
 def build_focused_tui_view_model(
     panes: list[dict],
     palette: dict,
@@ -3287,38 +3595,164 @@ def _render_navigation_hints(view: dict) -> str:
     return " | ".join(f"{hint['key']}: {hint['label']}" for hint in view["navigation_hints"])
 
 
-def _render_composer_status(dashboard: dict, selected_agent_id: str | None = None) -> str:
+def _render_composer_status(
+    dashboard: dict,
+    selected_agent_id: str | None = None,
+    selected_session_id: str | None = None,
+) -> str:
     active_session = dashboard.get("active_session") or {}
+    if selected_session_id:
+        selected_summary = next(
+            (
+                session
+                for session in dashboard.get("recent_sessions", [])
+                if session.get("id") == selected_session_id
+            ),
+            None,
+        )
+        if selected_summary and selected_summary.get("id") != active_session.get("id"):
+            active_session = selected_summary
     model_catalog = dashboard.get("model_catalog") or {}
     active_model = model_catalog.get("active_model") or {}
     composer_context = active_session.get("composer_context") or {}
+    operator = active_session.get("operator") or {}
     session_id = active_session.get("id") or "new session"
     cwd = (active_session.get("cwd") or {}).get("cwd") if isinstance(active_session.get("cwd"), dict) else active_session.get("cwd")
     agent_id = selected_agent_id or active_session.get("agent_id") or "default"
     model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref") or "default"
     attachment_count = composer_context.get("attachment_count", 0)
     context_tokens = composer_context.get("total_estimated_tokens", 0)
+    phase = operator.get("phase") or "idle"
+    waiting = operator.get("waiting_approval_id")
+    approval = f" approval={waiting}" if waiting else ""
+    card = operator.get("approval_card") if isinstance(operator.get("approval_card"), dict) else {}
+    command = card.get("command") or card.get("operation")
+    if command and len(str(command)) > 48:
+        command = f"{str(command)[:45]}..."
+    approval_detail = f" command={command}" if waiting and command else ""
     return (
-        f"Models: /models or ctrl+x m | Select: /model <number|name> | Current model: {model_ref} | Session: {session_id} | cwd={cwd or '.'} | Agent: {agent_id} | "
+        f"Models: /models or ctrl+x m | Select: /model <number|name> | Current model: {model_ref} | Session: {session_id} | cwd={cwd or '.'} | "
+        f"Operator: {phase}{approval}{approval_detail} | Agent: {agent_id} | "
         f"Submit: enter | New line: shift+enter | Attachments: {attachment_count} | Context est: {context_tokens} tokens"
     )
 
 
-def _render_session_rail(dashboard: dict) -> str:
+def _render_session_rail(dashboard: dict, *, selected_index: int = 0) -> str:
     sessions = dashboard.get("recent_sessions") or []
     active_session = dashboard.get("active_session") or {}
-    lines = ["Sessions", ""]
+    lines = ["Sessions", "enter switch | n new | / search"]
     if not sessions:
-        lines.extend(["No sessions", 'Start: harness "prompt" --project .'])
+        lines.extend(["", "No sessions", "Start by typing a prompt"])
         return "\n".join(lines)
+    selected_index = max(0, min(int(selected_index or 0), len(sessions[:12]) - 1))
     active_id = active_session.get("id")
-    for session in sessions[:12]:
-        marker = ">" if session.get("id") == active_id else " "
-        title = str(session.get("title") or session.get("id") or "untitled")
-        status = str(session.get("status") or "unknown")
-        lines.append(f"{marker} {title[:22]}")
-        lines.append(f"  {session.get('id')} {status} cwd={session.get('cwd') or '.'}")
-    lines.extend(["", 'Continue: harness "..." --continue'])
+    for index, session in enumerate(sessions[:12]):
+        marker = ">" if index == selected_index else " "
+        active_marker = "*" if session.get("id") == active_id else " "
+        title = _session_title(session)
+        status = _status_label(session.get("status") or "unknown")
+        lines.append(f"{marker}{active_marker} {title[:34]}")
+        lines.append(f"   {status}")
+    selected = sessions[selected_index]
+    lines.extend(["", f"Selected: {_session_title(selected)}"])
+    return "\n".join(lines)
+
+
+def _session_pane_row_label(session: dict, *, selected: bool = False, active: bool = False) -> str:
+    marker = ">" if selected else " "
+    active_marker = "*" if active else " "
+    status = _status_label(session.get("status") or "unknown")
+    title = _session_title(session)
+    if len(title) > 30:
+        title = title[:27].rstrip() + "..."
+    return f"{marker}{active_marker} {title:<30} {status}"
+
+
+def _render_session_pane_header(projection: dict, *, focused: bool) -> str:
+    counts = projection.get("counts") or {}
+    focus = "focused" if focused else "ctrl+x s"
+    active_filter = projection.get("filter") or "open"
+    filter_label = "" if active_filter == "open" else f" | {active_filter}"
+    return (
+        f"Sessions | {focus}{filter_label} | {counts.get('filtered', 0)} shown "
+        f"| {counts.get('open', 0)} open | {counts.get('running', 0)} running"
+    )
+
+
+def _render_session_pane_detail(projection: dict) -> str:
+    sessions = projection.get("sessions") or []
+    selected_id = projection.get("selected_session_id")
+    selected = next((session for session in sessions if session.get("id") == selected_id), None)
+    query = projection.get("query") or ""
+    if selected is None:
+        suffix = f" | search={query}" if query else ""
+        return f"No matching sessions{suffix}."
+    latest = _clean_event_summary(selected.get("latest_event") or "no events")
+    title = _session_title(selected)
+    active_bits = []
+    if selected.get("active_task_id"):
+        active_bits.append("task linked")
+    if selected.get("active_run_id"):
+        active_bits.append("run linked")
+    active_work = f" | {', '.join(active_bits)}" if active_bits else ""
+    return (
+        f"{title}\n"
+        f"{_status_label(selected.get('status'))} | {selected.get('message_count', 0)} messages{active_work}\n"
+        f"{latest}"
+    )
+
+
+def _render_session_pane_actions(*, search_active: bool, query: str) -> str:
+    if search_active:
+        return f"Search: {query or '<type>'} | enter/esc finish | backspace edit"
+    return "enter switch | n new | e rename | / search | f filter | a archive"
+
+
+def render_session_delete_dialog(session: dict, *, buffer: str = "") -> str:
+    lines = [
+        "[bold red]Hard delete session[/bold red]",
+        "",
+        f"Title: {escape(str(session.get('display_title') or session.get('title') or 'Untitled session'))}",
+        f"ID: {escape(str(session.get('id') or 'unknown'))}",
+        f"Status: {escape(str(session.get('status') or 'unknown'))}",
+        f"Messages: {session.get('message_count', 0)}",
+        f"Run: {escape(str(session.get('active_run_id') or 'none'))}",
+        f"Task: {escape(str(session.get('active_task_id') or 'none'))}",
+        "",
+        "This removes session-owned messages, parts, todos, permissions, links, events, and session folder.",
+        "Linked runs, tasks, artifacts, and active repository files are retained.",
+        "",
+        f"Type DELETE then enter: {escape(buffer)}",
+        "Esc cancels.",
+    ]
+    return "\n".join(lines)
+
+
+def render_session_rename_dialog(session: dict, *, buffer: str = "") -> str:
+    return "\n".join(
+        [
+            "[bold]Rename session[/bold]",
+            "",
+            f"Current: {escape(str(session.get('display_title') or session.get('title') or 'Untitled session'))}",
+            f"ID: {escape(str(session.get('id') or 'unknown'))}",
+            "",
+            f"New title: {escape(buffer)}",
+            "Enter saves. Esc cancels.",
+        ]
+    )
+
+
+def render_agent_selection_dialog(agents: list[str], *, selected_agent: str | None, selected_index: int = 0) -> str:
+    if not agents:
+        agents = ["default"]
+    selected_index = min(max(selected_index, 0), len(agents) - 1)
+    lines = ["[bold]Select agent[/bold]", ""]
+    for index, agent in enumerate(agents):
+        marker = ">" if index == selected_index else " "
+        current = " current" if agent == (selected_agent or "default") else ""
+        lines.append(f"{marker} {escape(agent)}{current}")
+    lines.append("")
+    lines.append("Enter selects. Esc cancels.")
     return "\n".join(lines)
 
 
@@ -3329,10 +3763,10 @@ def create_read_only_tui_app(project_root: Path):
 def create_harness_app(project_root: Path, *, codex_like: bool = False):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Container, Horizontal, VerticalScroll
+    from textual.containers import Container, Horizontal, Vertical, VerticalScroll
     from textual.css.query import NoMatches
     from textual.theme import Theme
-    from textual.widgets import Footer, Header, Static, TextArea
+    from textual.widgets import Footer, Header, Label, ListItem, ListView, Static, TextArea
     from harness.chat import ChatSessionState, handle_chat_input
 
     dashboard = build_tui_dashboard(project_root)
@@ -3393,11 +3827,26 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 event.prevent_default()
                 event.stop()
                 self.app.action_leader_key()
+            elif self.app.session_text_dialog_active:
+                event.prevent_default()
+                event.stop()
+                self.app.action_handle_text_dialog_key(event)
+            elif event.key in SESSION_PREVIOUS_KEYS | SESSION_NEXT_KEYS:
+                event.prevent_default()
+                event.stop()
+                if event.key in SESSION_PREVIOUS_KEYS:
+                    self.app.action_session_previous()
+                else:
+                    self.app.action_session_next()
+            elif event.key in SESSION_DELETE_KEYS:
+                event.prevent_default()
+                event.stop()
+                self.app.action_delete_selected_session()
             elif self.app.dialog_visible and event.key in {"down", "up"}:
                 event.prevent_default()
                 event.stop()
                 self.app.action_move_dialog_selection(1 if event.key == "down" else -1)
-            elif self.app.dialog_visible and event.key == "enter":
+            elif self.app.dialog_visible and event.key in ENTER_KEYS:
                 event.prevent_default()
                 event.stop()
                 self.app.action_activate_dialog_selection()
@@ -3408,28 +3857,28 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     self.app.action_handle_leader_key(event.key, event.character)
                 else:
                     self.app.action_cancel_leader_key()
-            elif event.key in {"ctrl+enter", "ctrl+j"}:
+            elif event.key == "ctrl+enter":
                 event.prevent_default()
                 event.stop()
                 self.app.action_submit_prompt()
-            elif event.key == "shift+enter":
+            elif event.key in SHIFT_ENTER_KEYS:
                 event.prevent_default()
                 event.stop()
                 self.insert("\n")
-            elif event.key == "enter" and self.app.should_insert_slash_suggestion:
+            elif event.key in ENTER_KEYS and self.app.should_insert_slash_suggestion:
                 event.prevent_default()
                 event.stop()
                 self.app.action_insert_selected_slash_suggestion()
-            elif event.key == "enter" and self.value.strip().startswith("/"):
+            elif event.key in ENTER_KEYS and self.value.strip().startswith("/"):
                 event.prevent_default()
                 event.stop()
                 if not self.app.action_activate_safe_slash_command():
                     self.app.action_submit_prompt()
-            elif event.key == "enter" and self.app.palette_focus_active:
+            elif event.key in ENTER_KEYS and self.app.palette_focus_active:
                 event.prevent_default()
                 event.stop()
                 self.app.action_activate_selected_palette_entry()
-            elif event.key == "enter":
+            elif event.key in ENTER_KEYS:
                 event.prevent_default()
                 event.stop()
                 self.app.action_submit_prompt()
@@ -3474,20 +3923,39 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             background: $surface;
         }
 
-        #session-rail {
-            width: 32;
-            border: round $secondary;
+        #session-pane {
+            width: 36;
+            border: round $primary;
             margin: 1 0 1 1;
             padding: 1;
-            background: $panel;
+            background: $surface;
+        }
+
+        #session-pane:focus-within {
+            border: round $accent;
+        }
+
+        #session-list {
+            height: 1fr;
+        }
+
+        #session-list > ListItem {
+            height: 1;
+            padding: 0 1;
+        }
+
+        #session-pane-header,
+        #session-pane-detail,
+        #session-pane-actions {
+            height: auto;
         }
 
         #side {
             width: 1fr;
-            border: round $secondary;
+            border: round $primary;
             margin: 1 1 1 0;
             padding: 1;
-            background: $panel;
+            background: $surface;
         }
 
         #prompt {
@@ -3560,6 +4028,9 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             Binding("escape", "clear_search", "Clear input", priority=True),
             Binding("tab", "section_next", "Next section", priority=True),
             Binding("shift+tab,backtab", "section_previous", "Previous section", priority=True),
+            Binding("alt+up,ctrl+left,ctrl+pageup", "session_previous", "Previous session", priority=True),
+            Binding("alt+down,ctrl+right,ctrl+pagedown", "session_next", "Next session", priority=True),
+            Binding("ctrl+d", "delete_selected_session", "Purge session", priority=True),
             Binding("ctrl+x", "leader_key", "Leader", priority=True),
             Binding("ctrl+p,f2", "toggle_palette_focus", "Palette focus", priority=True),
         ]
@@ -3573,8 +4044,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._latest_response: dict = {}
             self._latest_palette_activation: dict = {}
             self._focus_mode = "dashboard"
+            self._active_section_id = "action"
             self._collapsed_section_ids: set[str] = set()
             self._section_cursor_index = 0
+            self._session_cursor_index = 0
+            self._selected_session_id: str | None = None
+            self._session_filter = "open"
+            self._session_query = ""
+            self._session_search_active = False
+            self._left_pane_focused = False
             self._slash_suggestion_index = 0
             self._request_in_flight = False
             self._request_started_at: float | None = None
@@ -3585,9 +4063,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._dialog_kind = ""
             self._dialog_query = ""
             self._dialog_selected_index = 0
+            self._dialog_text_buffer = ""
+            self._dialog_context: dict = {}
             self._selected_agent_id = "plan"
             self._selected_theme_id = "light"
             self._dashboard_cache: dict | None = dict(dashboard)
+            self._dashboard_cache_session_id: str | None = None
             self._dashboard_cache_at = time.monotonic()
             self._refresh_timer = None
             self._live_refresh_failures = 0
@@ -3618,11 +4099,18 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         def dialog_visible(self) -> bool:
             return self._dialog_visible
 
+        @property
+        def session_text_dialog_active(self) -> bool:
+            return self._dialog_kind in {"session_delete", "session_rename"}
+
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
             with Horizontal(id="layout"):
-                with VerticalScroll(id="session-rail"):
-                    yield Static(_render_session_rail(dashboard), id="session-rail-content")
+                with Vertical(id="session-pane"):
+                    yield Static("", id="session-pane-header")
+                    yield ListView(id="session-list")
+                    yield Static("", id="session-pane-detail")
+                    yield Static("", id="session-pane-actions")
                 with VerticalScroll(id="chat"):
                     yield Static("", id="chat-content")
                 with VerticalScroll(id="side"):
@@ -3632,7 +4120,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             with Container(id="dialog-overlay", classes="hidden"):
                 yield Static("", id="dialog-panel")
             yield Static("", id="slash-status", classes="hidden")
-            yield Static(_render_composer_status(dashboard, self._selected_agent_id), id="composer-status")
+            yield Static(
+                _render_composer_status(dashboard, self._selected_agent_id, self._chat_state.session_id),
+                id="composer-status",
+            )
             yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
             yield Footer()
 
@@ -3649,21 +4140,42 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 timer.stop()
 
         def on_key(self, event) -> None:
+            if self.session_text_dialog_active:
+                event.prevent_default()
+                event.stop()
+                self.action_handle_text_dialog_key(event)
+                return
             if event.key == "ctrl+x":
                 event.prevent_default()
                 event.stop()
                 self.action_leader_key()
+                return
+            if event.key in SESSION_PREVIOUS_KEYS | SESSION_NEXT_KEYS:
+                event.prevent_default()
+                event.stop()
+                if event.key in SESSION_PREVIOUS_KEYS:
+                    self.action_session_previous()
+                else:
+                    self.action_session_next()
+                return
+            if event.key in SESSION_DELETE_KEYS:
+                event.prevent_default()
+                event.stop()
+                self.action_delete_selected_session()
                 return
             if self._dialog_visible and event.key in {"down", "up"}:
                 event.prevent_default()
                 event.stop()
                 self.action_move_dialog_selection(1 if event.key == "down" else -1)
                 return
-            if self._dialog_visible and event.key == "enter":
+            if self._dialog_visible and event.key in ENTER_KEYS:
                 event.prevent_default()
                 event.stop()
                 self.action_activate_dialog_selection()
                 return
+            if self._left_pane_focused:
+                if self._handle_session_pane_key(event):
+                    return
             if self._leader_key_active:
                 if self.is_leader_shortcut(event.key, event.character):
                     event.prevent_default()
@@ -3687,11 +4199,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._dialog_query = ""
             self._dialog_selected_index = 0
             self._show_functionality_dialog()
-            self._render_palette_activation_status("Leader: m Models.", ok=True)
+            self._render_palette_activation_status("Leader: m Models, s Sessions.", ok=True)
 
         def is_leader_shortcut(self, key: str, character: str | None = None) -> bool:
             pressed = (character or key or "").casefold()
-            return pressed in {"m", "t"}
+            return pressed in {"m", "s", "t"}
 
         def action_cancel_leader_key(self) -> None:
             self._leader_key_active = False
@@ -3701,6 +4213,9 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._leader_key_active = False
             if pressed == "m":
                 self._show_models_list(source="leader", slash="ctrl+x m")
+                return
+            if pressed == "s":
+                self.action_focus_session_pane()
                 return
             if pressed == "t":
                 self._show_theme_dialog()
@@ -3765,6 +4280,27 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if self._activate_safe_slash_command(prompt.value):
                 return
             request = self._request_from_prompt_submission(prompt.value)
+            if not request and self._focus_mode == "dashboard" and not self._request_in_flight:
+                view = self._current_view()
+                self._show_dialog(render_right_panel_detail(view), kind="right_panel_detail")
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_palette_activation/v1",
+                    "ok": True,
+                    "entry_id": "right_panel.detail",
+                    "activation_kind": "ui_action",
+                    "ui_action_applied": True,
+                    "source": "right_panel_enter",
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                    "evidence_status": "right_panel_detail_rendered",
+                    "policy_boundary": _safe_palette_policy_boundary(),
+                    "blocked_reasons": [],
+                    **_palette_no_side_effect_flags(),
+                }
+                self._render_palette_activation_status("Opened right-panel detail.", ok=True)
+                self._render_current_view()
+                return
             if not request or self._request_in_flight:
                 return
             self._prompt_history.append(request)
@@ -3800,11 +4336,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             try:
                 response = handle_chat_input(request, project_root, self._chat_state, progress_callback=progress)
             except Exception as exc:
+                error = SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)
                 response = {
                     "ok": False,
                     "kind": "chat_error",
                     "title": "Chat Error",
-                    "lines": [str(exc)],
+                    "lines": [error],
                 }
             self.call_from_thread(self._finish_chat_request, stream_index, response)
 
@@ -3868,6 +4405,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._leader_key_active = False
                 self._hide_dialog()
                 return
+            if self._session_search_active:
+                self._session_search_active = False
+                self._session_query = ""
+                self._render_current_view()
+                return
+            if self._left_pane_focused:
+                self.action_focus_composer()
+                return
             prompt = self.query_one("#prompt", TextArea)
             if prompt.value:
                 prompt.value = ""
@@ -3876,6 +4421,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._focus_mode = "dashboard"
                 self._collapsed_section_ids.clear()
                 self._section_cursor_index = 0
+                self._active_section_id = "action"
                 self._render_current_view()
 
         def action_section_next(self) -> None:
@@ -3883,6 +4429,321 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def action_section_previous(self) -> None:
             self._move_section_cursor(-1)
+
+        def action_session_next(self) -> None:
+            self._move_session_cursor(1)
+
+        def action_session_previous(self) -> None:
+            self._move_session_cursor(-1)
+
+        def action_delete_selected_session(self) -> None:
+            self.action_open_session_delete_dialog()
+
+        def action_focus_session_pane(self) -> None:
+            self._left_pane_focused = True
+            self._leader_key_active = False
+            self._hide_dialog()
+            self._render_current_view()
+            try:
+                self.query_one("#session-list", ListView).focus()
+            except NoMatches:
+                return
+
+        def action_focus_composer(self) -> None:
+            self._left_pane_focused = False
+            self._session_search_active = False
+            try:
+                self.query_one("#prompt", TextArea).focus()
+            except NoMatches:
+                return
+            self._render_current_view()
+
+        def _handle_session_pane_key(self, event) -> bool:
+            if self._session_search_active:
+                event.prevent_default()
+                event.stop()
+                self._handle_session_search_key(event)
+                return True
+            key = event.key
+            character = event.character or ""
+            if key in {"up", "k"}:
+                event.prevent_default()
+                event.stop()
+                self._move_session_pane_selection(-1)
+                return True
+            if key in {"down", "j"}:
+                event.prevent_default()
+                event.stop()
+                self._move_session_pane_selection(1)
+                return True
+            if key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.action_switch_to_selected_session()
+                return True
+            if key == "escape":
+                event.prevent_default()
+                event.stop()
+                self.action_focus_composer()
+                return True
+            if character == "/" or character.casefold() == "s":
+                event.prevent_default()
+                event.stop()
+                self._session_search_active = True
+                self._session_query = ""
+                self._render_current_view()
+                return True
+            if character == "n":
+                event.prevent_default()
+                event.stop()
+                self.action_create_blank_session()
+                return True
+            if character == "a":
+                event.prevent_default()
+                event.stop()
+                self.action_archive_selected_session()
+                return True
+            if character == "r":
+                event.prevent_default()
+                event.stop()
+                self.action_restore_selected_session()
+                return True
+            if character == "d":
+                event.prevent_default()
+                event.stop()
+                self.action_open_session_delete_dialog()
+                return True
+            if character == "x":
+                event.prevent_default()
+                event.stop()
+                self.action_abort_selected_session()
+                return True
+            if character == "e":
+                event.prevent_default()
+                event.stop()
+                self.action_open_session_rename_dialog()
+                return True
+            if character == "F" or key == "shift+f":
+                event.prevent_default()
+                event.stop()
+                self.action_fork_selected_session()
+                return True
+            if character == "f":
+                event.prevent_default()
+                event.stop()
+                self.action_cycle_session_filter()
+                return True
+            if character == "m":
+                event.prevent_default()
+                event.stop()
+                self._show_model_dialog()
+                return True
+            if character == "g":
+                event.prevent_default()
+                event.stop()
+                self._show_agent_dialog()
+                return True
+            return False
+
+        def _handle_session_search_key(self, event) -> None:
+            if event.key in {"escape", "enter"}:
+                self._session_search_active = False
+                self._render_current_view()
+                return
+            if event.key == "backspace":
+                self._session_query = self._session_query[:-1]
+                self._render_current_view()
+                return
+            if event.key == "ctrl+u":
+                self._session_query = ""
+                self._render_current_view()
+                return
+            if event.character and event.character.isprintable():
+                self._session_query += event.character
+                self._render_current_view()
+
+        def _session_pane_projection(self) -> dict:
+            selected_id = self._selected_session_id or self._chat_state.session_id
+            projection = build_session_pane_projection(
+                project_root,
+                selected_session_id=selected_id,
+                status_filter=self._session_filter,
+                query=self._session_query,
+            )
+            self._selected_session_id = projection.get("selected_session_id")
+            sessions = projection.get("sessions") or []
+            self._session_cursor_index = next(
+                (index for index, session in enumerate(sessions) if session.get("id") == self._selected_session_id),
+                0,
+            )
+            return projection
+
+        def _selected_session_row(self) -> dict | None:
+            projection = self._session_pane_projection()
+            selected_id = projection.get("selected_session_id")
+            return next((session for session in projection.get("sessions", []) if session.get("id") == selected_id), None)
+
+        def _move_session_pane_selection(self, step: int) -> None:
+            projection = self._session_pane_projection()
+            sessions = projection.get("sessions") or []
+            if not sessions:
+                self._selected_session_id = None
+                self._session_cursor_index = 0
+                self._render_current_view()
+                return
+            self._session_cursor_index = (self._session_cursor_index + step) % len(sessions)
+            self._selected_session_id = str(sessions[self._session_cursor_index].get("id") or "")
+            self._render_current_view()
+
+        def action_switch_to_selected_session(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            self._chat_state.session_id = str(row["id"])
+            self._selected_agent_id = str(row.get("agent_id") or self._selected_agent_id)
+            self._render_palette_activation_status(f"Switched to {row.get('display_title') or row['id']}.", ok=True)
+            self._render_current_view()
+
+        def action_create_blank_session(self) -> None:
+            try:
+                store = SQLiteStore.open_initialized(project_root)
+                session = store.create_session(
+                    title="New session",
+                    intent="tui_blank_session",
+                    metadata={"created_by": "tui_session_pane", "cwd": "."},
+                )
+            except Exception as exc:
+                self._render_palette_activation_status(f"New session failed: {exc}", ok=False)
+                return
+            self._selected_session_id = session.id
+            self._chat_state.session_id = session.id
+            self._session_filter = "open"
+            self._session_query = ""
+            self._session_search_active = False
+            self.query_one("#prompt", TextArea).value = ""
+            self._dashboard_snapshot(force=True)
+            self._render_palette_activation_status(f"Created session {session.id}.", ok=True)
+            self._render_current_view()
+
+        def action_archive_selected_session(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            if not row.get("can_archive"):
+                self._render_palette_activation_status("Selected session is already archived.", ok=False)
+                return
+            try:
+                SQLiteStore.open_initialized(project_root).archive_session(str(row["id"]))
+            except Exception as exc:
+                self._render_palette_activation_status(f"Archive failed: {exc}", ok=False)
+                return
+            self._after_session_removed_or_hidden(str(row["id"]))
+            self._render_palette_activation_status(f"Archived {row.get('display_title') or row['id']}.", ok=True)
+            self._render_current_view()
+
+        def action_restore_selected_session(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            if not row.get("can_restore"):
+                self._render_palette_activation_status("Selected session is not archived.", ok=False)
+                return
+            try:
+                session = SQLiteStore.open_initialized(project_root).restore_session(str(row["id"]))
+            except Exception as exc:
+                self._render_palette_activation_status(f"Restore failed: {exc}", ok=False)
+                return
+            self._selected_session_id = session.id
+            self._chat_state.session_id = session.id
+            if self._session_filter == "archived":
+                self._session_filter = "open"
+            self._dashboard_snapshot(force=True)
+            self._render_palette_activation_status(f"Restored {row.get('display_title') or row['id']}.", ok=True)
+            self._render_current_view()
+
+        def action_abort_selected_session(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            if not row.get("can_abort"):
+                self._render_palette_activation_status("Only running or waiting sessions can be aborted here.", ok=False)
+                return
+            try:
+                SQLiteStore.open_initialized(project_root).cancel_session(str(row["id"]), reason="tui_session_pane")
+            except Exception as exc:
+                self._render_palette_activation_status(f"Abort failed: {exc}", ok=False)
+                return
+            self._dashboard_snapshot(force=True)
+            self._render_palette_activation_status("Cancelled session metadata. No process was stopped.", ok=True)
+            self._render_current_view()
+
+        def action_fork_selected_session(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            try:
+                child = SQLiteStore.open_initialized(project_root).fork_session(
+                    str(row["id"]),
+                    title=f"Fork of {row.get('display_title') or row['id']}",
+                )
+            except Exception as exc:
+                self._render_palette_activation_status(f"Fork failed: {exc}", ok=False)
+                return
+            self._selected_session_id = child.id
+            self._chat_state.session_id = child.id
+            self._session_filter = "open"
+            self._dashboard_snapshot(force=True)
+            self._render_palette_activation_status(f"Forked session {child.id}.", ok=True)
+            self._render_current_view()
+
+        def action_cycle_session_filter(self) -> None:
+            index = SESSION_PANE_FILTERS.index(self._session_filter) if self._session_filter in SESSION_PANE_FILTERS else 0
+            self._session_filter = SESSION_PANE_FILTERS[(index + 1) % len(SESSION_PANE_FILTERS)]
+            self._session_query = ""
+            self._session_search_active = False
+            self._render_palette_activation_status(f"Session filter: {self._session_filter}.", ok=True)
+            self._render_current_view()
+
+        def action_open_session_delete_dialog(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            if self._request_in_flight and row.get("id") == self._chat_state.session_id:
+                self._render_palette_activation_status("Cannot hard delete the active in-flight session.", ok=False)
+                return
+            self._dialog_text_buffer = ""
+            self._dialog_context = {"session": row}
+            self._show_dialog(render_session_delete_dialog(row, buffer=""), kind="session_delete")
+
+        def action_open_session_rename_dialog(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            self._dialog_text_buffer = ""
+            self._dialog_context = {"session": row}
+            self._show_dialog(render_session_rename_dialog(row, buffer=""), kind="session_rename")
+
+        def _after_session_removed_or_hidden(self, removed_session_id: str) -> None:
+            self._dashboard_snapshot(force=True)
+            projection = build_session_pane_projection(
+                project_root,
+                selected_session_id=None,
+                status_filter=self._session_filter,
+                query=self._session_query,
+            )
+            remaining = projection.get("sessions") or []
+            self._selected_session_id = projection.get("selected_session_id")
+            if self._chat_state.session_id == removed_session_id:
+                self._chat_state.session_id = self._selected_session_id
+            if not remaining:
+                self._session_cursor_index = 0
 
         def action_toggle_palette_focus(self) -> None:
             self._focus_mode = "palette" if self._focus_mode == "dashboard" else "dashboard"
@@ -3900,6 +4761,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                         str(prompt.value or "missing"),
                         {
                             "focus_mode": self._focus_mode,
+                            "active_section_id": self._active_section_id,
                             "active_section_index": self._section_cursor_index,
                             "collapsed_section_ids": self._collapsed_section_ids,
                             "selected_theme": self._selected_theme_id,
@@ -3923,6 +4785,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 str(entry["id"]),
                 {
                     "focus_mode": self._focus_mode,
+                    "active_section_id": self._active_section_id,
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
                     "selected_theme": self._selected_theme_id,
@@ -3961,8 +4824,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                         )
                 else:
                     self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
-                    self._section_cursor_index = int(state.get("active_section_index") or 0)
-                    self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+                    self._active_section_id = _right_panel_resolve_section_id(
+                        state.get("active_section_id")
+                        or _right_panel_section_id_at_index(state.get("active_section_index"))
+                    )
+                    self._section_cursor_index = _right_panel_section_index(self._active_section_id)
+                    self._collapsed_section_ids = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids")))
                     self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
                     self._apply_theme_selection(str(state.get("selected_theme") or self._selected_theme_id))
                     prompt.value = str(state.get("query", ""))
@@ -3984,7 +4851,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             query = request.removeprefix("/model").strip()
             if not query:
                 self._focus_mode = "dashboard"
-                self._section_cursor_index = _section_index("project_overview")
+                self._active_section_id = "project"
+                self._section_cursor_index = _right_panel_section_index("project")
                 prompt.value = "/model "
                 try:
                     prompt.cursor_position = len(prompt.value)
@@ -4073,6 +4941,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 str(entry["id"]),
                 {
                     "focus_mode": self._focus_mode,
+                    "active_section_id": self._active_section_id,
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
                 },
@@ -4149,7 +5018,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._render_current_view()
 
         def _show_model_dialog(self, *, query: str = "", selected_index: int = 0) -> None:
-            dashboard = self._dashboard_snapshot()
+            dashboard = build_tui_dashboard(
+                project_root,
+                selected_session_id=self._selected_session_id or self._chat_state.session_id,
+            )
             self._dialog_query = query
             self._dialog_selected_index = selected_index
             self._show_dialog(
@@ -4179,6 +5051,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._show_functionality_dialog(query=self._dialog_query, selected_index=self._dialog_selected_index)
             elif self._dialog_kind == "themes":
                 self._show_theme_dialog(selected_index=self._dialog_selected_index)
+            elif self._dialog_kind == "agents":
+                self._show_agent_dialog(selected_index=self._dialog_selected_index)
 
         def action_activate_dialog_selection(self) -> None:
             if self._dialog_kind == "models":
@@ -4187,6 +5061,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._activate_selected_functionality_row()
             elif self._dialog_kind == "themes":
                 self._activate_selected_theme_dialog_entry()
+            elif self._dialog_kind == "agents":
+                self._activate_selected_agent_dialog_entry()
 
         def _dialog_row_count(self) -> int:
             if self._dialog_kind == "models":
@@ -4196,7 +5072,95 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 return len(filter_functionality_table(table, self._dialog_query)["rows"])
             if self._dialog_kind == "themes":
                 return len(THEME_DIALOG_ENTRIES)
+            if self._dialog_kind == "agents":
+                return len(self._agent_dialog_entries())
             return 0
+
+        def action_handle_text_dialog_key(self, event) -> None:
+            if event.key == "escape":
+                self._hide_dialog()
+                self._render_palette_activation_status("Session action cancelled.", ok=False)
+                return
+            if event.key == "backspace":
+                self._dialog_text_buffer = self._dialog_text_buffer[:-1]
+                self._refresh_text_dialog()
+                return
+            if event.key == "ctrl+u":
+                self._dialog_text_buffer = ""
+                self._refresh_text_dialog()
+                return
+            if event.key == "enter":
+                if self._dialog_kind == "session_delete":
+                    self._confirm_session_hard_delete()
+                elif self._dialog_kind == "session_rename":
+                    self._confirm_session_rename()
+                return
+            if event.character and event.character.isprintable():
+                self._dialog_text_buffer += event.character
+                self._refresh_text_dialog()
+
+        def _refresh_text_dialog(self) -> None:
+            session = self._dialog_context.get("session") or {}
+            if self._dialog_kind == "session_delete":
+                self._show_dialog(render_session_delete_dialog(session, buffer=self._dialog_text_buffer), kind="session_delete")
+            elif self._dialog_kind == "session_rename":
+                self._show_dialog(render_session_rename_dialog(session, buffer=self._dialog_text_buffer), kind="session_rename")
+
+        def _confirm_session_hard_delete(self) -> None:
+            session = self._dialog_context.get("session") or {}
+            session_id = str(session.get("id") or "")
+            if self._dialog_text_buffer != "DELETE":
+                self._render_palette_activation_status("Type DELETE to confirm hard delete.", ok=False)
+                self._refresh_text_dialog()
+                return
+            if self._request_in_flight and session_id == self._chat_state.session_id:
+                self._hide_dialog()
+                self._render_palette_activation_status("Cannot hard delete the active in-flight session.", ok=False)
+                return
+            try:
+                counts = SQLiteStore.open_initialized(project_root).hard_delete_session(session_id)
+            except Exception as exc:
+                self._hide_dialog()
+                self._render_palette_activation_status(f"Hard delete failed: {exc}", ok=False)
+                return
+            self._hide_dialog()
+            self._after_session_removed_or_hidden(session_id)
+            self._render_palette_activation_status(
+                f"Hard deleted {session_id}; runs/tasks/artifacts retained.",
+                ok=True,
+            )
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_session_action/v1",
+                "ok": True,
+                "entry_id": "sessions.hard_delete",
+                "activation_kind": "session_state_mutation",
+                "deletion_counts": counts,
+                "process_started": False,
+                "filesystem_modified": True,
+                "active_repo_modified": False,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+            self._render_current_view()
+
+        def _confirm_session_rename(self) -> None:
+            session = self._dialog_context.get("session") or {}
+            session_id = str(session.get("id") or "")
+            title = self._dialog_text_buffer.strip()
+            if not title:
+                self._render_palette_activation_status("Session title cannot be empty.", ok=False)
+                self._refresh_text_dialog()
+                return
+            try:
+                SQLiteStore.open_initialized(project_root).update_session_title(session_id, title)
+            except Exception as exc:
+                self._hide_dialog()
+                self._render_palette_activation_status(f"Rename failed: {exc}", ok=False)
+                return
+            self._hide_dialog()
+            self._dashboard_snapshot(force=True)
+            self._render_palette_activation_status(f"Renamed session to {title}.", ok=True)
+            self._render_current_view()
 
         def _activate_selected_model_dialog_entry(self) -> None:
             dashboard = self._dashboard_snapshot()
@@ -4271,6 +5235,69 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 kind="themes",
             )
 
+        def _agent_dialog_entries(self) -> list[str]:
+            dashboard = self._dashboard_snapshot()
+            project_agents = [
+                str(agent.get("agent_id"))
+                for agent in dashboard.get("agents", [])
+                if agent.get("agent_id")
+            ]
+            entries = ["default", "plan", "build", *project_agents]
+            deduped = []
+            for entry in entries:
+                if entry not in deduped:
+                    deduped.append(entry)
+            return deduped
+
+        def _show_agent_dialog(self, *, selected_index: int | None = None) -> None:
+            row = self._selected_session_row()
+            current_agent = str((row or {}).get("agent_id") or "default")
+            entries = self._agent_dialog_entries()
+            if selected_index is None:
+                selected_index = entries.index(current_agent) if current_agent in entries else 0
+            self._dialog_selected_index = selected_index
+            self._show_dialog(
+                render_agent_selection_dialog(entries, selected_agent=current_agent, selected_index=selected_index),
+                kind="agents",
+            )
+
+        def _activate_selected_agent_dialog_entry(self) -> None:
+            row = self._selected_session_row()
+            if row is None:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            entries = self._agent_dialog_entries()
+            if not entries:
+                self._render_palette_activation_status("No agents available.", ok=False)
+                return
+            index = min(max(self._dialog_selected_index, 0), len(entries) - 1)
+            selected_agent = entries[index]
+            agent_value = None if selected_agent == "default" else selected_agent
+            try:
+                store = SQLiteStore.open_initialized(project_root)
+                session = store.update_session(str(row["id"]), agent_id=agent_value)
+                store.append_store_event(
+                    "session",
+                    session.id,
+                    "agent.selected",
+                    {
+                        "agent_id": agent_value,
+                        "source": "tui_session_pane",
+                        "process_started": False,
+                        "permission_granting": False,
+                    },
+                    session_id=session.id,
+                    redaction_state="not_required",
+                )
+            except Exception as exc:
+                self._render_palette_activation_status(f"Agent selection failed: {exc}", ok=False)
+                return
+            self._selected_agent_id = selected_agent
+            self._hide_dialog()
+            self._dashboard_snapshot(force=True)
+            self._render_palette_activation_status(f"Selected agent {selected_agent}.", ok=True)
+            self._render_current_view()
+
         def _activate_selected_theme_dialog_entry(self) -> None:
             index = min(max(self._dialog_selected_index, 0), len(THEME_DIALOG_ENTRIES) - 1)
             theme_id = str(THEME_DIALOG_ENTRIES[index]["id"])
@@ -4322,11 +5349,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             except NoMatches:
                 self._dialog_visible = False
                 self._dialog_kind = ""
+                self._dialog_context = {}
+                self._dialog_text_buffer = ""
                 return
             panel.update("")
             overlay.add_class("hidden")
             self._dialog_visible = False
             self._dialog_kind = ""
+            self._dialog_context = {}
+            self._dialog_text_buffer = ""
 
         def _persist_model_selection(self, activation: dict, *, source: str) -> dict:
             action = activation.get("action") or {}
@@ -4352,7 +5383,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             try:
                 dashboard = self._dashboard_snapshot(force=True)
                 active_session = dashboard.get("active_session") or {}
-                session_id = active_session.get("id")
+                session_id = self._selected_session_id or self._chat_state.session_id or active_session.get("id")
                 if not session_id:
                     return {
                         **activation,
@@ -4374,7 +5405,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 cfg = load_config(project_root)
                 validation = validate_model_selection(cfg, raw_model_ref)
                 parsed = parse_model_ref(raw_model_ref)
-                store = SQLiteStore(project_root)
+                store = SQLiteStore.open_initialized(project_root)
                 validation_payload = validation.model_dump(mode="json")
                 if not validation.executable:
                     store.append_store_event(
@@ -4495,10 +5526,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             try:
                 dashboard = self._dashboard_snapshot(force=True)
                 active_session = dashboard.get("active_session") or {}
-                session_id = active_session.get("id")
+                session_id = self._selected_session_id or self._chat_state.session_id or active_session.get("id")
                 if not session_id:
                     return
-                store = SQLiteStore(project_root)
+                store = SQLiteStore.open_initialized(project_root)
                 payload = {
                     "source": source,
                     "entry_id": activation.get("entry_id"),
@@ -4558,6 +5589,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     str(command["entry_id"]),
                     {
                         "focus_mode": self._focus_mode,
+                        "active_section_id": self._active_section_id,
                         "active_section_index": self._section_cursor_index,
                         "collapsed_section_ids": self._collapsed_section_ids,
                         "selected_theme": self._selected_theme_id,
@@ -4576,8 +5608,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 }
                 state = result.get("view_state") or {}
                 self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
-                self._section_cursor_index = int(state.get("active_section_index") or 0)
-                self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+                self._active_section_id = _right_panel_resolve_section_id(
+                    state.get("active_section_id")
+                    or _right_panel_section_id_at_index(state.get("active_section_index"))
+                )
+                self._section_cursor_index = _right_panel_section_index(self._active_section_id)
+                self._collapsed_section_ids = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids")))
                 self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
                 self._apply_theme_selection(str(state.get("selected_theme") or self._selected_theme_id))
                 prompt.value = str(state.get("query", ""))
@@ -4672,8 +5708,37 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             view = self._current_view()
             if not view["sections"]:
                 self._section_cursor_index = 0
+                self._active_section_id = "action"
                 return
             self._section_cursor_index = (self._section_cursor_index + step) % len(view["sections"])
+            self._active_section_id = str(view["sections"][self._section_cursor_index]["id"])
+            self._render_current_view()
+
+        def _move_session_cursor(self, step: int) -> None:
+            projection = build_session_pane_projection(
+                project_root,
+                selected_session_id=self._chat_state.session_id or self._selected_session_id,
+                status_filter="open",
+                query="",
+            )
+            sessions = projection.get("sessions") or []
+            if not sessions:
+                self._session_cursor_index = 0
+                self._selected_session_id = None
+                self._render_current_view()
+                return
+            current_id = self._chat_state.session_id or projection.get("selected_session_id")
+            current_index = next((index for index, session in enumerate(sessions) if session.get("id") == current_id), 0)
+            self._session_cursor_index = (current_index + step) % len(sessions)
+            self._selected_session_id = str(sessions[self._session_cursor_index].get("id") or "")
+            self._chat_state.session_id = self._selected_session_id
+            self._focus_mode = "dashboard"
+            self._active_section_id = "sessions"
+            self._section_cursor_index = _right_panel_section_index("sessions")
+            self._render_palette_activation_status(
+                f"Selected session: {sessions[self._session_cursor_index].get('display_title') or 'Untitled session'}.",
+                ok=True,
+            )
             self._render_current_view()
 
         def _current_view(self) -> dict:
@@ -4683,6 +5748,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 refreshed_dashboard,
                 {
                     "palette": self._palette_snapshot(refreshed_dashboard),
+                    "active_section_id": self._active_section_id,
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
                     "active_orchestrator": self._chat_state.selected_orchestrator_id or "coding_orchestrator",
@@ -4697,6 +5763,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "latest_palette_activation": self._latest_palette_activation,
                     "selected_agent_id": self._selected_agent_id,
                     "selected_theme": self._selected_theme_id,
+                    "active_session_id": self._chat_state.session_id,
+                    "request_in_flight": self._request_in_flight,
                 },
                 prompt.value,
                 focus_mode=self._focus_mode,
@@ -4769,16 +5837,64 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def _dashboard_snapshot(self, *, force: bool = False) -> dict:
             now = time.monotonic()
-            if force or self._dashboard_cache is None or now - self._dashboard_cache_at >= 1.5:
-                self._dashboard_cache = build_tui_dashboard(project_root)
+            selected_session_id = self._selected_session_id or self._chat_state.session_id
+            if (
+                force
+                or self._dashboard_cache is None
+                or selected_session_id != self._dashboard_cache_session_id
+                or now - self._dashboard_cache_at >= 1.5
+            ):
+                self._dashboard_cache = build_tui_dashboard(project_root, selected_session_id=selected_session_id)
+                self._dashboard_cache_session_id = selected_session_id
                 self._dashboard_cache_at = now
             return self._dashboard_cache
 
         def _clamp_section_cursor(self, view: dict) -> None:
             if not view["sections"]:
                 self._section_cursor_index = 0
+                self._active_section_id = "action"
             elif self._section_cursor_index >= len(view["sections"]):
                 self._section_cursor_index = len(view["sections"]) - 1
+                self._active_section_id = str(view["sections"][self._section_cursor_index]["id"])
+            elif view.get("active_section_id"):
+                self._active_section_id = str(view["active_section_id"])
+                self._section_cursor_index = int(view.get("active_section_index") or self._section_cursor_index)
+
+        def _render_session_pane(self, dashboard_snapshot: dict | None = None) -> None:
+            try:
+                header = self.query_one("#session-pane-header", Static)
+                session_list = self.query_one("#session-list", ListView)
+                detail = self.query_one("#session-pane-detail", Static)
+                actions = self.query_one("#session-pane-actions", Static)
+            except NoMatches:
+                return
+            projection = self._session_pane_projection()
+            active_id = self._chat_state.session_id
+            sessions = projection.get("sessions") or []
+            selected_id = projection.get("selected_session_id")
+            items = [
+                ListItem(
+                    Label(
+                        _session_pane_row_label(
+                            session,
+                            selected=session.get("id") == selected_id,
+                            active=session.get("id") == active_id,
+                        )
+                    )
+                )
+                for session in sessions
+            ]
+            session_list.clear()
+            if items:
+                session_list.extend(items)
+            selected_index = next((index for index, session in enumerate(sessions) if session.get("id") == selected_id), None)
+            try:
+                session_list.index = selected_index
+            except Exception:
+                pass
+            header.update(_render_session_pane_header(projection, focused=self._left_pane_focused))
+            detail.update(_render_session_pane_detail(projection))
+            actions.update(_render_session_pane_actions(search_active=self._session_search_active, query=self._session_query))
 
         def _render_chat(self) -> None:
             working_seconds = None
@@ -4790,7 +5906,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 working_seconds=working_seconds,
                 separator_width=chat_width,
             )
-            self.query_one("#chat-content", Static).update(transcript)
+            _update_markup_static(self.query_one("#chat-content", Static), transcript)
             self.call_after_refresh(lambda: self.query_one("#chat", VerticalScroll).scroll_end(animate=False))
 
         def _render_view(self, view: dict) -> None:
@@ -4798,9 +5914,9 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self.query_one("#search-status", Static).update(render_right_panel_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
             refreshed_dashboard = self._dashboard_snapshot()
-            self.query_one("#session-rail-content", Static).update(_render_session_rail(refreshed_dashboard))
+            self._render_session_pane(refreshed_dashboard)
             self.query_one("#composer-status", Static).update(
-                _render_composer_status(refreshed_dashboard, self._selected_agent_id)
+                _render_composer_status(refreshed_dashboard, self._selected_agent_id, self._chat_state.session_id)
             )
             container = self.query_one("#pane-container", Static)
             container.update(render_right_panel(view))
@@ -4816,7 +5932,7 @@ def run_read_only_tui(project_root: Path) -> None:
     run_harness_app(project_root)
 
 
-def _chat_response_to_tui_message(response: dict) -> dict:
+def _chat_response_to_tui_message(response: dict, *, debug: bool = False) -> dict:
     lines = list(response.get("lines", []))
     if response.get("kind") == "self_managed_local_action":
         return {
@@ -4829,6 +5945,14 @@ def _chat_response_to_tui_message(response: dict) -> dict:
         for item in response["tool_results"]:
             status = "ok" if item.get("ok") else item.get("error_type") or "failed"
             lines.append(f"- {item.get('tool')}: {status}")
+    approval_card = response.get("approval_card") if isinstance(response.get("approval_card"), dict) else None
+    if approval_card and response.get("kind") == "session_tool_permission_required":
+        if not any(str(line).startswith("approval:") for line in lines):
+            lines.append(f"approval: {approval_card.get('approval_id') or approval_card.get('permission_id')}")
+        if approval_card.get("command") and not any(str(line).startswith("command:") for line in lines):
+            lines.append(f"command: {approval_card['command']}")
+        if approval_card.get("cwd") and not any(str(line).startswith("cwd:") for line in lines):
+            lines.append(f"cwd: {approval_card['cwd']}")
     if response.get("contract"):
         contract = response["contract"]
         lines.extend(
@@ -4844,6 +5968,15 @@ def _chat_response_to_tui_message(response: dict) -> dict:
         if blocks:
             lines.append("Context:")
             lines.append("- " + ", ".join(str(block.get("kind")) for block in blocks[:6]))
+    if debug:
+        debug_payload = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+        if response.get("event_sequence"):
+            lines.append("Debug:")
+            lines.append("- events: " + ", ".join(str(kind) for kind in response.get("event_sequence", [])[:12]))
+        if debug_payload.get("exception_type"):
+            lines.append(f"- exception: {debug_payload.get('exception_type')}")
+        if debug_payload.get("traceback"):
+            lines.append("- traceback captured")
     return {
         "role": "assistant",
         "title": response.get("title") or response.get("kind") or "Harness",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import threading
 from datetime import timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,6 +16,7 @@ from harness.models import SessionPermissionBoundaryKind, SessionPermissionScope
 from harness.session_tools import (
     SessionToolPermissionDecisionStatus,
     SessionToolSideEffect,
+    build_session_approval_card,
     decide_session_tool_permission,
     default_session_tool_descriptors,
     get_session_tool_descriptor,
@@ -49,6 +51,36 @@ def _start_fetch_server(body: bytes, content_type: str) -> tuple[ThreadingHTTPSe
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, f"http://127.0.0.1:{server.server_port}/page"
+
+
+def _start_mcp_search_server(body: bytes, content_type: str = "text/event-stream") -> tuple[ThreadingHTTPServer, str, list[dict]]:
+    requests: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            length = int(self.headers.get("Content-Length") or "0")
+            payload = self.rfile.read(length)
+            requests.append(
+                {
+                    "path": self.path,
+                    "body": payload.decode("utf-8", errors="replace"),
+                    "accept": self.headers.get("Accept"),
+                    "content_type": self.headers.get("Content-Type"),
+                }
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, f"http://127.0.0.1:{server.server_port}/mcp", requests
 
 
 def _run_git_for_test(cwd, args: list[str]) -> None:
@@ -503,6 +535,29 @@ def test_patch_tool_requires_permission_then_persists_plan_artifacts_without_app
     assert patch_artifact.metadata["files"] == ["app.py"]
     assert patch_artifact.metadata["applies_to_active_workspace"] is False
     assert patch_artifact.metadata["git_mutation_started"] is False
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+    repeated = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "patch",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"patch": patch}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)["result"]
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["error_type"] == "permission_required"
+    assert repeated_payload["permission_id"] != first_payload["permission_id"]
 
 
 def test_direct_write_tool_requires_permission_then_persists_plan_artifacts_without_writing(tmp_path) -> None:
@@ -611,6 +666,29 @@ def test_direct_write_tool_requires_permission_then_persists_plan_artifacts_with
     assert content_artifact.metadata["file_written"] is False
     assert content_artifact.metadata["filesystem_modified"] is False
     assert content_artifact.metadata["policy_boundary"] == plan_payload["policy_boundary"]
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+    repeated = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "direct-write",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"path": "notes.txt", "content": "proposed content\n"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)["result"]
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["error_type"] == "permission_required"
+    assert repeated_payload["permission_id"] != first_payload["permission_id"]
 
 
 def test_direct_write_tool_denies_blocked_path_without_creating_file(tmp_path) -> None:
@@ -730,6 +808,29 @@ def test_docker_test_tool_requires_permission_then_persists_plan_without_executi
     assert plan_payload["executed"] is False
     assert plan_payload["command"] == ["pytest", "-q"]
     assert plan_payload["cwd"] == "tests"
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+    repeated = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "docker-test",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(args),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)["result"]
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["error_type"] == "permission_required"
+    assert repeated_payload["permission_id"] != first_payload["permission_id"]
 
 
 def test_docker_test_tool_denies_shell_string_command(tmp_path) -> None:
@@ -981,6 +1082,29 @@ def test_web_fetch_tool_requires_permission_then_fetches_and_persists_response_a
     assert metadata["fetch_executed"] is True
     assert metadata["status_code"] == 200
     assert metadata["content_artifact_id"] == content_artifact.id
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+    repeated = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "web-fetch",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)["result"]
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["error_type"] == "permission_required"
+    assert repeated_payload["permission_id"] != first_payload["permission_id"]
 
 
 def test_web_fetch_tool_denies_disallowed_domain_without_network(tmp_path) -> None:
@@ -1285,6 +1409,179 @@ def test_web_search_tool_requires_permission_then_executes_configured_endpoint_a
     assert metadata["network_called"] is True
     assert metadata["search_executed"] is True
     assert metadata["results_artifact_id"] == results_artifact.id
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+    repeated = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "web-search",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)["result"]
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["error_type"] == "permission_required"
+    assert repeated_payload["permission_id"] != first_payload["permission_id"]
+
+
+def test_web_search_tool_executes_exa_mcp_provider_after_exact_approval(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    mcp_payload = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Title: Italy current event\nURL: https://news.example/italy\nHighlights:\nMCP result text.",
+                    }
+                ]
+            },
+        }
+    ).encode("utf-8")
+    server, endpoint, requests = _start_mcp_search_server(b"event: message\ndata: " + mcp_payload + b"\n\n")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": False,
+        "search_enabled": True,
+        "approval_required": True,
+        "search_provider": "exa_mcp",
+        "search_endpoint_url": endpoint,
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="MCP web search")
+    arguments = {"query": "Italy tragic news today 2026", "num_results": 2, "search_type": "fast"}
+
+    try:
+        first = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "web-search",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+        assert first.exit_code == 0, first.output
+        first_payload = json.loads(first.output)["result"]
+        assert first_payload["ok"] is False
+        assert first_payload["error_type"] == "permission_required"
+
+        allowed = runner.invoke(
+            app,
+            [
+                "session",
+                "permission",
+                session.id,
+                "--project",
+                str(tmp_path),
+                "--resolve",
+                first_payload["permission_id"],
+                "--decision",
+                "allowed",
+                "--output",
+                "json",
+            ],
+        )
+        second = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "web-search",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)["result"]
+    assert second_payload["ok"] is True
+    assert "Web search executed." in second_payload["preview"]
+    assert "MCP result text." in second_payload["preview"]
+    assert len(requests) == 1
+    request_payload = json.loads(requests[0]["body"])
+    assert request_payload["method"] == "tools/call"
+    assert request_payload["params"]["name"] == "web_search_exa"
+    assert request_payload["params"]["arguments"]["query"] == "Italy tragic news today 2026"
+    assert request_payload["params"]["arguments"]["numResults"] == 2
+    metadata_artifact = next(
+        artifact
+        for artifact in SQLiteStore(tmp_path).list_artifacts(second_payload["run_id"])
+        if artifact.kind == "session_tool_web_search_metadata"
+    )
+    metadata = json.loads(metadata_artifact.path.read_text(encoding="utf-8"))
+    assert metadata["provider"] == "exa_mcp"
+    assert metadata["network_called"] is True
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+
+def test_web_search_mcp_provider_rejects_domain_filter_that_cannot_be_enforced(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": False,
+        "search_enabled": True,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+        "search_provider": "exa_mcp",
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="MCP web search")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "web-search",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"query": "Harness docs"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "does not support Harness allowed_domains enforcement" in payload["preview"]
 
 
 def test_web_search_tool_denies_unapproved_domain_filter_without_network(tmp_path) -> None:
@@ -1543,6 +1840,29 @@ def test_repo_clone_tool_requires_permission_then_clones_into_managed_cache_and_
     assert metadata["external_cache_used"] is True
     assert metadata["status"] == "cloned"
     assert metadata["head"]
+    assert SQLiteStore(tmp_path).get_session_permission(first_payload["permission_id"]).status == SessionPermissionStatus.EXPIRED
+
+    repeated = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "repo-clone",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps(arguments),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)["result"]
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["error_type"] == "permission_required"
+    assert repeated_payload["permission_id"] != first_payload["permission_id"]
 
 
 def test_repo_clone_tool_denies_credential_url_without_network(tmp_path) -> None:
@@ -1929,6 +2249,16 @@ def test_session_read_grep_and_glob_tools_persist_events_and_transcript(tmp_path
     assert all(part.metadata["read_only"] is True for part in read_parts)
     assert all(part.metadata["filesystem_modified"] is False for part in read_parts)
     assert all(part.metadata["permission_granting"] is False for part in read_parts)
+    records = [
+        event.payload["record"]
+        for event in events
+        if event.kind == "harness.tool_call.after" and event.payload["record"]["tool_id"] in {"read", "grep", "glob"}
+    ]
+    assert {record["tool_id"] for record in records} == {"read", "grep", "glob"}
+    assert all(record["schema_version"] == "harness.tool_call/v1" for record in records)
+    assert all(record["permission_state"] == "not_required" for record in records)
+    assert all(record["status"] == "completed" for record in records)
+    assert all(record["normalized_args"]["approval_target"]["project_root_fingerprint"] for record in records)
 
 
 def test_session_cwd_tools_inherit_cd_and_reject_symlink_escape(tmp_path) -> None:
@@ -2024,6 +2354,13 @@ def test_shell_permission_is_exact_and_simple_cd_routes_to_session_cwd(tmp_path)
     assert str(tmp_path / "src") in second_payload["result"]["preview"]
     assert SQLiteStore(tmp_path).get_session_permission(permission.id).status == SessionPermissionStatus.EXPIRED
 
+    repeated = runner.invoke(app, ["session", "tool", session.id, "shell", "--project", str(tmp_path), "--input-json", '{"command":"pwd","timeout_seconds":30}', "--output", "json"])
+    assert repeated.exit_code == 0, repeated.output
+    repeated_payload = json.loads(repeated.output)
+    assert repeated_payload["ok"] is False
+    assert repeated_payload["result"]["error_type"] == "permission_required"
+    assert repeated_payload["result"]["permission_id"] != permission.id
+
     timeout_changed = runner.invoke(app, ["session", "tool", session.id, "shell", "--project", str(tmp_path), "--input-json", '{"command":"pwd","timeout_seconds":300}', "--output", "json"])
     assert timeout_changed.exit_code == 0, timeout_changed.output
     changed_payload = json.loads(timeout_changed.output)
@@ -2037,6 +2374,110 @@ def test_shell_permission_is_exact_and_simple_cd_routes_to_session_cwd(tmp_path)
     assert cd_payload["result"]["tool_id"] == "cd"
     assert "No process was started." in cd_payload["result"]["preview"]
     assert SQLiteStore(tmp_path).get_session(session.id).metadata["cwd"] == "."
+
+
+def test_shell_approval_target_changes_with_cwd_timeout_and_executable(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="shell exact target", metadata={"cwd": "src"})
+
+    def request(arguments: dict) -> tuple[dict, dict, dict]:
+        result = runner.invoke(
+            app,
+            [
+                "session",
+                "tool",
+                session.id,
+                "shell",
+                "--project",
+                str(tmp_path),
+                "--input-json",
+                json.dumps(arguments),
+                "--output",
+                "json",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)["result"]
+        assert payload["ok"] is False
+        assert payload["error_type"] == "permission_required"
+        permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+        card = build_session_approval_card(SQLiteStore(tmp_path), session.id, permission.id, fallback_arguments=arguments)
+        return payload, json.loads(permission.normalized_target_pattern), card
+
+    first, first_target, first_card = request({"command": "pwd", "timeout_seconds": 30})
+    cwd_changed, cwd_target, cwd_card = request({"command": "pwd", "cwd": "tests", "timeout_seconds": 30})
+    timeout_changed, timeout_target, timeout_card = request({"command": "pwd", "timeout_seconds": 31})
+    executable_changed, executable_target, executable_card = request(
+        {"command": "pwd", "timeout_seconds": 30, "shell_executable": sys.executable}
+    )
+
+    assert len(
+        {
+            first["permission_id"],
+            cwd_changed["permission_id"],
+            timeout_changed["permission_id"],
+            executable_changed["permission_id"],
+        }
+    ) == 4
+    assert first_target["normalized_cwd"] == "src"
+    assert cwd_target["normalized_cwd"] == "tests"
+    assert first_target["timeout_seconds"] == 30
+    assert timeout_target["timeout_seconds"] == 31
+    assert first_target["shell_executable"] != executable_target["shell_executable"]
+    assert first_card["command"] == "pwd"
+    assert first_card["cwd"] == "src"
+    assert cwd_card["cwd"] == "tests"
+    assert timeout_card["timeout_seconds"] == 31
+    assert first_card["shell_executable"] != executable_card["shell_executable"]
+    assert first_card["sandbox_profile"] == "session_tool_shell_exact"
+    assert first_card["network_policy"] == "host_network_available"
+    for target in (first_target, cwd_target, timeout_target, executable_target):
+        assert target["project_root_fingerprint"]
+        assert target["session_id"] == session.id
+        assert target["tool_id"] == "shell"
+        assert target["normalized_operation"] == "pwd"
+        assert target["timeout"] == target["timeout_seconds"]
+        assert target["env_policy"] == "minimal_inherited_path_home"
+        assert target["network_policy"] == "host_network_available"
+        assert target["sandbox_profile"] == "session_tool_shell_exact"
+        assert target["run_mode"] == "read_only"
+
+
+def test_denied_shell_call_writes_blocked_tool_call_record(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    session = SQLiteStore(tmp_path).create_session(title="shell denied")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "shell",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            '{"command":"pwd","shell_executable":"/missing/not-a-shell"}',
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "Shell executable is not executable" in payload["preview"]
+    records = [
+        event.payload["record"]
+        for event in SQLiteStore(tmp_path).list_session_store_events(session.id)
+        if event.kind == "harness.tool_call.after" and event.payload["record"]["tool_id"] == "shell"
+    ]
+    assert records[-1]["permission_state"] == "denied"
+    assert records[-1]["status"] == "blocked"
 
 
 def test_session_read_tool_denies_secret_or_outside_path_with_permission_evidence(tmp_path) -> None:
@@ -2077,6 +2518,44 @@ def test_session_read_tool_denies_secret_or_outside_path_with_permission_evidenc
     assert checked.payload["action"] == "read"
     assert checked.payload["target"] == ".env"
     assert checked.payload["boundary_kind"] == "local_only"
+
+
+def test_session_read_context_excluded_path_requires_permission_with_tool_call_record(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    session = SQLiteStore(tmp_path).create_session(title="Excluded read")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "read",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            '{"path":".harness/config.yaml"}',
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_required"
+    assert payload["permission_id"]
+    store = SQLiteStore(tmp_path)
+    permission = store.get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.PENDING
+    assert permission.normalized_action == "read"
+    records = [
+        event.payload["record"]
+        for event in store.list_session_store_events(session.id)
+        if event.kind == "harness.tool_call.after" and event.payload["record"]["tool_id"] == "read"
+    ]
+    assert records[-1]["permission_state"] == "pending"
+    assert records[-1]["status"] == "blocked"
 
 
 def test_session_tool_permission_decision_is_path_sensitive(tmp_path) -> None:

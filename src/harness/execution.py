@@ -49,6 +49,11 @@ from harness.sandbox_profiles import (
 )
 from harness.security import sanitize_for_logging
 from harness.security_explanations import explanations_from_reasons, explanations_from_security_decision
+from harness.task_operator_bridge import (
+    SESSION_OPERATOR_EXECUTION_ADAPTER,
+    SESSION_OPERATOR_TASK_TYPES,
+    execute_operator_task_lease,
+)
 
 
 EXECUTION_ADAPTER_REJECTED = "execution_adapter_rejected"
@@ -198,6 +203,66 @@ class ReadOnlySummaryExecutionAdapter:
             project_root=project_root,
             result=result,
         )
+
+
+class SessionOperatorExecutionAdapter:
+    id = SESSION_OPERATOR_EXECUTION_ADAPTER
+    descriptor = ExecutionAdapterDescriptor(
+        id=SESSION_OPERATOR_EXECUTION_ADAPTER,
+        description="Run one leased task through the Harness natural-language operator loop using typed session tools and exact approvals.",
+        supported_task_types=sorted(SESSION_OPERATOR_TASK_TYPES),
+        required_task_metadata={"execution_adapter": SESSION_OPERATOR_EXECUTION_ADAPTER},
+        rejected_task_metadata=[
+            "daemon_policy_forbidden",
+            "requires_active_repo_write",
+            "requires_external_network",
+            "requires_docker",
+            "requires_paid_provider",
+            "requires_hosted_boundary",
+        ],
+        required_approvals=[],
+        backend_requirements=["provider-native tool-capable chat backend"],
+        sandbox_requirements=["Harness session-tool gateway", "exact approval resume for shell/test tools"],
+        sandbox_profile_id=NONE_SANDBOX_PROFILE,
+        side_effect_summary="Writes harness task/run/session evidence and executes only session tools allowed by Harness policy.",
+        replay_policy=ToolReplayPolicy.IDEMPOTENT_WITH_KEY,
+        safety_notes=[
+            "Descriptors are documentation and validation metadata, not permission grants.",
+            "Shell/test tools still require exact one-shot approvals through the session permission gate.",
+            "Active repo mutation remains behind the separate apply-back boundary.",
+        ],
+        autonomy_default="auto_allowed",
+        max_autonomous_retries=0,
+        required_autonomy_scopes=["safe-local", "daemon-safe"],
+        output_contracts=["harness.daemon_execute/v1", "harness.manifest/v1.1", "harness.operator_task_tool_results/v1"],
+        terminal_evidence_required=["task", "attempt", "lease", "run", "turn", "manifest"],
+    )
+
+    def inspect_eligibility(
+        self,
+        project_root: Path,
+        lease: TaskLease,
+        task: TaskRecord | None,
+        attempt: TaskAttempt | None,
+    ) -> dict[str, Any]:
+        eligibility = _base_adapter_eligibility(self.descriptor, lease, task, attempt)
+        if task is not None and task.metadata.get("task_type") not in SESSION_OPERATOR_TASK_TYPES:
+            return {
+                **eligibility,
+                "eligible": False,
+                "reason_code": "unsupported_task_type",
+                "reason": f"Unsupported task_type for {self.id}: {task.metadata.get('task_type')}.",
+                "rejection_reasons": [f"Unsupported task_type for {self.id}: {task.metadata.get('task_type')}."],
+            }
+        return eligibility
+
+    def execute(
+        self,
+        project_root: Path,
+        lease_id: str,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+    ) -> DaemonExecuteResult:
+        return execute_operator_task_lease(project_root, lease_id, owner=owner)
 
 
 class CodexIsolatedEditExecutionAdapter:
@@ -707,6 +772,7 @@ def builtin_execution_adapters() -> dict[str, ExecutionAdapter]:
     adapters: list[ExecutionAdapter] = [
         DryRunExecutionAdapter(),
         ReadOnlySummaryExecutionAdapter(),
+        SessionOperatorExecutionAdapter(),
         CodexIsolatedEditExecutionAdapter(),
         RepoPlanningExecutionAdapter(),
     ]

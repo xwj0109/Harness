@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -8,9 +9,14 @@ from harness import __version__
 from harness.capabilities import build_capability_catalog
 from harness.config import HARNESS_DIR, default_config, load_config
 from harness.execution import list_execution_adapter_descriptors
-from harness.memory.sqlite_store import SQLiteStore
+from harness.memory.sqlite_store import (
+    SESSION_SCHEMA_REPAIR_MESSAGE,
+    SQLiteStore,
+    is_missing_session_schema_error,
+)
 from harness.model_catalog import list_model_catalog, list_provider_catalog, validate_model_selection
-from harness.models import EventStreamType, SessionPartKind, TaskStatus
+from harness.models import EventStreamType, SessionPartKind, SessionPermissionStatus, SessionStatus, TaskStatus
+from harness.operator_loop import session_operator_status_projection
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
 from harness.security import sanitize_for_logging
@@ -26,7 +32,7 @@ from harness.session_timeline import (
 OPERATOR_CONTEXT_SCHEMA_VERSION = "harness.operator_context/v1"
 
 
-def build_operator_context(project_root: Path) -> dict:
+def build_operator_context(project_root: Path, *, selected_session_id: str | None = None) -> dict:
     project_root = resolve_project_root(project_root)
     initialized = _is_initialized(project_root)
     catalog_config, catalog_source, catalog_error = _load_catalog_config(project_root)
@@ -60,7 +66,16 @@ def build_operator_context(project_root: Path) -> dict:
         },
         "recent_runs": [],
         "recent_sessions": [],
+        "session_pane": {
+            "schema_version": "harness.session_pane/v1",
+            "sessions": [],
+            "selected_session_id": None,
+            "filter": "open",
+            "query": "",
+            "counts": {"total": 0, "open": 0, "running": 0, "waiting_approval": 0, "archived": 0, "filtered": 0},
+        },
         "active_session": None,
+        "live_activity": _empty_live_activity("setup_needed" if not initialized else "idle"),
         "model_catalog": _model_catalog_projection(
             catalog_config,
             provider_catalog,
@@ -163,14 +178,25 @@ def build_operator_context(project_root: Path) -> dict:
         ]
         return dashboard
 
-    store = SQLiteStore(project_root)
     try:
+        store = SQLiteStore.open_initialized(project_root)
         agents = store.list_project_agents()
         objectives = store.list_objectives()
         tasks = store.list_tasks()
         leases = store.list_task_leases()
         runs = store.list_runs()[:5]
-        sessions = store.list_sessions()[:5]
+        all_open_sessions = [
+            session
+            for session in store.list_sessions()
+            if session.status != SessionStatus.ARCHIVED
+        ]
+        sessions = all_open_sessions[:5]
+        selected_session = None
+        if selected_session_id:
+            try:
+                selected_session = store.get_session(selected_session_id)
+            except KeyError:
+                selected_session = None
         memory_records = store.list_memory_records()[:5]
         cfg = catalog_config
         catalog_cache = store.replace_provider_model_catalog_cache(provider_catalog, model_catalog)
@@ -182,9 +208,11 @@ def build_operator_context(project_root: Path) -> dict:
         terminal_tabs = _terminal_tabs_summary(store)
     except sqlite3.Error as exc:
         dashboard["initialized"] = False
+        dashboard["live_activity"] = _empty_live_activity("blocked")
+        message = SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)
         dashboard["state_error"] = {
             "type": exc.__class__.__name__,
-            "message": str(exc),
+            "message": message,
         }
         dashboard["guidance"] = [
             {
@@ -199,6 +227,11 @@ def build_operator_context(project_root: Path) -> dict:
     task_status_counts = {status.value: 0 for status in TaskStatus}
     for task in tasks:
         task_status_counts[task.status.value] = task_status_counts.get(task.status.value, 0) + 1
+    active_session_id = selected_session.id if selected_session is not None else (sessions[0].id if sessions else None)
+    model_sessions = list(sessions)
+    if selected_session is not None:
+        model_sessions = [selected_session, *[session for session in model_sessions if session.id != selected_session.id]]
+
     dashboard["summary"] = {
         "imported_agents": len(agents),
         "objectives": len(objectives),
@@ -263,6 +296,7 @@ def build_operator_context(project_root: Path) -> dict:
         {
             "id": session.id,
             "title": sanitize_for_logging(session.title),
+            "display_title": _session_display_title(store, session),
             "status": session.status.value,
             "intent": sanitize_for_logging(session.intent),
             "agent_id": sanitize_for_logging(session.agent_id),
@@ -275,13 +309,19 @@ def build_operator_context(project_root: Path) -> dict:
         }
         for session in sessions
     ]
-    if sessions:
-        dashboard["active_session"] = _session_preview(store, sessions[0].id, project_root)
+    if active_session_id:
+        dashboard["active_session"] = _session_preview(store, active_session_id, project_root)
+    dashboard["session_pane"] = build_session_pane_projection(
+        project_root,
+        selected_session_id=active_session_id,
+        status_filter="open",
+        query="",
+    )
     dashboard["model_catalog"] = _model_catalog_projection(
         cfg,
         provider_catalog,
         model_catalog,
-        sessions=sessions,
+        sessions=model_sessions,
         cache=catalog_cache,
         source=catalog_source,
         config_error=catalog_error,
@@ -397,7 +437,308 @@ def build_operator_context(project_root: Path) -> dict:
                 "description": "Scaffold a declarative custom agent bundle.",
             }
         )
+    dashboard["live_activity"] = _build_live_activity_projection(
+        store,
+        dashboard,
+        recent_runs=runs,
+        active_session_id=active_session_id,
+    )
     return dashboard
+
+
+def _live_activity_policy_boundary() -> dict:
+    return {
+        "kind": "tui_live_activity_projection",
+        "source": "persisted_harness_state",
+        "process_started": False,
+        "filesystem_modified": False,
+        "active_repo_modified": False,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "shell_started": False,
+        "docker_started": False,
+        "adapter_dispatched": False,
+        "permission_granting": False,
+        "authority_granting": False,
+        "artifact_contents_included": False,
+    }
+
+
+def _empty_live_activity(active_signal: str = "idle") -> dict:
+    return {
+        "schema_version": "harness.tui_live_activity/v1",
+        "active_signal": active_signal,
+        "pending_permissions": [],
+        "open_todos": [],
+        "latest_events": [],
+        "recent_artifacts": [],
+        "counts": {
+            "ready": 0,
+            "running": 0,
+            "blocked": 0,
+            "waiting_approval": 0,
+            "done": 0,
+            "recent_sessions": 0,
+            "recent_runs": 0,
+            "recent_artifacts": 0,
+            "pending_permissions": 0,
+            "open_todos": 0,
+        },
+        "policy_boundary": _live_activity_policy_boundary(),
+    }
+
+
+def _build_live_activity_projection(
+    store: SQLiteStore,
+    dashboard: dict,
+    *,
+    recent_runs: list,
+    active_session_id: str | None,
+) -> dict:
+    pending_permissions = _pending_permission_rows(store, active_session_id)
+    open_todos = _open_todo_rows(store, active_session_id)
+    latest_events = _latest_session_event_rows(store, active_session_id)
+    recent_artifacts = _recent_artifact_rows(store, recent_runs)
+    counts = _live_activity_counts(dashboard, pending_permissions, open_todos, recent_artifacts)
+    return {
+        "schema_version": "harness.tui_live_activity/v1",
+        "active_signal": _live_activity_signal(dashboard, counts),
+        "pending_permissions": pending_permissions,
+        "open_todos": open_todos,
+        "latest_events": latest_events,
+        "recent_artifacts": recent_artifacts,
+        "counts": counts,
+        "policy_boundary": _live_activity_policy_boundary(),
+    }
+
+
+def _pending_permission_rows(store: SQLiteStore, session_id: str | None) -> list[dict]:
+    if not session_id:
+        return []
+    try:
+        permissions = store.list_session_permissions(session_id, SessionPermissionStatus.PENDING)
+    except Exception:
+        return []
+    return [
+        {
+            "id": permission.id,
+            "tool_id": sanitize_for_logging(permission.tool_id),
+            "action": sanitize_for_logging(permission.normalized_action),
+            "target": sanitize_for_logging(permission.normalized_target_pattern),
+            "risk": sanitize_for_logging(permission.risk),
+            "scope": permission.scope.value,
+            "expires_at": permission.expires_at.isoformat(),
+        }
+        for permission in permissions[-5:]
+    ]
+
+
+def _open_todo_rows(store: SQLiteStore, session_id: str | None) -> list[dict]:
+    if not session_id:
+        return []
+    try:
+        todos = [
+            todo
+            for todo in store.list_session_todos(session_id)
+            if todo.status in {"pending", "in_progress"}
+        ]
+    except Exception:
+        return []
+    return [
+        {
+            "id": todo.id,
+            "content": sanitize_for_logging(todo.content),
+            "status": todo.status,
+            "priority": todo.priority,
+            "updated_at": todo.updated_at.isoformat(),
+        }
+        for todo in todos[:5]
+    ]
+
+
+def _latest_session_event_rows(store: SQLiteStore, session_id: str | None) -> list[dict]:
+    if not session_id:
+        return []
+    try:
+        events = list_session_timeline(store, session_id, limit=6)
+    except Exception:
+        return []
+    return [
+        {
+            "id": event.id,
+            "seq": event.seq,
+            "kind": sanitize_for_logging(event.kind),
+            "line": render_timeline_event(event),
+            "created_at": event.created_at.isoformat(),
+        }
+        for event in events
+    ]
+
+
+def _recent_artifact_rows(store: SQLiteStore, recent_runs: list) -> list[dict]:
+    rows: list[dict] = []
+    for run in recent_runs[:5]:
+        try:
+            artifacts = store.list_artifacts(run.id)
+        except Exception:
+            continue
+        for artifact in artifacts[-3:]:
+            rows.append(
+                {
+                    "id": artifact.id,
+                    "run_id": artifact.run_id,
+                    "kind": sanitize_for_logging(artifact.kind),
+                    "path": sanitize_for_logging(artifact.path.name),
+                    "redaction_state": sanitize_for_logging(artifact.redaction_state),
+                    "evidence_status": sanitize_for_logging(artifact.evidence_status),
+                    "size_bytes": artifact.size_bytes,
+                    "created_at": artifact.created_at.isoformat(),
+                }
+            )
+    return rows[:6]
+
+
+def _live_activity_counts(
+    dashboard: dict,
+    pending_permissions: list[dict],
+    open_todos: list[dict],
+    recent_artifacts: list[dict],
+) -> dict:
+    task_counts = dashboard.get("task_status_counts") or {}
+    active_session = dashboard.get("active_session") or {}
+    operator = active_session.get("operator") or {}
+    progress = dashboard.get("progress") or {}
+    running = int(task_counts.get("leased", 0) or 0) + len(progress.get("active_run_ids") or [])
+    if operator.get("phase") == "turn":
+        running += 1
+    return {
+        "ready": int(task_counts.get("ready", 0) or 0),
+        "running": running,
+        "blocked": int(task_counts.get("blocked", 0) or 0),
+        "waiting_approval": int(task_counts.get("waiting_approval", 0) or 0),
+        "done": int(task_counts.get("succeeded", 0) or 0),
+        "recent_sessions": int((dashboard.get("summary") or {}).get("recent_sessions", 0) or 0),
+        "recent_runs": int((dashboard.get("summary") or {}).get("recent_runs", 0) or 0),
+        "recent_artifacts": len(recent_artifacts),
+        "pending_permissions": len(pending_permissions),
+        "open_todos": len(open_todos),
+    }
+
+
+def _live_activity_signal(dashboard: dict, counts: dict) -> str:
+    if not dashboard.get("initialized"):
+        return "setup_needed"
+    active_session = dashboard.get("active_session") or {}
+    operator = active_session.get("operator") or {}
+    progress = dashboard.get("progress") or {}
+    if counts.get("pending_permissions") or counts.get("waiting_approval") or operator.get("waiting_approval_id"):
+        return "approval_required"
+    if operator.get("phase") == "turn":
+        return "responding"
+    if dashboard.get("active_leases") or progress.get("active_lease_ids") or progress.get("active_run_ids") or counts.get("running"):
+        return "running"
+    if counts.get("blocked") or progress.get("mode") == "blocked" or progress.get("blocked_reasons"):
+        return "blocked"
+    if counts.get("ready"):
+        return "ready"
+    return "idle"
+
+
+def build_session_pane_projection(
+    project_root: Path,
+    *,
+    selected_session_id: str | None = None,
+    status_filter: str = "open",
+    query: str = "",
+) -> dict:
+    project_root = resolve_project_root(project_root)
+    if not _is_initialized(project_root):
+        return {
+            "schema_version": "harness.session_pane/v1",
+            "sessions": [],
+            "selected_session_id": None,
+            "filter": status_filter if status_filter in {"open", "running", "archived", "all"} else "open",
+            "query": query.strip(),
+            "counts": {"total": 0, "open": 0, "running": 0, "waiting_approval": 0, "archived": 0, "filtered": 0},
+            "ok": False,
+        }
+    store = SQLiteStore.open_initialized(project_root)
+    all_sessions = store.list_sessions()
+    normalized_filter = status_filter if status_filter in {"open", "running", "archived", "all"} else "open"
+    normalized_query = query.strip().casefold()
+    running_statuses = {SessionStatus.RUNNING, SessionStatus.WAITING_APPROVAL}
+    counts = {
+        "total": len(all_sessions),
+        "open": sum(1 for session in all_sessions if session.status != SessionStatus.ARCHIVED),
+        "running": sum(1 for session in all_sessions if session.status in running_statuses),
+        "waiting_approval": sum(1 for session in all_sessions if session.status == SessionStatus.WAITING_APPROVAL),
+        "archived": sum(1 for session in all_sessions if session.status == SessionStatus.ARCHIVED),
+    }
+    filtered = []
+    for session in all_sessions:
+        if normalized_filter == "open" and session.status == SessionStatus.ARCHIVED:
+            continue
+        if normalized_filter == "running" and session.status not in running_statuses:
+            continue
+        if normalized_filter == "archived" and session.status != SessionStatus.ARCHIVED:
+            continue
+        row = _session_pane_row(store, session)
+        searchable = " ".join(
+            str(row.get(key) or "")
+            for key in ("id", "display_title", "status", "agent_id", "raw_model_ref", "cwd", "active_run_id", "active_task_id")
+        ).casefold()
+        if normalized_query and normalized_query not in searchable:
+            continue
+        filtered.append(row)
+    selected_id = selected_session_id if any(row["id"] == selected_session_id for row in filtered) else None
+    if selected_id is None and filtered:
+        selected_id = filtered[0]["id"]
+    return {
+        "schema_version": "harness.session_pane/v1",
+        "ok": True,
+        "sessions": filtered,
+        "selected_session_id": selected_id,
+        "filter": normalized_filter,
+        "query": query.strip(),
+        "counts": {**counts, "filtered": len(filtered)},
+        "policy_boundary": {
+            "kind": "session_pane_projection",
+            "process_started": False,
+            "filesystem_modified": False,
+            "active_repo_modified": False,
+            "permission_granting": False,
+        },
+    }
+
+
+def _session_pane_row(store: SQLiteStore, session) -> dict:
+    timeline = list_session_timeline(store, session.id, limit=1)
+    messages = store.list_session_messages(session.id)
+    terminal = session.status in {
+        SessionStatus.COMPLETED,
+        SessionStatus.FAILED,
+        SessionStatus.CANCELLED,
+        SessionStatus.ARCHIVED,
+    }
+    return {
+        "id": session.id,
+        "display_title": _session_display_title(store, session),
+        "title": sanitize_for_logging(session.title),
+        "status": session.status.value,
+        "agent_id": sanitize_for_logging(session.agent_id),
+        "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
+        "cwd": sanitize_for_logging(session.metadata.get("cwd", ".")),
+        "active_run_id": session.active_run_id,
+        "active_task_id": session.active_task_id,
+        "updated_at": session.updated_at.isoformat(),
+        "latest_event": render_timeline_event(timeline[-1]) if timeline else None,
+        "message_count": len(messages),
+        "can_archive": session.status != SessionStatus.ARCHIVED,
+        "can_restore": session.status == SessionStatus.ARCHIVED,
+        "can_abort": session.status in {SessionStatus.RUNNING, SessionStatus.WAITING_APPROVAL},
+        "can_hard_delete": True,
+        "is_terminal": terminal,
+    }
 
 
 def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) -> dict:
@@ -409,11 +750,19 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         cwd = session_cwd_payload(project_root, session.metadata, load_config(project_root).context_excludes)
     except Exception:
         cwd = {"cwd": session.metadata.get("cwd", "."), "resolved_abs_path": None}
+    operator = session_operator_status_projection(
+        store,
+        session_id,
+        project_root=project_root,
+        cwd=str(cwd.get("cwd") or "."),
+        active_tools=_operator_active_tools(),
+    )
     return {
         "schema_version": "harness.session_preview/v1",
         "id": session.id,
         "status": session.status.value,
         "title": sanitize_for_logging(session.title),
+        "display_title": _session_display_title(store, session),
         "agent_id": sanitize_for_logging(session.agent_id),
         "provider_id": sanitize_for_logging(session.provider_id),
         "model_id": sanitize_for_logging(session.model_id),
@@ -421,12 +770,61 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
         "active_run_id": session.active_run_id,
         "cwd": cwd,
+        "operator": operator,
         "ui_preferences": sanitize_for_logging(session.ui_preferences),
         "latest_ui_activation": _ui_activation_preview(latest_ui_activation) if latest_ui_activation else None,
         "composer_context": _session_composer_context(store, session_id, project_root),
         "timeline": [render_timeline_event(event) for event in timeline_events],
         "transcript": [render_transcript_entry(entry) for entry in transcript_entries],
     }
+
+
+def _session_display_title(store: SQLiteStore, session) -> str:
+    title = str(sanitize_for_logging(session.title) or "").strip()
+    if title and not _is_generic_session_title(title):
+        return _compact_session_topic(title)
+    for message in store.list_session_messages(session.id):
+        if message.role.value != "user":
+            continue
+        topic = _compact_session_topic(str(sanitize_for_logging(message.content_preview) or ""))
+        if topic:
+            return topic
+    if isinstance(session.metadata, dict):
+        metadata_goal = _compact_session_topic(str(sanitize_for_logging(session.metadata.get("initial_goal_preview")) or ""))
+        if metadata_goal:
+            return metadata_goal
+    summary = _compact_session_topic(str(sanitize_for_logging(session.summary) or ""))
+    if summary:
+        return summary
+    intent = _compact_session_topic(str(sanitize_for_logging(session.intent) or ""))
+    if intent and intent != "session tool gateway":
+        return intent
+    return "Untitled session"
+
+
+def _is_generic_session_title(title: str) -> bool:
+    normalized = re.sub(r"[\W_]+", " ", title).strip().casefold()
+    return normalized in {"", "harness chat", "chat", "session", "new session", "untitled", "untitled session"}
+
+
+def _compact_session_topic(text: str, *, max_chars: int = 54) -> str:
+    cleaned = re.sub(r"\s+", " ", text).strip(" \t\r\n\"'")
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^(please|can you|could you|would you|i want to|we want to)\s+", "", cleaned, flags=re.IGNORECASE)
+    if not cleaned:
+        return ""
+    cleaned = cleaned[0].upper() + cleaned[1:]
+    if len(cleaned) <= max_chars:
+        return cleaned
+    clipped = cleaned[: max_chars + 1].rsplit(" ", 1)[0].rstrip(" ,.;:")
+    return (clipped or cleaned[:max_chars].rstrip()) + "..."
+
+
+def _operator_active_tools() -> list[str]:
+    from harness.session_tools import default_session_tool_descriptors
+
+    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
 
 
 def _session_composer_context(store: SQLiteStore, session_id: str, project_root: Path) -> dict:
@@ -723,8 +1121,8 @@ def _objective_for_progress(objectives: list, tasks: list) -> object | None:
     return objectives[0]
 
 
-def build_tui_dashboard(project_root: Path) -> dict:
-    context = build_operator_context(project_root)
+def build_tui_dashboard(project_root: Path, *, selected_session_id: str | None = None) -> dict:
+    context = build_operator_context(project_root, selected_session_id=selected_session_id)
     dashboard = dict(context)
     dashboard["schema_version"] = "harness.tui_dashboard/v1"
     dashboard["safety_boundaries"] = [

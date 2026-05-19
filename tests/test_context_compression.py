@@ -112,7 +112,7 @@ def test_retrieved_code_block_is_deterministically_extractively_compressed() -> 
 
 def test_pack_chat_context_compression_is_disabled_by_default_and_enableable(tmp_path) -> None:
     source = "\n".join(
-        ["def target_symbol():", "    return 'needle'"] + [f"line_{i} = '{'x' * 120}'" for i in range(80)]
+        ["def target_symbol():", "    return 'needle'"] + [f"line_{i} = '{'x' * 120}'" for i in range(220)]
     )
     (tmp_path / "target.py").write_text(source, encoding="utf-8")
     store = SQLiteStore(tmp_path)
@@ -120,12 +120,12 @@ def test_pack_chat_context_compression_is_disabled_by_default_and_enableable(tmp
     budgeter = HeuristicTokenBudgeter()
     rebuild_repo_file_context_chunks(tmp_path, store=store, budgeter=budgeter)
 
-    uncompressed = pack_chat_context(tmp_path, query="target_symbol", budgeter=budgeter, budget_chars=13_500)
+    uncompressed = pack_chat_context(tmp_path, query="target_symbol", budgeter=budgeter, budget_chars=14_000)
     compressed = pack_chat_context(
         tmp_path,
         query="target_symbol",
         budgeter=budgeter,
-        budget_chars=13_500,
+        budget_chars=14_000,
         enable_compression=True,
     )
 
@@ -138,6 +138,9 @@ def test_pack_chat_context_compression_is_disabled_by_default_and_enableable(tmp
     assert selected["compressed"] is True
     assert selected["compression"]["method"] == "extractive_line_window"
     assert selected["original_chunk_ids"]
+    assert compressed_payload["context_summary"]["selected_chunk_count"] >= 1
+    assert compressed_payload["context_summary"]["compressed_block_ids"]
+    assert "retrieved chunks" in compressed_payload["context_summary"]["source_categories"]
     assert provenance["lineage"]["compressed"] is True
     assert provenance["lineage"]["compression"]["original_chunk_ids"] == selected["original_chunk_ids"]
     assert provenance["lineage"]["permission_granting"] is False

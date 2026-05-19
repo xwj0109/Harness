@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -113,6 +114,22 @@ SCHEMA_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
         "Local derived context vector tables.",
     ),
 )
+SESSION_SCHEMA_REPAIR_MESSAGE = "The Harness session database is missing required tables. Run: harness doctor --repair"
+REQUIRED_SESSION_SCHEMA_TABLES: tuple[str, ...] = (
+    "runs",
+    "events",
+    "artifacts",
+    "sessions",
+    "session_messages",
+    "session_parts",
+    "event_store",
+    "session_permissions",
+)
+
+
+def is_missing_session_schema_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return isinstance(exc, sqlite3.Error) and "no such table" in message
 
 
 def _normalize_session_todo_status(status: str) -> str:
@@ -211,7 +228,14 @@ ALLOWED_TASK_TRANSITIONS = {
         TaskStatus.SKIPPED,
     },
     TaskStatus.BLOCKED: {TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.SKIPPED},
-    TaskStatus.WAITING_APPROVAL: {TaskStatus.READY, TaskStatus.CANCELLED, TaskStatus.SKIPPED},
+    TaskStatus.WAITING_APPROVAL: {
+        TaskStatus.READY,
+        TaskStatus.RUNNING,
+        TaskStatus.SUCCEEDED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.SKIPPED,
+    },
     TaskStatus.LEASED: {
         TaskStatus.RUNNING,
         TaskStatus.READY,
@@ -331,6 +355,12 @@ class SQLiteStore:
         self.harness_dir = self.project_root / ".harness"
         self.db_path = self.harness_dir / "harness.sqlite"
         self.runs_dir = self.harness_dir / "runs"
+
+    @classmethod
+    def open_initialized(cls, project_root: Path) -> "SQLiteStore":
+        store = cls(project_root)
+        store.initialize()
+        return store
 
     def initialize(self) -> None:
         self.harness_dir.mkdir(parents=True, exist_ok=True)
@@ -645,6 +675,106 @@ class SQLiteStore:
 
     def delete_session(self, session_id: str) -> SessionSpec:
         return self.archive_session(session_id)
+
+    def restore_session(self, session_id: str) -> SessionSpec:
+        self.get_session(session_id)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sessions
+                SET status = ?, archived_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (SessionStatus.ACTIVE.value, timestamp, session_id),
+            )
+        self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.restored",
+            {"restored_at": timestamp, "permission_granting": False},
+            session_id=session_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        return self.get_session(session_id)
+
+    def hard_delete_session(self, session_id: str) -> dict[str, Any]:
+        self.get_session(session_id)
+        session_dir = self.harness_dir / "sessions" / session_id
+        counts: dict[str, Any] = {
+            "session_id": session_id,
+            "session_parts": 0,
+            "session_messages": 0,
+            "session_todos": 0,
+            "session_permissions": 0,
+            "session_run_links": 0,
+            "session_events": 0,
+            "session_rows": 0,
+            "child_sessions_unlinked": 0,
+            "runs_unlinked": 0,
+            "tasks_unlinked": 0,
+            "objectives_unlinked": 0,
+            "artifacts_unlinked": 0,
+            "events_unlinked": 0,
+            "event_store_unlinked": 0,
+            "session_directory_removed": False,
+            "runs_deleted": 0,
+            "tasks_deleted": 0,
+            "artifacts_deleted": 0,
+            "active_repo_modified": False,
+            "process_started": False,
+            "permission_granting": False,
+        }
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            child_result = conn.execute(
+                """
+                UPDATE sessions
+                SET parent_session_id = CASE WHEN parent_session_id = ? THEN NULL ELSE parent_session_id END,
+                    forked_from_message_id = CASE
+                      WHEN forked_from_message_id IN (SELECT id FROM session_messages WHERE session_id = ?) THEN NULL
+                      ELSE forked_from_message_id
+                    END
+                WHERE parent_session_id = ?
+                   OR forked_from_message_id IN (SELECT id FROM session_messages WHERE session_id = ?)
+                """,
+                (session_id, session_id, session_id, session_id),
+            )
+            counts["child_sessions_unlinked"] = child_result.rowcount
+            for table, key in (
+                ("session_parts", "session_parts"),
+                ("session_todos", "session_todos"),
+                ("session_permissions", "session_permissions"),
+                ("session_run_links", "session_run_links"),
+            ):
+                result = conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session_id,))
+                counts[key] = result.rowcount
+            result = conn.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+            counts["session_messages"] = result.rowcount
+            result = conn.execute(
+                "DELETE FROM event_store WHERE stream_type = ? AND stream_id = ?",
+                (EventStreamType.SESSION.value, session_id),
+            )
+            counts["session_events"] = result.rowcount
+            for table, key in (
+                ("runs", "runs_unlinked"),
+                ("tasks", "tasks_unlinked"),
+                ("objectives", "objectives_unlinked"),
+                ("artifacts", "artifacts_unlinked"),
+                ("events", "events_unlinked"),
+            ):
+                result = conn.execute(f"UPDATE {table} SET session_id = NULL WHERE session_id = ?", (session_id,))
+                counts[key] = result.rowcount
+            result = conn.execute("UPDATE event_store SET session_id = NULL WHERE session_id = ?", (session_id,))
+            counts["event_store_unlinked"] = result.rowcount
+            result = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            counts["session_rows"] = result.rowcount
+            if counts["session_rows"] != 1:
+                raise KeyError(f"Session not found: {session_id}")
+        if session_dir.exists():
+            shutil.rmtree(session_dir)
+            counts["session_directory_removed"] = True
+        return counts
 
     def cancel_session(self, session_id: str, *, reason: str | None = None) -> SessionSpec:
         self.get_session(session_id)
@@ -2045,6 +2175,29 @@ class SQLiteStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def inspect_required_session_schema(self) -> dict[str, Any]:
+        if not self.db_path.exists():
+            return {
+                "db_exists": False,
+                "required_tables": list(REQUIRED_SESSION_SCHEMA_TABLES),
+                "present_tables": [],
+                "missing_tables": list(REQUIRED_SESSION_SCHEMA_TABLES),
+                "ok": False,
+                "repairable": False,
+            }
+        with self.connect() as conn:
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        present = {str(row["name"]) for row in rows}
+        missing = [table for table in REQUIRED_SESSION_SCHEMA_TABLES if table not in present]
+        return {
+            "db_exists": True,
+            "required_tables": list(REQUIRED_SESSION_SCHEMA_TABLES),
+            "present_tables": sorted(table for table in present if table in REQUIRED_SESSION_SCHEMA_TABLES),
+            "missing_tables": missing,
+            "ok": not missing,
+            "repairable": bool(missing),
+        }
+
     def create_run(
         self,
         goal: str | None,
@@ -3260,6 +3413,10 @@ class SQLiteStore:
         attempt_number = self._next_attempt_number(conn, task.id)
         attempt_id = f"task_attempt_{uuid.uuid4().hex[:12]}"
         lease_id = f"task_lease_{uuid.uuid4().hex[:12]}"
+        attempt_metadata = {
+            "task_idempotency_key": task.idempotency_key,
+            "attempt_idempotency_key": f"{task.idempotency_key}:attempt:{attempt_number}",
+        }
         conn.execute(
             """
             INSERT INTO task_attempts (
@@ -3280,7 +3437,7 @@ class SQLiteStore:
                 None,
                 None,
                 None,
-                "{}",
+                json.dumps(sanitize_for_logging(attempt_metadata), sort_keys=True, default=str),
             ),
         )
         conn.execute(

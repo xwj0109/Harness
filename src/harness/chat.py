@@ -37,17 +37,45 @@ from harness.config import HARNESS_DIR, default_config, load_config, write_defau
 from harness.context_pack import pack_chat_context
 from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.events import append_jsonl
-from harness.memory.sqlite_store import SQLiteStore
-from harness.models import ArtifactRecord, RunRecord, SessionPermissionStatus, TaskLease, TaskRecord
+from harness.memory.sqlite_store import (
+    SESSION_SCHEMA_REPAIR_MESSAGE,
+    SQLiteStore,
+    is_missing_session_schema_error,
+)
+from harness.models import ArtifactRecord, RunMode, RunRecord, SessionPermissionStatus, TaskLease, TaskRecord
+from harness.natural_language_router import (
+    NaturalLanguageIntent,
+    NaturalLanguageRoute,
+    route_natural_language,
+)
 from harness.objective_runner import run_objective_autonomously
 from harness.operator_context import build_operator_context, render_operator_context_lines
+from harness.operator_loop import (
+    HarnessAgentLoop,
+    HarnessOperatorBusyError,
+    HarnessOperatorRuntime,
+    create_turn_state_from_session,
+    model_supports_native_tools,
+    persist_save_point,
+    persist_turn_aborted,
+    persist_turn_finished,
+    persist_turn_started,
+    persist_turn_waiting_approval,
+)
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.security import sanitize_for_logging
 from harness.security_explanations import explanations_from_reasons
-from harness.session_cwd import session_cwd_payload
-from harness.session_tools import default_session_tool_descriptors, execute_session_tool, get_session_tool_descriptor
+from harness.session_cwd import CwdResolutionError, cwd_recovery_message, session_cwd_payload
+from harness.session_tools import (
+    build_session_approval_card,
+    default_session_tool_descriptors,
+    execute_session_tool,
+    get_session_tool_descriptor,
+    persist_session_tool_denial,
+)
+from harness.task_operator_bridge import apply_operator_task_permission_resolution
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tools.patch import apply_planned_updates, plan_unified_diff
 from harness.workflow_templates import WorkflowTemplate, template_for_intent
@@ -392,6 +420,7 @@ class ChatSessionState:
     autonomy_profile_id: str = "manual"
     transcript: list[dict[str, Any]] = field(default_factory=list)
     progress: list[str] = field(default_factory=list)
+    operator_runtime: HarnessOperatorRuntime = field(default_factory=HarnessOperatorRuntime)
 
     def reset(self) -> None:
         self.session_id = None
@@ -414,6 +443,7 @@ class ChatSessionState:
         self.autonomy_profile_id = "manual"
         self.transcript = []
         self.progress = []
+        self.operator_runtime.abort()
 
 
 def chat_context(project_root: Path) -> dict[str, Any]:
@@ -494,13 +524,36 @@ def _dispatch_chat_input(
     if raw in {"/confirm", "yes", "y"}:
         return _confirm_pending(project_root, state)
     if raw in {"/decline", "no", "n", "cancel"}:
+        denial = _deny_pending_session_tool_permission(project_root, state)
         state.pending_draft = None
         state.pending_orchestration = None
         state.pending_execute_lease_id = None
         state.pending_action_contract = None
         state.pending_session_tool_call = None
         state.pending_hosted_approval = False
-        return _response("declined", "Declined", ["No action was taken."], ok=True)
+        _persist_active_operator_turn_aborted(project_root, state, reason="declined")
+        state.operator_runtime.abort()
+        return _response(
+            "declined",
+            "Declined",
+            _decline_response_lines(denial),
+            ok=True,
+            extra={"operator_status": _operator_status_payload(project_root, state), "denial": denial},
+        )
+    if state.pending_session_tool_call is not None and raw.casefold().startswith(("no ", "deny ")):
+        feedback = raw.split(" ", 1)[1].strip()
+        denial = _deny_pending_session_tool_permission(project_root, state, feedback=feedback)
+        state.pending_session_tool_call = None
+        state.pending_hosted_approval = False
+        _persist_active_operator_turn_aborted(project_root, state, reason="declined")
+        state.operator_runtime.abort()
+        return _response(
+            "declined",
+            "Declined",
+            _decline_response_lines(denial),
+            ok=True,
+            extra={"operator_status": _operator_status_payload(project_root, state), "denial": denial},
+        )
     if raw.startswith("/"):
         return _handle_slash(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
     return _handle_intent(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
@@ -704,9 +757,27 @@ def _handle_slash(
                 "/stop - stop the foreground orchestration loop",
                 "/apply-back [deny|approve|keep] - review inspected Codex diff artifacts",
                 "/confirm - confirm pending draft or execution",
+                "/decline [feedback] - deny pending approval or execution",
                 "/reset - clear in-memory chat references",
                 "/quit - exit",
             ],
+        )
+    if command in {"decline", "deny"}:
+        denial = _deny_pending_session_tool_permission(project_root, state, feedback=tail or None)
+        state.pending_draft = None
+        state.pending_orchestration = None
+        state.pending_execute_lease_id = None
+        state.pending_action_contract = None
+        state.pending_session_tool_call = None
+        state.pending_hosted_approval = False
+        _persist_active_operator_turn_aborted(project_root, state, reason="declined")
+        state.operator_runtime.abort()
+        return _response(
+            "declined",
+            "Declined",
+            _decline_response_lines(denial),
+            ok=True,
+            extra={"operator_status": _operator_status_payload(project_root, state), "denial": denial},
         )
     if command == "tools":
         return _session_tools_response(project_root)
@@ -847,6 +918,38 @@ def _handle_intent(
     chat_model: ChatModel | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    if route_chat_intent(raw)["intent"] == "show_progress":
+        return _orchestration_progress_response(project_root, state.latest_objective_id, state)
+    start_error = _begin_operator_turn(raw, project_root, state)
+    if start_error is not None:
+        return start_error
+    try:
+        response = _handle_intent_routed(
+            raw,
+            project_root,
+            state,
+            chat_model=chat_model,
+            progress_callback=progress_callback,
+        )
+    except Exception:
+        _persist_active_operator_turn_aborted(project_root, state, reason="failed")
+        state.operator_runtime.finish()
+        raise
+    _settle_operator_turn(project_root, state, response)
+    return response
+
+
+def _handle_intent_routed(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    chat_model: ChatModel | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    natural_language_response = _natural_language_route_response(raw, project_root, state, progress_callback=progress_callback)
+    if natural_language_response is not None:
+        return natural_language_response
     managed_action_response = _maybe_run_managed_action(raw, project_root, state)
     if managed_action_response is not None:
         return managed_action_response
@@ -915,6 +1018,231 @@ def _handle_intent(
     if intent == "deny_apply_back":
         return _apply_back_review_response(project_root, state, choice="deny")
     return _model_chat_response(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
+
+
+def _begin_operator_turn(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any] | None:
+    if state.operator_runtime.phase.value != "idle":
+        return _response(
+            "operator_busy",
+            "Operator Busy",
+            [
+                f"Phase: {state.operator_runtime.phase.value}",
+                "Wait for the current turn to finish, approve it with /confirm, or cancel it with /decline.",
+            ],
+            ok=False,
+            extra={"operator_status": _operator_status_payload(project_root, state)},
+        )
+    if not _is_initialized(project_root):
+        return None
+    try:
+        store, session_id = _ensure_chat_session(project_root, state)
+        session = store.get_session(session_id)
+        cfg = load_config(project_root)
+        active_tools = _operator_active_tools()
+        turn_state = create_turn_state_from_session(
+            project_root=project_root,
+            session=session,
+            model_profile_id=cfg.chat.default_model_profile,
+            backend_id=cfg.chat.default_model_profile,
+            agent_id=session.agent_id or state.selected_orchestrator_id or "operator",
+            workbench_id=session.workbench_id,
+            active_tools=active_tools,
+            run_mode=RunMode.READ_ONLY,
+            stream_options={"stream": cfg.chat.stream},
+        )
+        state.operator_runtime.start_turn(turn_state)
+        persist_turn_started(store, turn_state, prompt=raw)
+    except HarnessOperatorBusyError:
+        return _response(
+            "operator_busy",
+            "Operator Busy",
+            ["Another operator turn is already active."],
+            ok=False,
+            extra={"operator_status": _operator_status_payload(project_root, state)},
+        )
+    except Exception:
+        _persist_active_operator_turn_aborted(project_root, state, reason="start_failed")
+        state.operator_runtime.finish()
+        raise
+    return None
+
+
+def _settle_operator_turn(project_root: Path, state: ChatSessionState, response: dict[str, Any]) -> None:
+    if response.get("kind") == "session_tool_permission_required":
+        permission_id = response.get("permission_id")
+        if permission_id is None and isinstance(response.get("tool_request"), dict):
+            permission_id = response.get("tool_request", {}).get("permission_id")
+        if permission_id is None and state.pending_session_tool_call is not None:
+            permission_id = state.pending_session_tool_call.get("permission_id")
+        state.operator_runtime.wait_for_approval(str(permission_id) if permission_id else None)
+        _persist_active_operator_turn_waiting_approval(project_root, state, str(permission_id) if permission_id else None)
+        response["operator_status"] = _operator_status_payload(project_root, state)
+        return
+    _persist_active_operator_turn_finished(project_root, state, reason="completed")
+    state.operator_runtime.finish()
+    response["operator_status"] = _operator_status_payload(project_root, state)
+
+
+def _persist_operator_save_point(
+    store: SQLiteStore,
+    state: ChatSessionState,
+    *,
+    flushed_event_count: int,
+    flushed_artifact_count: int = 0,
+) -> None:
+    turn_state = state.operator_runtime.active_turn_state
+    if turn_state is None:
+        return
+    try:
+        session = store.get_session(turn_state.session_id)
+        next_turn_state = create_turn_state_from_session(
+            project_root=Path(turn_state.project_root),
+            session=session,
+            model_profile_id=turn_state.model_profile_id,
+            backend_id=turn_state.backend_id,
+            agent_id=session.agent_id or turn_state.agent_id,
+            workbench_id=session.workbench_id or turn_state.workbench_id,
+            active_tools=_operator_active_tools(),
+            run_mode=turn_state.run_mode,
+            context_pack_sha256=turn_state.context_pack_sha256,
+            stream_options=dict(turn_state.stream_options),
+        )
+        persist_save_point(
+            store,
+            turn_state,
+            next_turn_state=next_turn_state,
+            flushed_event_count=flushed_event_count,
+            flushed_artifact_count=flushed_artifact_count,
+        )
+    except Exception:
+        return
+
+
+def _persist_active_operator_turn_finished(project_root: Path, state: ChatSessionState, *, reason: str) -> None:
+    turn_state = state.operator_runtime.active_turn_state
+    if turn_state is None or not _is_initialized(project_root):
+        return
+    try:
+        persist_turn_finished(_require_store(project_root), turn_state, reason=reason)
+    except Exception:
+        return
+
+
+def _persist_active_operator_turn_waiting_approval(
+    project_root: Path,
+    state: ChatSessionState,
+    approval_id: str | None,
+) -> None:
+    turn_state = state.operator_runtime.active_turn_state
+    if turn_state is None or not _is_initialized(project_root):
+        return
+    try:
+        persist_turn_waiting_approval(_require_store(project_root), turn_state, waiting_approval_id=approval_id)
+    except Exception:
+        return
+
+
+def _persist_active_operator_turn_aborted(project_root: Path, state: ChatSessionState, *, reason: str) -> None:
+    turn_state = state.operator_runtime.active_turn_state
+    if turn_state is None or not _is_initialized(project_root):
+        return
+    try:
+        persist_turn_aborted(_require_store(project_root), turn_state, reason=reason)
+    except Exception:
+        return
+
+
+def _operator_status_payload(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+    return state.operator_runtime.status(
+        project_root=resolve_project_root(state.active_project_root or project_root),
+        cwd=_chat_session_cwd(project_root, state),
+        active_tools=_operator_active_tools(),
+    ).model_dump(mode="json")
+
+
+def _operator_active_tools() -> list[str]:
+    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+
+
+def _natural_language_route_response(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any] | None:
+    route = route_natural_language(
+        raw,
+        project_root,
+        session_cwd=_chat_session_cwd(project_root, state),
+        context_excludes=_chat_context_excludes(project_root),
+    )
+    if route.intent in {NaturalLanguageIntent.UNSUPPORTED, NaturalLanguageIntent.DIRECT_SLASH_COMMAND}:
+        return None
+    _emit_progress(progress_callback, "procedure", "Ran natural-language routing")
+    _emit_progress(progress_callback, "procedure", f"- intent: {route.intent.value}")
+    return _execute_natural_language_route(project_root, state, route)
+
+
+def _execute_natural_language_route(
+    project_root: Path,
+    state: ChatSessionState,
+    route: NaturalLanguageRoute,
+) -> dict[str, Any]:
+    if not route.ok:
+        if route.intent == NaturalLanguageIntent.PROJECT_SWITCH:
+            return _response(
+                "project_switch_boundary",
+                "Project Boundary",
+                [
+                    route.message or "That path is outside the active project.",
+                    f"Active project: {project_root}",
+                    f"Target: {route.target_path or 'unknown'}",
+                    f"Next: {route.proposed_command or '/project <path>'}",
+                ],
+                ok=False,
+                extra={"route": route.model_dump(mode="json")},
+            )
+        return _response(
+            "natural_language_route_blocked",
+            "Route Blocked",
+            [route.message or "Harness could not safely route that request."],
+            ok=False,
+            extra={"route": route.model_dump(mode="json")},
+        )
+    if route.intent in {NaturalLanguageIntent.PROJECT_SWITCH, NaturalLanguageIntent.WORKSPACE_SWITCH}:
+        target = route.target_project_root or route.target_path or ""
+        return _project_switch_response(
+            project_root,
+            state,
+            target,
+            command="workspace" if route.intent == NaturalLanguageIntent.WORKSPACE_SWITCH else "project",
+        )
+    if route.tool_id is not None:
+        return _run_session_tool_response(project_root, state, route.tool_id, route.tool_arguments)
+    return _response(
+        "natural_language_route_unsupported",
+        "Unsupported",
+        ["Harness recognized the phrase but no safe route is implemented for it yet."],
+        ok=False,
+        extra={"route": route.model_dump(mode="json")},
+    )
+
+
+def _chat_context_excludes(project_root: Path) -> list[str]:
+    try:
+        return list(load_config(project_root).context_excludes)
+    except FileNotFoundError:
+        return list(default_config().context_excludes)
+
+
+def _chat_session_cwd(project_root: Path, state: ChatSessionState) -> str:
+    if not state.session_id or not _is_initialized(project_root):
+        return "."
+    try:
+        return str(_require_store(project_root).get_session(state.session_id).metadata.get("cwd") or ".")
+    except Exception:
+        return "."
 
 
 def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessionState) -> dict[str, Any]:
@@ -1030,6 +1358,7 @@ def _model_chat_response(
         model_profile=model_profile,
         safety_boundaries=list(context_payload["safety_boundaries"]),
     )
+    _attach_context_pack_hash(state, context_manifest)
     _emit_progress(progress_callback, "procedure", "Explored")
     for line in _context_manifest_progress_lines(context_manifest):
         _emit_progress(progress_callback, "procedure", line)
@@ -1044,6 +1373,17 @@ def _model_chat_response(
     tool_results: list[dict[str, Any]] = []
     try:
         model = chat_model or build_default_chat_model(project_root)
+        if model_supports_native_tools(model) and _is_initialized(project_root):
+            return _native_agent_loop_response(
+                raw,
+                project_root,
+                state,
+                model=model,
+                chat_ctx=chat_ctx,
+                messages=messages,
+                context_manifest=context_manifest,
+                progress_callback=progress_callback,
+            )
         _emit_progress(progress_callback, "procedure", "Ran model turn")
         model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
         for _index in range(MAX_CHAT_TOOL_CALLS):
@@ -1053,7 +1393,7 @@ def _model_chat_response(
             if not _is_initialized(project_root) and tool_request.tool in {"repo_tree", "read_file", "search_repo", "show_diff"}:
                 normalized_request = tool_request
             else:
-                normalized_request = _normalize_session_tool_request(tool_request)
+                normalized_request = _normalize_session_tool_request(tool_request, user_prompt=raw)
             _emit_progress(progress_callback, "reasoning", f"Reasoning: requesting {normalized_request.tool}.")
             _emit_progress(progress_callback, "procedure", f"Ran {normalized_request.tool}")
             try:
@@ -1063,6 +1403,27 @@ def _model_chat_response(
             if session_tool_result is not None:
                 if not session_tool_result.ok and session_tool_result.error_type == "permission_required":
                     return _session_tool_permission_response(normalized_request, session_tool_result)
+                if not session_tool_result.ok and session_tool_result.error_type in {
+                    "permission_denied",
+                    "path_security",
+                    "secret_path",
+                    "context_excluded",
+                    "invalid_cwd",
+                    "schema_validation_failed",
+                }:
+                    return _response(
+                        "session_tool_blocked",
+                        "Tool Blocked",
+                        _session_tool_blocked_lines(normalized_request.tool, session_tool_result.preview),
+                        ok=False,
+                        extra={
+                            "tool_request": {
+                                "tool": normalized_request.tool,
+                                "arguments": sanitize_for_logging(normalized_request.arguments),
+                            },
+                            "result": session_tool_result.model_dump(mode="json"),
+                        },
+                    )
                 tool_results.append(
                     {
                         "tool": session_tool_result.tool_id,
@@ -1134,62 +1495,221 @@ def _model_chat_response(
             "model_profile": chat_ctx.model_profile,
             "mode": chat_ctx.mode,
             "hosted_fallback": False,
-            "context_manifest": {
-                "blocks": [
-                    {
-                        "kind": block.kind,
-                        "title": block.title,
-                        "source": block.source,
-                        "token_estimate": block.token_estimate,
-                        "truncated": block.truncated,
-                        "role": block.role,
-                    }
-                    for block in context_manifest.blocks
-                ],
-                "blocked_paths": context_manifest.blocked_paths,
-                "warnings": context_manifest.warnings,
-                "budget_report": context_manifest.budget_report.to_payload(),
-                "role_summary": context_manifest.role_summary,
-                "retriever": context_manifest.retriever,
-                "selected_chunks": list(context_manifest.selected_chunks or []),
-                "context_provenance": [
-                    record.model_dump(mode="json") for record in (context_manifest.context_provenance or [])
-                ],
-                "untrusted_context_warnings": list(context_manifest.untrusted_context_warnings or []),
-            },
+            "context_manifest": _context_manifest_response_payload(context_manifest),
             "tool_results": tool_results,
             "action_proposals": model_response.action_proposals,
         },
     )
 
 
+def _native_agent_loop_response(
+    raw: str,
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    model: ChatModel,
+    chat_ctx: ChatContext,
+    messages: list[ChatMessage],
+    context_manifest: Any,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    store, session_id = _ensure_chat_session(project_root, state)
+    turn_state = state.operator_runtime.active_turn_state
+    if turn_state is None:
+        session = store.get_session(session_id)
+        cfg = load_config(project_root)
+        turn_state = create_turn_state_from_session(
+            project_root=project_root,
+            session=session,
+            model_profile_id=cfg.chat.default_model_profile,
+            backend_id=cfg.chat.default_model_profile,
+            agent_id=session.agent_id or state.selected_orchestrator_id or "operator",
+            workbench_id=session.workbench_id,
+            active_tools=_operator_active_tools(),
+            run_mode=RunMode.READ_ONLY,
+            stream_options={"stream": cfg.chat.stream},
+        )
+        if state.operator_runtime.phase.value == "idle":
+            state.operator_runtime.start_turn(turn_state)
+        persist_turn_started(store, turn_state, prompt=raw)
+    loop = HarnessAgentLoop(
+        store=store,
+        project_root=project_root,
+        session_id=session_id,
+        model=model,
+        chat_context=chat_ctx,
+        messages=_native_agent_loop_messages(messages),
+        turn_state=turn_state,
+        progress_callback=progress_callback,
+        queue_drain_callback=state.operator_runtime.drain_save_point_queues,
+    )
+    loop_result = loop.run(raw)
+    state.operator_runtime.active_turn_state = loop_result.turn_state or loop.turn_state
+    if loop_result.tool_results:
+        last_run_id = next((item.run_id for item in reversed(loop_result.tool_results) if item.run_id), None)
+        if last_run_id:
+            state.latest_run_id = last_run_id
+    tool_result_payloads = [item.to_payload() for item in loop_result.tool_results]
+    if loop_result.status == "approval_required":
+        if loop_result.pending_tool_call is not None:
+            state.pending_session_tool_call = loop_result.pending_tool_call
+        permission_result = loop_result.permission_result
+        if permission_result is None:
+            return _response(
+                "agent_loop_failed",
+                "Tool Loop Blocked",
+                ["The model requested approval, but Harness could not build a permission request."],
+                ok=False,
+                extra={"tool_results": tool_result_payloads, "native_tool_loop": True},
+            )
+        return _session_tool_permission_response(
+            ChatToolRequest(
+                type="harness.tool_request/v1",
+                tool=permission_result.tool_id,
+                arguments=dict((loop_result.pending_tool_call or {}).get("arguments") or {}),
+            ),
+            permission_result,
+            store=store,
+            session_id=session_id,
+        )
+    if loop_result.status != "final":
+        title = "Tool Loop Guard" if loop_result.status == "guard_triggered" else "Tool Loop Blocked"
+        return _response(
+            "agent_loop_guard_triggered" if loop_result.status == "guard_triggered" else "agent_loop_failed",
+            title,
+            [loop_result.final_output],
+            ok=False,
+            extra={
+                "native_tool_loop": True,
+                "stop_reason": loop_result.stop_reason,
+                "tool_results": tool_result_payloads,
+            },
+        )
+    return _response(
+        "llm_chat",
+        "Assistant",
+        loop_result.final_output.splitlines(),
+        ok=True,
+        extra={
+            "model_profile": chat_ctx.model_profile,
+            "mode": chat_ctx.mode,
+            "hosted_fallback": False,
+            "native_tool_loop": True,
+            "context_manifest": _context_manifest_response_payload(context_manifest),
+            "tool_results": tool_result_payloads,
+            "action_proposals": [],
+        },
+    )
+
+
+def _native_agent_loop_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    native_instruction = ChatMessage(
+        role="system",
+        content=(
+            "This backend supports provider-native Harness session tools. "
+            "Use the supplied native tool schemas for project inspection and session-local navigation. "
+            "Do not emit harness.tool_request/v1 JSON unless native tools are unavailable. "
+            "Permission-required tools pause for Harness approval; do not claim they ran until Harness returns evidence."
+        ),
+    )
+    if not messages:
+        return [native_instruction]
+    return [*messages[:-1], native_instruction, messages[-1]]
+
+
+def _context_manifest_response_payload(context_manifest: Any) -> dict[str, Any]:
+    payload = context_manifest.to_payload() if hasattr(context_manifest, "to_payload") else None
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "blocks": [
+            {
+                "kind": block.kind,
+                "title": block.title,
+                "source": block.source,
+                "token_estimate": block.token_estimate,
+                "truncated": block.truncated,
+                "role": block.role,
+            }
+            for block in context_manifest.blocks
+        ],
+        "blocked_paths": context_manifest.blocked_paths,
+        "warnings": context_manifest.warnings,
+        "budget_report": context_manifest.budget_report.to_payload(),
+        "role_summary": context_manifest.role_summary,
+        "retriever": context_manifest.retriever,
+        "selected_chunks": list(context_manifest.selected_chunks or []),
+        "context_provenance": [
+            record.model_dump(mode="json") for record in (context_manifest.context_provenance or [])
+        ],
+        "untrusted_context_warnings": list(context_manifest.untrusted_context_warnings or []),
+    }
+
+
 def _context_manifest_progress_lines(context_manifest: Any) -> list[str]:
+    summary = context_manifest.to_payload().get("context_summary", {}) if hasattr(context_manifest, "to_payload") else {}
     lines = [f"- Project: {context_manifest.project_root}"]
-    block_labels: list[str] = []
+    selected_count = int(summary.get("selected_block_count") or len(getattr(context_manifest, "blocks", [])))
+    role_counts = summary.get("role_counts") or getattr(context_manifest, "role_summary", {})
+    role_parts = _context_role_parts(role_counts)
+    context_line = f"- Context: {selected_count} selected {_plural('block', selected_count)}"
+    if role_parts:
+        context_line += ", " + ", ".join(role_parts)
+    lines.append(context_line)
+    source_categories = [str(item) for item in summary.get("source_categories") or []]
+    if source_categories:
+        lines.append(f"- Sources: {', '.join(source_categories[:6])}")
+    token_budget = summary.get("token_budget") or {}
+    used_tokens = token_budget.get("used_input_tokens")
+    max_tokens = token_budget.get("max_input_tokens")
+    if used_tokens is not None and max_tokens is not None:
+        lines.append(f"- Budget: {int(used_tokens):,} / {int(max_tokens):,} tokens")
+    retriever = summary.get("retriever")
+    selected_chunk_count = int(summary.get("selected_chunk_count") or 0)
+    if retriever or selected_chunk_count:
+        lines.append(
+            f"- Retrieval: {retriever or 'none'}, {selected_chunk_count} selected {_plural('chunk', selected_chunk_count)}"
+        )
     read_sources: list[str] = []
     for block in context_manifest.blocks:
         if block.source:
             read_sources.append(str(block.source))
-        else:
-            block_labels.append(str(block.kind))
-    if block_labels:
-        lines.append(f"- Context blocks: {', '.join(block_labels[:8])}")
-    role_summary = getattr(context_manifest, "role_summary", {})
-    if role_summary:
-        pinned = int(role_summary.get("pinned") or 0)
-        retrieved = int(role_summary.get("retrieved") or 0)
-        derived = int(role_summary.get("derived") or 0)
-        role_parts = [f"pinned={pinned}", f"retrieved={retrieved}"]
-        if derived:
-            role_parts.append(f"derived={derived}")
-        lines.append(f"- Context roles: {', '.join(role_parts)}")
     if read_sources:
         lines.append(f"- Read {', '.join(read_sources[:6])}")
-    if context_manifest.blocked_paths:
-        lines.append(f"- Blocked paths: {len(context_manifest.blocked_paths)}")
-    if context_manifest.warnings:
-        lines.append(f"- Warnings: {', '.join(context_manifest.warnings[:3])}")
+    blocked_path_count = int(summary.get("blocked_path_count") or len(getattr(context_manifest, "blocked_paths", [])))
+    if blocked_path_count:
+        lines.append(f"- Blocked paths: {blocked_path_count}")
+    warning_codes = [str(item) for item in summary.get("warning_codes") or getattr(context_manifest, "warnings", [])]
+    if warning_codes:
+        lines.append(f"- Warnings: {', '.join(warning_codes[:3])}")
     return lines
+
+
+def _context_role_parts(role_counts: Any) -> list[str]:
+    if not isinstance(role_counts, dict):
+        return []
+    parts: list[str] = []
+    for role in ("pinned", "retrieved", "derived"):
+        count = int(role_counts.get(role) or 0)
+        if count:
+            parts.append(f"{count} {role}")
+    return parts
+
+
+def _plural(noun: str, count: int) -> str:
+    return noun if count == 1 else f"{noun}s"
+
+
+def _attach_context_pack_hash(state: ChatSessionState, context_manifest: Any) -> None:
+    turn_state = state.operator_runtime.active_turn_state
+    if turn_state is None or not hasattr(context_manifest, "to_payload"):
+        return
+    try:
+        payload = context_manifest.to_payload()
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        turn_state.context_pack_sha256 = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    except Exception:
+        return
 
 
 def _complete_model_turn(
@@ -1263,6 +1783,8 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
             content=(
                 "Available Harness session tools. Model-visible tool calls must use the "
                 "harness.tool_request/v1 envelope and route through the session-tool registry. "
+                "For web-search, always include arguments.query with the concrete search query inferred "
+                "from the user's request; do not emit an empty arguments object. "
                 "Permission-required tools pause until the operator approves the exact permission id:\n"
                 + json.dumps(_model_tool_specs_payload(), sort_keys=True, default=str)
             ),
@@ -1476,8 +1998,23 @@ def _run_session_tool_response(project_root: Path, state: ChatSessionState, tool
         return _uninitialized_response(project_root)
     try:
         store, session_id = _ensure_chat_session(project_root, state)
+        before_event_count = len(store.list_session_store_events(session_id))
         result = execute_session_tool(store, project_root, session_id, tool_id, arguments)
+    except CwdResolutionError as exc:
+        return _response(
+            "session_cwd_invalid",
+            "Session Cwd Recovery",
+            [cwd_recovery_message(exc)],
+            ok=False,
+        )
     except Exception as exc:
+        if is_missing_session_schema_error(exc):
+            return _response(
+                "session_schema_missing",
+                "Session Database Repair Required",
+                [SESSION_SCHEMA_REPAIR_MESSAGE],
+                ok=False,
+            )
         return _response("session_tool_failed", "Tool Failed", [str(exc)], ok=False)
     state.latest_run_id = result.run_id
     if result.error_type == "permission_required":
@@ -1488,7 +2025,26 @@ def _run_session_tool_response(project_root: Path, state: ChatSessionState, tool
             "arguments": sanitize_for_logging(arguments),
             "permission_id": result.permission_id,
         }
-        return _session_tool_permission_response(ChatToolRequest(type="harness.tool_request/v1", tool=tool_id, arguments=arguments), result)
+        after_event_count = len(store.list_session_store_events(session_id))
+        _persist_operator_save_point(
+            store,
+            state,
+            flushed_event_count=max(0, after_event_count - before_event_count),
+            flushed_artifact_count=0,
+        )
+        return _session_tool_permission_response(
+            ChatToolRequest(type="harness.tool_request/v1", tool=tool_id, arguments=arguments),
+            result,
+            store=store,
+            session_id=session_id,
+        )
+    after_event_count = len(store.list_session_store_events(session_id))
+    _persist_operator_save_point(
+        store,
+        state,
+        flushed_event_count=max(0, after_event_count - before_event_count),
+        flushed_artifact_count=1 if result.artifact_id else 0,
+    )
     lines = result.preview.splitlines() or [result.preview]
     if result.artifact_id:
         lines.append(f"Output artifact: {result.artifact_id}")
@@ -1501,13 +2057,54 @@ def _run_session_tool_response(project_root: Path, state: ChatSessionState, tool
     )
 
 
-def _session_tool_permission_response(request: ChatToolRequest, result: Any) -> dict[str, Any]:
+def _session_tool_permission_response(
+    request: ChatToolRequest,
+    result: Any,
+    *,
+    store: SQLiteStore | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     permission_id = getattr(result, "permission_id", None)
+    approval_card = None
+    if permission_id:
+        try:
+            if store is None:
+                raise ValueError("missing store")
+            approval_card = build_session_approval_card(
+                store,
+                session_id or str(getattr(result, "session_id")),
+                str(permission_id),
+                fallback_arguments=dict(request.arguments or {}),
+            )
+        except Exception:
+            approval_card = _fallback_approval_card(request, result)
+    if approval_card is None:
+        approval_card = _fallback_approval_card(request, result)
     state_lines = [
-        f"Tool: {request.tool}",
-        f"Permission: {permission_id or 'pending'}",
-        f"Next: /confirm to allow this exact tool call, or /decline to cancel.",
+        "Approval required to run session tool:",
+        f"tool: {approval_card.get('tool_id') or request.tool}",
+        f"cwd: {approval_card.get('cwd') or '.'}",
     ]
+    command = approval_card.get("command")
+    operation = approval_card.get("operation")
+    if command:
+        state_lines.append(f"command: {command}")
+    elif operation:
+        state_lines.append(f"operation: {operation}")
+    if approval_card.get("timeout_seconds") is not None:
+        state_lines.append(f"timeout: {approval_card['timeout_seconds']}s")
+    if approval_card.get("shell_executable"):
+        state_lines.append(f"shell: {approval_card['shell_executable']}")
+    if approval_card.get("sandbox_profile"):
+        state_lines.append(f"sandbox: {approval_card['sandbox_profile']}")
+    if approval_card.get("network_policy"):
+        state_lines.append(f"network: {approval_card['network_policy']}")
+    state_lines.extend(
+        [
+            f"approval: {permission_id or 'pending'}",
+            "Next: /confirm to approve once, or /decline [feedback] to deny.",
+        ]
+    )
     preview = getattr(result, "preview", "")
     if preview:
         state_lines.extend(["", *str(preview).splitlines()])
@@ -1516,7 +2113,34 @@ def _session_tool_permission_response(request: ChatToolRequest, result: Any) -> 
         "Permission Required",
         state_lines,
         ok=False,
-        extra={"tool_request": {"tool": request.tool, "arguments": sanitize_for_logging(request.arguments)}, "permission_id": permission_id},
+        extra={
+            "tool_request": {"tool": request.tool, "arguments": sanitize_for_logging(request.arguments)},
+            "permission_id": permission_id,
+            "approval_card": approval_card,
+        },
+    )
+
+
+def _fallback_approval_card(request: ChatToolRequest, result: Any) -> dict[str, Any]:
+    arguments = dict(request.arguments or {})
+    return sanitize_for_logging(
+        {
+            "schema_version": "harness.session_approval_card/v1",
+            "approval_id": getattr(result, "permission_id", None),
+            "permission_id": getattr(result, "permission_id", None),
+            "session_id": getattr(result, "session_id", None),
+            "run_id": getattr(result, "run_id", None),
+            "tool_id": request.tool,
+            "cwd": arguments.get("cwd") or ".",
+            "operation": arguments.get("command") or request.tool,
+            "command": arguments.get("command"),
+            "timeout_seconds": arguments.get("timeout_seconds") or arguments.get("timeout"),
+            "shell_executable": arguments.get("shell_executable") or arguments.get("shell"),
+            "sandbox_profile": None,
+            "network_policy": None,
+            "status": "pending",
+            "approve_once": True,
+        }
     )
 
 
@@ -1557,7 +2181,29 @@ def _session_tool_result_message(result: Any) -> str:
     )
 
 
-def _normalize_session_tool_request(request: ChatToolRequest) -> ChatToolRequest:
+def _session_tool_blocked_lines(tool_id: str, preview: str) -> list[str]:
+    lines = preview.splitlines() or [preview]
+    normalized_preview = preview.lower()
+    if tool_id == "web-search" and (
+        "web search is disabled by project web_tools policy" in normalized_preview
+        or "web search endpoint is not configured by project web_tools policy" in normalized_preview
+    ):
+        lines.extend(
+            [
+                "",
+                "Web search is an external-network session tool and must be enabled in project config before it can request approval.",
+                "Configure .harness/config.yaml:",
+                "  web_tools.enabled: true",
+                "  web_tools.search_enabled: true",
+                "  web_tools.search_provider: exa_mcp",
+                "  # or: web_tools.search_provider: configured_http with web_tools.search_endpoint_url set",
+                "After that, Harness will still pause for exact web-search approval before any network request.",
+            ]
+        )
+    return lines
+
+
+def _normalize_session_tool_request(request: ChatToolRequest, *, user_prompt: str | None = None) -> ChatToolRequest:
     aliases = {
         "repo_tree": "glob",
         "read_file": "read",
@@ -1582,6 +2228,14 @@ def _normalize_session_tool_request(request: ChatToolRequest) -> ChatToolRequest
         }
     elif request.tool == "show_diff":
         arguments = {"path": arguments.get("path"), "stat_only": bool(arguments.get("stat_only") or False)}
+    elif tool == "web-search":
+        query = arguments.get("query") or arguments.get("q") or arguments.get("search_query") or arguments.get("text")
+        if (query is None or not str(query).strip()) and user_prompt:
+            query = user_prompt
+        if query is not None:
+            arguments["query"] = str(query).strip()
+        for alias in ("q", "search_query", "text"):
+            arguments.pop(alias, None)
     return ChatToolRequest(type=request.type, tool=tool, arguments=arguments)
 
 
@@ -2435,8 +3089,63 @@ def _mode_response(mode: str | None, state: ChatSessionState) -> dict[str, Any]:
     )
 
 
+def _deny_pending_session_tool_permission(
+    project_root: Path,
+    state: ChatSessionState,
+    *,
+    feedback: str | None = None,
+) -> dict[str, Any] | None:
+    if state.pending_session_tool_call is None:
+        return None
+    pending = dict(state.pending_session_tool_call)
+    permission_id = str(pending.get("permission_id") or "")
+    if not permission_id:
+        return None
+    pending_root = resolve_project_root(str(pending.get("project_root") or project_root))
+    if not _is_initialized(pending_root):
+        return None
+    try:
+        store = _require_store(pending_root)
+        permission = store.resolve_session_permission(
+            permission_id,
+            SessionPermissionStatus.DENIED,
+            reason=feedback or "Declined from harness chat confirmation.",
+        )
+        denial = persist_session_tool_denial(store, permission.session_id, permission_id, feedback=feedback)
+        task_operator_resume = apply_operator_task_permission_resolution(
+            pending_root,
+            permission.session_id,
+            permission_id,
+            status=SessionPermissionStatus.DENIED,
+            feedback=feedback,
+        )
+        if task_operator_resume is not None:
+            denial["task_operator_resume"] = task_operator_resume
+        return denial
+    except (KeyError, ValueError):
+        return None
+
+
+def _decline_response_lines(denial: dict[str, Any] | None) -> list[str]:
+    lines = ["No action was taken."]
+    if denial is None:
+        return lines
+    card = denial.get("approval_card") if isinstance(denial.get("approval_card"), dict) else {}
+    if card:
+        lines.append(f"Denied approval: {card.get('approval_id') or denial.get('permission_id')}")
+        lines.append(f"Tool: {card.get('tool_id') or denial.get('tool_id')}")
+    feedback = denial.get("feedback")
+    if feedback:
+        lines.append(f"Feedback: {feedback}")
+    error = denial.get("model_visible_error")
+    if error:
+        lines.append("Model-visible tool error recorded.")
+    return lines
+
+
 def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
     if state.pending_session_tool_call is not None:
+        state.operator_runtime.resume_waiting_turn()
         pending = dict(state.pending_session_tool_call)
         state.pending_session_tool_call = None
         pending_root = resolve_project_root(str(pending.get("project_root") or project_root))
@@ -2452,12 +3161,25 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
             )
         state.active_project_root = str(pending_root)
         state.session_id = str(pending.get("session_id") or state.session_id or "")
-        return _run_session_tool_response(
+        response = _run_session_tool_response(
             pending_root,
             state,
             str(pending.get("tool_id") or ""),
             dict(pending.get("arguments") or {}),
         )
+        if permission_id:
+            result_payload = response.get("result") if isinstance(response.get("result"), dict) else None
+            task_operator_resume = apply_operator_task_permission_resolution(
+                pending_root,
+                state.session_id,
+                permission_id,
+                status=SessionPermissionStatus.ALLOWED,
+                resumed_result=result_payload,
+            )
+            if task_operator_resume is not None:
+                response["task_operator_resume"] = task_operator_resume
+        _settle_operator_turn(pending_root, state, response)
+        return response
     if state.pending_action_contract is not None:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
@@ -4281,7 +5003,7 @@ def _require_store(project_root: Path) -> SQLiteStore:
     project_root = resolve_project_root(project_root)
     if not _is_initialized(project_root):
         raise ValueError(f"Project is not initialized: {project_root}")
-    return SQLiteStore(project_root)
+    return SQLiteStore.open_initialized(project_root)
 
 
 def _is_initialized(project_root: Path) -> bool:

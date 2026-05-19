@@ -32,10 +32,25 @@ class ChatDelta:
 
 
 @dataclass(frozen=True)
+class ChatToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ChatToolSchema:
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class ChatResponse:
     content: str
     raw: dict[str, Any] | None = None
     action_proposals: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[ChatToolCall] = field(default_factory=list)
 
 
 class ChatModel(Protocol):

@@ -92,6 +92,7 @@ def _event_label(kind: str) -> str:
     labels = {
         "session.created": "Session created",
         "session.archived": "Session archived",
+        "session.restored": "Session restored",
         "session.cancelled": "Session cancelled",
         "session.forked": "Session forked",
         "session.message.appended": "Message appended",

@@ -5,9 +5,12 @@ import json
 import os
 import re
 import shlex
+import ssl
 import subprocess
 import urllib.error
 import urllib.request
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from html.parser import HTMLParser
@@ -23,12 +26,14 @@ from harness.models import (
     EventStreamType,
     RedactionState,
     RunEventType,
+    RunMode,
     SessionMessageRole,
     SessionPartKind,
     SessionPermissionBoundaryKind,
     SessionPermissionScope,
     SessionPermissionStatus,
 )
+from harness.operator_models import HarnessToolCallRecord
 from harness.paths import PathSecurityError, is_excluded_relative, relative_to_project, resolve_under_project
 from harness.policy import (
     backend_descriptor_sha256,
@@ -37,11 +42,12 @@ from harness.policy import (
     resolve_backend_effective_policy,
     resolve_task_effective_policy,
     resolve_workbench_effective_policy,
+    stable_json_sha256,
 )
 from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, validate_test_command
 from harness.security import assert_not_secret_path, is_secret_path, sanitize_for_logging
-from harness.session_cwd import CwdResolutionError, CwdResolver, session_cwd_from_metadata
+from harness.session_cwd import CwdResolutionError, CwdResolver, cwd_recovery_message, session_cwd_from_metadata
 from harness.tools.patch import PatchValidationError, _is_blocked_edit_path, plan_unified_diff
 
 
@@ -115,8 +121,214 @@ class SessionToolPermissionDecision(BaseModel):
     reasons: list[str] = Field(default_factory=list)
 
 
+def build_session_approval_card(
+    store: SQLiteStore,
+    session_id: str,
+    permission_id: str,
+    *,
+    fallback_arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return a concise, operator-facing projection for an exact pending approval."""
+    permission = store.get_session_permission(permission_id)
+    if permission.session_id != session_id:
+        raise ValueError(f"Permission {permission_id} does not belong to session {session_id}.")
+    before_event = _latest_tool_call_before_event(store, session_id, permission)
+    event_payload = before_event.payload if before_event is not None and isinstance(before_event.payload, dict) else {}
+    record = event_payload.get("record") if isinstance(event_payload.get("record"), dict) else {}
+    approval_target = event_payload.get("approval_target") if isinstance(event_payload.get("approval_target"), dict) else {}
+    if not approval_target:
+        normalized_args = record.get("normalized_args") if isinstance(record.get("normalized_args"), dict) else {}
+        approval_target = (
+            normalized_args.get("approval_target")
+            if isinstance(normalized_args.get("approval_target"), dict)
+            else {}
+        )
+    target_payload = _json_object_or_none(permission.normalized_target_pattern) or {}
+    if not approval_target:
+        approval_target = target_payload
+    raw_args = record.get("raw_args") if isinstance(record.get("raw_args"), dict) else {}
+    if not raw_args and isinstance(fallback_arguments, dict):
+        raw_args = fallback_arguments
+    command = (
+        approval_target.get("normalized_command")
+        or approval_target.get("command")
+        or raw_args.get("command")
+    )
+    operation = (
+        approval_target.get("normalized_operation")
+        or command
+        or permission.normalized_action
+    )
+    timeout_seconds = (
+        approval_target.get("timeout_seconds")
+        or approval_target.get("timeout")
+        or raw_args.get("timeout_seconds")
+        or raw_args.get("timeout")
+    )
+    cwd = approval_target.get("normalized_cwd") or approval_target.get("cwd") or record.get("cwd") or "."
+    card = {
+        "schema_version": "harness.session_approval_card/v1",
+        "approval_id": permission.id,
+        "permission_id": permission.id,
+        "session_id": session_id,
+        "run_id": permission.run_id,
+        "tool_id": permission.tool_id,
+        "cwd": cwd,
+        "operation": operation,
+        "command": command,
+        "timeout_seconds": timeout_seconds,
+        "shell_executable": approval_target.get("shell_executable") or raw_args.get("shell_executable") or raw_args.get("shell"),
+        "sandbox_profile": approval_target.get("sandbox_profile"),
+        "network_policy": approval_target.get("network_policy"),
+        "env_policy": approval_target.get("env_policy"),
+        "run_mode": approval_target.get("run_mode"),
+        "boundary_kind": permission.boundary_kind.value,
+        "risk": permission.risk,
+        "status": permission.status.value,
+        "scope": permission.scope.value,
+        "policy_reasons": list(permission.policy_reasons),
+        "approval_target": approval_target,
+        "reply_route": f"/sessions/{session_id}/approval/{permission.id}",
+        "approve_once": True,
+        "resume_supported": bool(raw_args),
+    }
+    return sanitize_for_logging(card)
+
+
+def pending_session_tool_call_from_permission(
+    store: SQLiteStore,
+    session_id: str,
+    permission_id: str,
+) -> dict[str, Any] | None:
+    permission = store.get_session_permission(permission_id)
+    if permission.session_id != session_id:
+        raise ValueError(f"Permission {permission_id} does not belong to session {session_id}.")
+    before_event = _latest_tool_call_before_event(store, session_id, permission)
+    if before_event is None or not isinstance(before_event.payload, dict):
+        return None
+    record = before_event.payload.get("record")
+    if not isinstance(record, dict):
+        return None
+    raw_args = record.get("raw_args")
+    if not isinstance(raw_args, dict):
+        normalized_args = record.get("normalized_args") if isinstance(record.get("normalized_args"), dict) else {}
+        candidate = normalized_args.get("arguments")
+        raw_args = candidate if isinstance(candidate, dict) else {}
+    tool_id = str(record.get("tool_id") or permission.tool_id)
+    if not tool_id or not raw_args:
+        return None
+    return sanitize_for_logging(
+        {
+            "schema_version": "harness.pending_session_tool_call/v1",
+            "project_root": None,
+            "session_id": session_id,
+            "tool_id": tool_id,
+            "arguments": raw_args,
+            "permission_id": permission_id,
+            "run_id": permission.run_id,
+            "tool_call_id": record.get("tool_call_id"),
+            "approval_card": build_session_approval_card(store, session_id, permission_id),
+        }
+    )
+
+
+def persist_session_tool_denial(
+    store: SQLiteStore,
+    session_id: str,
+    permission_id: str,
+    *,
+    feedback: str | None = None,
+) -> dict[str, Any]:
+    permission = store.get_session_permission(permission_id)
+    if permission.session_id != session_id:
+        raise ValueError(f"Permission {permission_id} does not belong to session {session_id}.")
+    card = build_session_approval_card(store, session_id, permission_id)
+    feedback_text = str(sanitize_for_logging(feedback or "")).strip()
+    lines = [
+        "Tool call denied by operator.",
+        f"Tool: {permission.tool_id}",
+        f"Permission: {permission.id}",
+    ]
+    if feedback_text:
+        lines.append(f"Feedback: {feedback_text}")
+    text = "\n".join(lines)
+    event = store.append_store_event(
+        EventStreamType.SESSION,
+        session_id,
+        "harness.approval.denied",
+        {
+            "permission_id": permission_id,
+            "tool_id": permission.tool_id,
+            "feedback": feedback_text or None,
+            "approval_card": card,
+            "model_visible_error": text,
+            "summary": f"{permission.tool_id} denied",
+        },
+        session_id=session_id,
+        run_id=permission.run_id,
+        redaction_state=RedactionState.REDACTED,
+    )
+    message = store.append_session_message(
+        session_id,
+        SessionMessageRole.TOOL,
+        text,
+        run_id=permission.run_id,
+    )
+    store.append_session_part(
+        session_id,
+        message.id,
+        SessionPartKind.TOOL_RESULT,
+        text=text,
+        run_id=permission.run_id,
+        metadata={
+            "tool_id": permission.tool_id,
+            "ok": False,
+            "error_type": "permission_denied",
+            "permission_id": permission_id,
+            "model_visible": True,
+            "permission_granting": False,
+        },
+        redaction_state=RedactionState.REDACTED,
+    )
+    return {
+        "schema_version": "harness.session_tool_denial/v1",
+        "permission_id": permission_id,
+        "tool_id": permission.tool_id,
+        "feedback": feedback_text or None,
+        "model_visible_error": text,
+        "event": event.model_dump(mode="json"),
+        "approval_card": card,
+    }
+
+
+def _latest_tool_call_before_event(store: SQLiteStore, session_id: str, permission: Any) -> Any | None:
+    if not permission.run_id:
+        return None
+    events = store.list_session_store_events(session_id)
+    candidates = [
+        event
+        for event in events
+        if event.kind == "harness.tool_call.before"
+        and event.run_id == permission.run_id
+        and isinstance(event.payload, dict)
+    ]
+    return candidates[-1] if candidates else None
+
+
+@dataclass(frozen=True)
+class SessionToolCallGate:
+    descriptor: SessionToolDescriptor
+    decision: SessionToolPermissionDecision
+    record: HarnessToolCallRecord
+    effective_policy_sha256: str
+    approval_target: dict[str, Any]
+    allow_excluded: bool = False
+
+
 TOOL_RESULT_INLINE_PREVIEW_BYTES = 16 * 1024
 WEB_FETCH_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+WEB_SEARCH_EXA_MCP_URL = "https://mcp.exa.ai/mcp"
+WEB_SEARCH_PARALLEL_MCP_URL = "https://search.parallel.ai/mcp"
 REPO_OVERVIEW_STRUCTURE_LIMIT = 200
 REPO_OVERVIEW_IGNORED_DIRS = {
     ".git",
@@ -624,7 +836,7 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
         SessionToolDescriptor(
             id="web-search",
             title="Web search",
-            description="Plan a web search through an external-network policy gate.",
+            description="Search the web through an external-network policy gate and configured search provider.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
@@ -648,7 +860,7 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
             enabled=True,
             safety_notes=[
                 "Descriptors are documentation and validation metadata, not permission grants.",
-                "Search execution is approval-required and requires an explicit configured search endpoint.",
+                "Search execution is approval-required and requires an explicit project web_tools search provider.",
                 "Search results must be stored as replayable, redacted evidence before display.",
             ],
         ),
@@ -826,13 +1038,327 @@ def get_session_tool_descriptor(tool_id: str) -> SessionToolDescriptor:
     raise KeyError(f"Session tool not found: {tool_id}")
 
 
+def before_tool_call(
+    store: SQLiteStore,
+    project_root: Path,
+    session_id: str,
+    tool_id: str,
+    arguments: dict[str, Any],
+    *,
+    tool_call_id: str | None = None,
+    turn_id: str | None = None,
+    run_id: str | None = None,
+    run_mode: RunMode | str = RunMode.READ_ONLY,
+) -> SessionToolCallGate:
+    normalized_tool_id, normalized_args = _normalize_tool_identity(tool_id, arguments)
+    descriptor = get_session_tool_descriptor(normalized_tool_id)
+    validation_error = validate_session_tool_arguments(descriptor, normalized_args)
+    if validation_error is not None:
+        raise ValueError(validation_error)
+    run_mode_value = RunMode(run_mode.value if isinstance(run_mode, RunMode) else run_mode)
+    decision = decide_session_tool_permission(
+        store,
+        project_root,
+        session_id,
+        normalized_tool_id,
+        normalized_args,
+        run_mode=run_mode_value,
+    )
+    permission_state = _tool_call_permission_state(decision)
+    record = HarnessToolCallRecord(
+        tool_call_id=tool_call_id or f"call_{uuid.uuid4().hex[:12]}",
+        turn_id=turn_id,
+        session_id=session_id,
+        tool_id=normalized_tool_id,
+        raw_args=sanitize_for_logging(arguments),
+        normalized_args=_normalized_record_args(
+            project_root,
+            store,
+            session_id,
+            normalized_tool_id,
+            normalized_args,
+            decision,
+            run_mode=run_mode_value,
+        ),
+        cwd=_record_cwd(project_root, store, session_id, normalized_tool_id, decision),
+        permission_state=permission_state,
+        started_at=datetime.now(timezone.utc),
+        status="running",
+    )
+    approval_target = _approval_target_payload(project_root, session_id, normalized_tool_id, decision, run_mode=run_mode_value)
+    policy_snapshot = {
+        "surface": "session_tool_gateway",
+        "project_root": str(project_root.resolve()),
+        "session_id": session_id,
+        "tool_id": normalized_tool_id,
+        "side_effect": descriptor.side_effect.value,
+        "risk": descriptor.risk.value,
+        "boundary_kind": descriptor.boundary_kind.value,
+        "decision": decision.status.value,
+        "run_mode": run_mode_value.value,
+        "approval_target": approval_target,
+    }
+    policy_sha = stable_json_sha256(policy_snapshot)
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session_id,
+        "harness.tool_call.before",
+        {
+            "record": record.model_dump(mode="json"),
+            "decision": decision.model_dump(mode="json"),
+            "approval_target": approval_target,
+            "effective_policy_sha256": policy_sha,
+            "side_effect": descriptor.side_effect.value,
+            "risk": descriptor.risk.value,
+            "summary": f"{normalized_tool_id} {decision.status.value}",
+        },
+        session_id=session_id,
+        run_id=run_id,
+        redaction_state=RedactionState.REDACTED,
+    )
+    return SessionToolCallGate(
+        descriptor=descriptor,
+        decision=decision,
+        record=record,
+        effective_policy_sha256=policy_sha,
+        approval_target=approval_target,
+        allow_excluded=bool(decision.reasons and "existing session permission" in decision.reasons[0]),
+    )
+
+
+def after_tool_call(
+    store: SQLiteStore,
+    gate: SessionToolCallGate,
+    result: SessionToolExecutionResult,
+) -> HarnessToolCallRecord:
+    status = _tool_call_status_from_result(result)
+    permission_state = gate.record.permission_state
+    if result.error_type == "permission_required":
+        permission_state = "pending"
+    elif result.error_type in {"permission_denied", "path_security", "secret_path"}:
+        permission_state = "denied"
+    elif gate.decision.status == SessionToolPermissionDecisionStatus.ALLOW and gate.record.permission_state == "approved":
+        permission_state = "approved"
+    elif gate.decision.status == SessionToolPermissionDecisionStatus.ALLOW:
+        permission_state = "not_required"
+    record = gate.record.model_copy(
+        update={
+            "permission_state": permission_state,
+            "finished_at": datetime.now(timezone.utc),
+            "status": status,
+            "result_artifact_ids": [result.artifact_id] if result.artifact_id else [],
+        }
+    )
+    store.append_store_event(
+        EventStreamType.SESSION,
+        result.session_id,
+        "harness.tool_call.after",
+        {
+            "record": record.model_dump(mode="json"),
+            "result": {
+                "ok": result.ok,
+                "tool_id": result.tool_id,
+                "run_id": result.run_id,
+                "artifact_id": result.artifact_id,
+                "truncated": result.truncated,
+                "error_type": result.error_type,
+                "permission_id": result.permission_id,
+                "preview": result.preview[:4096],
+            },
+            "effective_policy_sha256": gate.effective_policy_sha256,
+            "summary": f"{result.tool_id} {status}",
+        },
+        session_id=result.session_id,
+        run_id=result.run_id,
+        artifact_id=result.artifact_id,
+        redaction_state=RedactionState.REDACTED,
+    )
+    return record
+
+
+def validate_session_tool_arguments(descriptor: SessionToolDescriptor, arguments: dict[str, Any]) -> str | None:
+    if not isinstance(arguments, dict):
+        return f"Tool arguments for {descriptor.id} must be an object."
+    schema = descriptor.input_schema or {}
+    required = schema.get("required") or []
+    if isinstance(required, list):
+        for key in required:
+            if isinstance(key, str) and key not in arguments:
+                return f"Missing required argument for {descriptor.id}: {key}"
+    if schema.get("additionalProperties") is False:
+        properties = schema.get("properties") or {}
+        if isinstance(properties, dict):
+            extra = sorted(key for key in arguments if key not in properties)
+            if extra:
+                return f"Unexpected argument for {descriptor.id}: {extra[0]}"
+    properties = schema.get("properties") or {}
+    if isinstance(properties, dict):
+        for key, value in arguments.items():
+            property_schema = properties.get(key)
+            if isinstance(property_schema, dict) and not _json_schema_value_matches(value, property_schema):
+                return f"Invalid argument type for {descriptor.id}.{key}"
+    return None
+
+
+def _normalize_tool_identity(tool_id: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    normalized_args = dict(arguments)
+    if tool_id == "shell":
+        cd_path = _simple_shell_cd_path(str(normalized_args.get("command") or ""))
+        if cd_path is not None:
+            return "cd", {"path": cd_path, "actor": normalized_args.get("actor") or "model"}
+    return tool_id, normalized_args
+
+
+def _tool_call_permission_state(
+    decision: SessionToolPermissionDecision,
+) -> str:
+    if decision.status == SessionToolPermissionDecisionStatus.ASK:
+        return "pending"
+    if decision.status == SessionToolPermissionDecisionStatus.DENY:
+        return "denied"
+    if decision.reasons and "existing session permission" in decision.reasons[0]:
+        return "approved"
+    return "not_required"
+
+
+def _normalized_record_args(
+    project_root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    tool_id: str,
+    arguments: dict[str, Any],
+    decision: SessionToolPermissionDecision,
+    *,
+    run_mode: RunMode,
+) -> dict[str, Any]:
+    target_payload = _approval_target_payload(project_root, session_id, tool_id, decision, run_mode=run_mode)
+    normalized = {
+        "arguments": sanitize_for_logging(arguments),
+        "action": decision.action,
+        "target": decision.target,
+        "approval_target": target_payload,
+    }
+    if tool_id == "shell":
+        normalized["shell"] = target_payload
+    elif tool_id == "cd":
+        normalized["cwd"] = decision.target
+    else:
+        normalized["cwd"] = _record_cwd(project_root, store, session_id, tool_id, decision)
+    return normalized
+
+
+def _record_cwd(
+    project_root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    tool_id: str,
+    decision: SessionToolPermissionDecision,
+) -> str:
+    parsed = _json_object_or_none(decision.target)
+    if parsed is not None:
+        for key in ("normalized_cwd", "cwd"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value:
+                return value
+    if tool_id == "cd" and decision.target:
+        return decision.target
+    try:
+        return session_cwd_from_metadata(store.get_session(session_id).metadata)
+    except Exception:
+        return "."
+
+
+def _approval_target_payload(
+    project_root: Path,
+    session_id: str,
+    tool_id: str,
+    decision: SessionToolPermissionDecision,
+    *,
+    run_mode: RunMode,
+) -> dict[str, Any]:
+    target_payload = _json_object_or_none(decision.target) or {}
+    normalized_cwd = target_payload.get("normalized_cwd") or target_payload.get("cwd")
+    if not isinstance(normalized_cwd, str) or not normalized_cwd:
+        normalized_cwd = "."
+    project_root_fingerprint = hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest()
+    payload = {
+        "schema_version": "harness.tool_approval_target/v1",
+        "project_root_fingerprint": project_root_fingerprint,
+        "project_fingerprint": target_payload.get("project_fingerprint") or project_root_fingerprint,
+        "session_id": session_id,
+        "tool_id": tool_id,
+        "normalized_cwd": normalized_cwd,
+        "normalized_operation": target_payload.get("normalized_operation") or target_payload.get("command") or decision.action,
+        "normalized_command": target_payload.get("normalized_command") or target_payload.get("command"),
+        "timeout": target_payload.get("timeout") or target_payload.get("timeout_seconds"),
+        "timeout_seconds": target_payload.get("timeout_seconds"),
+        "shell_executable": target_payload.get("shell_executable"),
+        "env_policy": target_payload.get("env_policy") or "not_applicable",
+        "network_policy": target_payload.get("network_policy") or "not_applicable",
+        "sandbox_profile": target_payload.get("sandbox_profile") or "session_tool_gateway",
+        "run_mode": target_payload.get("run_mode") or run_mode.value,
+        "action": decision.action,
+        "target": decision.target,
+        "boundary_kind": decision.boundary_kind.value,
+    }
+    return sanitize_for_logging(payload)
+
+
+def _json_object_or_none(value: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _tool_call_status_from_result(result: SessionToolExecutionResult) -> str:
+    if result.ok:
+        return "completed"
+    if result.error_type in {"permission_required", "permission_denied", "path_security", "secret_path", "context_excluded", "invalid_cwd"}:
+        return "blocked"
+    return "failed"
+
+
+def _json_schema_value_matches(value: Any, schema: dict[str, Any]) -> bool:
+    if "oneOf" in schema and isinstance(schema["oneOf"], list):
+        return any(isinstance(candidate, dict) and _json_schema_value_matches(value, candidate) for candidate in schema["oneOf"])
+    expected = schema.get("type")
+    if isinstance(expected, list):
+        return any(_json_type_matches(value, item) for item in expected if isinstance(item, str))
+    if isinstance(expected, str):
+        return _json_type_matches(value, expected)
+    return True
+
+
+def _json_type_matches(value: Any, expected: str) -> bool:
+    if expected == "null":
+        return value is None
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "object":
+        return isinstance(value, dict)
+    return True
+
+
 def decide_session_tool_permission(
     store: SQLiteStore,
     project_root: Path,
     session_id: str,
     tool_id: str,
     arguments: dict[str, Any],
+    *,
+    run_mode: RunMode | str = RunMode.READ_ONLY,
 ) -> SessionToolPermissionDecision:
+    run_mode_value = RunMode(run_mode.value if isinstance(run_mode, RunMode) else run_mode)
     descriptor = get_session_tool_descriptor(tool_id)
     action = _tool_action(tool_id)
     target = _tool_target(tool_id, arguments)
@@ -854,6 +1380,7 @@ def decide_session_tool_permission(
                 session_id,
                 "cd",
                 {"path": cd_path, "actor": arguments.get("actor") or "model"},
+                run_mode=run_mode_value,
             )
     dynamic_permission_tools = {
         "cd",
@@ -972,11 +1499,18 @@ def decide_session_tool_permission(
         if tool_id == "shell":
             context_excluded_target = False
             try:
-                target = _shell_permission_target(project_root.resolve(), store, session_id, arguments)
+                target = _shell_permission_target(project_root.resolve(), store, session_id, arguments, run_mode=run_mode_value)
             except CwdResolutionError as exc:
                 if exc.error_type != "context_excluded":
                     raise
-                target = _shell_permission_target(project_root.resolve(), store, session_id, arguments, allow_excluded=True)
+                target = _shell_permission_target(
+                    project_root.resolve(),
+                    store,
+                    session_id,
+                    arguments,
+                    allow_excluded=True,
+                    run_mode=run_mode_value,
+                )
                 context_excluded_target = True
             if _has_allowed_permission(store, session_id, tool_id, action, target, descriptor.boundary_kind):
                 return SessionToolPermissionDecision(
@@ -1159,12 +1693,15 @@ def execute_session_tool(
     session_id: str,
     tool_id: str,
     arguments: dict[str, Any],
+    *,
+    tool_call_id: str | None = None,
+    turn_id: str | None = None,
+    run_mode: RunMode | str = RunMode.READ_ONLY,
 ) -> SessionToolExecutionResult:
-    if tool_id == "shell":
-        cd_path = _simple_shell_cd_path(str(arguments.get("command") or ""))
-        if cd_path is not None:
-            tool_id = "cd"
-            arguments = {"path": cd_path, "actor": arguments.get("actor") or "model"}
+    if not store.db_path.exists():
+        raise ValueError(f"Project is not initialized: {store.project_root}")
+    store.initialize()
+    tool_id, arguments = _normalize_tool_identity(tool_id, arguments)
     descriptor = get_session_tool_descriptor(tool_id)
     if (
         descriptor.enabled
@@ -1195,7 +1732,19 @@ def execute_session_tool(
         run_id=run.id,
         redaction_state=RedactionState.REDACTED,
     )
-    decision = decide_session_tool_permission(store, project_root, session_id, tool_id, arguments)
+    gate = before_tool_call(
+        store,
+        project_root,
+        session_id,
+        tool_id,
+        arguments,
+        tool_call_id=tool_call_id,
+        turn_id=turn_id,
+        run_id=run.id,
+        run_mode=run_mode,
+    )
+    decision = gate.decision
+    descriptor = gate.descriptor
     store.append_store_event(
         EventStreamType.SESSION,
         session_id,
@@ -1230,6 +1779,11 @@ def execute_session_tool(
             if decision.status == SessionToolPermissionDecisionStatus.DENY:
                 permission = store.resolve_session_permission(permission.id, SessionPermissionStatus.DENIED, reason=message)
                 error_type = "permission_denied"
+                if tool_id == "shell" and "Shell executable" in message:
+                    message = (
+                        f"{message}\n"
+                        "Configure a valid absolute shell path with shell_executable before retrying."
+                    )
             else:
                 error_type = "permission_required"
             output = message
@@ -1243,13 +1797,19 @@ def execute_session_tool(
                 tool_id,
                 arguments,
                 run_id=run.id,
-                allow_excluded=bool(decision.reasons and "existing session permission" in decision.reasons[0]),
+                allow_excluded=gate.allow_excluded,
             )
             ok = True
             error_type = None
             permission_id = None
-            if tool_id == "shell":
-                _expire_once_permission(store, session_id, tool_id, decision.action, decision.target, decision.boundary_kind)
+            consume_once_permission_after_execution(
+                store,
+                session_id,
+                tool_id,
+                decision.action,
+                decision.target,
+                decision.boundary_kind,
+            )
     except _DeniedToolCall as exc:
         output = exc.message
         ok = False
@@ -1267,6 +1827,11 @@ def execute_session_tool(
         )
         permission = store.resolve_session_permission(permission.id, SessionPermissionStatus.DENIED, reason=exc.message)
         permission_id = permission.id
+    except CwdResolutionError as exc:
+        output = cwd_recovery_message(exc)
+        ok = False
+        error_type = "invalid_cwd"
+        permission_id = None
     except Exception as exc:
         output = str(sanitize_for_logging(str(exc)))
         ok = False
@@ -1347,7 +1912,7 @@ def execute_session_tool(
         run_id=run.id,
         redaction_state=RedactionState.NOT_REQUIRED,
     )
-    return SessionToolExecutionResult(
+    result = SessionToolExecutionResult(
         ok=ok,
         session_id=session_id,
         run_id=run.id,
@@ -1358,6 +1923,8 @@ def execute_session_tool(
         error_type=error_type,
         permission_id=permission_id,
     )
+    after_tool_call(store, gate, result)
+    return result
 
 
 def _tool_policy_evidence(tool_id: str, *, descriptor: SessionToolDescriptor) -> dict[str, Any]:
@@ -1513,7 +2080,7 @@ def _matching_allowed_permission(
     return None
 
 
-def _expire_once_permission(
+def consume_once_permission_after_execution(
     store: SQLiteStore,
     session_id: str,
     tool_id: str,
@@ -3115,9 +3682,8 @@ def _web_search_plan_values(root: Path, arguments: dict[str, Any]) -> dict[str, 
     cfg = load_config(root).web_tools
     if not cfg.enabled or not cfg.search_enabled:
         raise ValueError("Web search is disabled by project web_tools policy.")
-    endpoint = str(cfg.search_endpoint_url or "").strip()
-    if not endpoint:
-        raise ValueError("Web search endpoint is not configured by project web_tools policy.")
+    provider = _normalize_web_search_provider(str(cfg.search_provider or "configured_http"))
+    endpoint = _web_search_endpoint_for_provider(provider, str(cfg.search_endpoint_url or "").strip())
     endpoint_target = _normalize_web_search_endpoint(endpoint)
     num_results = _bounded_int(arguments.get("num_results", arguments.get("numResults", 8)), "Web search result limit", minimum=1, maximum=20)
     search_type = str(arguments.get("search_type") or arguments.get("type") or "auto").strip().lower()
@@ -3140,6 +3706,11 @@ def _web_search_plan_values(root: Path, arguments: dict[str, Any]) -> dict[str, 
     if project_allowed_domains and any(domain not in project_allowed_domains for domain in requested_domains):
         raise ValueError("Web search requested domain filter includes domains not allowed by project web_tools policy.")
     effective_domains = requested_domains or project_allowed_domains
+    if provider in {"exa_mcp", "parallel_mcp"} and effective_domains:
+        raise ValueError(
+            f"Web search provider {provider} does not support Harness allowed_domains enforcement. "
+            "Use configured_http with a domain-enforcing search endpoint or clear web_tools.allowed_domains."
+        )
     return {
         "schema_version": "harness.session_tool_web_search_plan/v1",
         "query": query,
@@ -3149,7 +3720,7 @@ def _web_search_plan_values(root: Path, arguments: dict[str, Any]) -> dict[str, 
         "livecrawl": livecrawl,
         "context_max_characters": context_max_characters,
         "allowed_domains": effective_domains,
-        "provider": "configured_http",
+        "provider": provider,
         "endpoint": endpoint,
         "endpoint_target": endpoint_target,
         "requires_network": True,
@@ -3160,6 +3731,37 @@ def _web_search_plan_values(root: Path, arguments: dict[str, Any]) -> dict[str, 
             "Search execution must persist provider metadata, result hashes, redaction state, and result artifacts before display.",
         ],
     }
+
+
+def _normalize_web_search_provider(raw_provider: str) -> str:
+    provider = raw_provider.strip().lower().replace("-", "_")
+    aliases = {
+        "http": "configured_http",
+        "configured": "configured_http",
+        "configured_http": "configured_http",
+        "exa": "exa_mcp",
+        "exa_mcp": "exa_mcp",
+        "opencode_exa": "exa_mcp",
+        "parallel": "parallel_mcp",
+        "parallel_mcp": "parallel_mcp",
+        "opencode_parallel": "parallel_mcp",
+    }
+    normalized = aliases.get(provider)
+    if normalized is None:
+        raise ValueError("Web search provider must be configured_http, exa_mcp, or parallel_mcp.")
+    return normalized
+
+
+def _web_search_endpoint_for_provider(provider: str, configured_endpoint: str) -> str:
+    if provider == "configured_http":
+        if not configured_endpoint:
+            raise ValueError("Web search endpoint is not configured by project web_tools policy.")
+        return configured_endpoint
+    if provider == "exa_mcp":
+        return configured_endpoint or WEB_SEARCH_EXA_MCP_URL
+    if provider == "parallel_mcp":
+        return configured_endpoint or WEB_SEARCH_PARALLEL_MCP_URL
+    raise ValueError("Web search provider must be configured_http, exa_mcp, or parallel_mcp.")
 
 
 def _normalize_web_search_endpoint(raw_url: str) -> str:
@@ -3176,6 +3778,9 @@ def _normalize_web_search_endpoint(raw_url: str) -> str:
 
 
 def _execute_web_search(plan: dict[str, Any]) -> dict[str, Any]:
+    provider = str(plan.get("provider") or "configured_http")
+    if provider in {"exa_mcp", "parallel_mcp"}:
+        return _execute_mcp_web_search(plan, provider=provider)
     params = {
         "q": str(plan["query"]),
         "num_results": str(plan["num_results"]),
@@ -3196,17 +3801,7 @@ def _execute_web_search(plan: dict[str, Any]) -> dict[str, Any]:
         },
         method="GET",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            status_code = int(getattr(response, "status", 200))
-            headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
-            body = response.read(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        status_code = int(exc.code)
-        headers = {str(key).lower(): str(value) for key, value in exc.headers.items()}
-        body = exc.read(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
-    except urllib.error.URLError as exc:
-        raise ValueError(f"Web search failed: {exc.reason}") from exc
+    status_code, headers, body = _open_web_search_request(request)
     if len(body) > WEB_FETCH_MAX_RESPONSE_BYTES:
         raise ValueError("Search response too large (exceeds 5MB limit).")
     content_type = headers.get("content-type", "")
@@ -3220,6 +3815,133 @@ def _execute_web_search(plan: dict[str, Any]) -> dict[str, Any]:
         "content_length_header": headers.get("content-length"),
         "output": output,
     }
+
+
+def _execute_mcp_web_search(plan: dict[str, Any], *, provider: str) -> dict[str, Any]:
+    if provider == "parallel_mcp":
+        tool_name = "web_search"
+        arguments = {
+            "objective": str(plan["query"]),
+            "search_queries": [str(plan["query"])],
+        }
+    else:
+        tool_name = "web_search_exa"
+        arguments = {
+            "query": str(plan["query"]),
+            "type": str(plan["search_type"]),
+            "numResults": int(plan["num_results"]),
+            "livecrawl": str(plan["livecrawl"]),
+            "contextMaxCharacters": int(plan["context_max_characters"]),
+        }
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": arguments,
+        },
+    }
+    headers = {
+        "User-Agent": "harness-session-tools/1.0",
+        "Accept": "application/json, text/event-stream",
+        "Content-Type": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if provider == "parallel_mcp" and os.environ.get("PARALLEL_API_KEY"):
+        headers["Authorization"] = f"Bearer {os.environ['PARALLEL_API_KEY']}"
+    request = urllib.request.Request(
+        str(plan["endpoint"]),
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    status_code, response_headers, body = _open_web_search_request(request)
+    if len(body) > WEB_FETCH_MAX_RESPONSE_BYTES:
+        raise ValueError("Search response too large (exceeds 5MB limit).")
+    content_type = response_headers.get("content-type", "")
+    charset = _web_fetch_charset(content_type)
+    text = body.decode(charset, errors="replace")
+    output = _parse_mcp_web_search_response(text) or "No search results found. Please try a different query."
+    return {
+        "status_code": status_code,
+        "headers": response_headers,
+        "content_type": content_type,
+        "content_length_header": response_headers.get("content-length"),
+        "output": output,
+    }
+
+
+def _open_web_search_request(request: urllib.request.Request) -> tuple[int, dict[str, str], bytes]:
+    try:
+        with _urlopen_with_project_certs(request, timeout=25) as response:
+            status_code = int(getattr(response, "status", 200))
+            headers = {str(key).lower(): str(value) for key, value in response.headers.items()}
+            body = response.read(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        status_code = int(exc.code)
+        headers = {str(key).lower(): str(value) for key, value in exc.headers.items()}
+        body = exc.read(WEB_FETCH_MAX_RESPONSE_BYTES + 1)
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Web search failed: {exc.reason}") from exc
+    return status_code, headers, body
+
+
+def _urlopen_with_project_certs(request: urllib.request.Request, *, timeout: int):
+    if str(getattr(request, "full_url", "")).lower().startswith("https://"):
+        context = _certifi_ssl_context()
+        if context is not None:
+            return urllib.request.urlopen(request, timeout=timeout, context=context)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _certifi_ssl_context() -> ssl.SSLContext | None:
+    try:
+        import certifi  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return None
+
+
+def _parse_mcp_web_search_response(text: str) -> str | None:
+    trimmed = text.strip()
+    direct = _parse_mcp_web_search_payload(trimmed)
+    if direct:
+        return direct
+    for line in text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        parsed = _parse_mcp_web_search_payload(line[6:].strip())
+        if parsed:
+            return parsed
+    return None
+
+
+def _parse_mcp_web_search_payload(payload: str) -> str | None:
+    if not payload or not payload.startswith("{"):
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        error = data["error"]
+        message = str(error.get("message") or "MCP web search failed.")
+        raise ValueError(f"Web search failed: {sanitize_for_logging(message)}")
+    result = data.get("result") if isinstance(data, dict) else None
+    content = result.get("content") if isinstance(result, dict) else None
+    if not isinstance(content, list):
+        return None
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    return None
 
 
 def _format_web_search_output(text: str, content_type: str) -> str:
@@ -3360,17 +4082,27 @@ def _shell_permission_target(
     arguments: dict[str, Any],
     *,
     allow_excluded: bool = False,
+    run_mode: RunMode | str = RunMode.READ_ONLY,
 ) -> str:
-    plan = _shell_plan_values(root, store, session_id, arguments, allow_excluded=allow_excluded)
+    run_mode_value = RunMode(run_mode.value if isinstance(run_mode, RunMode) else run_mode)
+    plan = _shell_plan_values(root, store, session_id, arguments, allow_excluded=allow_excluded, run_mode=run_mode_value)
     target = {
         "project_fingerprint": plan["project_fingerprint"],
+        "project_root_fingerprint": plan["project_root_fingerprint"],
         "session_id": session_id,
+        "tool_id": "shell",
+        "normalized_cwd": plan["cwd"],
         "resolved_cwd": plan["resolved_cwd"],
         "command": plan["command"],
+        "normalized_command": plan["command"],
+        "normalized_operation": plan["command"],
+        "timeout": plan["timeout_seconds"],
         "timeout_seconds": plan["timeout_seconds"],
         "shell_executable": plan["shell_executable"],
         "env_policy": plan["env_policy"],
         "network_policy": plan["network_policy"],
+        "sandbox_profile": plan["sandbox_profile"],
+        "run_mode": plan["run_mode"],
     }
     return json.dumps(target, sort_keys=True, separators=(",", ":"))
 
@@ -3382,7 +4114,9 @@ def _shell_plan_values(
     arguments: dict[str, Any],
     *,
     allow_excluded: bool = False,
+    run_mode: RunMode | str = RunMode.READ_ONLY,
 ) -> dict[str, Any]:
+    run_mode_value = RunMode(run_mode.value if isinstance(run_mode, RunMode) else run_mode)
     command = str(arguments.get("command") or "").strip()
     if not command:
         raise ValueError("Missing shell command.")
@@ -3400,6 +4134,7 @@ def _shell_plan_values(
     return {
         "schema_version": "harness.session_shell_plan/v1",
         "project_fingerprint": project_fingerprint,
+        "project_root_fingerprint": project_fingerprint,
         "session_id": session_id,
         "cwd": cwd.normalized_project_relative_cwd,
         "resolved_cwd": cwd.resolved_abs_path,
@@ -3408,6 +4143,8 @@ def _shell_plan_values(
         "shell_executable": shell_executable,
         "env_policy": "minimal_inherited_path_home",
         "network_policy": "host_network_available",
+        "sandbox_profile": "session_tool_shell_exact",
+        "run_mode": run_mode_value.value,
         "process_started": False,
         "shell_execution_started": False,
     }

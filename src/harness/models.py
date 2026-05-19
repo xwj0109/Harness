@@ -388,6 +388,9 @@ class TokenUsageSnapshot(BaseModel):
 def run_mode_for_task_type(task_type: str | None) -> RunMode:
     mapping = {
         "read_only_repo_summary": RunMode.READ_ONLY,
+        "session_plan": RunMode.READ_ONLY,
+        "session_read_only_research": RunMode.READ_ONLY,
+        "session_operator": RunMode.READ_ONLY,
         "repo_planning": RunMode.PLANNING,
         "simple_code_edit": RunMode.LOCAL_EDIT,
         "codex_code_edit": RunMode.CODEX_EDIT,

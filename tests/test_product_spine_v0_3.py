@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 from harness.cli.main import app
+from harness.chat import ChatSessionState, handle_chat_input
+from harness.chat_model import ChatContext, ChatResponse, ChatToolCall, ChatToolSchema
 from harness.backends.codex_cli import CodexRunResult
+from harness.execution import execute_lease
 from harness.intent_router import route_instruction
+from harness.local_server import _reply_to_session_permission
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import (
     EventStreamType,
@@ -17,10 +22,46 @@ from harness.models import (
     SessionPartKind,
     SessionStatus,
 )
+from harness.session_tools import pending_session_tool_call_from_permission
 from harness.session_events import SessionEventKind, append_session_event, read_session_events
 
 
 runner = CliRunner()
+
+
+class FakeNativeToolTaskModel:
+    def __init__(self, responses: list[ChatResponse]) -> None:
+        self.responses = list(responses)
+        self.calls: list[dict] = []
+
+    def complete_with_tools(
+        self,
+        messages: list,
+        context: ChatContext,
+        tools: list[ChatToolSchema],
+    ) -> ChatResponse:
+        self.calls.append({"messages": list(messages), "context": context, "tools": list(tools)})
+        if not self.responses:
+            return ChatResponse(content="Done.")
+        return self.responses.pop(0)
+
+    def stream(self, _messages, _context):
+        raise AssertionError("task operator should use provider-native tool calls")
+
+    def complete(self, _messages, _context):
+        raise AssertionError("task operator should use provider-native tool calls")
+
+
+def _operator_task(store: SQLiteStore, title: str, *, metadata: dict | None = None):
+    base = {
+        "execution_adapter": "session_read_tools",
+        "task_type": "session_plan",
+        "allowed_tools": ["read", "glob", "grep", "git-diff", "pwd"],
+        "required_artifact_kinds": ["final_report"],
+    }
+    if metadata:
+        base.update(metadata)
+    return store.create_task(title, metadata=base)
 
 
 def test_session_create_attach_and_transcript_round_trip(tmp_path) -> None:
@@ -53,6 +94,295 @@ def test_session_create_attach_and_transcript_round_trip(tmp_path) -> None:
     assert store.list_events(run.id)[0].session_id == session.id
     assert artifact.session_id == session.id
     assert read_session_events(tmp_path, session.id)[0].event_type == SessionEventKind.REPORT_READY
+
+
+def test_task_runs_read_only_operator_loop_and_records_linkage(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "README.md").write_text("Harness task bridge\n", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    task = _operator_task(store, "Inspect README with session tools", metadata={"allowed_tools": ["read"]})
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I will read the file.",
+                tool_calls=[ChatToolCall(id="call_read", name="read", arguments={"path": "README.md"})],
+            ),
+            ChatResponse(content="README inspected."),
+        ]
+    )
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+
+    result = execute_lease(tmp_path, selection["lease"].id)
+
+    assert result.ok is True
+    assert result.decision == "operator_task_completed"
+    assert result.adapter_id == "session_read_tools"
+    assert result.task.status.value == "succeeded"
+    assert result.attempt.run_id == result.run.id
+    assert result.attempt.metadata["task_idempotency_key"] == task.idempotency_key
+    assert result.attempt.metadata["attempt_idempotency_key"].endswith(":attempt:1")
+    assert result.run.task_id == task.id
+    assert result.manifest.task_id == task.id
+    assert {artifact.kind for artifact in result.manifest.artifacts} >= {"final_report", "operator_tool_result_index"}
+    assert result.adapter_result["turn_id"]
+    assert result.adapter_result["tool_results"][0]["tool"] == "read"
+    session = store.get_session(result.run.session_id)
+    assert session.active_task_id == task.id
+    assert session.active_run_id == result.run.id
+    events = store.list_session_store_events(session.id)
+    assert any(event.kind == "operator.turn.started" for event in events)
+    assert any(event.kind == "harness.task_operator.completed" for event in events)
+
+
+def test_task_operator_loop_pauses_for_shell_approval_and_resumes_once(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    command = f"{sys.executable} -c \"print('task approval ran')\""
+    task = _operator_task(
+        store,
+        "Run approved task command",
+        metadata={"allowed_tools": ["shell"], "required_artifact_kinds": ["final_report"]},
+    )
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I need shell approval.",
+                tool_calls=[
+                    ChatToolCall(
+                        id="call_shell",
+                        name="shell",
+                        arguments={"command": command, "timeout_seconds": 30, "shell_executable": "/bin/sh"},
+                    )
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+
+    paused = execute_lease(tmp_path, selection["lease"].id)
+
+    assert paused.ok is False
+    assert paused.decision == "operator_task_waiting_approval"
+    assert paused.approval_id
+    assert paused.task.status.value == "waiting_approval"
+    assert paused.attempt.status.value == "waiting_approval"
+    assert paused.lease.status.value == "active"
+    assert "Shell command executed." not in json.dumps(paused.model_dump(mode="json"))
+
+    reply = _reply_to_session_permission(
+        store,
+        paused.run.session_id,
+        paused.approval_id,
+        {"decision": "allow", "message": "approve this exact command"},
+        project_root=tmp_path,
+        resume=True,
+    )
+
+    assert reply["decision"] == "allowed"
+    assert reply["tool_execution_started"] is True
+    assert reply["task_operator_resume"]["decision"] == "operator_task_completed"
+    assert reply["task_operator_resume"]["task_id"] == task.id
+    assert store.get_task(task.id).status.value == "succeeded"
+    assert store.get_task_attempt(paused.attempt.id).status.value == "succeeded"
+    assert store.get_task_lease(paused.lease.id).status.value == "released"
+    assert store.get_session_permission(paused.approval_id).status.value == "expired"
+    events = store.list_session_store_events(paused.run.session_id)
+    shell_outputs = [
+        event
+        for event in events
+        if event.kind == "tool_call.output" and isinstance(event.payload, dict) and event.payload.get("tool_id") == "shell"
+    ]
+    assert len(shell_outputs) == 2
+    assert sum("Shell command executed." in event.payload.get("preview", "") for event in shell_outputs) == 1
+
+
+def test_task_operator_denial_fails_waiting_task(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = _operator_task(store, "Deny unsafe command", metadata={"allowed_tools": ["shell"]})
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I need shell approval.",
+                tool_calls=[
+                    ChatToolCall(
+                        id="call_shell",
+                        name="shell",
+                        arguments={"command": "echo denied", "timeout_seconds": 30},
+                    )
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+    paused = execute_lease(tmp_path, selection["lease"].id)
+
+    reply = _reply_to_session_permission(
+        store,
+        paused.run.session_id,
+        paused.approval_id,
+        {"decision": "deny", "message": "needs a narrower command"},
+        project_root=tmp_path,
+        resume=True,
+    )
+
+    assert reply["decision"] == "denied"
+    assert reply["tool_execution_started"] is False
+    assert reply["task_operator_resume"]["decision"] == "operator_task_approval_denied"
+    assert store.get_task(task.id).status.value == "failed"
+    attempt = store.get_task_attempt(paused.attempt.id)
+    assert attempt.status.value == "failed"
+    assert attempt.failure_code == "approval_denied"
+
+
+def test_task_operator_chat_approval_resumes_waiting_task_once(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    command = f"{sys.executable} -c \"print('chat task approval ran')\""
+    task = _operator_task(
+        store,
+        "Run chat approved task command",
+        metadata={"allowed_tools": ["shell"], "required_artifact_kinds": ["final_report"]},
+    )
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I need shell approval.",
+                tool_calls=[
+                    ChatToolCall(
+                        id="call_shell",
+                        name="shell",
+                        arguments={"command": command, "timeout_seconds": 30, "shell_executable": "/bin/sh"},
+                    )
+                ],
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+    paused = execute_lease(tmp_path, selection["lease"].id)
+    pending = pending_session_tool_call_from_permission(store, paused.run.session_id, paused.approval_id)
+    assert pending is not None
+
+    state = ChatSessionState(session_id=paused.run.session_id, active_project_root=str(tmp_path))
+    pending["project_root"] = str(tmp_path)
+    state.pending_session_tool_call = pending
+    response = handle_chat_input("yes", tmp_path, state)
+
+    assert response["kind"] == "session_tool_result"
+    assert response["ok"] is True
+    assert response["task_operator_resume"]["decision"] == "operator_task_completed"
+    assert response["task_operator_resume"]["task_id"] == task.id
+    assert store.get_task(task.id).status.value == "succeeded"
+    assert store.get_task_attempt(paused.attempt.id).status.value == "succeeded"
+    assert store.get_task_lease(paused.lease.id).status.value == "released"
+    assert store.get_session_permission(paused.approval_id).status.value == "expired"
+    shell_outputs = [
+        event
+        for event in store.list_session_store_events(paused.run.session_id)
+        if event.kind == "tool_call.output" and isinstance(event.payload, dict) and event.payload.get("tool_id") == "shell"
+    ]
+    assert len(shell_outputs) == 2
+    assert sum("Shell command executed." in event.payload.get("preview", "") for event in shell_outputs) == 1
+
+
+def test_task_operator_chat_denial_fails_waiting_task(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = _operator_task(store, "Deny from chat", metadata={"allowed_tools": ["shell"]})
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I need shell approval.",
+                tool_calls=[ChatToolCall(id="call_shell", name="shell", arguments={"command": "echo denied", "timeout_seconds": 30})],
+            )
+        ]
+    )
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+    paused = execute_lease(tmp_path, selection["lease"].id)
+    pending = pending_session_tool_call_from_permission(store, paused.run.session_id, paused.approval_id)
+    assert pending is not None
+
+    state = ChatSessionState(session_id=paused.run.session_id, active_project_root=str(tmp_path))
+    pending["project_root"] = str(tmp_path)
+    state.pending_session_tool_call = pending
+    response = handle_chat_input("no needs a narrower command", tmp_path, state)
+
+    assert response["kind"] == "declined"
+    assert response["denial"]["task_operator_resume"]["decision"] == "operator_task_approval_denied"
+    assert store.get_task(task.id).status.value == "failed"
+    attempt = store.get_task_attempt(paused.attempt.id)
+    assert attempt.status.value == "failed"
+    assert attempt.failure_code == "approval_denied"
+    shell_outputs = [
+        event
+        for event in store.list_session_store_events(paused.run.session_id)
+        if event.kind == "tool_call.output" and isinstance(event.payload, dict) and event.payload.get("tool_id") == "shell"
+    ]
+    assert sum("Shell command executed." in event.payload.get("preview", "") for event in shell_outputs) == 0
+
+
+def test_task_operator_missing_expected_artifact_fails_but_preserves_retry_evidence(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = _operator_task(
+        store,
+        "Produce impossible artifact",
+        metadata={"allowed_tools": ["pwd"], "required_artifact_kinds": ["nonexistent_artifact"]},
+    )
+    first_selection = store.select_next_task_for_lease()
+    assert first_selection is not None
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(content="I will check pwd.", tool_calls=[ChatToolCall(id="call_pwd", name="pwd", arguments={})]),
+            ChatResponse(content="Done without the required artifact."),
+        ]
+    )
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+
+    failed = execute_lease(tmp_path, first_selection["lease"].id)
+
+    assert failed.ok is False
+    assert failed.decision == "operator_task_missing_expected_artifact"
+    assert store.get_task(task.id).status.value == "failed"
+    assert {artifact.kind for artifact in store.list_artifacts(failed.run.id)} >= {"final_report", "operator_tool_result_index"}
+    first_attempt = store.get_task_attempt(failed.attempt.id)
+    assert first_attempt.failure_code == "operator_task_missing_expected_artifact"
+
+    retried = store.retry_task(task.id)
+    second_selection = store.select_next_task_for_lease()
+
+    assert retried.status.value == "ready"
+    assert second_selection is not None
+    assert second_selection["attempt"].attempt_number == 2
+    assert second_selection["attempt"].metadata["task_idempotency_key"] == task.idempotency_key
+    assert second_selection["attempt"].metadata["attempt_idempotency_key"].endswith(":attempt:2")
+    assert store.list_artifacts(failed.run.id)
+
+
+def test_duplicate_run_next_does_not_lease_same_operator_task_twice(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = _operator_task(store, "Lease once")
+
+    first = store.daemon_run_once(owner="test-daemon", pid=123)
+    second = store.daemon_run_once(owner="test-daemon", pid=123)
+
+    assert first.decision == "leased_task"
+    assert first.selected_task.id == task.id
+    assert second.decision == "renewed_lease"
+    assert second.selected_task is None
+    assert second.lease.id == first.lease.id
+    assert len(store.list_task_attempts(task.id)) == 1
 
 
 def test_session_spine_persists_messages_parts_events_and_archive_export(tmp_path) -> None:

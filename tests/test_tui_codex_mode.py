@@ -1,12 +1,18 @@
 import asyncio
+import json
+import sqlite3
 
 from rich.console import Console
 
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import RunEventType, TokenUsageSnapshot
+from harness.models import RunEventType, SessionPermissionBoundaryKind, SessionPermissionScope, TokenUsageSnapshot
 from harness.tui import (
     _append_streaming_content,
+    _chat_response_to_tui_message,
     _merge_codex_stream_and_final_lines,
+    _update_markup_static,
+    _render_composer_status,
+    build_tui_dashboard,
     build_codex_mode_model,
     create_harness_app,
     render_codex_like_transcript,
@@ -68,6 +74,93 @@ def test_codex_mode_model_handles_no_runs(tmp_path) -> None:
     assert "No persisted run events yet." in model["panes"][0]["lines"]
 
 
+def test_tui_dashboard_and_composer_include_operator_phase_cwd_and_approval(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    session = store.create_session(title="Operator status", metadata={"cwd": "src"})
+    permission = store.request_session_permission(
+        session.id,
+        tool_id="shell",
+        normalized_action="run",
+        normalized_target_pattern=json.dumps(
+            {
+                "normalized_cwd": "src",
+                "command": "pytest -q",
+                "normalized_command": "pytest -q",
+                "timeout_seconds": 120,
+                "sandbox_profile": "session_tool_shell_exact",
+                "network_policy": "host_network_available",
+            },
+            sort_keys=True,
+        ),
+        boundary_kind=SessionPermissionBoundaryKind.SHELL,
+        risk="medium",
+        scope=SessionPermissionScope.ONCE,
+    )
+
+    dashboard = build_tui_dashboard(tmp_path)
+    operator = dashboard["active_session"]["operator"]
+    composer = _render_composer_status(dashboard)
+
+    assert operator["phase"] == "waiting_approval"
+    assert operator["cwd"] == "src"
+    assert operator["waiting_approval_id"] == permission.id
+    assert "cwd=src" in composer
+    assert "Operator: waiting_approval" in composer
+    assert permission.id in composer
+    assert "command=pytest -q" in composer
+    assert operator["approval_card"]["command"] == "pytest -q"
+
+
+def test_codex_mode_model_repairs_missing_session_schema_without_raw_sqlite(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    with sqlite3.connect(store.db_path) as conn:
+        conn.execute("DROP TABLE IF EXISTS sessions")
+
+    model = build_codex_mode_model(tmp_path)
+
+    assert model["ok"] is True
+    assert "no such table" not in json.dumps(model).lower()
+    assert SQLiteStore(tmp_path).inspect_required_session_schema()["ok"] is True
+
+
+def test_tui_chat_response_renderer_hides_raw_payloads_unless_debug() -> None:
+    response = {
+        "title": "Assistant",
+        "lines": ["Done."],
+        "tool_results": [{"tool": "grep", "ok": True, "content": "{\"type\":\"harness.tool_result/v1\"}"}],
+        "event_sequence": ["operator.turn.started", "tool_call.output"],
+        "debug": {"exception_type": "ValueError", "traceback": "Traceback (most recent call last): ..."},
+    }
+
+    normal = _chat_response_to_tui_message(response)
+    debug = _chat_response_to_tui_message(response, debug=True)
+
+    assert "harness.tool_result/v1" not in json.dumps(normal)
+    assert "Traceback" not in json.dumps(normal)
+    debug_json = json.dumps(debug)
+    assert "operator.turn.started" in debug_json
+    assert "exception: ValueError" in debug_json
+    assert "traceback captured" in debug_json
+
+    approval = _chat_response_to_tui_message(
+        {
+            "kind": "session_tool_permission_required",
+            "title": "Permission Required",
+            "lines": [],
+            "approval_card": {
+                "approval_id": "perm_123",
+                "tool_id": "shell",
+                "cwd": ".",
+                "command": "pytest -q",
+            },
+        }
+    )
+    assert "approval: perm_123" in approval["lines"]
+    assert "command: pytest -q" in approval["lines"]
+
+
 def test_codex_like_transcript_matches_prompt_entered_layout() -> None:
     rendered = render_codex_like_transcript(
         [
@@ -83,7 +176,10 @@ def test_codex_like_transcript_matches_prompt_entered_layout() -> None:
                     "Ran intent routing",
                     "- intent: unsupported",
                     "Explored",
-                    "- Context blocks: harness_vocabulary, repo_tree",
+                    "- Context: 2 selected blocks, 1 pinned, 1 retrieved",
+                    "- Sources: harness policy, repo tree",
+                    "- Budget: 120 / 1,000 tokens",
+                    "- Warnings: approximate_token_budget_only",
                 ],
             },
         ],
@@ -96,7 +192,10 @@ def test_codex_like_transcript_matches_prompt_entered_layout() -> None:
     assert "[on #eeeeee][dim]›[/dim] arbitrary request[/]" in rendered
     assert "[green]●[/green] [bold]Ran[/bold] [dim]intent[/dim] [dim]routing[/dim]" in rendered
     assert "[dim]•[/dim] [bold]Explored[/bold]" in rendered
-    assert "[dark_cyan]Context blocks:[/dark_cyan] [dim]harness_vocabulary, repo_tree[/dim]" in rendered
+    assert "[dark_cyan]Context:[/dark_cyan] [dim]2 selected blocks, 1 pinned, 1 retrieved[/dim]" in rendered
+    assert "[dark_cyan]Sources:[/dark_cyan] [dim]harness policy, repo tree[/dim]" in rendered
+    assert "[dark_cyan]Budget:[/dark_cyan] [dim]120 / 1,000 tokens[/dim]" in rendered
+    assert "[dark_cyan]Warnings:[/dark_cyan] [dim]approximate_token_budget_only[/dim]" in rendered
     assert "[dim]○[/dim] [dim]Working (3s • esc to interrupt)[/dim]" in rendered
     assert "Harness chat" not in rendered
     assert "[cyan]" not in rendered
@@ -147,13 +246,27 @@ def test_codex_like_transcript_escapes_literal_rich_closing_tags() -> None:
             {
                 "role": "assistant",
                 "title": "Chat Error",
-                "lines": ["closing tag '[/cyan]' does not match any open tag"],
+                "lines": [
+                    "closing tag '[/cyan]' does not match any open tag",
+                    "closing tag '[/bold]' does not match any open tag",
+                ],
             },
         ]
     )
 
     Console().render_str(rendered)
     assert r"\[/cyan]" in rendered
+    assert r"\[/bold]" in rendered
+
+
+def test_markup_static_update_falls_back_to_plain_text_on_bad_markup() -> None:
+    from textual.widgets import Static
+
+    widget = Static("")
+
+    _update_markup_static(widget, "closing tag [/bold] does not match any open tag")
+
+    assert r"\[/bold]" in str(widget.content)
 
 
 def test_codex_like_finish_keeps_live_steps_before_final_answer() -> None:
@@ -163,7 +276,7 @@ def test_codex_like_finish_keeps_live_steps_before_final_answer() -> None:
             "Ran intent routing",
             "- intent: unsupported",
             "Explored",
-            "- Context blocks: harness_vocabulary, repo_tree",
+            "- Context: 2 selected blocks, 1 pinned, 1 retrieved",
         ],
         [
             "Final answer line one.",

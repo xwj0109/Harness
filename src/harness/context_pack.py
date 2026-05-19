@@ -21,9 +21,10 @@ from harness.context_budget import (
 from harness.context_compression import ExtractiveContextCompressor
 from harness.context_retrieval import LexicalContextRetriever, RetrievedContextChunk
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import ContextProvenanceRecord, ContextSourceKind, ContextTrustLevel
+from harness.models import BlockedStateCode, ContextProvenanceRecord, ContextSourceKind, ContextTrustLevel
 from harness.operator_context import build_operator_context
 from harness.paths import is_excluded_relative, relative_to_project, resolve_project_root
+from harness.policy import POLICY_KEYS
 from harness.registry import builtin_spec_registry
 from harness.sandbox_profiles import list_sandbox_profiles
 from harness.security import assert_not_secret_path, sanitize_for_logging, scan_text_for_secrets
@@ -99,6 +100,7 @@ class ContextManifest:
     untrusted_context_warnings: list[str] | None = None
 
     def to_payload(self) -> dict[str, Any]:
+        context_summary = build_context_summary(self)
         payload = {
             "project_root": self.project_root,
             "blocks": [block.to_payload() for block in self.blocks],
@@ -107,6 +109,8 @@ class ContextManifest:
             "warnings": self.warnings,
             "budget_report": self.budget_report.to_payload(),
             "role_summary": dict(self.role_summary),
+            "context_summary": context_summary,
+            "context_snapshot": context_summary,
         }
         if self.retriever:
             payload["retriever"] = self.retriever
@@ -119,6 +123,38 @@ class ContextManifest:
         if self.untrusted_context_warnings is not None:
             payload["untrusted_context_warnings"] = list(self.untrusted_context_warnings)
         return payload
+
+
+def build_context_summary(manifest: ContextManifest) -> dict[str, Any]:
+    blocks = list(manifest.blocks)
+    provenance = list(manifest.context_provenance or [])
+    selected_chunks = list(manifest.selected_chunks or [])
+    budget = manifest.budget_report
+    compressed_block_ids = [
+        _block_id(block)
+        for block in blocks
+        if bool((block.retrieval or {}).get("compressed"))
+    ]
+    source_categories = _source_categories(blocks, provenance)
+    return {
+        "selected_block_count": len(blocks),
+        "role_counts": dict(manifest.role_summary),
+        "source_categories": source_categories,
+        "token_budget": {
+            "used_input_tokens": budget.used_input_tokens,
+            "max_input_tokens": budget.max_input_tokens,
+            "model_profile": budget.model_profile,
+            "approximate": budget.approximate,
+        },
+        "retriever": manifest.retriever,
+        "selected_chunk_count": len(selected_chunks),
+        "truncated_block_ids": [_block_id(block) for block in blocks if block.truncated],
+        "compressed_block_ids": compressed_block_ids,
+        "blocked_path_count": len(manifest.blocked_paths),
+        "warning_codes": list(manifest.warnings),
+        "provenance_count": len(provenance),
+        "selected_sources": [_selected_source(block) for block in blocks],
+    }
 
 
 def pack_chat_context(
@@ -296,6 +332,87 @@ def _block(
         truncated=truncated,
         role=role,
     )
+
+
+def _block_id(block: ContextBlock) -> str:
+    if block.source:
+        return f"{block.kind}:{block.source}"
+    if block.provenance_id:
+        return f"{block.kind}:{block.provenance_id}"
+    return block.kind
+
+
+def _selected_source(block: ContextBlock) -> dict[str, Any]:
+    source = block.source or (block.retrieval or {}).get("path") or block.title
+    status: list[str] = []
+    if block.truncated:
+        status.append("truncated")
+    if bool((block.retrieval or {}).get("compressed")):
+        status.append("compressed")
+    return {
+        "id": _block_id(block),
+        "kind": block.kind,
+        "source": str(source),
+        "role": block.role,
+        "token_estimate": block.token_estimate,
+        "status": status,
+        "category": _source_category_for_block(block),
+    }
+
+
+def _source_categories(blocks: list[ContextBlock], provenance: list[ContextProvenanceRecord]) -> list[str]:
+    categories: list[str] = []
+    for block in blocks:
+        category = _source_category_for_block(block)
+        if category not in categories:
+            categories.append(category)
+    for record in provenance:
+        category = _source_category_for_provenance(record)
+        if category not in categories:
+            categories.append(category)
+    return categories
+
+
+def _source_category_for_block(block: ContextBlock) -> str:
+    if block.kind == "harness_vocabulary":
+        return "harness vocabulary"
+    if block.kind == "builtin_harness_domain":
+        return "registry"
+    if block.kind == "security_policy_summary":
+        return "harness policy"
+    if block.kind == "sandbox_profiles":
+        return "sandbox profiles"
+    if block.kind == "request_context":
+        return "request"
+    if block.kind == "memory_summary":
+        return "memory"
+    if block.kind == "repo_tree":
+        return "repo tree"
+    if block.kind == "project_file":
+        return "repo file"
+    if block.kind in {"git_status", "git_diff_stat", "git_diff"}:
+        return "git"
+    if block.kind == "recent_artifacts":
+        return "artifacts"
+    if block.kind == "harness_state":
+        return "harness state"
+    if block.kind == "retrieved_context_chunk":
+        return "retrieved chunks"
+    return block.kind.replace("_", " ")
+
+
+def _source_category_for_provenance(record: ContextProvenanceRecord) -> str:
+    if record.source_kind == ContextSourceKind.REPO_FILE:
+        return "repo file"
+    if record.source_kind == ContextSourceKind.MEMORY_RECORD:
+        return "memory"
+    if record.source_kind == ContextSourceKind.ARTIFACT:
+        return "artifacts"
+    if record.source_kind == ContextSourceKind.TASK_METADATA:
+        return "harness state"
+    if record.source_kind == ContextSourceKind.GENERATED_PLAN:
+        return "harness policy"
+    return record.source_kind.value.replace("_", " ")
 
 
 def _fit_block(block: ContextBlock, remaining_tokens: int, budgeter: TokenBudgeter) -> ContextBlock:
@@ -559,22 +676,31 @@ def _builtin_registry_block(warnings: list[str]) -> ContextBlock | None:
 
 def _security_policy_block() -> ContextBlock:
     payload = {
+        "schema_version": "harness.security_policy_summary/v1",
+        "policy_keys": list(POLICY_KEYS),
         "security_layer": [
-            "path guards block project escapes and secret-like paths",
-            "context excludes prevent hidden state and build/cache folders from entering model context",
-            "hosted/data-boundary work requires explicit approval",
-            "registered adapters fail closed on unknown adapters, unsafe metadata, missing approvals, and breaker controls",
-            "apply-back requires separate approval after isolated edit review",
+            {
+                "id": "path_guards",
+                "summary": "Path guards block project escapes and secret-like paths.",
+            },
+            {
+                "id": "context_excludes",
+                "summary": "Configured context excludes prevent hidden state and build/cache folders from entering model context.",
+            },
+            {
+                "id": "hosted_boundary",
+                "summary": "Hosted and data-boundary work is governed by effective policy and approval state.",
+            },
+            {
+                "id": "registered_adapters",
+                "summary": "Registered adapters fail closed on unknown adapters, unsafe metadata, missing approvals, and breaker controls.",
+            },
+            {
+                "id": "apply_back",
+                "summary": "Apply-back requires separate approval after isolated edit review.",
+            },
         ],
-        "blocked_state_codes": [
-            "missing_approval",
-            "disabled_adapter",
-            "unsafe_metadata",
-            "unknown_adapter",
-            "sandbox_profile_mismatch",
-            "breaker_open",
-            "forbidden_path_or_secret_like_content",
-        ],
+        "blocked_state_codes": [code.value for code in BlockedStateCode],
     }
     return _json_block("security_policy_summary", "Security and policy summary", payload, role="pinned")
 

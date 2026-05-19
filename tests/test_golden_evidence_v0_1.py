@@ -233,6 +233,7 @@ def test_golden_doctor_evidence_contract(tmp_path, monkeypatch) -> None:
     assert normalized["ok"] is True
     assert set(checks) == {
         "initialized",
+        "session_schema",
         "config_loadable",
         "local_artifact_ignores",
         "backend_descriptors",
@@ -242,6 +243,7 @@ def test_golden_doctor_evidence_contract(tmp_path, monkeypatch) -> None:
         "sandbox_safety",
     }
     assert checks["initialized"]["status"] == "pass"
+    assert checks["session_schema"]["status"] == "pass"
     assert checks["config_loadable"]["status"] == "pass"
     assert checks["backend_preflight"]["status"] == "warn"
     assert checks["docker_binary"]["status"] == "pass"

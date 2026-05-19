@@ -147,6 +147,7 @@ class WebToolsConfig(BaseModel):
     search_enabled: bool = False
     approval_required: bool = True
     allowed_domains: list[str] = Field(default_factory=list)
+    search_provider: str = "configured_http"
     search_endpoint_url: str | None = None
 
 
