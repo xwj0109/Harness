@@ -71,6 +71,9 @@ def test_phase_4a_session_tool_descriptors_are_low_risk_and_plan_safe() -> None:
         "read",
         "glob",
         "grep",
+        "git-diff",
+        "pwd",
+        "cd",
         "artifact-read",
         "lsp-diagnostics",
         "lsp-symbols",
@@ -124,13 +127,12 @@ def test_phase_4b_descriptors_are_disabled_and_permission_required() -> None:
     by_id = {descriptor.id: descriptor for descriptor in descriptors}
     disabled_high_risk_ids = {
         "managed-action",
-        "shell",
         "mcp",
         "plugin-tool",
         "pty",
     }
 
-    assert disabled_high_risk_ids | {"patch", "direct-write", "docker-test"} <= set(by_id)
+    assert disabled_high_risk_ids | {"patch", "direct-write", "docker-test", "shell"} <= set(by_id)
     for tool_id in disabled_high_risk_ids:
         descriptor = by_id[tool_id]
         assert descriptor.enabled is False
@@ -139,6 +141,10 @@ def test_phase_4b_descriptors_are_disabled_and_permission_required() -> None:
         assert descriptor.risk in {"medium", "high"}
         assert "disabled by default" in " ".join(descriptor.safety_notes)
     assert by_id["shell"].boundary_kind == SessionPermissionBoundaryKind.SHELL
+    assert by_id["shell"].enabled is True
+    assert by_id["shell"].permission_required is True
+    assert by_id["shell"].side_effect == SessionToolSideEffect.EXECUTION
+    assert by_id["shell"].replay_policy.value == "rerun_forbidden"
     assert by_id["patch"].enabled is True
     assert by_id["patch"].permission_required is True
     assert by_id["patch"].side_effect == SessionToolSideEffect.MUTATION
@@ -215,6 +221,9 @@ def test_session_tools_cli_lists_descriptor_metadata_without_grants(tmp_path) ->
         "read",
         "glob",
         "grep",
+        "git-diff",
+        "pwd",
+        "cd",
         "artifact-read",
         "lsp-diagnostics",
         "lsp-symbols",
@@ -223,13 +232,14 @@ def test_session_tools_cli_lists_descriptor_metadata_without_grants(tmp_path) ->
         "todo",
         "question",
     }
-    assert any(tool["id"] == "shell" and tool["enabled"] is False for tool in payload["tools"])
+    assert any(tool["id"] == "shell" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert any(tool["id"] == "web-search" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert any(tool["id"] == "mcp-resource" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert any(tool["id"] == "plugin-tool" and tool["enabled"] is False for tool in payload["tools"])
     assert any(tool["id"] == "skill-load" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert shell_payload["tools"][0]["id"] == "shell"
-    assert shell_payload["tools"][0]["enabled"] is False
+    assert shell_payload["tools"][0]["enabled"] is True
+    assert shell_payload["tools"][0]["permission_required"] is True
     assert any(tool["id"] == "web-fetch" and tool["enabled"] is True and tool["permission_required"] is True for tool in payload["tools"])
     assert "Descriptors are documentation and validation metadata, not permission grants." in inspect_one.output
     assert "artifact-read" in inspect_one.output
@@ -334,7 +344,7 @@ def test_session_todo_and_question_cli_persist_transcript_parts_and_events(tmp_p
     assert question_part.metadata["permission_granting"] is False
 
 
-def test_disabled_phase_4b_tool_records_denied_evidence_without_execution(tmp_path) -> None:
+def test_shell_tool_records_permission_request_without_execution(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
     session = store.create_session(title="Disabled shell")
@@ -359,13 +369,13 @@ def test_disabled_phase_4b_tool_records_denied_evidence_without_execution(tmp_pa
     payload = json.loads(result.output)
     assert payload["ok"] is False
     assert payload["result"]["tool_id"] == "shell"
-    assert payload["result"]["error_type"] == "permission_denied"
+    assert payload["result"]["error_type"] == "permission_required"
     assert payload["result"]["permission_id"]
-    assert "Session tool is disabled by policy: shell" in payload["result"]["preview"]
+    assert "Shell execution requires an exact normalized session-shell permission grant." in payload["result"]["preview"]
 
     reloaded = SQLiteStore(tmp_path)
     permission = reloaded.get_session_permission(payload["result"]["permission_id"])
-    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.status == SessionPermissionStatus.PENDING
     assert permission.tool_id == "shell"
     assert permission.boundary_kind == SessionPermissionBoundaryKind.SHELL
     assert reloaded.get_session(session.id).active_run_id == payload["result"]["run_id"]
@@ -375,7 +385,7 @@ def test_disabled_phase_4b_tool_records_denied_evidence_without_execution(tmp_pa
     assert "Tool started" in tail.output
     assert "Permission checked" in tail.output
     assert "Permission requested" in tail.output
-    assert "Permission resolved" in tail.output
+    assert "Permission resolved" not in tail.output
     assert "Tool output" in tail.output
 
 
@@ -1919,6 +1929,114 @@ def test_session_read_grep_and_glob_tools_persist_events_and_transcript(tmp_path
     assert all(part.metadata["read_only"] is True for part in read_parts)
     assert all(part.metadata["filesystem_modified"] is False for part in read_parts)
     assert all(part.metadata["permission_granting"] is False for part in read_parts)
+
+
+def test_session_cwd_tools_inherit_cd_and_reject_symlink_escape(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "app.py").write_text("alpha = 1\n", encoding="utf-8")
+    (tmp_path / "tests" / "app.py").write_text("test alpha\n", encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}_outside"
+    outside.mkdir()
+    (tmp_path / "src" / "escape").symlink_to(outside, target_is_directory=True)
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="cwd inheritance")
+
+    cd = runner.invoke(app, ["session", "tool", session.id, "cd", "--project", str(tmp_path), "--input-json", '{"path":"src","actor":"operator"}', "--output", "json"])
+    read = runner.invoke(app, ["session", "tool", session.id, "read", "--project", str(tmp_path), "--input-json", '{"path":"app.py"}', "--output", "json"])
+    grep = runner.invoke(app, ["session", "tool", session.id, "grep", "--project", str(tmp_path), "--input-json", '{"pattern":"alpha","path":".","limit":10}', "--output", "json"])
+    glob = runner.invoke(app, ["session", "tool", session.id, "glob", "--project", str(tmp_path), "--input-json", '{"pattern":"*.py"}', "--output", "json"])
+    explicit = runner.invoke(app, ["session", "tool", session.id, "read", "--project", str(tmp_path), "--input-json", '{"path":"app.py","cwd":"tests"}', "--output", "json"])
+    pwd = runner.invoke(app, ["session", "tool", session.id, "pwd", "--project", str(tmp_path), "--output", "json"])
+    escape = runner.invoke(app, ["session", "tool", session.id, "grep", "--project", str(tmp_path), "--input-json", '{"pattern":"alpha","path":"escape"}', "--output", "json"])
+
+    assert cd.exit_code == 0, cd.output
+    assert read.exit_code == 0, read.output
+    assert grep.exit_code == 0, grep.output
+    assert glob.exit_code == 0, glob.output
+    assert explicit.exit_code == 0, explicit.output
+    assert pwd.exit_code == 0, pwd.output
+    assert escape.exit_code == 0, escape.output
+    assert json.loads(cd.output)["ok"] is True
+    assert SQLiteStore(tmp_path).get_session(session.id).metadata["cwd"] == "src"
+    assert json.loads(read.output)["result"]["preview"] == "alpha = 1\n"
+    assert "src/app.py:1: alpha = 1" in json.loads(grep.output)["result"]["preview"]
+    assert json.loads(glob.output)["result"]["preview"] == "src/app.py"
+    assert json.loads(explicit.output)["result"]["preview"] == "test alpha\n"
+    assert "Session cwd: src" in json.loads(pwd.output)["result"]["preview"]
+    assert json.loads(escape.output)["ok"] is False
+    assert json.loads(escape.output)["result"]["error_type"] == "permission_denied"
+    events = SQLiteStore(tmp_path).list_session_store_events(session.id)
+    assert any(event.kind == "session.cwd_changed" and event.payload["new_cwd"] == "src" for event in events)
+
+
+def test_git_diff_session_tool_uses_session_cwd_and_persists_patch_artifact(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    _run_git_for_test(tmp_path, ["init"])
+    _run_git_for_test(tmp_path, ["config", "user.email", "test@example.com"])
+    _run_git_for_test(tmp_path, ["config", "user.name", "Harness Test"])
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("alpha = 1\n", encoding="utf-8")
+    _run_git_for_test(tmp_path, ["add", "src/app.py"])
+    _run_git_for_test(tmp_path, ["commit", "-m", "initial"])
+    (tmp_path / "src" / "app.py").write_text("alpha = 2\n", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="diff", metadata={"cwd": "src"})
+
+    result = runner.invoke(app, ["session", "tool", session.id, "git-diff", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True
+    assert "Target: src" in payload["result"]["preview"]
+    assert "-alpha = 1" in payload["result"]["preview"]
+    assert "+alpha = 2" in payload["result"]["preview"]
+    output_events = [
+        event.payload
+        for event in SQLiteStore(tmp_path).list_session_store_events(session.id)
+        if event.kind == "tool_call.output" and event.payload.get("tool_id") == "git-diff"
+    ]
+    assert output_events[-1]["read_only"] is True
+    assert output_events[-1]["git_mutation_started"] is False
+
+
+def test_shell_permission_is_exact_and_simple_cd_routes_to_session_cwd(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "src").mkdir()
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="shell", metadata={"cwd": "src"})
+
+    first = runner.invoke(app, ["session", "tool", session.id, "shell", "--project", str(tmp_path), "--input-json", '{"command":"pwd","timeout_seconds":30}', "--output", "json"])
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)
+    assert first_payload["ok"] is False
+    assert first_payload["result"]["error_type"] == "permission_required"
+    permission = SQLiteStore(tmp_path).get_session_permission(first_payload["result"]["permission_id"])
+    assert '"timeout_seconds":30' in permission.normalized_target_pattern
+    SQLiteStore(tmp_path).resolve_session_permission(permission.id, SessionPermissionStatus.ALLOWED, reason="test")
+
+    second = runner.invoke(app, ["session", "tool", session.id, "shell", "--project", str(tmp_path), "--input-json", '{"command":"pwd","timeout_seconds":30}', "--output", "json"])
+    assert second.exit_code == 0, second.output
+    second_payload = json.loads(second.output)
+    assert second_payload["ok"] is True
+    assert "Shell command executed." in second_payload["result"]["preview"]
+    assert str(tmp_path / "src") in second_payload["result"]["preview"]
+    assert SQLiteStore(tmp_path).get_session_permission(permission.id).status == SessionPermissionStatus.EXPIRED
+
+    timeout_changed = runner.invoke(app, ["session", "tool", session.id, "shell", "--project", str(tmp_path), "--input-json", '{"command":"pwd","timeout_seconds":300}', "--output", "json"])
+    assert timeout_changed.exit_code == 0, timeout_changed.output
+    changed_payload = json.loads(timeout_changed.output)
+    assert changed_payload["ok"] is False
+    assert changed_payload["result"]["permission_id"] != permission.id
+
+    cd = runner.invoke(app, ["session", "tool", session.id, "shell", "--project", str(tmp_path), "--input-json", '{"command":"cd .."}', "--output", "json"])
+    assert cd.exit_code == 0, cd.output
+    cd_payload = json.loads(cd.output)
+    assert cd_payload["ok"] is True
+    assert cd_payload["result"]["tool_id"] == "cd"
+    assert "No process was started." in cd_payload["result"]["preview"]
+    assert SQLiteStore(tmp_path).get_session(session.id).metadata["cwd"] == "."
 
 
 def test_session_read_tool_denies_secret_or_outside_path_with_permission_evidence(tmp_path) -> None:

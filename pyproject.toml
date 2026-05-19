@@ -42,7 +42,7 @@ harness = "harness.cli.main:app"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"harness.memory" = ["schema.sql"]
+"harness.memory" = ["schema.sql", "migrations/*.sql"]
 "harness" = [
   "builtin_specs/*.yaml",
   "builtin_specs/agents/**/*.yaml",

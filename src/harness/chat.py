@@ -38,7 +38,7 @@ from harness.context_pack import pack_chat_context
 from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.events import append_jsonl
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import ArtifactRecord, RunRecord, TaskLease, TaskRecord
+from harness.models import ArtifactRecord, RunRecord, SessionPermissionStatus, TaskLease, TaskRecord
 from harness.objective_runner import run_objective_autonomously
 from harness.operator_context import build_operator_context, render_operator_context_lines
 from harness.paths import resolve_project_root
@@ -46,6 +46,8 @@ from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.security import sanitize_for_logging
 from harness.security_explanations import explanations_from_reasons
+from harness.session_cwd import session_cwd_payload
+from harness.session_tools import default_session_tool_descriptors, execute_session_tool, get_session_tool_descriptor
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tools.patch import apply_planned_updates, plan_unified_diff
 from harness.workflow_templates import WorkflowTemplate, template_for_intent
@@ -369,6 +371,8 @@ class ChatDraftTask:
 
 @dataclass
 class ChatSessionState:
+    session_id: str | None = None
+    active_project_root: str | None = None
     latest_task_id: str | None = None
     latest_lease_id: str | None = None
     latest_run_id: str | None = None
@@ -378,6 +382,7 @@ class ChatSessionState:
     pending_orchestration: OrchestratedRunDraft | None = None
     pending_execute_lease_id: str | None = None
     pending_action_contract: ActionContract | None = None
+    pending_session_tool_call: dict[str, Any] | None = None
     pending_hosted_approval: bool = False
     selected_orchestrator_id: str | None = None
     latest_objective_id: str | None = None
@@ -389,6 +394,7 @@ class ChatSessionState:
     progress: list[str] = field(default_factory=list)
 
     def reset(self) -> None:
+        self.session_id = None
         self.latest_task_id = None
         self.latest_lease_id = None
         self.latest_run_id = None
@@ -398,6 +404,7 @@ class ChatSessionState:
         self.pending_orchestration = None
         self.pending_execute_lease_id = None
         self.pending_action_contract = None
+        self.pending_session_tool_call = None
         self.pending_hosted_approval = False
         self.selected_orchestrator_id = None
         self.latest_objective_id = None
@@ -456,7 +463,7 @@ def handle_chat_input(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     state = state or ChatSessionState()
-    project_root = resolve_project_root(project_root)
+    project_root = resolve_project_root(state.active_project_root or project_root)
     raw = text.strip()
     response = _dispatch_chat_input(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
     if response.get("kind") != "reset":
@@ -491,6 +498,7 @@ def _dispatch_chat_input(
         state.pending_orchestration = None
         state.pending_execute_lease_id = None
         state.pending_action_contract = None
+        state.pending_session_tool_call = None
         state.pending_hosted_approval = False
         return _response("declined", "Declined", ["No action was taken."], ok=True)
     if raw.startswith("/"):
@@ -663,6 +671,10 @@ def _handle_slash(
             [
                 "/home, /status - show project state",
                 "/init - initialize this project for Harness records",
+                "/tools - list model-visible session tools",
+                "/pwd - show active project root and session cwd",
+                "/cd <path> - change durable session cwd inside the active project",
+                "/project <path>, /workspace <path> - switch active root explicitly",
                 "/mode [normal|codex-like] - show or change chat action mode",
                 "/dashboard - show passive dashboard context",
                 "/orchestrators - list built-in orchestrators",
@@ -696,6 +708,18 @@ def _handle_slash(
                 "/quit - exit",
             ],
         )
+    if command == "tools":
+        return _session_tools_response(project_root)
+    if command == "pwd":
+        return _run_session_tool_response(project_root, state, "pwd", {})
+    if command == "cd":
+        target = tail or "."
+        switch = _cd_project_switch_response(project_root, state, target)
+        if switch is not None:
+            return switch
+        return _run_session_tool_response(project_root, state, "cd", {"path": target, "actor": "operator"})
+    if command in {"project", "workspace"}:
+        return _project_switch_response(project_root, state, tail, command=command)
     if command == "init":
         return _init_response(project_root, state)
     if command == "mode":
@@ -777,7 +801,7 @@ def _handle_slash(
             progress_callback=progress_callback,
         )
     if command == "diff":
-        return _artifact_response(project_root, state.latest_diff_artifact) if state.latest_diff_artifact else _diff_response(project_root)
+        return _artifact_response(project_root, state.latest_diff_artifact) if state.latest_diff_artifact else _run_session_tool_response(project_root, state, "git-diff", {})
     if command == "test":
         return _action_contract_response(
             project_root,
@@ -883,7 +907,7 @@ def _handle_intent(
     if intent == "execute_adapter":
         return _prepare_execute_response(project_root, state.latest_lease_id, state)
     if intent == "show_diff":
-        return _artifact_response(project_root, state.latest_diff_artifact)
+        return _artifact_response(project_root, state.latest_diff_artifact) if state.latest_diff_artifact else _run_session_tool_response(project_root, state, "git-diff", {})
     if intent == "apply_back_review":
         return _apply_back_review_response(project_root, state)
     if intent == "approve_apply_back":
@@ -904,6 +928,7 @@ def _deterministic_chat_guidance(raw: str, project_root: Path, state: ChatSessio
         or state.pending_orchestration
         or state.pending_execute_lease_id
         or state.pending_action_contract
+        or state.pending_session_tool_call
         or state.pending_hosted_approval
     ):
         lines.append("There is a pending action. Type yes or /confirm to continue, or no to cancel.")
@@ -996,14 +1021,22 @@ def _model_chat_response(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     context_payload = chat_context(project_root)
-    context_manifest = pack_chat_context(project_root)
+    mode = mode_override or ("codex-like" if state.codex_like_mode else "normal")
+    model_profile = context_payload["chat"]["default_model_profile"]
+    context_manifest = pack_chat_context(
+        project_root,
+        query=raw,
+        mode=mode,
+        model_profile=model_profile,
+        safety_boundaries=list(context_payload["safety_boundaries"]),
+    )
     _emit_progress(progress_callback, "procedure", "Explored")
     for line in _context_manifest_progress_lines(context_manifest):
         _emit_progress(progress_callback, "procedure", line)
     chat_ctx = ChatContext(
         project_root=str(project_root),
-        model_profile=context_payload["chat"]["default_model_profile"],
-        mode=mode_override or ("codex-like" if state.codex_like_mode else "normal"),
+        model_profile=model_profile,
+        mode=mode,
         context_blocks=[block.to_payload() for block in context_manifest.blocks],
         safety_boundaries=list(context_payload["safety_boundaries"]),
     )
@@ -1017,11 +1050,41 @@ def _model_chat_response(
             tool_request = parse_tool_request(model_response.content)
             if tool_request is None:
                 break
-            _emit_progress(progress_callback, "reasoning", f"Reasoning: requesting {tool_request.tool}.")
-            _emit_progress(progress_callback, "procedure", f"Ran {tool_request.tool}")
-            tool_result = run_chat_tool(tool_request, default_chat_tool_context(project_root))
+            if not _is_initialized(project_root) and tool_request.tool in {"repo_tree", "read_file", "search_repo", "show_diff"}:
+                normalized_request = tool_request
+            else:
+                normalized_request = _normalize_session_tool_request(tool_request)
+            _emit_progress(progress_callback, "reasoning", f"Reasoning: requesting {normalized_request.tool}.")
+            _emit_progress(progress_callback, "procedure", f"Ran {normalized_request.tool}")
+            try:
+                session_tool_result = _try_execute_model_session_tool(project_root, state, normalized_request)
+            except ValueError as exc:
+                return _response("session_tool_failed", "Tool Failed", [str(exc)], ok=False)
+            if session_tool_result is not None:
+                if not session_tool_result.ok and session_tool_result.error_type == "permission_required":
+                    return _session_tool_permission_response(normalized_request, session_tool_result)
+                tool_results.append(
+                    {
+                        "tool": session_tool_result.tool_id,
+                        "ok": session_tool_result.ok,
+                        "error_type": session_tool_result.error_type,
+                    }
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "kind": "procedure",
+                            "content": f"- {session_tool_result.tool_id}: {'ok' if session_tool_result.ok else session_tool_result.error_type or 'failed'}",
+                        }
+                    )
+                messages.append(ChatMessage(role="assistant", content=model_response.content))
+                messages.append(ChatMessage(role="user", content=f"Harness tool result:\n{_session_tool_result_message(session_tool_result)}"))
+                _emit_progress(progress_callback, "procedure", "Ran model turn")
+                model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
+                continue
+            tool_result = run_chat_tool(normalized_request, default_chat_tool_context(project_root))
             if tool_result.error_type == "action_contract_required":
-                return _action_contract_response(project_root, state, tool_request)
+                return _action_contract_response(project_root, state, normalized_request)
             if tool_result.error_type == "unknown_tool":
                 return _response(
                     "action_contract_rejected",
@@ -1030,8 +1093,8 @@ def _model_chat_response(
                     ok=False,
                     extra={
                         "tool_request": {
-                            "tool": tool_request.tool,
-                            "arguments": sanitize_for_logging(tool_request.arguments),
+                            "tool": normalized_request.tool,
+                            "arguments": sanitize_for_logging(normalized_request.arguments),
                         },
                         "error_type": tool_result.error_type,
                     },
@@ -1079,11 +1142,20 @@ def _model_chat_response(
                         "source": block.source,
                         "token_estimate": block.token_estimate,
                         "truncated": block.truncated,
+                        "role": block.role,
                     }
                     for block in context_manifest.blocks
                 ],
                 "blocked_paths": context_manifest.blocked_paths,
                 "warnings": context_manifest.warnings,
+                "budget_report": context_manifest.budget_report.to_payload(),
+                "role_summary": context_manifest.role_summary,
+                "retriever": context_manifest.retriever,
+                "selected_chunks": list(context_manifest.selected_chunks or []),
+                "context_provenance": [
+                    record.model_dump(mode="json") for record in (context_manifest.context_provenance or [])
+                ],
+                "untrusted_context_warnings": list(context_manifest.untrusted_context_warnings or []),
             },
             "tool_results": tool_results,
             "action_proposals": model_response.action_proposals,
@@ -1102,6 +1174,15 @@ def _context_manifest_progress_lines(context_manifest: Any) -> list[str]:
             block_labels.append(str(block.kind))
     if block_labels:
         lines.append(f"- Context blocks: {', '.join(block_labels[:8])}")
+    role_summary = getattr(context_manifest, "role_summary", {})
+    if role_summary:
+        pinned = int(role_summary.get("pinned") or 0)
+        retrieved = int(role_summary.get("retrieved") or 0)
+        derived = int(role_summary.get("derived") or 0)
+        role_parts = [f"pinned={pinned}", f"retrieved={retrieved}"]
+        if derived:
+            role_parts.append(f"derived={derived}")
+        lines.append(f"- Context roles: {', '.join(role_parts)}")
     if read_sources:
         lines.append(f"- Read {', '.join(read_sources[:6])}")
     if context_manifest.blocked_paths:
@@ -1179,8 +1260,12 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
     messages.append(
         ChatMessage(
             role="system",
-            content="Available Harness chat tools. Tools with risk=read can run in the chat loop; other tools become action contracts:\n"
-            + json.dumps(chat_tool_specs_payload(), sort_keys=True, default=str),
+            content=(
+                "Available Harness session tools. Model-visible tool calls must use the "
+                "harness.tool_request/v1 envelope and route through the session-tool registry. "
+                "Permission-required tools pause until the operator approves the exact permission id:\n"
+                + json.dumps(_model_tool_specs_payload(), sort_keys=True, default=str)
+            ),
         )
     )
     if context.context_blocks:
@@ -1196,6 +1281,16 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
                 messages.append(ChatMessage(role="assistant", content="\n".join(str(line) for line in lines)))
     messages.append(ChatMessage(role="user", content=raw))
     return messages
+
+
+def _model_tool_specs_payload() -> list[dict[str, Any]]:
+    session_specs = [descriptor.model_dump(mode="json") for descriptor in default_session_tool_descriptors()]
+    legacy_gated = [
+        spec
+        for spec in chat_tool_specs_payload()
+        if spec.get("risk") != "read" or bool(spec.get("requires_confirmation"))
+    ]
+    return session_specs + legacy_gated
 
 
 def _local_model_unavailable_response(project_root: Path, exc: Exception) -> dict[str, Any]:
@@ -1339,6 +1434,207 @@ def _diff_response(project_root: Path) -> dict[str, Any]:
             preview += "\n[diff truncated]"
         lines.extend(["Git diff:", *preview.splitlines()])
     return _response("diff", "Diff", lines, ok=True)
+
+
+def _ensure_chat_session(project_root: Path, state: ChatSessionState) -> tuple[SQLiteStore, str]:
+    if not _is_initialized(project_root):
+        raise ValueError(f"Project is not initialized: {project_root}")
+    store = _require_store(project_root)
+    if state.session_id is not None:
+        try:
+            store.get_session(state.session_id)
+            return store, state.session_id
+        except KeyError:
+            state.session_id = None
+    session = store.create_session(
+        title="Harness chat",
+        intent="session_tool_gateway",
+        metadata={"cwd": "."},
+    )
+    state.session_id = session.id
+    state.active_project_root = str(project_root)
+    return store, session.id
+
+
+def _session_tools_response(project_root: Path) -> dict[str, Any]:
+    descriptors = default_session_tool_descriptors()
+    lines = [
+        f"{descriptor.id}: side_effect={descriptor.side_effect.value} permission_required={str(descriptor.permission_required).lower()} enabled={str(descriptor.enabled).lower()}"
+        for descriptor in descriptors
+    ]
+    return _response(
+        "session_tools",
+        "Session Tools",
+        lines,
+        ok=True,
+        extra={"project_root": str(project_root), "tools": [descriptor.model_dump(mode="json") for descriptor in descriptors]},
+    )
+
+
+def _run_session_tool_response(project_root: Path, state: ChatSessionState, tool_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if not _is_initialized(project_root):
+        return _uninitialized_response(project_root)
+    try:
+        store, session_id = _ensure_chat_session(project_root, state)
+        result = execute_session_tool(store, project_root, session_id, tool_id, arguments)
+    except Exception as exc:
+        return _response("session_tool_failed", "Tool Failed", [str(exc)], ok=False)
+    state.latest_run_id = result.run_id
+    if result.error_type == "permission_required":
+        state.pending_session_tool_call = {
+            "project_root": str(project_root),
+            "session_id": session_id,
+            "tool_id": tool_id,
+            "arguments": sanitize_for_logging(arguments),
+            "permission_id": result.permission_id,
+        }
+        return _session_tool_permission_response(ChatToolRequest(type="harness.tool_request/v1", tool=tool_id, arguments=arguments), result)
+    lines = result.preview.splitlines() or [result.preview]
+    if result.artifact_id:
+        lines.append(f"Output artifact: {result.artifact_id}")
+    return _response(
+        "session_tool_result",
+        f"Tool {tool_id}",
+        lines,
+        ok=result.ok,
+        extra={"result": result.model_dump(mode="json")},
+    )
+
+
+def _session_tool_permission_response(request: ChatToolRequest, result: Any) -> dict[str, Any]:
+    permission_id = getattr(result, "permission_id", None)
+    state_lines = [
+        f"Tool: {request.tool}",
+        f"Permission: {permission_id or 'pending'}",
+        f"Next: /confirm to allow this exact tool call, or /decline to cancel.",
+    ]
+    preview = getattr(result, "preview", "")
+    if preview:
+        state_lines.extend(["", *str(preview).splitlines()])
+    return _response(
+        "session_tool_permission_required",
+        "Permission Required",
+        state_lines,
+        ok=False,
+        extra={"tool_request": {"tool": request.tool, "arguments": sanitize_for_logging(request.arguments)}, "permission_id": permission_id},
+    )
+
+
+def _try_execute_model_session_tool(project_root: Path, state: ChatSessionState, request: ChatToolRequest) -> Any | None:
+    try:
+        get_session_tool_descriptor(request.tool)
+    except KeyError:
+        return None
+    if not _is_initialized(project_root):
+        raise ValueError(f"Project is not initialized: {project_root}")
+    store, session_id = _ensure_chat_session(project_root, state)
+    result = execute_session_tool(store, project_root, session_id, request.tool, request.arguments)
+    state.latest_run_id = result.run_id
+    if result.error_type == "permission_required":
+        state.pending_session_tool_call = {
+            "project_root": str(project_root),
+            "session_id": session_id,
+            "tool_id": request.tool,
+            "arguments": sanitize_for_logging(request.arguments),
+            "permission_id": result.permission_id,
+        }
+    return result
+
+
+def _session_tool_result_message(result: Any) -> str:
+    return json.dumps(
+        {
+            "type": "harness.tool_result/v1",
+            "tool": result.tool_id,
+            "ok": result.ok,
+            "content": result.preview,
+            "artifact_id": result.artifact_id,
+            "error_type": result.error_type,
+            "run_id": result.run_id,
+        },
+        sort_keys=True,
+        default=str,
+    )
+
+
+def _normalize_session_tool_request(request: ChatToolRequest) -> ChatToolRequest:
+    aliases = {
+        "repo_tree": "glob",
+        "read_file": "read",
+        "search_repo": "grep",
+        "show_diff": "git-diff",
+    }
+    tool = aliases.get(request.tool, request.tool)
+    arguments = dict(request.arguments)
+    if request.tool == "repo_tree":
+        path = arguments.get("path")
+        arguments = {"pattern": "**/*", **({"cwd": path} if path else {})}
+    elif request.tool == "read_file":
+        arguments = {
+            "path": arguments.get("path") or arguments.get("file") or "",
+            **({"cwd": arguments.get("cwd")} if arguments.get("cwd") else {}),
+        }
+    elif request.tool == "search_repo":
+        arguments = {
+            "pattern": arguments.get("pattern") or arguments.get("query") or "",
+            "path": arguments.get("path"),
+            "regex": bool(arguments.get("regex") or False),
+        }
+    elif request.tool == "show_diff":
+        arguments = {"path": arguments.get("path"), "stat_only": bool(arguments.get("stat_only") or False)}
+    return ChatToolRequest(type=request.type, tool=tool, arguments=arguments)
+
+
+def _cd_project_switch_response(project_root: Path, state: ChatSessionState, target: str) -> dict[str, Any] | None:
+    try:
+        candidate = Path(target).expanduser()
+        resolved = candidate.resolve() if candidate.is_absolute() else (project_root / candidate).resolve()
+        resolved.relative_to(project_root.resolve())
+    except ValueError:
+        return _project_switch_response(project_root, state, str(resolved), command="project", proposed_from_cd=True)
+    except OSError:
+        return None
+    return None
+
+
+def _project_switch_response(
+    project_root: Path,
+    state: ChatSessionState,
+    target: str,
+    *,
+    command: str,
+    proposed_from_cd: bool = False,
+) -> dict[str, Any]:
+    if not target.strip():
+        active = resolve_project_root(state.active_project_root or project_root)
+        return _response("project", "Project", [f"Project root: {active}", f"Session: {state.session_id or 'none'}"], ok=True)
+    target_root = resolve_project_root(target)
+    initialized = _is_initialized(target_root)
+    state.active_project_root = str(target_root)
+    state.session_id = None
+    state.pending_session_tool_call = None
+    if not initialized:
+        return _response(
+            "project_switch_requires_init",
+            "Project Switch",
+            [
+                f"Target root: {target_root}",
+                f"Initialized: false",
+                "Run /init to initialize this root before session tools can persist events there.",
+            ],
+            ok=False,
+            extra={"project_root": str(target_root), "source": "cd" if proposed_from_cd else command},
+        )
+    return _response(
+        "project_switched",
+        "Project Switched",
+        [
+            f"Project root: {target_root}",
+            "Attached session: will attach or create on the next session tool call.",
+        ],
+        ok=True,
+        extra={"project_root": str(target_root), "command": command},
+    )
 
 
 def _action_contract_response(project_root: Path, state: ChatSessionState, tool_request: Any) -> dict[str, Any]:
@@ -2140,6 +2436,28 @@ def _mode_response(mode: str | None, state: ChatSessionState) -> dict[str, Any]:
 
 
 def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+    if state.pending_session_tool_call is not None:
+        pending = dict(state.pending_session_tool_call)
+        state.pending_session_tool_call = None
+        pending_root = resolve_project_root(str(pending.get("project_root") or project_root))
+        if not _is_initialized(pending_root):
+            return _uninitialized_response(pending_root)
+        store = _require_store(pending_root)
+        permission_id = str(pending.get("permission_id") or "")
+        if permission_id:
+            store.resolve_session_permission(
+                permission_id,
+                SessionPermissionStatus.ALLOWED,
+                reason="Approved from harness chat confirmation.",
+            )
+        state.active_project_root = str(pending_root)
+        state.session_id = str(pending.get("session_id") or state.session_id or "")
+        return _run_session_tool_response(
+            pending_root,
+            state,
+            str(pending.get("tool_id") or ""),
+            dict(pending.get("arguments") or {}),
+        )
     if state.pending_action_contract is not None:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
@@ -2541,7 +2859,17 @@ def _status_response(project_root: Path, state: ChatSessionState | None = None) 
     context = build_operator_context(project_root)
     active = _active_orchestrator_id(state or ChatSessionState())
     lines = render_operator_context_lines(context, active_orchestrator=active)
-    return _response("status", "Project State", lines, ok=True, extra={"context": context})
+    cwd_payload: dict[str, Any] | None = None
+    if state is not None and _is_initialized(project_root):
+        try:
+            store, session_id = _ensure_chat_session(project_root, state)
+            session = store.get_session(session_id)
+            cwd_payload = session_cwd_payload(project_root, session.metadata, load_config(project_root).context_excludes)
+            lines.append(f"Session cwd: {cwd_payload['cwd']}")
+            lines.append(f"Resolved cwd: {cwd_payload['resolved_abs_path']}")
+        except Exception:
+            cwd_payload = None
+    return _response("status", "Project State", lines, ok=True, extra={"context": context, "session_cwd": cwd_payload})
 
 
 def _tasks_response(project_root: Path) -> dict[str, Any]:

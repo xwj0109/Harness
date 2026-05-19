@@ -17,6 +17,7 @@ from harness.models import BackendStatus, BillingMode, DataBoundary, EventStream
 from harness.cli.main import app
 from harness.memory.sqlite_store import SQLiteStore
 from harness.tui import (
+    THEME_DIALOG_ENTRIES,
     activate_command_palette_entry,
     build_focused_tui_view_model,
     build_tui_dashboard,
@@ -25,17 +26,21 @@ from harness.tui import (
     build_chat_welcome_message,
     build_command_palette,
     build_command_palette_panes,
+    build_functionality_table,
     build_right_panel_model,
     create_harness_app,
     build_slash_commands,
     build_tui_settings_catalog,
     handle_slash_command,
     filter_command_palette,
+    filter_functionality_table,
     filter_slash_commands,
     filter_tui_panes,
     render_chat_message,
     render_dashboard_text,
     render_filter_status,
+    render_model_selection_dialog,
+    render_functionality_table_dialog,
     render_palette_status,
     render_right_panel,
     render_right_panel_status,
@@ -587,6 +592,17 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert dashboard["tasks"] == []
     assert dashboard["active_leases"] == []
     assert dashboard["daemon"]["latest_events"] == []
+    assert dashboard["model_catalog"]["source"] == "default_config"
+    assert [provider["provider_id"] for provider in dashboard["model_catalog"]["providers"]] == [
+        "codex_cli",
+        "local_openai_compatible",
+        "paid_openai_compatible",
+    ]
+    assert any(model["raw_model_ref"] == "codex_cli/gpt-5.5" for model in dashboard["model_catalog"]["models"])
+    model_dialog = render_model_selection_dialog(dashboard)
+    assert "No models match." not in model_dialog
+    assert "codex_cli" in model_dialog
+    assert "gpt-5.5" in model_dialog
     assert dashboard["guidance"][0]["id"] == "initialize_project"
     assert [pane["id"] for pane in panes] == [
         "overview",
@@ -605,6 +621,8 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert "Project" in rendered
     assert "Initialized: False" in rendered
     assert "Commands" in rendered
+    assert "Providers: 3" in rendered
+    assert "codex_cli/gpt-5.5" in rendered
     assert "Safety" in rendered
     assert "no_hidden_execution" in rendered
     assert not (tmp_path / ".harness").exists()
@@ -624,6 +642,9 @@ def test_tui_dashboard_reports_stale_project_database_without_traceback(tmp_path
     assert dashboard["ok"] is True
     assert dashboard["initialized"] is False
     assert dashboard["state_error"]["type"] == "OperationalError"
+    assert dashboard["model_catalog"]["source"] == "default_config"
+    assert any(provider["provider_id"] == "codex_cli" for provider in dashboard["model_catalog"]["providers"])
+    assert any(model["raw_model_ref"] == "codex_cli/gpt-5.5" for model in dashboard["model_catalog"]["models"])
     assert dashboard["guidance"] == [
         {
             "id": "repair_project_state",
@@ -852,6 +873,506 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "base_url" not in serialized
 
 
+def test_tui_model_selection_palette_projects_configured_models(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Model picker", raw_model_ref="codex_cli/gpt-5.5")
+    dashboard = build_tui_dashboard(tmp_path)
+    palette = build_command_palette(model_catalog=dashboard["model_catalog"])
+    filtered = filter_command_palette(palette, "select model")
+
+    model_entries = [entry for entry in filtered["entries"] if entry["group_id"] == "model_selection"]
+    assert model_entries
+    assert any(entry["model_ref"] == "codex_cli/gpt-5.5" for entry in model_entries)
+    local_entry = next(entry for entry in model_entries if entry["model_ref"].startswith("local_openai_compatible/"))
+    local_model_ref = local_entry["model_ref"]
+    assert local_entry["activation"]["kind"] == "session_model_selection"
+    assert local_entry["activation"]["policy_boundary"]["provider_call_allowed"] is False
+    assert local_entry["activation"]["policy_boundary"]["model_execution_allowed"] is False
+    assert local_entry["activation"]["policy_boundary"]["session_metadata_mutation_allowed"] is True
+    assert local_entry["activation"]["process_started"] is False
+    assert local_entry["activation"]["permission_granting"] is False
+
+    activation = activate_command_palette_entry(
+        palette,
+        local_entry["id"],
+        {"active_section_index": 0, "collapsed_section_ids": set()},
+    )
+    assert activation["ok"] is True
+    assert activation["activation_kind"] == "session_model_selection"
+    assert activation["session_model_selection_requested"] is True
+    assert activation["action"]["raw_model_ref"] == local_model_ref
+    assert activation["provider_started"] is False
+    assert activation["process_started"] is False
+    assert activation["filesystem_modified"] is False
+    assert activation["permission_granting"] is False
+    assert store.get_session(session.id).raw_model_ref == "codex_cli/gpt-5.5"
+
+
+def test_tui_model_picker_persists_session_model_without_provider_execution(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Model picker", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+    local_model_ref = next(
+        model["raw_model_ref"]
+        for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]
+        if model["raw_model_ref"].startswith("local_openai_compatible/")
+    )
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            composer_status = app.query_one("#composer-status", Static)
+            initial_messages = len(app._messages)
+
+            assert f"Session: {session.id}" in str(composer_status.content)
+            assert "Current model: codex_cli/gpt-5.5" in str(composer_status.content)
+
+            await pilot.press("ctrl+p")
+            for char in "qwen":
+                await pilot.press(char)
+            await pilot.pause()
+            assert app._focus_mode == "palette"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            activation = app._latest_palette_activation
+            assert activation["activation_kind"] == "session_model_selection"
+            assert activation["raw_model_ref"] == local_model_ref
+            assert activation["session_model_selected"] is True
+            assert activation["model_validation"]["executable"] is True
+            assert activation["harness_state_modified"] is True
+            assert activation["session_event_persisted"] is True
+            assert activation["command_started"] is False
+            assert activation["provider_started"] is False
+            assert activation["model_execution_started"] is False
+            assert activation["process_started"] is False
+            assert activation["filesystem_modified"] is False
+            assert activation["permission_granting"] is False
+            assert activation["authority_granting"] is False
+
+    asyncio.run(run_pilot())
+
+    updated = SQLiteStore(tmp_path).get_session(session.id)
+    assert updated.raw_model_ref == local_model_ref
+    assert updated.provider_id == "local_openai_compatible"
+    assert updated.model_id
+    events = SQLiteStore(tmp_path).list_session_store_events(session.id)
+    selected_events = [event for event in events if event.kind == "session.model_selected"]
+    validation_events = [event for event in events if event.kind == "session.model_validation"]
+    assert selected_events[-1].payload["raw_model_ref"] == local_model_ref
+    assert validation_events[-1].payload["source"] == "tui_model_picker"
+    assert validation_events[-1].payload["provider_execution_started"] is False
+    assert validation_events[-1].payload["model_execution_started"] is False
+    assert validation_events[-1].payload["hidden_model_fallback"] is False
+    assert validation_events[-1].payload["permission_granting"] is False
+
+
+def test_tui_model_slash_command_persists_session_model_without_palette_shortcut(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Model slash", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+    local_model_ref = next(
+        model["raw_model_ref"]
+        for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]
+        if model["raw_model_ref"].startswith("local_openai_compatible/")
+    )
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            initial_messages = len(app._messages)
+
+            prompt.value = "/model qwen"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert app._request_in_flight is False
+            activation = app._latest_palette_activation
+            assert activation["activation_kind"] == "session_model_selection"
+            assert activation["source"] == "slash"
+            assert activation["slash"] == "/model"
+            assert activation["raw_model_ref"] == local_model_ref
+            assert activation["session_model_selected"] is True
+            assert activation["model_validation"]["executable"] is True
+            assert activation["command_started"] is False
+            assert activation["provider_started"] is False
+            assert activation["model_execution_started"] is False
+            assert activation["process_started"] is False
+            assert activation["filesystem_modified"] is False
+            assert activation["permission_granting"] is False
+            assert activation["authority_granting"] is False
+
+    asyncio.run(run_pilot())
+
+    updated = SQLiteStore(tmp_path).get_session(session.id)
+    assert updated.raw_model_ref == local_model_ref
+    validation_events = [
+        event
+        for event in SQLiteStore(tmp_path).list_session_store_events(session.id)
+        if event.kind == "session.model_validation"
+    ]
+    assert validation_events[-1].payload["source"] == "tui_model_picker"
+    assert validation_events[-1].payload["provider_execution_started"] is False
+    assert validation_events[-1].payload["permission_granting"] is False
+
+
+def test_tui_models_slash_lists_numbered_models_and_selects_by_number(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Model numbered", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+    unique_refs = []
+    for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]:
+        if model["raw_model_ref"] not in unique_refs:
+            unique_refs.append(model["raw_model_ref"])
+    assert len(unique_refs) >= 2
+    selected_ref = unique_refs[1]
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            composer_status = app.query_one("#composer-status", Static)
+            slash_status = app.query_one("#slash-status", Static)
+            dialog = app.query_one("#dialog-panel", Static)
+            initial_messages = len(app._messages)
+
+            assert "Models: /models or ctrl+x m" in str(composer_status.content)
+            assert "Select: /model <number|name>" in str(composer_status.content)
+
+            prompt.value = "/model"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+            assert prompt.value == "/model "
+            assert len(app._messages) == initial_messages
+            assert "Select model" in str(dialog.content)
+            assert "Search" in str(dialog.content)
+            assert app._latest_palette_activation["activation_kind"] == "model_picker_help"
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["process_started"] is False
+
+            prompt.value = "/models"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages + 1
+            assert app._messages[-1]["title"] == "Model Selection"
+            assert any(f"2. " in line and selected_ref in line for line in app._messages[-1]["lines"])
+            assert "Select model" in str(dialog.content)
+            assert "Recent" in str(dialog.content)
+            assert selected_ref.split("/", 1)[-1] in str(dialog.content)
+            assert "/model <number>" in str(dialog.content)
+            assert app._latest_palette_activation["activation_kind"] == "model_list"
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["process_started"] is False
+
+            prompt.value = "/model 2"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+            activation = app._latest_palette_activation
+            assert activation["activation_kind"] == "session_model_selection"
+            assert activation["raw_model_ref"] == selected_ref
+            assert activation["session_model_selected"] is True
+            assert activation["provider_started"] is False
+            assert activation["process_started"] is False
+            assert activation["permission_granting"] is False
+            assert str(dialog.content) == ""
+
+    asyncio.run(run_pilot())
+
+    assert SQLiteStore(tmp_path).get_session(session.id).raw_model_ref == selected_ref
+
+
+def test_tui_opencode_leader_key_lists_models_without_palette_focus(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.containers import Container
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    SQLiteStore(tmp_path).create_session(title="Leader models", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            slash_status = app.query_one("#slash-status", Static)
+            overlay = app.query_one("#dialog-overlay", Container)
+            dialog = app.query_one("#dialog-panel", Static)
+            initial_messages = len(app._messages)
+
+            await pilot.press("ctrl+x")
+            await pilot.pause()
+            assert app.leader_key_active is True
+            assert "Leader: m Models." in str(slash_status.content)
+            assert app._focus_mode == "dashboard"
+            assert "Commands" in str(dialog.content)
+            assert "Suggested" in str(dialog.content)
+            assert "Switch model" in str(dialog.content)
+            assert "ctrl+x m" in str(dialog.content)
+            assert overlay.size.width >= 120
+            assert dialog.size.width < overlay.size.width
+            assert dialog.size.width <= 84
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._dialog_selected_index == 1
+            assert "Continue session" in str(dialog.content)
+            await pilot.press("up")
+            await pilot.pause()
+            assert app._dialog_selected_index == 0
+
+            await pilot.press("m")
+            await pilot.pause()
+            assert app.leader_key_active is False
+            assert app._focus_mode == "dashboard"
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages + 1
+            assert app._messages[-1]["title"] == "Model Selection"
+            assert any("codex_cli/gpt-5.5" in line for line in app._messages[-1]["lines"])
+            assert "Select model" in str(dialog.content)
+            assert "Recent" in str(dialog.content)
+            assert "gpt-5.5" in str(dialog.content)
+            assert "codex_cli" in str(dialog.content)
+            assert "Connect provider" in str(dialog.content)
+            assert app._latest_palette_activation["activation_kind"] == "model_list"
+            assert app._latest_palette_activation["source"] == "leader"
+            assert app._latest_palette_activation["slash"] == "ctrl+x m"
+            assert app._latest_palette_activation["provider_started"] is False
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_command_table_enter_opens_selected_functionality(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    SQLiteStore(tmp_path).create_session(title="Command table", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            dialog = app.query_one("#dialog-panel", Static)
+            initial_messages = len(app._messages)
+
+            await pilot.press("ctrl+x")
+            await pilot.pause()
+            assert app._dialog_kind == "commands"
+            assert "Authority" in str(dialog.content)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._dialog_kind == "models"
+            assert prompt.value == "/model "
+            assert len(app._messages) == initial_messages
+            assert "Select model" in str(dialog.content)
+            assert "gpt-5.5" in str(dialog.content)
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_command_table_search_activates_safe_ui_function(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    SQLiteStore(tmp_path).create_session(title="Command search", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            dialog = app.query_one("#dialog-panel", Static)
+
+            await pilot.press("ctrl+x")
+            for char in "settings":
+                await pilot.press(char)
+            await pilot.pause()
+
+            assert app.leader_key_active is False
+            assert app._dialog_kind == "commands"
+            assert app._dialog_query == "settings"
+            assert "settings" in str(dialog.content)
+            assert "ui-only" in str(dialog.content)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert prompt.value == ""
+            assert str(dialog.content) == ""
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.settings"
+            assert app._latest_palette_activation["activation_kind"] == "ui_action"
+            assert app._latest_palette_activation["process_started"] is False
+            assert app._latest_palette_activation["filesystem_modified"] is False
+            assert app._latest_palette_activation["permission_granting"] is False
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_theme_switching_is_safe_ui_only(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    SQLiteStore(tmp_path).create_session(title="Theme switch", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            dialog = app.query_one("#dialog-panel", Static)
+
+            assert app._selected_theme_id == "light"
+            assert str(app.theme) == "harness-light"
+            assert app.current_theme.name == "harness-light"
+            assert app.has_class("-light-mode") is True
+            assert app.has_class("-dark-mode") is False
+
+            prompt.value = "/theme"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+            assert app._dialog_kind == "themes"
+            assert "Switch theme" in str(dialog.content)
+            assert "Light" in str(dialog.content)
+            assert "Dark" in str(dialog.content)
+            assert "System" in str(dialog.content)
+            assert "runtime only" in str(dialog.content)
+            assert "brighter Harness surface" in str(dialog.content)
+            assert prompt.value == ""
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._selected_theme_id == "dark"
+            assert str(app.theme) == "textual-dark"
+            assert app.has_class("-dark-mode") is True
+            assert app.has_class("-light-mode") is False
+            activation = app._latest_palette_activation
+            assert activation["entry_id"] == "ui_controls.theme_dark"
+            assert activation["activation_kind"] == "ui_action"
+            assert activation["process_started"] is False
+            assert activation["filesystem_modified"] is False
+            assert activation["permission_granting"] is False
+            assert activation["local_state_changes"]["changed_fields"] == ["selected_theme"]
+
+            await pilot.press("ctrl+x")
+            await pilot.press("t")
+            await pilot.pause()
+            assert app._dialog_kind == "themes"
+            assert "Switch theme" in str(dialog.content)
+            await pilot.press("up")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._selected_theme_id == "light"
+            assert str(app.theme) == "harness-light"
+            assert app.current_theme.name == "harness-light"
+            assert app.has_class("-light-mode") is True
+            assert app.has_class("-dark-mode") is False
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.theme_light"
+
+            await pilot.press("ctrl+x")
+            for char in "switch theme":
+                await pilot.press(char)
+            await pilot.pause()
+            assert "Switch theme" in str(dialog.content)
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._dialog_kind == "themes"
+            assert "Light" in str(dialog.content)
+            assert "Dark" in str(dialog.content)
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._selected_theme_id == "dark"
+            assert str(app.theme) == "textual-dark"
+            assert app.has_class("-dark-mode") is True
+            assert str(dialog.content) == ""
+
+            await pilot.press("ctrl+x")
+            await pilot.press("t")
+            await pilot.pause()
+            assert app._dialog_kind == "themes"
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._selected_theme_id == "system"
+            assert str(app.theme) == "textual-light"
+            assert app.current_theme.name == "textual-light"
+            assert app.has_class("-light-mode") is True
+            assert app.has_class("-dark-mode") is False
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.theme_system"
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_model_dialog_arrows_select_highlighted_model(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Arrow model", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
+    unique_refs = []
+    for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]:
+        if model["raw_model_ref"] not in unique_refs:
+            unique_refs.append(model["raw_model_ref"])
+    assert len(unique_refs) >= 2
+    selected_ref = unique_refs[1]
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(130, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            dialog = app.query_one("#dialog-panel", Static)
+            initial_messages = len(app._messages)
+
+            prompt.value = "/model"
+            await pilot.press("ctrl+enter")
+            await pilot.pause()
+            assert app._dialog_kind == "models"
+            assert app._dialog_selected_index == 0
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert app._dialog_selected_index == 1
+            assert selected_ref.split("/", 1)[-1] in str(dialog.content)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert prompt.value == ""
+            assert len(app._messages) == initial_messages
+            assert str(dialog.content) == ""
+            activation = app._latest_palette_activation
+            assert activation["activation_kind"] == "session_model_selection"
+            assert activation["raw_model_ref"] == selected_ref
+            assert activation["provider_started"] is False
+            assert activation["model_execution_started"] is False
+            assert activation["process_started"] is False
+            assert activation["permission_granting"] is False
+
+    asyncio.run(run_pilot())
+
+    assert SQLiteStore(tmp_path).get_session(session.id).raw_model_ref == selected_ref
+
+
 def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     bundle_path = tmp_path / "search_agent_bundle"
@@ -1011,6 +1532,7 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert group_ids == [
         "orientation",
         "ui_controls",
+        "model_selection",
         "agent_authoring",
         "native_agents",
         "project_agents",
@@ -1291,14 +1813,14 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "command_palette",
         "safety",
     ]
-    assert view["sections"][0]["pane_ids"] == ["overview", "guidance", "commands"]
+    assert view["sections"][0]["pane_ids"] == ["overview", "models", "guidance", "commands"]
     assert view["sections"][1]["pane_ids"] == ["sessions"]
     assert view["sections"][2]["pane_ids"] == ["tasks", "leases", "daemon"]
     assert view["sections"][5]["pane_ids"] == ["settings"]
     assert view["sections"][6]["pane_ids"][0] == "command_palette"
     assert view["sections"][6]["pane_ids"][-1] == "command_palette_selected"
     assert "command_palette_ui_controls" in view["sections"][6]["pane_ids"]
-    assert view["pane_order"][:7] == ["overview", "guidance", "commands", "sessions", "tasks", "leases", "daemon"]
+    assert view["pane_order"][:8] == ["overview", "models", "guidance", "commands", "sessions", "tasks", "leases", "daemon"]
     assert view["pane_order"][-1] == "safety"
     assert view["empty_state"] is None
     assert view["focus_mode"] == "dashboard"
@@ -1316,10 +1838,12 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "tab",
         "shift+tab",
         "ctrl+p/f2",
+        "ctrl+x m",
         "c",
         "shift+c",
         "ctrl+q",
         "enter",
+        "shift+enter",
         "safe-actions",
     }
 
@@ -2014,17 +2538,25 @@ def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkey
             composer_status = app.query_one("#composer-status", Static)
             session_rail = app.query_one("#session-rail-content", Static)
 
-            assert "Composer: multiline" in str(composer_status.content)
+            assert "Models: /models or ctrl+x m" in str(composer_status.content)
+            assert "Select: /model <number|name>" in str(composer_status.content)
             assert f"Session: {session.id}" in str(composer_status.content)
             assert "Agent: plan" in str(composer_status.content)
-            assert "Model: codex_cli/gpt-5.5" in str(composer_status.content)
+            assert "Current model: codex_cli/gpt-5.5" in str(composer_status.content)
             assert "Attachments: 1" in str(composer_status.content)
             assert "Context est:" in str(composer_status.content)
             assert "Composer session" in str(session_rail.content)
             assert 'Continue: harness "..." --continue' in str(session_rail.content)
 
-            prompt.value = "first line\nsecond line"
-            await pilot.press("ctrl+enter")
+            for char in "first line":
+                await pilot.press(char)
+            await pilot.press("shift+enter")
+            for char in "second line":
+                await pilot.press(char)
+            await pilot.pause()
+            assert prompt.value == "first line\nsecond line"
+
+            await pilot.press("enter")
             await pilot.pause()
             assert app._prompt_history == ["first line\nsecond line"]
             assert prompt.value == ""
@@ -2500,12 +3032,17 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
         "specs",
         "tasks",
         "settings",
+        "theme",
+        "dark-mode",
+        "light-mode",
         "lease",
         "inspect-lease",
         "execute-read-only",
         "execute",
         "plan-task",
         "runs",
+        "models",
+        "model",
         "policy",
         "artifacts",
         "wheel",
@@ -2528,10 +3065,15 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
         for command in slash_commands["commands"]
     )
     settings = next(command for command in slash_commands["commands"] if command["name"] == "settings")
+    theme = next(command for command in slash_commands["commands"] if command["name"] == "theme")
+    dark_mode = next(command for command in slash_commands["commands"] if command["name"] == "dark-mode")
+    light_mode = next(command for command in slash_commands["commands"] if command["name"] == "light-mode")
     home = next(command for command in slash_commands["commands"] if command["name"] == "home")
     sessions = next(command for command in slash_commands["commands"] if command["name"] == "sessions")
     tasks = next(command for command in slash_commands["commands"] if command["name"] == "tasks")
     runs = next(command for command in slash_commands["commands"] if command["name"] == "runs")
+    models = next(command for command in slash_commands["commands"] if command["name"] == "models")
+    model = next(command for command in slash_commands["commands"] if command["name"] == "model")
     clear = next(command for command in slash_commands["commands"] if command["name"] == "clear")
     palette_focus = next(command for command in slash_commands["commands"] if command["name"] == "palette")
     dashboard_focus = next(command for command in slash_commands["commands"] if command["name"] == "dashboard")
@@ -2539,6 +3081,10 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     expand_all = next(command for command in slash_commands["commands"] if command["name"] == "expand-all")
     assert settings["entry_id"] == "ui_controls.settings"
     assert settings["activation"]["kind"] == "ui_action"
+    assert theme["entry_id"] == "ui_controls.theme_cycle"
+    assert theme["activation"]["kind"] == "ui_action"
+    assert dark_mode["activation"]["kind"] == "ui_action"
+    assert light_mode["activation"]["kind"] == "ui_action"
     assert home["activation"]["kind"] == "ui_action"
     assert sessions["activation"]["kind"] == "ui_action"
     assert tasks["activation"]["kind"] == "ui_action"
@@ -2548,6 +3094,8 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     assert dashboard_focus["activation"]["kind"] == "ui_action"
     assert toggle_section["activation"]["kind"] == "ui_action"
     assert expand_all["activation"]["kind"] == "ui_action"
+    assert models["activation"]["kind"] == "model_list"
+    assert model["activation"]["kind"] == "session_model_selection"
 
     read_only = filter_slash_commands(slash_commands, "/execute-read-only")
     task_matches = filter_slash_commands(slash_commands, "task")
@@ -2564,12 +3112,65 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     assert "subprocess" not in serialized
 
 
+def test_tui_functionality_table_groups_commands_by_operator_workflow() -> None:
+    table = build_functionality_table()
+    rendered = render_functionality_table_dialog(table)
+    filtered = filter_functionality_table(table, "dispatch")
+
+    assert table["schema_version"] == "harness.tui_functionality_table/v1"
+    assert [group["id"] for group in table["groups"]] == [
+        "suggested",
+        "session",
+        "agent",
+        "tasks",
+        "adapters",
+        "evidence",
+        "provider",
+        "system",
+    ]
+    assert any(row["title"] == "Switch model" and row["invoke"] == "ctrl+x m" for row in table["rows"])
+    model_row = next(row for row in table["rows"] if row["id"] == "suggested.model")
+    execute_row = next(row for row in table["rows"] if row["id"] == "adapters.execute")
+    settings_row = next(row for row in table["rows"] if row["id"] == "system.settings")
+    theme_row = next(row for row in table["rows"] if row["id"] == "system.theme")
+
+    assert model_row["authority"] == "session metadata"
+    assert model_row["status"] == "state"
+    assert model_row["does_not"] == "call provider, execute model, hidden fallback"
+    assert execute_row["authority"] == "registered dispatch"
+    assert execute_row["status"] == "dispatch"
+    assert settings_row["authority"] == "ui-only"
+    assert settings_row["status"] == "ui"
+    assert theme_row["title"] == "Switch theme"
+    assert theme_row["invoke"] == "ctrl+x t"
+    assert theme_row["authority"] == "ui-only"
+    assert any(theme["id"] == "light" and theme["textual_theme"] == "harness-light" for theme in build_tui_settings_catalog()["themes"])
+    assert any(theme["id"] == "system" and theme["textual_theme"] == "textual-light" for theme in THEME_DIALOG_ENTRIES)
+    assert not any(row["id"] == "system.dark-mode" for row in table["rows"])
+    assert not any(row["id"] == "system.light-mode" for row in table["rows"])
+    assert "Switch to dark mode" not in rendered
+    assert "Switch to light mode" not in rendered
+    assert "Commands" in rendered
+    assert "Suggested" in rendered
+    assert "Authority" in rendered
+    assert "[bold deep_sky_blue1]Commands" in rendered
+    assert "[bold dark_orange3]Suggested" in rendered
+    assert "[bold steel_blue1]Authority" in rendered
+    assert "enter runs safe UI rows or stages command text" in rendered
+    assert any(row["name"] == "execute" for row in filtered["rows"])
+    serialized = json.dumps(table)
+    assert "api_key" not in serialized
+    assert "OPENAI_API_KEY" not in serialized
+    assert "base_url" not in serialized
+
+
 def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
     slash_commands = build_slash_commands()
 
     all_suggestions = render_slash_command_suggestions(slash_commands, "/")
     execute_suggestions = render_slash_command_suggestions(slash_commands, "/execute")
     settings_suggestions = render_slash_command_suggestions(slash_commands, "/settings")
+    model_suggestions = render_slash_command_suggestions(slash_commands, "/model")
     plain_text = render_slash_command_suggestions(slash_commands, "execute")
     missing = render_slash_command_suggestions(slash_commands, "/does-not-exist")
     selected_second = render_slash_command_suggestions(slash_commands, "/", selected_index=1)
@@ -2583,6 +3184,9 @@ def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
     assert "Print the MVP agent command sequence without running it." in all_suggestions
     assert "/execute-read-only" in execute_suggestions
     assert "/settings" in settings_suggestions
+    assert "/models" in model_suggestions
+    assert "/model" in model_suggestions
+    assert "Select the active session model" in model_suggestions
     assert "Focus the read-only TUI settings catalog." in settings_suggestions
     assert "/home" not in execute_suggestions
     assert plain_text == ""
@@ -2604,6 +3208,8 @@ def test_tui_chat_slash_command_responses_are_templates_only() -> None:
     assert help_response["ok"] is True
     assert help_response["kind"] == "help"
     assert any("/execute-read-only" in line for line in help_response["messages"][0]["lines"])
+    assert any("/models" in line for line in help_response["messages"][0]["lines"])
+    assert any("/model" in line for line in help_response["messages"][0]["lines"])
     assert command_response["ok"] is True
     assert command_response["kind"] == "command_template"
     assert command_response["command"]["name"] == "execute-read-only"
@@ -7978,7 +8584,7 @@ def test_cli_bare_prompt_runs_codex_direct_agent(tmp_path, monkeypatch) -> None:
 
         def run_direct_agent(self, project_root, prompt, final_message_path, *, model=None, reasoning_effort=None):
             assert prompt == "change value"
-            assert model == "gpt-test"
+            assert model == "codex_cli/gpt-5.5"
             assert reasoning_effort == "medium"
             (Path(project_root) / "app.py").write_text("value = 2\n", encoding="utf-8")
             final_message_path.write_text("Changed the value.", encoding="utf-8")
@@ -8006,7 +8612,7 @@ def test_cli_bare_prompt_runs_codex_direct_agent(tmp_path, monkeypatch) -> None:
             "--project",
             str(tmp_path),
             "--model",
-            "gpt-test",
+            "codex_cli/gpt-5.5",
             "--reasoning-effort",
             "medium",
             "--no-stream",

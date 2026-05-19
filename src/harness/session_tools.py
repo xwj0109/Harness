@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shlex
 import subprocess
 import urllib.error
 import urllib.request
@@ -39,6 +41,7 @@ from harness.policy import (
 from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, validate_test_command
 from harness.security import assert_not_secret_path, is_secret_path, sanitize_for_logging
+from harness.session_cwd import CwdResolutionError, CwdResolver, session_cwd_from_metadata
 from harness.tools.patch import PatchValidationError, _is_blocked_edit_path, plan_unified_diff
 
 
@@ -54,6 +57,7 @@ class SessionToolReplayPolicy(str, Enum):
     EVENT_AND_PREVIEW = "event_and_preview"
     ARTIFACT_FOR_LARGE_OUTPUT = "artifact_for_large_output"
     PERMISSION_EVENT_ONLY = "permission_event_only"
+    RERUN_FORBIDDEN = "rerun_forbidden"
 
 
 class SessionToolRisk(str, Enum):
@@ -169,13 +173,59 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
     ]
     return [
         SessionToolDescriptor(
+            id="pwd",
+            title="Print session cwd",
+            description="Show the active project root, session cwd, and resolved absolute cwd.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {},
+            },
+            output_schema=_TEXT_OUTPUT_SCHEMA,
+            side_effect=SessionToolSideEffect.SESSION_LOCAL,
+            risk=SessionToolRisk.LOW,
+            boundary_kind=SessionPermissionBoundaryKind.LOCAL_ONLY,
+            permission_key="tool.pwd.session_cwd",
+            permission_required=False,
+            replay_policy=SessionToolReplayPolicy.EVENT_AND_PREVIEW,
+            allowed_in_plan_agent=True,
+            safety_notes=notes + ["Pwd reads durable session cwd state and starts no process."],
+        ),
+        SessionToolDescriptor(
+            id="cd",
+            title="Change session cwd",
+            description="Change the durable session cwd inside the active project without starting a process.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": "string"},
+                    "actor": {"type": "string", "enum": ["operator", "model"], "default": "model"},
+                },
+                "required": ["path"],
+            },
+            output_schema=_TEXT_OUTPUT_SCHEMA,
+            side_effect=SessionToolSideEffect.SESSION_LOCAL,
+            risk=SessionToolRisk.LOW,
+            boundary_kind=SessionPermissionBoundaryKind.LOCAL_ONLY,
+            permission_key="tool.cd.session_cwd",
+            permission_required=False,
+            replay_policy=SessionToolReplayPolicy.EVENT_AND_PREVIEW,
+            allowed_in_plan_agent=True,
+            safety_notes=notes
+            + [
+                "Cd is a session state transition, not shell process execution.",
+                "Moving outside the active project is rejected so the UI can propose /project or /workspace instead.",
+            ],
+        ),
+        SessionToolDescriptor(
             id="read",
             title="Read file",
             description="Read a file inside the project boundary and return a redacted preview.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
-                "properties": {"path": {"type": "string"}},
+                "properties": {"path": {"type": "string"}, "cwd": {"type": ["string", "null"]}},
                 "required": ["path"],
             },
             output_schema=_TEXT_OUTPUT_SCHEMA,
@@ -197,6 +247,7 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
                 "additionalProperties": False,
                 "properties": {
                     "pattern": {"type": "string"},
+                    "cwd": {"type": ["string", "null"]},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
                 },
                 "required": ["pattern"],
@@ -221,6 +272,7 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": ["string", "null"]},
+                    "cwd": {"type": ["string", "null"]},
                     "regex": {"type": "boolean", "default": False},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 200},
                 },
@@ -235,6 +287,29 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
             replay_policy=SessionToolReplayPolicy.ARTIFACT_FOR_LARGE_OUTPUT,
             allowed_in_plan_agent=True,
             safety_notes=notes + ["Grep output must redact secret-like matches before rendering."],
+        ),
+        SessionToolDescriptor(
+            id="git-diff",
+            title="Git diff",
+            description="Show read-only git diff output for the active project, optionally scoped to cwd or path.",
+            input_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "path": {"type": ["string", "null"]},
+                    "cwd": {"type": ["string", "null"]},
+                    "stat_only": {"type": "boolean", "default": False},
+                },
+            },
+            output_schema=_TEXT_OUTPUT_SCHEMA,
+            side_effect=SessionToolSideEffect.NONE,
+            risk=SessionToolRisk.LOW,
+            boundary_kind=SessionPermissionBoundaryKind.LOCAL_ONLY,
+            permission_key="tool.git_diff.project_read",
+            permission_required=False,
+            replay_policy=SessionToolReplayPolicy.ARTIFACT_FOR_LARGE_OUTPUT,
+            allowed_in_plan_agent=True,
+            safety_notes=notes + ["Git diff is read-only and must never start git mutation commands."],
         ),
         SessionToolDescriptor(
             id="artifact-read",
@@ -441,7 +516,10 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "cwd": {"type": ["string", "null"]},
+                },
                 "required": ["command"],
             },
             output_schema=_TEXT_OUTPUT_SCHEMA,
@@ -488,11 +566,16 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
         SessionToolDescriptor(
             id="shell",
             title="Shell command",
-            description="Run a shell command.",
+            description="Run a permissioned, auditable, bounded session shell command.",
             input_schema={
                 "type": "object",
                 "additionalProperties": False,
-                "properties": {"command": {"type": "string"}, "cwd": {"type": ["string", "null"]}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": ["string", "null"]},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 900, "default": 120},
+                    "shell_executable": {"type": ["string", "null"]},
+                },
                 "required": ["command"],
             },
             output_schema=_TEXT_OUTPUT_SCHEMA,
@@ -501,9 +584,14 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
             boundary_kind=SessionPermissionBoundaryKind.SHELL,
             permission_key="tool.shell.execution",
             permission_required=True,
-            replay_policy=SessionToolReplayPolicy.ARTIFACT_FOR_LARGE_OUTPUT,
-            enabled=False,
-            safety_notes=disabled_notes + ["Shell remains approval-required with no model auto-run by default."],
+            replay_policy=SessionToolReplayPolicy.RERUN_FORBIDDEN,
+            enabled=True,
+            safety_notes=notes
+            + [
+                "Shell is exact-permission required and non-idempotent by default.",
+                "Simple cd <path> is routed to the session-local cd tool and starts no process.",
+                "No shell command is considered read-only unless added to a deliberate allowlist.",
+            ],
         ),
         SessionToolDescriptor(
             id="web-fetch",
@@ -681,6 +769,7 @@ def default_session_tool_descriptors() -> list[SessionToolDescriptor]:
                 "additionalProperties": False,
                 "properties": {
                     "path": {"type": "string", "default": "."},
+                    "cwd": {"type": ["string", "null"]},
                     "repository": {"type": "string"},
                     "depth": {"type": "number", "minimum": 1, "maximum": 6, "default": 3},
                 },
@@ -756,7 +845,27 @@ def decide_session_tool_permission(
             boundary_kind=descriptor.boundary_kind,
             reasons=[f"Session tool is disabled by policy: {tool_id}"],
         )
-    if tool_id not in {"web-fetch", "web-search", "repo-clone", "mcp-resource"} and _has_allowed_permission(store, session_id, tool_id, action, target, descriptor.boundary_kind):
+    if tool_id == "shell":
+        cd_path = _simple_shell_cd_path(str(arguments.get("command") or ""))
+        if cd_path is not None:
+            return decide_session_tool_permission(
+                store,
+                project_root,
+                session_id,
+                "cd",
+                {"path": cd_path, "actor": arguments.get("actor") or "model"},
+            )
+    dynamic_permission_tools = {
+        "cd",
+        "docker-test",
+        "mcp-resource",
+        "repo-clone",
+        "shell",
+        "skill-load",
+        "web-fetch",
+        "web-search",
+    }
+    if tool_id not in dynamic_permission_tools and _has_allowed_permission(store, session_id, tool_id, action, target, descriptor.boundary_kind):
         return SessionToolPermissionDecision(
             status=SessionToolPermissionDecisionStatus.ALLOW,
             tool_id=tool_id,
@@ -766,6 +875,41 @@ def decide_session_tool_permission(
             reasons=["Allowed by existing session permission."],
         )
     try:
+        if tool_id == "cd":
+            context_excluded_target = False
+            try:
+                target = _validate_cd_target(store, project_root.resolve(), session_id, arguments)
+            except CwdResolutionError as exc:
+                if exc.error_type != "context_excluded":
+                    raise
+                target = _validate_cd_target(store, project_root.resolve(), session_id, arguments, allow_excluded=True)
+                context_excluded_target = True
+            if _has_allowed_permission(store, session_id, tool_id, action, target, descriptor.boundary_kind):
+                return SessionToolPermissionDecision(
+                    status=SessionToolPermissionDecisionStatus.ALLOW,
+                    tool_id=tool_id,
+                    action=action,
+                    target=target,
+                    boundary_kind=descriptor.boundary_kind,
+                    reasons=["Allowed by existing session permission."],
+                )
+            if context_excluded_target:
+                return SessionToolPermissionDecision(
+                    status=SessionToolPermissionDecisionStatus.ASK,
+                    tool_id=tool_id,
+                    action=action,
+                    target=target,
+                    boundary_kind=descriptor.boundary_kind,
+                    reasons=[f"Session cwd target is excluded from context: {target}"],
+                )
+            return SessionToolPermissionDecision(
+                status=SessionToolPermissionDecisionStatus.ALLOW,
+                tool_id=tool_id,
+                action=action,
+                target=target,
+                boundary_kind=descriptor.boundary_kind,
+                reasons=["Allowed as a session-local cwd transition inside the active project."],
+            )
         if tool_id == "patch":
             patch = str(arguments.get("patch") or "")
             summary, _updates = plan_unified_diff(patch, project_root.resolve(), load_config(project_root).context_excludes)
@@ -807,7 +951,7 @@ def decide_session_tool_permission(
                 reasons=["Direct-write planning requires explicit active-repo-write permission even though no files are written."],
             )
         if tool_id == "docker-test":
-            target = _validate_docker_test_plan(project_root.resolve(), arguments)
+            target = _validate_docker_test_plan(project_root.resolve(), store, session_id, arguments)
             if _has_allowed_permission(store, session_id, tool_id, action, target, descriptor.boundary_kind):
                 return SessionToolPermissionDecision(
                     status=SessionToolPermissionDecisionStatus.ALLOW,
@@ -824,6 +968,41 @@ def decide_session_tool_permission(
                 target=target,
                 boundary_kind=descriptor.boundary_kind,
                 reasons=["Docker-test planning requires explicit execution permission even though Docker is not run."],
+            )
+        if tool_id == "shell":
+            context_excluded_target = False
+            try:
+                target = _shell_permission_target(project_root.resolve(), store, session_id, arguments)
+            except CwdResolutionError as exc:
+                if exc.error_type != "context_excluded":
+                    raise
+                target = _shell_permission_target(project_root.resolve(), store, session_id, arguments, allow_excluded=True)
+                context_excluded_target = True
+            if _has_allowed_permission(store, session_id, tool_id, action, target, descriptor.boundary_kind):
+                return SessionToolPermissionDecision(
+                    status=SessionToolPermissionDecisionStatus.ALLOW,
+                    tool_id=tool_id,
+                    action=action,
+                    target=target,
+                    boundary_kind=descriptor.boundary_kind,
+                    reasons=["Allowed by existing session permission."],
+                )
+            if context_excluded_target:
+                return SessionToolPermissionDecision(
+                    status=SessionToolPermissionDecisionStatus.ASK,
+                    tool_id=tool_id,
+                    action=action,
+                    target=target,
+                    boundary_kind=descriptor.boundary_kind,
+                    reasons=["Shell cwd is excluded from context and requires exact shell permission."],
+                )
+            return SessionToolPermissionDecision(
+                status=SessionToolPermissionDecisionStatus.ASK,
+                tool_id=tool_id,
+                action=action,
+                target=target,
+                boundary_kind=descriptor.boundary_kind,
+                reasons=["Shell execution requires an exact normalized session-shell permission grant."],
             )
         if tool_id == "web-fetch":
             target = _validate_web_fetch_plan(project_root.resolve(), arguments)
@@ -902,9 +1081,11 @@ def decide_session_tool_permission(
                 reasons=["Cached MCP resource reads require explicit permission even though no MCP process or network connection is started."],
             )
         if tool_id == "read":
-            _resolve_allowed_path(project_root.resolve(), str(arguments.get("path") or ""), load_config(project_root).context_excludes, action=action)
+            _resolve_session_tool_path(project_root.resolve(), store, session_id, arguments, "path", action=action)
         elif tool_id == "grep" and arguments.get("path"):
-            _resolve_allowed_path(project_root.resolve(), str(arguments.get("path")), load_config(project_root).context_excludes, action=action)
+            _resolve_session_tool_path(project_root.resolve(), store, session_id, arguments, "path", action=action)
+        elif tool_id == "git-diff":
+            _validate_git_diff_target(project_root.resolve(), store, session_id, arguments)
         elif tool_id == "artifact-read":
             _assert_artifact_linked_to_session(store, session_id, str(arguments.get("artifact_id") or ""))
         elif tool_id == "policy-explain":
@@ -943,6 +1124,16 @@ def decide_session_tool_permission(
             boundary_kind=descriptor.boundary_kind,
             reasons=[exc.message],
         )
+    except CwdResolutionError as exc:
+        status = SessionToolPermissionDecisionStatus.ASK if exc.error_type == "context_excluded" else SessionToolPermissionDecisionStatus.DENY
+        return SessionToolPermissionDecision(
+            status=status,
+            tool_id=tool_id,
+            action=exc.action,
+            target=exc.target,
+            boundary_kind=descriptor.boundary_kind,
+            reasons=[exc.message],
+        )
     except (PatchValidationError, PathSecurityError, CommandValidationError, ValueError) as exc:
         return SessionToolPermissionDecision(
             status=SessionToolPermissionDecisionStatus.DENY,
@@ -958,7 +1149,7 @@ def decide_session_tool_permission(
         action=action,
         target=target,
         boundary_kind=descriptor.boundary_kind,
-        reasons=["Allowed by Phase 4A local/session read-only policy."],
+        reasons=["Allowed by local/session tool policy."],
     )
 
 
@@ -969,13 +1160,18 @@ def execute_session_tool(
     tool_id: str,
     arguments: dict[str, Any],
 ) -> SessionToolExecutionResult:
+    if tool_id == "shell":
+        cd_path = _simple_shell_cd_path(str(arguments.get("command") or ""))
+        if cd_path is not None:
+            tool_id = "cd"
+            arguments = {"path": cd_path, "actor": arguments.get("actor") or "model"}
     descriptor = get_session_tool_descriptor(tool_id)
     if (
         descriptor.enabled
         and descriptor.side_effect not in {SessionToolSideEffect.NONE, SessionToolSideEffect.SESSION_LOCAL}
-        and tool_id not in {"patch", "direct-write", "docker-test", "web-fetch", "web-search", "repo-clone"}
+        and tool_id not in {"patch", "direct-write", "docker-test", "shell", "web-fetch", "web-search", "repo-clone"}
     ):
-        raise ValueError(f"Session tool is not enabled for Phase 4A execution: {tool_id}")
+        raise ValueError(f"Session tool is not enabled for session-gateway execution: {tool_id}")
     store.get_session(session_id)
     run = store.create_run(
         f"Session tool {tool_id}",
@@ -1052,6 +1248,8 @@ def execute_session_tool(
             ok = True
             error_type = None
             permission_id = None
+            if tool_id == "shell":
+                _expire_once_permission(store, session_id, tool_id, decision.action, decision.target, decision.boundary_kind)
     except _DeniedToolCall as exc:
         output = exc.message
         ok = False
@@ -1163,17 +1361,36 @@ def execute_session_tool(
 
 
 def _tool_policy_evidence(tool_id: str, *, descriptor: SessionToolDescriptor) -> dict[str, Any]:
-    if tool_id in {"read", "glob", "grep"}:
+    if tool_id in {"read", "glob", "grep", "git-diff", "repo-overview"}:
         return {
             "policy_boundary": {
                 "kind": "project_read_only",
                 "boundary_kind": descriptor.boundary_kind.value,
-                "source": "session_tool_read_glob_grep",
+                "source": "session_tool_read_glob_grep" if tool_id in {"read", "glob", "grep"} else "session_tool_project_read",
             },
             "project_boundary_enforced": True,
             "context_excludes_enforced": True,
             "secret_path_filtering": True,
             "read_only": True,
+            "process_started": False,
+            "network_accessed": False,
+            "shell_execution_started": False,
+            "filesystem_modified": False,
+            "active_repo_modified": False,
+            "git_mutation_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "blocked_reasons": [],
+        }
+    if tool_id in {"cd", "pwd"}:
+        return {
+            "policy_boundary": {
+                "kind": "session_local_state",
+                "boundary_kind": descriptor.boundary_kind.value,
+                "source": "session_tool_cwd",
+            },
+            "session_local": True,
+            "read_only": False,
             "process_started": False,
             "network_accessed": False,
             "shell_execution_started": False,
@@ -1198,9 +1415,12 @@ class _DeniedToolCall(Exception):
 
 def _tool_action(tool_id: str) -> str:
     return {
+        "cd": "cd",
         "read": "read",
         "glob": "list",
         "grep": "search",
+        "git-diff": "git-diff",
+        "pwd": "pwd",
         "artifact-read": "artifact-read",
         "lsp-diagnostics": "lsp-diagnostics",
         "lsp-symbols": "lsp-symbols",
@@ -1208,6 +1428,7 @@ def _tool_action(tool_id: str) -> str:
         "policy-explain": "policy-explain",
         "repo-clone": "repo-clone",
         "repo-overview": "repo-overview",
+        "shell": "run",
         "skill-load": "skill-load",
         "web-fetch": "web-fetch",
         "web-search": "web-search",
@@ -1217,12 +1438,18 @@ def _tool_action(tool_id: str) -> str:
 
 
 def _tool_target(tool_id: str, arguments: dict[str, Any]) -> str:
+    if tool_id == "cd":
+        return str(arguments.get("path") or ".")
     if tool_id == "read":
         return str(arguments.get("path") or "")
     if tool_id == "glob":
         return str(arguments.get("pattern") or "**/*")
     if tool_id == "grep":
         return str(arguments.get("path") or ".")
+    if tool_id == "git-diff":
+        return str(arguments.get("path") or arguments.get("cwd") or ".")
+    if tool_id == "pwd":
+        return "."
     if tool_id == "artifact-read":
         return str(arguments.get("artifact_id") or "")
     if tool_id == "lsp-diagnostics":
@@ -1237,6 +1464,8 @@ def _tool_target(tool_id: str, arguments: dict[str, Any]) -> str:
         return str(arguments.get("repository") or arguments.get("url") or "")
     if tool_id == "repo-overview":
         return str(arguments.get("path") or arguments.get("repository") or ".")
+    if tool_id == "shell":
+        return str(arguments.get("command") or "")
     if tool_id == "skill-load":
         return str(arguments.get("skill") or arguments.get("name") or "")
     if tool_id == "web-fetch":
@@ -1257,6 +1486,17 @@ def _has_allowed_permission(
     target: str,
     boundary_kind: SessionPermissionBoundaryKind,
 ) -> bool:
+    return _matching_allowed_permission(store, session_id, tool_id, action, target, boundary_kind) is not None
+
+
+def _matching_allowed_permission(
+    store: SQLiteStore,
+    session_id: str,
+    tool_id: str,
+    action: str,
+    target: str,
+    boundary_kind: SessionPermissionBoundaryKind,
+) -> Any | None:
     now = datetime.now(timezone.utc)
     for permission in store.list_session_permissions(session_id, status=SessionPermissionStatus.ALLOWED):
         if permission.tool_id != tool_id:
@@ -1269,8 +1509,24 @@ def _has_allowed_permission(
             continue
         if permission.expires_at <= now:
             continue
-        return True
-    return False
+        return permission
+    return None
+
+
+def _expire_once_permission(
+    store: SQLiteStore,
+    session_id: str,
+    tool_id: str,
+    action: str,
+    target: str,
+    boundary_kind: SessionPermissionBoundaryKind,
+) -> None:
+    permission = _matching_allowed_permission(store, session_id, tool_id, action, target, boundary_kind)
+    if permission is not None and permission.scope == SessionPermissionScope.ONCE:
+        store.expire_session_permission(
+            permission.id,
+            reason="One-shot session tool permission consumed.",
+        )
 
 
 def _execute_low_risk_tool(
@@ -1285,6 +1541,50 @@ def _execute_low_risk_tool(
 ) -> str:
     root = project_root.resolve()
     excludes = load_config(root).context_excludes
+    session = store.get_session(session_id)
+    session_cwd = session_cwd_from_metadata(session.metadata)
+    resolver = CwdResolver(project_root=root, context_excludes=excludes)
+    if tool_id == "pwd":
+        current = resolver.current(session_cwd, allow_excluded=True)
+        return "\n".join(
+            [
+                f"Project root: {root}",
+                f"Session cwd: {current.normalized_project_relative_cwd}",
+                f"Resolved cwd: {current.resolved_abs_path}",
+            ]
+        )
+    if tool_id == "cd":
+        requested = str(arguments.get("path") or ".")
+        actor = str(arguments.get("actor") or "model")
+        if actor not in {"operator", "model"}:
+            actor = "model"
+        resolved = resolver.resolve_cd(
+            session_cwd=session_cwd,
+            requested_path=requested,
+            allow_excluded=allow_excluded,
+        )
+        store.update_session_cwd(
+            session_id,
+            project_root=str(root),
+            old_cwd=session_cwd,
+            new_cwd=resolved.normalized_project_relative_cwd,
+            requested_path=requested,
+            resolved_abs_path=resolved.resolved_abs_path,
+            actor=actor,
+            tool_call_id=run_id,
+            run_id=run_id,
+        )
+        return "\n".join(
+            [
+                f"Changed session cwd: {session_cwd} -> {resolved.normalized_project_relative_cwd}",
+                f"Resolved cwd: {resolved.resolved_abs_path}",
+                "No process was started.",
+            ]
+        )
+    if tool_id == "git-diff":
+        return _git_diff_tool(store, root, session_id, arguments, run_id=run_id, allow_excluded=allow_excluded)
+    if tool_id == "shell":
+        return _execute_shell_tool(store, root, session_id, arguments, run_id=run_id, allow_excluded=allow_excluded)
     if tool_id == "patch":
         patch = str(arguments.get("patch") or "")
         summary, updates = plan_unified_diff(patch, root, excludes)
@@ -1427,7 +1727,7 @@ def _execute_low_risk_tool(
             f"Plan artifact: {plan_artifact.id}"
         )
     if tool_id == "docker-test":
-        command, cwd, target = _docker_test_plan_values(root, arguments)
+        command, cwd, target = _docker_test_plan_values(root, store, session_id, arguments)
         plan_payload = {
             "schema_version": "harness.session_tool_docker_test_plan/v1",
             "command": command,
@@ -1623,8 +1923,7 @@ def _execute_low_risk_tool(
             f"Metadata artifact: {metadata_artifact.id}"
         )
     if tool_id == "read":
-        path_arg = str(arguments.get("path") or "")
-        path = _resolve_allowed_path(root, path_arg, excludes, action="read", allow_excluded=allow_excluded)
+        path = _resolve_session_tool_path(root, store, session_id, arguments, "path", action="read", allow_excluded=allow_excluded)
         if not path.is_file():
             raise ValueError("Path is not a file.")
         raw = path.read_bytes()
@@ -1634,8 +1933,21 @@ def _execute_low_risk_tool(
     if tool_id == "glob":
         pattern = str(arguments.get("pattern") or "**/*")
         limit = int(arguments.get("limit") or 200)
-        files = _project_files(root, excludes)
-        matches = [rel for rel in files if Path(rel).match(pattern) or re.fullmatch(fnmatch_to_regex(pattern), rel)]
+        cwd = resolver.resolve_cwd(
+            session_cwd=session_cwd,
+            call_cwd=str(arguments.get("cwd")) if arguments.get("cwd") not in {None, ""} else None,
+            allow_excluded=allow_excluded,
+            action="list",
+        )
+        files = _project_files(root, excludes, start=cwd.normalized_project_relative_cwd, allow_excluded=allow_excluded)
+        matches = []
+        for rel in files:
+            try:
+                local_rel = Path(rel).relative_to(Path(cwd.normalized_project_relative_cwd)).as_posix()
+            except ValueError:
+                local_rel = rel
+            if Path(local_rel).match(pattern) or re.fullmatch(fnmatch_to_regex(pattern), local_rel):
+                matches.append(rel)
         return "\n".join(matches[:limit])
     if tool_id == "grep":
         pattern = str(arguments.get("pattern") or "")
@@ -1643,8 +1955,17 @@ def _execute_low_risk_tool(
             raise ValueError("Missing pattern.")
         regex = bool(arguments.get("regex") or False)
         limit = int(arguments.get("limit") or 200)
-        base = arguments.get("path")
-        files = _project_files(root, excludes, start=str(base) if base else ".", allow_excluded=allow_excluded)
+        base_arg = arguments.get("path")
+        base_path = _resolve_session_tool_path(
+            root,
+            store,
+            session_id,
+            {"path": str(base_arg) if base_arg not in {None, ""} else ".", "cwd": arguments.get("cwd")},
+            "path",
+            action="search",
+            allow_excluded=allow_excluded,
+        )
+        files = _project_files(root, excludes, start=relative_to_project(root, base_path), allow_excluded=allow_excluded)
         hits: list[str] = []
         compiled = re.compile(pattern) if regex else None
         for rel in files:
@@ -1697,10 +2018,10 @@ def _execute_low_risk_tool(
         subject_id = arguments.get("subject_id")
         return _policy_explanation(store, project_root, session_id, subject_kind, str(subject_id) if subject_id else None)
     if tool_id == "repo-overview":
-        return _repo_overview(root, arguments, excludes, allow_excluded=allow_excluded)
+        return _repo_overview(root, store, session_id, arguments, excludes, allow_excluded=allow_excluded)
     if tool_id == "skill-load":
         return _skill_load_tool(store, root, session_id, arguments, run_id=run_id)
-    raise KeyError(f"Session tool is not executable in Phase 4A: {tool_id}")
+    raise KeyError(f"Session tool is not executable through the session gateway: {tool_id}")
 
 
 def _validate_skill_load_target(project_root: Path, arguments: dict[str, Any]) -> str:
@@ -1976,7 +2297,15 @@ def _mcp_resource_info(project_root: Path, arguments: dict[str, Any]) -> dict[st
     }
 
 
-def _repo_overview(root: Path, arguments: dict[str, Any], excludes: list[str], *, allow_excluded: bool = False) -> str:
+def _repo_overview(
+    root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    arguments: dict[str, Any],
+    excludes: list[str],
+    *,
+    allow_excluded: bool = False,
+) -> str:
     if arguments.get("repository"):
         clone_plan = _repo_clone_plan_values(root, {"repository": arguments.get("repository")})
         target = Path(str(clone_plan["local_path"]))
@@ -1999,7 +2328,15 @@ def _repo_overview(root: Path, arguments: dict[str, Any], excludes: list[str], *
         external_cache_used = True
     else:
         path_arg = str(arguments.get("path") or ".")
-        target = _resolve_allowed_path(root, path_arg, excludes, action="repo-overview", allow_excluded=allow_excluded)
+        target = _resolve_session_tool_path(
+            root,
+            store,
+            session_id,
+            {"path": path_arg, "cwd": arguments.get("cwd")},
+            "path",
+            action="repo-overview",
+            allow_excluded=allow_excluded,
+        )
         rel_target = relative_to_project(root, target)
         repository_label = None
         external_cache_used = False
@@ -2580,8 +2917,24 @@ def _validate_direct_write_target(root: Path, requested: str, excludes: list[str
     return relative_path
 
 
-def _validate_docker_test_plan(root: Path, arguments: dict[str, Any]) -> str:
-    _command, _cwd, target = _docker_test_plan_values(root, arguments)
+def _validate_cd_target(store: SQLiteStore, root: Path, session_id: str, arguments: dict[str, Any], *, allow_excluded: bool = False) -> str:
+    session = store.get_session(session_id)
+    resolver = CwdResolver(project_root=root, context_excludes=load_config(root).context_excludes)
+    resolved = resolver.resolve_cd(
+        session_cwd=session_cwd_from_metadata(session.metadata),
+        requested_path=str(arguments.get("path") or "."),
+        allow_excluded=allow_excluded,
+    )
+    return resolved.normalized_project_relative_cwd
+
+
+def _validate_git_diff_target(root: Path, store: SQLiteStore, session_id: str, arguments: dict[str, Any], *, allow_excluded: bool = False) -> str:
+    target = _resolve_git_diff_path(root, store, session_id, arguments, allow_excluded=allow_excluded)
+    return relative_to_project(root, target)
+
+
+def _validate_docker_test_plan(root: Path, store: SQLiteStore, session_id: str, arguments: dict[str, Any]) -> str:
+    _command, _cwd, target = _docker_test_plan_values(root, store, session_id, arguments)
     return target
 
 
@@ -2889,26 +3242,363 @@ def _bounded_int(value: Any, label: str, *, minimum: int, maximum: int) -> int:
     return parsed
 
 
-def _docker_test_plan_values(root: Path, arguments: dict[str, Any]) -> tuple[list[str], str | None, str]:
+def _docker_test_plan_values(root: Path, store: SQLiteStore, session_id: str, arguments: dict[str, Any]) -> tuple[list[str], str | None, str]:
     command_arg = arguments.get("command")
     command = command_arg if isinstance(command_arg, list) else [command_arg] if isinstance(command_arg, str) else []
     validate_test_command(command)
-    cwd_arg = arguments.get("cwd")
-    cwd = str(cwd_arg) if cwd_arg not in {None, ""} else None
-    if cwd is not None:
-        raw = Path(cwd)
-        if raw.is_absolute():
-            raise CommandValidationError("Docker test cwd must be project-relative.")
-        try:
-            resolved = resolve_under_project(root, raw)
-        except PathSecurityError as exc:
-            raise CommandValidationError(str(exc)) from exc
-        if not resolved.exists():
-            raise CommandValidationError(f"Docker test cwd does not exist: {cwd}")
-        if not resolved.is_dir():
-            raise CommandValidationError(f"Docker test cwd is not a directory: {cwd}")
-        cwd = relative_to_project(root, resolved)
+    try:
+        session = store.get_session(session_id)
+        resolver = CwdResolver(project_root=root, context_excludes=load_config(root).context_excludes)
+        resolved = resolver.resolve_cwd(
+            session_cwd=session_cwd_from_metadata(session.metadata),
+            call_cwd=str(arguments.get("cwd")) if arguments.get("cwd") not in {None, ""} else None,
+            action="docker-test",
+        )
+    except CwdResolutionError as exc:
+        raise CommandValidationError(exc.message) from exc
+    cwd = resolved.normalized_project_relative_cwd
     return command, cwd, f"{cwd or '.'}:{' '.join(command)}"
+
+
+def _git_diff_tool(
+    store: SQLiteStore,
+    root: Path,
+    session_id: str,
+    arguments: dict[str, Any],
+    *,
+    run_id: str,
+    allow_excluded: bool = False,
+) -> str:
+    target_path = _resolve_git_diff_path(root, store, session_id, arguments, allow_excluded=allow_excluded)
+    target_rel = relative_to_project(root, target_path)
+    if _git_output(root, ["rev-parse", "--is-inside-work-tree"]) != "true":
+        return "Git diff unavailable: project root is not inside a git work tree."
+    scope_args: list[str] = []
+    if target_rel != ".":
+        scope_args = ["--", target_rel]
+    stat = _run_git_capture(root, ["diff", "--stat", *scope_args])
+    stat_only = bool(arguments.get("stat_only") or arguments.get("statOnly") or False)
+    patch = "" if stat_only else _run_git_capture(root, ["diff", *scope_args])
+    metadata = {
+        "schema_version": "harness.session_tool_git_diff/v1",
+        "target": target_rel,
+        "stat_only": stat_only,
+        "process_started": True,
+        "git_process_started": True,
+        "git_mutation_started": False,
+        "filesystem_modified": False,
+        "active_repo_modified": False,
+        "read_only": True,
+    }
+    metadata_path = store.runs_dir / run_id / "session_tool_git_diff_metadata.json"
+    metadata_path.write_text(json.dumps(sanitize_for_logging(metadata), indent=2, sort_keys=True), encoding="utf-8")
+    metadata_artifact = store.register_artifact(
+        run_id,
+        "session_tool_git_diff_metadata",
+        metadata_path,
+        metadata={"tool_id": "git-diff", "target": target_rel, "read_only": True},
+        producer="session_tool",
+        redaction_state="redacted",
+        session_id=session_id,
+    )
+    body_parts = [
+        "Git diff (read-only).",
+        f"Target: {target_rel}",
+        f"Metadata artifact: {metadata_artifact.id}",
+        "",
+        "Stat:",
+        stat.strip() or "[no diff]",
+    ]
+    if not stat_only:
+        if patch:
+            diff_path = store.runs_dir / run_id / "session_tool_git_diff.patch"
+            diff_path.write_text(str(sanitize_for_logging(patch)), encoding="utf-8")
+            diff_artifact = store.register_artifact(
+                run_id,
+                "session_tool_git_diff_patch",
+                diff_path,
+                metadata={"tool_id": "git-diff", "target": target_rel, "read_only": True},
+                producer="session_tool",
+                redaction_state="redacted",
+                session_id=session_id,
+            )
+            body_parts.extend(["", f"Patch artifact: {diff_artifact.id}", "", patch])
+        else:
+            body_parts.extend(["", "[no diff]"])
+    return "\n".join(body_parts)
+
+
+def _run_git_capture(cwd: Path, args: list[str]) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    output = completed.stdout if completed.returncode == 0 else completed.stderr or completed.stdout
+    return str(sanitize_for_logging(output))
+
+
+def _simple_shell_cd_path(command: str) -> str | None:
+    stripped = command.strip()
+    if not stripped or "\n" in stripped or "\r" in stripped:
+        return None
+    try:
+        parts = shlex.split(stripped, posix=True)
+    except ValueError:
+        return None
+    if len(parts) == 2 and parts[0] == "cd":
+        return parts[1]
+    return None
+
+
+def _shell_permission_target(
+    root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    arguments: dict[str, Any],
+    *,
+    allow_excluded: bool = False,
+) -> str:
+    plan = _shell_plan_values(root, store, session_id, arguments, allow_excluded=allow_excluded)
+    target = {
+        "project_fingerprint": plan["project_fingerprint"],
+        "session_id": session_id,
+        "resolved_cwd": plan["resolved_cwd"],
+        "command": plan["command"],
+        "timeout_seconds": plan["timeout_seconds"],
+        "shell_executable": plan["shell_executable"],
+        "env_policy": plan["env_policy"],
+        "network_policy": plan["network_policy"],
+    }
+    return json.dumps(target, sort_keys=True, separators=(",", ":"))
+
+
+def _shell_plan_values(
+    root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    arguments: dict[str, Any],
+    *,
+    allow_excluded: bool = False,
+) -> dict[str, Any]:
+    command = str(arguments.get("command") or "").strip()
+    if not command:
+        raise ValueError("Missing shell command.")
+    timeout_seconds = _bounded_int(arguments.get("timeout_seconds", arguments.get("timeout", 120)), "Shell timeout", minimum=1, maximum=900)
+    shell_executable = _shell_executable(arguments)
+    session = store.get_session(session_id)
+    resolver = CwdResolver(project_root=root, context_excludes=load_config(root).context_excludes)
+    cwd = resolver.resolve_cwd(
+        session_cwd=session_cwd_from_metadata(session.metadata),
+        call_cwd=str(arguments.get("cwd")) if arguments.get("cwd") not in {None, ""} else None,
+        action="shell",
+        allow_excluded=allow_excluded,
+    )
+    project_fingerprint = hashlib.sha256(str(root).encode("utf-8")).hexdigest()
+    return {
+        "schema_version": "harness.session_shell_plan/v1",
+        "project_fingerprint": project_fingerprint,
+        "session_id": session_id,
+        "cwd": cwd.normalized_project_relative_cwd,
+        "resolved_cwd": cwd.resolved_abs_path,
+        "command": command,
+        "timeout_seconds": timeout_seconds,
+        "shell_executable": shell_executable,
+        "env_policy": "minimal_inherited_path_home",
+        "network_policy": "host_network_available",
+        "process_started": False,
+        "shell_execution_started": False,
+    }
+
+
+def _shell_executable(arguments: dict[str, Any]) -> str:
+    executable = str(arguments.get("shell_executable") or arguments.get("shell") or "/bin/sh").strip()
+    if not executable:
+        executable = "/bin/sh"
+    path = Path(executable)
+    if not path.is_absolute():
+        raise ValueError("Shell executable must be an absolute path.")
+    if not path.exists() or not os.access(path, os.X_OK):
+        raise ValueError(f"Shell executable is not executable: {executable}")
+    return str(path)
+
+
+def _shell_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TERM"):
+        value = os.environ.get(key)
+        if value is not None:
+            env[key] = value
+    return env
+
+
+def _execute_shell_tool(
+    store: SQLiteStore,
+    root: Path,
+    session_id: str,
+    arguments: dict[str, Any],
+    *,
+    run_id: str,
+    allow_excluded: bool = False,
+) -> str:
+    plan = _shell_plan_values(root, store, session_id, arguments, allow_excluded=allow_excluded)
+    started = False
+    timed_out = False
+    exit_code: int | None = None
+    stdout = ""
+    stderr = ""
+    try:
+        started = True
+        completed = subprocess.run(
+            plan["command"],
+            shell=True,
+            executable=plan["shell_executable"],
+            cwd=plan["resolved_cwd"],
+            env=_shell_env(),
+            capture_output=True,
+            text=True,
+            timeout=int(plan["timeout_seconds"]),
+            check=False,
+        )
+        exit_code = int(completed.returncode)
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        exit_code = None
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+    stdout = str(sanitize_for_logging(stdout))
+    stderr = str(sanitize_for_logging(stderr))
+    stdout_artifact_id: str | None = None
+    stderr_artifact_id: str | None = None
+    if stdout:
+        stdout_path = store.runs_dir / run_id / "session_tool_shell_stdout.txt"
+        stdout_path.write_text(stdout, encoding="utf-8")
+        stdout_artifact = store.register_artifact(
+            run_id,
+            "session_tool_shell_stdout",
+            stdout_path,
+            metadata={"tool_id": "shell", "stream": "stdout"},
+            producer="session_tool",
+            redaction_state="redacted",
+            session_id=session_id,
+        )
+        stdout_artifact_id = stdout_artifact.id
+    if stderr:
+        stderr_path = store.runs_dir / run_id / "session_tool_shell_stderr.txt"
+        stderr_path.write_text(stderr, encoding="utf-8")
+        stderr_artifact = store.register_artifact(
+            run_id,
+            "session_tool_shell_stderr",
+            stderr_path,
+            metadata={"tool_id": "shell", "stream": "stderr"},
+            producer="session_tool",
+            redaction_state="redacted",
+            session_id=session_id,
+        )
+        stderr_artifact_id = stderr_artifact.id
+    evidence = {
+        **plan,
+        "process_started": started,
+        "shell_execution_started": started,
+        "exit_code": exit_code,
+        "timed_out": timed_out,
+        "stdout_bytes": len(stdout.encode("utf-8")),
+        "stderr_bytes": len(stderr.encode("utf-8")),
+        "stdout_artifact_id": stdout_artifact_id,
+        "stderr_artifact_id": stderr_artifact_id,
+        "filesystem_modified": None,
+        "active_repo_modified": None,
+        "git_mutation_started": None,
+        "permission_granting": False,
+        "authority_granting": False,
+        "read_only": False,
+    }
+    metadata_path = store.runs_dir / run_id / "session_tool_shell_metadata.json"
+    metadata_path.write_text(json.dumps(sanitize_for_logging(evidence), indent=2, sort_keys=True), encoding="utf-8")
+    metadata_artifact = store.register_artifact(
+        run_id,
+        "session_tool_shell_metadata",
+        metadata_path,
+        metadata={
+            "tool_id": "shell",
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "process_started": started,
+            "shell_execution_started": started,
+        },
+        producer="session_tool",
+        redaction_state="redacted",
+        session_id=session_id,
+    )
+    stdout_preview = stdout[:4000]
+    stderr_preview = stderr[:4000]
+    lines = [
+        "Shell command executed.",
+        f"Command: {plan['command']}",
+        f"Cwd: {plan['cwd']}",
+        f"Shell: {plan['shell_executable']}",
+        f"Timeout: {plan['timeout_seconds']}s",
+        f"Exit code: {exit_code if exit_code is not None else 'timed out'}",
+        f"Timed out: {str(timed_out).lower()}",
+        f"Metadata artifact: {metadata_artifact.id}",
+    ]
+    if stdout_artifact_id:
+        lines.append(f"Stdout artifact: {stdout_artifact_id}")
+    if stderr_artifact_id:
+        lines.append(f"Stderr artifact: {stderr_artifact_id}")
+    if stdout_preview:
+        lines.extend(["", "Stdout:", stdout_preview])
+    if stderr_preview:
+        lines.extend(["", "Stderr:", stderr_preview])
+    return "\n".join(lines)
+
+
+def _resolve_session_tool_path(
+    root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    arguments: dict[str, Any],
+    path_key: str,
+    *,
+    action: str,
+    allow_excluded: bool = False,
+) -> Path:
+    session = store.get_session(session_id)
+    resolver = CwdResolver(project_root=root, context_excludes=load_config(root).context_excludes)
+    try:
+        return resolver.resolve_tool_path(
+            session_cwd=session_cwd_from_metadata(session.metadata),
+            call_cwd=str(arguments.get("cwd")) if arguments.get("cwd") not in {None, ""} else None,
+            requested_path=str(arguments.get(path_key) or "."),
+            action=action,
+            allow_excluded=allow_excluded,
+        )
+    except CwdResolutionError as exc:
+        raise _DeniedToolCall(exc.message, action=exc.action, target=exc.target, error_type=exc.error_type) from exc
+
+
+def _resolve_git_diff_path(
+    root: Path,
+    store: SQLiteStore,
+    session_id: str,
+    arguments: dict[str, Any],
+    *,
+    allow_excluded: bool = False,
+) -> Path:
+    path_arg = arguments.get("path")
+    return _resolve_session_tool_path(
+        root,
+        store,
+        session_id,
+        {"path": str(path_arg) if path_arg not in {None, ""} else ".", "cwd": arguments.get("cwd")},
+        "path",
+        action="git-diff",
+        allow_excluded=allow_excluded,
+    )
 
 
 def _resolve_allowed_path(root: Path, requested: str, excludes: list[str], *, action: str, allow_excluded: bool = False) -> Path:
@@ -2931,7 +3621,10 @@ def _project_files(root: Path, excludes: list[str], *, start: str = ".", allow_e
     candidates = [start_path] if start_path.is_file() else [path for path in start_path.rglob("*") if path.is_file()]
     files: list[str] = []
     for path in sorted(candidates):
-        rel = relative_to_project(root, path)
+        try:
+            rel = relative_to_project(root, path)
+        except ValueError:
+            continue
         if is_excluded_relative(rel, excludes) and not allow_excluded:
             continue
         if is_secret_path(path):

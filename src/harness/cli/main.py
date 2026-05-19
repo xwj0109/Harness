@@ -48,6 +48,15 @@ from harness.capabilities import build_capability_catalog, get_capability
 from harness.chat import chat_context, run_autonomous_read_loop, run_chat_loop
 from harness.command_catalog import build_command_catalog, command_action_unsupported
 from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
+from harness.context_chunks import (
+    rebuild_artifact_metadata_context_chunks,
+    rebuild_memory_context_chunks,
+    rebuild_repo_file_context_chunks,
+)
+from harness.context_pack import pack_chat_context
+from harness.context_policy import decide_context_transmission
+from harness.context_retrieval import LexicalContextRetriever
+from harness.context_vector import context_vector_index_health, rebuild_context_vector_index
 from harness.codex_runner import (
     CodexReadOnlyRepoSummaryRunner,
     CodexRepoPlanningRunner,
@@ -204,6 +213,7 @@ pr_app = typer.Typer(help="Pull request checkout/run helpers without network or 
 distribution_app = typer.Typer(help="Distribution and update diagnostics without modifying installation.")
 settings_app = typer.Typer(help="Operator settings diagnostics and preference projections.")
 commands_app = typer.Typer(help="Project command template discovery without execution.")
+context_app = typer.Typer(help="Passive context inspection, chunk cache, and local index diagnostics.")
 workspaces_app = typer.Typer(help="Workspace registry diagnostics without attach or sync.")
 server_app = typer.Typer(help="Local server lifecycle diagnostics without process mutation.")
 approvals_app = typer.Typer(help="Hosted data-boundary approval profiles.", invoke_without_command=True)
@@ -250,6 +260,7 @@ app.add_typer(pr_app, name="pr")
 app.add_typer(distribution_app, name="distribution")
 app.add_typer(settings_app, name="settings")
 app.add_typer(commands_app, name="commands")
+app.add_typer(context_app, name="context")
 app.add_typer(workspaces_app, name="workspaces")
 app.add_typer(server_app, name="server")
 app.add_typer(approvals_app, name="approvals")
@@ -500,6 +511,190 @@ def chat(
     except ValueError as exc:
         typer.echo(f"Chat command failed: {exc}")
         raise typer.Exit(code=1) from exc
+
+
+@context_app.command("inspect")
+def context_inspect(
+    query: Annotated[str | None, typer.Option("--query", help="Optional user turn for retrieval-aware context packing.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Inspect the packed chat context manifest without executing providers or tools."""
+
+    project_root = resolve_project_root(project)
+    manifest = pack_chat_context(project_root, query=query or "")
+    payload = manifest.to_payload()
+    payload["inspection"] = _context_cli_safety_payload(filesystem_modified=False)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Context blocks: {len(payload['blocks'])}")
+    typer.echo(f"Roles: {payload.get('role_summary')}")
+    typer.echo(f"Budget: {payload.get('budget_report', {}).get('used_input_tokens')} tokens used")
+    if payload.get("warnings"):
+        typer.echo(f"Warnings: {', '.join(payload['warnings'])}")
+
+
+@context_app.command("estimate")
+def context_estimate(
+    query: Annotated[str, typer.Argument(help="User turn to estimate against the current context pipeline.")] = "",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Estimate packed context budget use without executing providers or mutating state."""
+
+    project_root = resolve_project_root(project)
+    manifest = pack_chat_context(project_root, query=query)
+    report = manifest.budget_report.to_payload()
+    payload = {
+        "schema_version": "harness.context_estimate/v1",
+        "project_root": str(project_root),
+        "query_present": bool(query.strip()),
+        "budget_report": report,
+        "role_summary": dict(manifest.role_summary),
+        "warnings": list(manifest.warnings),
+        "inspection": _context_cli_safety_payload(filesystem_modified=False),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Tokenizer: {report['tokenizer']}")
+    typer.echo(f"Used input tokens: {report['used_input_tokens']}")
+    typer.echo(f"Approximate: {report['approximate']}")
+
+
+@context_app.command("chunks")
+def context_chunks(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """List cached context chunks without rebuilding or indexing."""
+
+    project_root = resolve_project_root(project)
+    db_path = project_root / HARNESS_DIR / "harness.sqlite"
+    chunks = []
+    if db_path.exists():
+        chunks = SQLiteStore(project_root).list_context_chunks()
+    payload = {
+        "schema_version": "harness.context_chunks_list/v1",
+        "project_root": str(project_root),
+        "count": len(chunks),
+        "chunks": [_context_chunk_payload(chunk) for chunk in chunks],
+        "inspection": _context_cli_safety_payload(filesystem_modified=False),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Context chunks: {len(chunks)}")
+    for chunk in chunks[:20]:
+        label = chunk.path or chunk.memory_id or chunk.artifact_id or chunk.source_id or chunk.id
+        typer.echo(f"- {chunk.source_kind.value}\t{label}\t{chunk.start_line or ''}-{chunk.end_line or ''}")
+
+
+@context_app.command("search")
+def context_search(
+    query: Annotated[str, typer.Argument(help="Local lexical query over cached context chunks.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    limit: Annotated[int, typer.Option("--limit", help="Maximum retrieved chunks.")] = 8,
+) -> None:
+    """Search cached chunks locally without rebuilding caches or executing tools."""
+
+    project_root = resolve_project_root(project)
+    results = LexicalContextRetriever(project_root).retrieve(query, limit=limit)
+    payload = {
+        "schema_version": "harness.context_search/v1",
+        "project_root": str(project_root),
+        "query": query,
+        "retriever": "lexical_context_chunks",
+        "count": len(results),
+        "results": [result.to_manifest_ref() for result in results],
+        "inspection": _context_cli_safety_payload(filesystem_modified=False),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Results: {len(results)}")
+    for result in results:
+        chunk = result.chunk
+        label = chunk.path or chunk.memory_id or chunk.artifact_id or chunk.id
+        typer.echo(f"{result.rank}\t{result.score:.3f}\t{label}")
+
+
+@context_app.command("policy")
+def context_policy(
+    destination: Annotated[str, typer.Argument(help="Destination such as local_sqlite, hosted_embedding, or qdrant.")],
+    source_kind: Annotated[str | None, typer.Option("--source-kind", help="Optional context source kind.")] = None,
+    trust_level: Annotated[str | None, typer.Option("--trust-level", help="Optional context trust level.")] = None,
+    path: Annotated[str | None, typer.Option("--path", help="Optional context path.")] = None,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Explain fail-closed context transmission policy for a destination."""
+
+    decision = decide_context_transmission(destination, source_kind=source_kind, trust_level=trust_level, path=path)
+    payload = decision.to_payload()
+    payload["inspection"] = _context_cli_safety_payload(filesystem_modified=False)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Destination: {destination}")
+    typer.echo(f"Allowed: {decision.allowed}")
+    typer.echo(f"Code: {decision.code}")
+    typer.echo(f"Reason: {decision.reason}")
+
+
+@context_app.command("rebuild-chunks")
+def context_rebuild_chunks(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Explicitly rebuild local context chunks from repo files, memory summaries, and artifact metadata."""
+
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    repo_chunks = rebuild_repo_file_context_chunks(project_root, store=store)
+    memory_chunks = rebuild_memory_context_chunks(project_root, store=store)
+    artifact_chunks = []
+    for run in store.list_runs()[:50]:
+        artifact_chunks.extend(rebuild_artifact_metadata_context_chunks(project_root, run.id, store=store))
+    payload = {
+        "schema_version": "harness.context_rebuild_chunks/v1",
+        "project_root": str(project_root),
+        "repo_chunks": len(repo_chunks),
+        "memory_chunks": len(memory_chunks),
+        "artifact_metadata_chunks": len(artifact_chunks),
+        "inspection": _context_cli_safety_payload(filesystem_modified=True),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Repo chunks: {len(repo_chunks)}")
+    typer.echo(f"Memory chunks: {len(memory_chunks)}")
+    typer.echo(f"Artifact metadata chunks: {len(artifact_chunks)}")
+
+
+@context_app.command("rebuild-index")
+def context_rebuild_index(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    """Explicitly rebuild the derived local vector index from cached context chunks."""
+
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    records = rebuild_context_vector_index(project_root, store=store)
+    health = context_vector_index_health(project_root, store=store).to_payload()
+    payload = {
+        "schema_version": "harness.context_rebuild_index/v1",
+        "project_root": str(project_root),
+        "records": len(records),
+        "health": health,
+        "inspection": _context_cli_safety_payload(filesystem_modified=True),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Vector records: {len(records)}")
+    typer.echo(f"Missing: {health['missing_count']} stale: {health['stale_count']} orphan: {health['orphan_count']}")
 
 
 @tui_home_app.command("set-image")
@@ -7741,6 +7936,46 @@ def _print_compare_result(result: dict) -> None:
 
 def _emit_json(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _context_cli_safety_payload(*, filesystem_modified: bool) -> dict:
+    return {
+        "permission_granting": False,
+        "policy_authority": False,
+        "approval_authority": False,
+        "process_started": False,
+        "filesystem_modified": filesystem_modified,
+        "provider_call_allowed": False,
+        "provider_preflight_started": False,
+        "docker_allowed": False,
+        "adapter_dispatch_allowed": False,
+        "active_repo_mutation_allowed": False,
+    }
+
+
+def _context_chunk_payload(chunk) -> dict:
+    return {
+        "chunk_id": chunk.id,
+        "source_kind": chunk.source_kind.value,
+        "trust_level": chunk.trust_level.value,
+        "path": chunk.path,
+        "source_id": chunk.source_id,
+        "artifact_id": chunk.artifact_id,
+        "memory_id": chunk.memory_id,
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+        "sha256": chunk.sha256,
+        "size_bytes": chunk.size_bytes,
+        "token_count": chunk.token_count,
+        "tokenizer": chunk.tokenizer,
+        "chunk_scheme": chunk.chunk_scheme,
+        "redaction_state": chunk.redaction_state,
+        "warnings": list(chunk.warnings),
+        "metadata": dict(chunk.metadata),
+        "permission_granting": False,
+        "policy_authority": False,
+        "approval_authority": False,
+    }
 
 
 def _tail_run_events(store: SQLiteStore, run_id: str, *, jsonl: bool, follow: bool) -> None:

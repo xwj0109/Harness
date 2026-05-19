@@ -102,6 +102,16 @@ SCHEMA_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
         "20260516_001_sessions.sql",
         "Session spine tables and append-only event store.",
     ),
+    (
+        "20260518_002_context_chunks",
+        "20260518_002_context_chunks.sql",
+        "Local context chunk cache tables.",
+    ),
+    (
+        "20260518_003_context_vectors",
+        "20260518_003_context_vectors.sql",
+        "Local derived context vector tables.",
+    ),
 )
 
 
@@ -1010,6 +1020,109 @@ class SQLiteStore:
             )
         return self.get_session(session_id)
 
+    def update_session_cwd(
+        self,
+        session_id: str,
+        *,
+        project_root: str,
+        old_cwd: str,
+        new_cwd: str,
+        requested_path: str,
+        resolved_abs_path: str,
+        actor: str,
+        tool_call_id: str | None = None,
+        run_id: str | None = None,
+    ) -> StoredEventRecord:
+        timestamp = now_iso()
+        event_id = f"evt2_{uuid.uuid4().hex[:12]}"
+        sanitized_actor = sanitize_for_logging({"kind": actor})
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT metadata_json FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            metadata = sanitize_for_logging(json.loads(row["metadata_json"] or "{}"))
+            metadata["cwd"] = new_cwd
+            conn.execute(
+                """
+                UPDATE sessions
+                SET metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(metadata, sort_keys=True, default=str), timestamp, session_id),
+            )
+            payload = sanitize_for_logging(
+                {
+                    "type": "session.cwd_changed",
+                    "session_id": session_id,
+                    "project_root": project_root,
+                    "old_cwd": old_cwd,
+                    "new_cwd": new_cwd,
+                    "requested_path": requested_path,
+                    "resolved_abs_path": resolved_abs_path,
+                    "actor": actor,
+                    "tool_call_id": tool_call_id,
+                    "permission_granting": False,
+                    "process_started": False,
+                    "shell_execution_started": False,
+                    "filesystem_modified": False,
+                    "active_repo_modified": False,
+                    "git_mutation_started": False,
+                    "summary": f"cwd {old_cwd} -> {new_cwd}",
+                }
+            )
+            seq = self._next_store_event_seq(conn, EventStreamType.SESSION.value, session_id)
+            conn.execute(
+                """
+                INSERT INTO event_store (
+                  id, stream_type, stream_id, seq, kind, visibility, redaction_state,
+                  session_id, message_id, run_id, task_id, artifact_id, actor_json,
+                  correlation_id, causation_id, payload_json, artifact_refs_json, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    EventStreamType.SESSION.value,
+                    session_id,
+                    seq,
+                    "session.cwd_changed",
+                    EventVisibility.USER_VISIBLE.value,
+                    RedactionState.REDACTED.value,
+                    session_id,
+                    None,
+                    run_id,
+                    None,
+                    None,
+                    json.dumps(sanitized_actor, sort_keys=True, default=str),
+                    tool_call_id,
+                    None,
+                    json.dumps(payload, sort_keys=True, default=str),
+                    json.dumps([], sort_keys=True, default=str),
+                    timestamp,
+                ),
+            )
+        return StoredEventRecord(
+            id=event_id,
+            stream_type=EventStreamType.SESSION,
+            stream_id=session_id,
+            seq=seq,
+            kind="session.cwd_changed",
+            visibility=EventVisibility.USER_VISIBLE,
+            redaction_state=RedactionState.REDACTED,
+            session_id=session_id,
+            message_id=None,
+            run_id=run_id,
+            task_id=None,
+            artifact_id=None,
+            actor=sanitized_actor,
+            correlation_id=tool_call_id,
+            causation_id=None,
+            payload=payload,
+            artifact_refs=[],
+            created_at=parse_dt(timestamp),
+        )
+
     def update_session_ui_preferences(self, session_id: str, preferences: dict[str, Any]) -> SessionSpec:
         current = self.get_session(session_id)
         updated = dict(current.ui_preferences)
@@ -1643,6 +1756,39 @@ class SQLiteStore:
             redaction_state=RedactionState.REDACTED,
         )
         return resolved
+
+    def expire_session_permission(self, permission_id: str, *, reason: str | None = None) -> SessionPermissionRequest:
+        current = self.get_session_permission(permission_id)
+        if current.status == SessionPermissionStatus.EXPIRED:
+            return current
+        if current.status != SessionPermissionStatus.ALLOWED:
+            raise ValueError(f"Permission request is not allowed: {permission_id}")
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE session_permissions
+                SET status = ?, resolved_at = ?
+                WHERE id = ?
+                """,
+                (SessionPermissionStatus.EXPIRED.value, timestamp, permission_id),
+            )
+        expired = self.get_session_permission(permission_id)
+        self.append_store_event(
+            EventStreamType.SESSION,
+            expired.session_id,
+            "permission.expired",
+            {
+                "permission_id": permission_id,
+                "status": SessionPermissionStatus.EXPIRED.value,
+                "reason": str(sanitize_for_logging(reason)) if reason else None,
+                "summary": f"{expired.tool_id} expired",
+            },
+            session_id=expired.session_id,
+            run_id=expired.run_id,
+            redaction_state=RedactionState.REDACTED,
+        )
+        return expired
 
     def get_session_permission(self, permission_id: str) -> SessionPermissionRequest:
         with self.connect() as conn:
@@ -2539,6 +2685,14 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.execute(
                 """
+                DELETE FROM context_vectors
+                WHERE chunk_id IN (SELECT id FROM context_chunks WHERE memory_id = ?)
+                """,
+                (memory_id,),
+            )
+            conn.execute("DELETE FROM context_chunks WHERE memory_id = ?", (memory_id,))
+            conn.execute(
+                """
                 UPDATE memory_records
                 SET summary = ?, redaction_state = ?, updated_at = ?, lineage_json = ?
                 WHERE id = ?
@@ -2552,6 +2706,261 @@ class SQLiteStore:
                 ),
             )
         return self.get_memory_record(memory_id)
+
+    def upsert_context_chunk(self, chunk: Any) -> Any:
+        payload = chunk.to_row() if hasattr(chunk, "to_row") else dict(chunk)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            existing = conn.execute("SELECT created_at FROM context_chunks WHERE id = ?", (payload["id"],)).fetchone()
+            created_at = existing["created_at"] if existing is not None else timestamp
+            conn.execute(
+                """
+                INSERT INTO context_chunks (
+                  id, schema_version, source_kind, trust_level, path, source_id, artifact_id, memory_id,
+                  start_line, end_line, sha256, size_bytes, token_count, tokenizer, chunk_scheme,
+                  text_preview, redaction_state, warnings_json, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  schema_version = excluded.schema_version,
+                  source_kind = excluded.source_kind,
+                  trust_level = excluded.trust_level,
+                  path = excluded.path,
+                  source_id = excluded.source_id,
+                  artifact_id = excluded.artifact_id,
+                  memory_id = excluded.memory_id,
+                  start_line = excluded.start_line,
+                  end_line = excluded.end_line,
+                  sha256 = excluded.sha256,
+                  size_bytes = excluded.size_bytes,
+                  token_count = excluded.token_count,
+                  tokenizer = excluded.tokenizer,
+                  chunk_scheme = excluded.chunk_scheme,
+                  text_preview = excluded.text_preview,
+                  redaction_state = excluded.redaction_state,
+                  warnings_json = excluded.warnings_json,
+                  metadata_json = excluded.metadata_json,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    payload["id"],
+                    payload["schema_version"],
+                    payload["source_kind"],
+                    payload["trust_level"],
+                    payload.get("path"),
+                    payload.get("source_id"),
+                    payload.get("artifact_id"),
+                    payload.get("memory_id"),
+                    payload.get("start_line"),
+                    payload.get("end_line"),
+                    payload["sha256"],
+                    payload["size_bytes"],
+                    payload.get("token_count"),
+                    payload.get("tokenizer"),
+                    payload["chunk_scheme"],
+                    payload["text_preview"],
+                    payload.get("redaction_state"),
+                    payload["warnings_json"],
+                    payload["metadata_json"],
+                    created_at,
+                    timestamp,
+                ),
+            )
+        return chunk
+
+    def list_context_chunks(
+        self,
+        *,
+        source_kind: str | None = None,
+        path: str | None = None,
+        memory_id: str | None = None,
+        artifact_id: str | None = None,
+    ) -> list[Any]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if source_kind is not None:
+            filters.append("source_kind = ?")
+            params.append(source_kind)
+        if path is not None:
+            filters.append("path = ?")
+            params.append(path)
+        if memory_id is not None:
+            filters.append("memory_id = ?")
+            params.append(memory_id)
+        if artifact_id is not None:
+            filters.append("artifact_id = ?")
+            params.append(artifact_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM context_chunks
+                {where}
+                ORDER BY source_kind ASC, path ASC, start_line ASC, id ASC
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_context_chunk(row) for row in rows]
+
+    def delete_context_chunks_for_memory(self, memory_id: str) -> int:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM context_vectors
+                WHERE chunk_id IN (SELECT id FROM context_chunks WHERE memory_id = ?)
+                """,
+                (memory_id,),
+            )
+            cursor = conn.execute("DELETE FROM context_chunks WHERE memory_id = ?", (memory_id,))
+            return int(cursor.rowcount or 0)
+
+    def delete_context_chunks_for_source_path(
+        self,
+        source_kind: str,
+        path: str,
+        *,
+        keep_ids: set[str] | None = None,
+        chunk_scheme: str | None = None,
+        tokenizer: str | None = None,
+    ) -> int:
+        filters = ["source_kind = ?", "path = ?"]
+        params: list[Any] = [source_kind, path]
+        if chunk_scheme is not None:
+            filters.append("chunk_scheme = ?")
+            params.append(chunk_scheme)
+        if tokenizer is not None:
+            filters.append("tokenizer = ?")
+            params.append(tokenizer)
+        if keep_ids:
+            placeholders = ", ".join("?" for _ in keep_ids)
+            filters.append(f"id NOT IN ({placeholders})")
+            params.extend(sorted(keep_ids))
+        with self.connect() as conn:
+            vector_filters = list(filters)
+            vector_params = list(params)
+            conn.execute(
+                f"""
+                DELETE FROM context_vectors
+                WHERE chunk_id IN (
+                  SELECT id FROM context_chunks WHERE {' AND '.join(vector_filters)}
+                )
+                """,
+                vector_params,
+            )
+            cursor = conn.execute(f"DELETE FROM context_chunks WHERE {' AND '.join(filters)}", params)
+            return int(cursor.rowcount or 0)
+
+    def upsert_context_vector(self, vector: Any) -> Any:
+        payload = vector.to_row() if hasattr(vector, "to_row") else dict(vector)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            existing = conn.execute("SELECT created_at FROM context_vectors WHERE id = ?", (payload["id"],)).fetchone()
+            created_at = existing["created_at"] if existing is not None else timestamp
+            conn.execute(
+                """
+                INSERT INTO context_vectors (
+                  id, schema_version, chunk_id, embedding_provider_id, dimension,
+                  quantization, source_sha256, vector_json, metadata_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  schema_version = excluded.schema_version,
+                  chunk_id = excluded.chunk_id,
+                  embedding_provider_id = excluded.embedding_provider_id,
+                  dimension = excluded.dimension,
+                  quantization = excluded.quantization,
+                  source_sha256 = excluded.source_sha256,
+                  vector_json = excluded.vector_json,
+                  metadata_json = excluded.metadata_json,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    payload["id"],
+                    payload["schema_version"],
+                    payload["chunk_id"],
+                    payload["embedding_provider_id"],
+                    payload["dimension"],
+                    payload["quantization"],
+                    payload["source_sha256"],
+                    payload["vector_json"],
+                    payload["metadata_json"],
+                    created_at,
+                    timestamp,
+                ),
+            )
+        return vector
+
+    def list_context_vectors(
+        self,
+        *,
+        embedding_provider_id: str | None = None,
+        chunk_id: str | None = None,
+    ) -> list[Any]:
+        filters: list[str] = []
+        params: list[Any] = []
+        if embedding_provider_id is not None:
+            filters.append("embedding_provider_id = ?")
+            params.append(embedding_provider_id)
+        if chunk_id is not None:
+            filters.append("chunk_id = ?")
+            params.append(chunk_id)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM context_vectors
+                {where}
+                ORDER BY embedding_provider_id ASC, chunk_id ASC, id ASC
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_context_vector(row) for row in rows]
+
+    def delete_context_vectors_not_in(self, chunk_ids: set[str], *, embedding_provider_id: str) -> int:
+        filters = ["embedding_provider_id = ?"]
+        params: list[Any] = [embedding_provider_id]
+        if chunk_ids:
+            placeholders = ", ".join("?" for _ in chunk_ids)
+            filters.append(f"chunk_id NOT IN ({placeholders})")
+            params.extend(sorted(chunk_ids))
+        with self.connect() as conn:
+            cursor = conn.execute(f"DELETE FROM context_vectors WHERE {' AND '.join(filters)}", params)
+            return int(cursor.rowcount or 0)
+
+    def stale_context_chunks(
+        self,
+        *,
+        source_kind: str,
+        path: str,
+        sha256: str | None = None,
+        sha256_values: set[str] | None = None,
+        chunk_scheme: str | None = None,
+        tokenizer: str | None = None,
+    ) -> list[Any]:
+        filters = ["source_kind = ?", "path = ?"]
+        params: list[Any] = [source_kind, path]
+        if sha256_values is not None:
+            if sha256_values:
+                placeholders = ", ".join("?" for _ in sha256_values)
+                filters.append(f"sha256 NOT IN ({placeholders})")
+                params.extend(sorted(sha256_values))
+        elif sha256 is not None:
+            filters.append("sha256 != ?")
+            params.append(sha256)
+        if chunk_scheme is not None:
+            filters.append("chunk_scheme = ?")
+            params.append(chunk_scheme)
+        if tokenizer is not None:
+            filters.append("tokenizer = ?")
+            params.append(tokenizer)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT * FROM context_chunks
+                WHERE {' AND '.join(filters)}
+                ORDER BY updated_at ASC, id ASC
+                """,
+                params,
+            ).fetchall()
+        return [self._row_to_context_chunk(row) for row in rows]
 
     def update_task_status(
         self,
@@ -5486,6 +5895,46 @@ class SQLiteStore:
             created_at=parse_dt(row["created_at"]),
             updated_at=parse_dt(row["updated_at"]),
             lineage=json.loads(row["lineage_json"]),
+        )
+
+    def _row_to_context_chunk(self, row: sqlite3.Row) -> Any:
+        from harness.context_chunks import ContextChunk
+
+        return ContextChunk(
+            id=row["id"],
+            schema_version=row["schema_version"],
+            source_kind=ContextSourceKind(row["source_kind"]),
+            trust_level=ContextTrustLevel(row["trust_level"]),
+            path=row["path"],
+            source_id=row["source_id"],
+            artifact_id=row["artifact_id"],
+            memory_id=row["memory_id"],
+            start_line=row["start_line"],
+            end_line=row["end_line"],
+            sha256=row["sha256"],
+            size_bytes=row["size_bytes"],
+            token_count=row["token_count"],
+            tokenizer=row["tokenizer"],
+            chunk_scheme=row["chunk_scheme"],
+            text_preview=row["text_preview"],
+            redaction_state=row["redaction_state"],
+            warnings=json.loads(row["warnings_json"]),
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    def _row_to_context_vector(self, row: sqlite3.Row) -> Any:
+        from harness.context_vector import VectorRecord
+
+        return VectorRecord(
+            id=row["id"],
+            schema_version=row["schema_version"],
+            chunk_id=row["chunk_id"],
+            embedding_provider_id=row["embedding_provider_id"],
+            dimension=row["dimension"],
+            quantization=row["quantization"],
+            source_sha256=row["source_sha256"],
+            vector=json.loads(row["vector_json"]),
+            metadata=json.loads(row["metadata_json"]),
         )
 
     def _row_to_run(self, row: sqlite3.Row) -> RunRecord:

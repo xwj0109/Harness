@@ -30,8 +30,10 @@ from harness.models import (
 )
 from harness.paths import is_excluded_relative, relative_to_project, resolve_project_root, resolve_under_project
 from harness.security import assert_not_secret_path, is_secret_path, redact_secret_text, sanitize_for_logging
+from harness.session_cwd import session_cwd_payload
 from harness.session_replay import build_session_replay_projection
 from harness.session_share import build_local_session_share_snapshot, hosted_share_unsupported
+from harness.session_tools import execute_session_tool
 from harness.tui import build_tui_settings_catalog
 from harness.workspace_catalog import build_workspace_catalog, build_workspace_clients_projection, workspace_action_unsupported
 
@@ -552,10 +554,18 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             },
             "/sessions/{session_id}/shell": {
                 "post": {
-                    "summary": "Fail-closed placeholder for session shell execution",
+                    "summary": "Run the permissioned session shell tool through the session-tool gateway",
                     "security": bearer,
                     "parameters": [_path_param("session_id")],
-                    "responses": _json_response(status="501"),
+                    "responses": _json_response(status="200"),
+                }
+            },
+            "/sessions/{session_id}/tool": {
+                "post": {
+                    "summary": "Run a session tool through the same gateway used by CLI and chat",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(status="200"),
                 }
             },
             "/sessions/{session_id}/parts/{part_id}/correct": {
@@ -1193,10 +1203,15 @@ def _route_get(
             return _sessions_status_projection(store)
         if len(parts) == 2:
             session = store.get_session(parts[1])
+            try:
+                cwd = session_cwd_payload(project_root, session.metadata, cfg.context_excludes)
+            except Exception:
+                cwd = {"cwd": session.metadata.get("cwd", "."), "resolved_abs_path": None}
             return {
                 "schema_version": "harness.session/v1",
                 "ok": True,
                 "session": session.model_dump(mode="json"),
+                "cwd": cwd,
                 "latest_ui_activation": _latest_session_ui_activation(store, session.id),
                 "permission_granting": False,
             }
@@ -1333,6 +1348,7 @@ def _route_post(
             intent="server_prompt" if prompt else "server_session",
             metadata={
                 "created_by": "harness_serve",
+                "cwd": ".",
                 "execution_started": False,
                 "permission_granting": False,
             },
@@ -1555,7 +1571,22 @@ def _route_post(
         if len(parts) == 3 and parts[2] == "shell":
             session_id = parts[1]
             store.get_session(session_id)
-            return _session_shell_unsupported(session_id, body)
+            return _session_tool_execution_response(store, project_root, session_id, "shell", body)
+        if len(parts) == 3 and parts[2] in {"tool", "tools"}:
+            session_id = parts[1]
+            store.get_session(session_id)
+            tool_id = _optional_body_text(body, "tool_id") or _optional_body_text(body, "tool")
+            if not tool_id:
+                raise ValueError("Missing required body field: tool_id")
+            arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else {
+                key: value for key, value in body.items() if key not in {"tool", "tool_id"}
+            }
+            return _session_tool_execution_response(store, project_root, session_id, tool_id, arguments)
+        if len(parts) == 4 and parts[2] in {"tool", "tools"}:
+            session_id = parts[1]
+            store.get_session(session_id)
+            arguments = body.get("arguments") if isinstance(body.get("arguments"), dict) else body
+            return _session_tool_execution_response(store, project_root, session_id, parts[3], arguments)
         if len(parts) == 5 and parts[2] == "messages" and parts[4] == "retract":
             session_id = parts[1]
             message_id = parts[3]
@@ -2750,6 +2781,10 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
     events = store.list_session_store_events(session.id)
     messages = store.list_session_messages(session.id)
     children = store.list_child_sessions(session.id)
+    try:
+        cwd = session_cwd_payload(store.project_root, session.metadata, load_config(store.project_root).context_excludes)
+    except Exception:
+        cwd = {"cwd": session.metadata.get("cwd", "."), "resolved_abs_path": None}
     return {
         "schema_version": "harness.session_status/v1",
         "ok": True,
@@ -2768,6 +2803,7 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
         "estimated_cost_usd": str(session.estimated_cost_usd) if session.estimated_cost_usd is not None else None,
         "message_count": len(messages),
         "event_count": len(events),
+        "cwd": cwd,
         "child_session_ids": [child.id for child in children],
         "latest_ui_activation": _latest_session_ui_activation(store, session.id),
         "terminal": session.status
@@ -5942,6 +5978,38 @@ def _session_shell_unsupported(session_id: str, body: dict[str, Any]) -> dict[st
         "execution_started": False,
         "permission_granting": False,
         "no_hidden_fallback": True,
+    }
+
+
+def _session_tool_execution_response(
+    store: SQLiteStore,
+    project_root: Path,
+    session_id: str,
+    tool_id: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any]:
+    result = execute_session_tool(store, project_root, session_id, tool_id, arguments)
+    session = store.get_session(session_id)
+    try:
+        cwd = session_cwd_payload(project_root, session.metadata, load_config(project_root).context_excludes)
+    except Exception:
+        cwd = {"cwd": session.metadata.get("cwd", "."), "resolved_abs_path": None}
+    return {
+        "schema_version": "harness.session_shell_action/v1" if tool_id == "shell" else "harness.session_tool_execution_response/v1",
+        "ok": result.ok,
+        "session_id": session_id,
+        "tool_id": result.tool_id,
+        "result": result.model_dump(mode="json"),
+        "cwd": cwd,
+        "permission_required": result.error_type == "permission_required",
+        "permission_id": result.permission_id,
+        "process_started": result.tool_id == "shell" and result.ok,
+        "command_executed": result.tool_id == "shell" and result.ok,
+        "tool_execution_started": result.ok,
+        "provider_execution_started": False,
+        "execution_started": result.ok,
+        "permission_granting": False,
+        "authority_granting": False,
     }
 
 

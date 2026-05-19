@@ -46,10 +46,17 @@ def test_freeform_chat_uses_chat_model_without_mutation(tmp_path) -> None:
     assert response["model_profile"] == "codex_cli"
     assert response["hosted_fallback"] is False
     assert response["context_manifest"]["blocks"]
+    assert response["context_manifest"]["role_summary"]["pinned"] >= 4
+    assert response["context_manifest"]["context_provenance"]
+    assert response["context_manifest"]["untrusted_context_warnings"]
+    assert all("content" not in record for record in response["context_manifest"]["context_provenance"])
+    assert all(record["lineage"]["permission_granting"] is False for record in response["context_manifest"]["context_provenance"])
+    assert {block["role"] for block in response["context_manifest"]["blocks"]} >= {"pinned", "retrieved"}
     assert {block["kind"] for block in response["context_manifest"]["blocks"]} >= {
         "harness_vocabulary",
         "harness_state",
         "builtin_harness_domain",
+        "request_context",
     }
     assert model.context is not None
     assert model.context.mode == "normal"

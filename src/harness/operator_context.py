@@ -14,6 +14,7 @@ from harness.models import EventStreamType, SessionPartKind, TaskStatus
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
 from harness.security import sanitize_for_logging
+from harness.session_cwd import session_cwd_payload
 from harness.session_timeline import (
     list_session_timeline,
     list_session_transcript,
@@ -28,6 +29,9 @@ OPERATOR_CONTEXT_SCHEMA_VERSION = "harness.operator_context/v1"
 def build_operator_context(project_root: Path) -> dict:
     project_root = resolve_project_root(project_root)
     initialized = _is_initialized(project_root)
+    catalog_config, catalog_source, catalog_error = _load_catalog_config(project_root)
+    provider_catalog = list_provider_catalog(catalog_config)
+    model_catalog = list_model_catalog(catalog_config)
     capability_catalog = build_capability_catalog(project_root).model_dump(mode="json")
     dashboard = {
         "schema_version": OPERATOR_CONTEXT_SCHEMA_VERSION,
@@ -57,14 +61,14 @@ def build_operator_context(project_root: Path) -> dict:
         "recent_runs": [],
         "recent_sessions": [],
         "active_session": None,
-        "model_catalog": {
-            "schema_version": "harness.operator_model_catalog/v1",
-            "providers": [],
-            "models": [],
-            "active_model": None,
-            "permission_granting": False,
-            "no_hidden_fallback": True,
-        },
+        "model_catalog": _model_catalog_projection(
+            catalog_config,
+            provider_catalog,
+            model_catalog,
+            sessions=[],
+            source=catalog_source,
+            config_error=catalog_error,
+        ),
         "memory": {
             "schema_version": "harness.memory_summary/v1",
             "total": 0,
@@ -168,12 +172,7 @@ def build_operator_context(project_root: Path) -> dict:
         runs = store.list_runs()[:5]
         sessions = store.list_sessions()[:5]
         memory_records = store.list_memory_records()[:5]
-        try:
-            cfg = load_config(project_root)
-        except FileNotFoundError:
-            cfg = default_config()
-        provider_catalog = list_provider_catalog(cfg)
-        model_catalog = list_model_catalog(cfg)
+        cfg = catalog_config
         catalog_cache = store.replace_provider_model_catalog_cache(provider_catalog, model_catalog)
         daemon_status = store.daemon_status()
         controls = store.list_execution_controls()
@@ -270,6 +269,7 @@ def build_operator_context(project_root: Path) -> dict:
             "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
             "active_run_id": session.active_run_id,
             "active_task_id": session.active_task_id,
+            "cwd": sanitize_for_logging(session.metadata.get("cwd", ".")),
             "ui_preferences": sanitize_for_logging(session.ui_preferences),
             "updated_at": session.updated_at.isoformat(),
         }
@@ -277,38 +277,15 @@ def build_operator_context(project_root: Path) -> dict:
     ]
     if sessions:
         dashboard["active_session"] = _session_preview(store, sessions[0].id, project_root)
-    dashboard["model_catalog"] = {
-        "schema_version": "harness.operator_model_catalog/v1",
-        "providers": [
-            {
-                "provider_id": provider.provider_id,
-                "enabled": provider.enabled,
-                "kind": provider.kind.value,
-                "credential_status": provider.credential_status.value,
-                "data_boundary": provider.metadata.data_boundary.value,
-                "constraints": provider.constraints,
-            }
-            for provider in provider_catalog
-        ],
-        "models": [
-            {
-                "provider_id": model.provider_id,
-                "model_id": sanitize_for_logging(model.model_id),
-                "raw_model_ref": sanitize_for_logging(model.raw_model_ref),
-                "model_profile_id": sanitize_for_logging(model.model_profile_id),
-                "source": model.source,
-                "context_limit": model.context_limit,
-                "tool_support": model.tool_support,
-                "reasoning_support": model.reasoning_support,
-                "modalities": model.modalities,
-            }
-            for model in model_catalog
-        ],
-        "active_model": _active_model_summary(cfg, sessions, model_catalog),
-        "cache": catalog_cache,
-        "permission_granting": False,
-        "no_hidden_fallback": True,
-    }
+    dashboard["model_catalog"] = _model_catalog_projection(
+        cfg,
+        provider_catalog,
+        model_catalog,
+        sessions=sessions,
+        cache=catalog_cache,
+        source=catalog_source,
+        config_error=catalog_error,
+    )
     dashboard["memory"] = {
         "schema_version": "harness.memory_summary/v1",
         "total": len(store.list_memory_records()),
@@ -428,6 +405,10 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
     timeline_events = list_session_timeline(store, session_id, limit=8)
     transcript_entries = list_session_transcript(store, session_id)[-4:]
     latest_ui_activation = next((event for event in reversed(timeline_events) if event.kind == "tui.ui_activation.applied"), None)
+    try:
+        cwd = session_cwd_payload(project_root, session.metadata, load_config(project_root).context_excludes)
+    except Exception:
+        cwd = {"cwd": session.metadata.get("cwd", "."), "resolved_abs_path": None}
     return {
         "schema_version": "harness.session_preview/v1",
         "id": session.id,
@@ -439,6 +420,7 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         "model_variant": sanitize_for_logging(session.model_variant),
         "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
         "active_run_id": session.active_run_id,
+        "cwd": cwd,
         "ui_preferences": sanitize_for_logging(session.ui_preferences),
         "latest_ui_activation": _ui_activation_preview(latest_ui_activation) if latest_ui_activation else None,
         "composer_context": _session_composer_context(store, session_id, project_root),
@@ -512,6 +494,71 @@ def _ui_activation_preview(event) -> dict:
         "permission_granting": bool(payload.get("permission_granting")),
         "authority_granting": bool(payload.get("authority_granting")),
     }
+
+
+def _load_catalog_config(project_root: Path):
+    try:
+        return load_config(project_root), "project_config", None
+    except FileNotFoundError:
+        return default_config(), "default_config", None
+    except Exception as exc:
+        return (
+            default_config(),
+            "default_config",
+            {
+                "type": exc.__class__.__name__,
+                "message": sanitize_for_logging(str(exc)),
+            },
+        )
+
+
+def _model_catalog_projection(
+    cfg,
+    provider_catalog: list,
+    model_catalog: list,
+    *,
+    sessions: list,
+    cache: dict | None = None,
+    source: str = "project_config",
+    config_error: dict | None = None,
+) -> dict:
+    projection = {
+        "schema_version": "harness.operator_model_catalog/v1",
+        "providers": [
+            {
+                "provider_id": provider.provider_id,
+                "enabled": provider.enabled,
+                "kind": provider.kind.value,
+                "credential_status": provider.credential_status.value,
+                "data_boundary": provider.metadata.data_boundary.value,
+                "constraints": provider.constraints,
+            }
+            for provider in provider_catalog
+        ],
+        "models": [
+            {
+                "provider_id": model.provider_id,
+                "model_id": sanitize_for_logging(model.model_id),
+                "raw_model_ref": sanitize_for_logging(model.raw_model_ref),
+                "model_profile_id": sanitize_for_logging(model.model_profile_id),
+                "source": model.source,
+                "context_limit": model.context_limit,
+                "tool_support": model.tool_support,
+                "reasoning_support": model.reasoning_support,
+                "modalities": model.modalities,
+            }
+            for model in model_catalog
+        ],
+        "active_model": _active_model_summary(cfg, sessions, model_catalog),
+        "source": source,
+        "permission_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if cache is not None:
+        projection["cache"] = cache
+    if config_error is not None:
+        projection["config_error"] = config_error
+    return projection
 
 
 def _terminal_tabs_summary(store: SQLiteStore) -> dict:

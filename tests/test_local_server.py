@@ -2730,6 +2730,9 @@ def test_local_server_control_config_project_and_session_shell_routes_fail_close
     assert init["provider_execution_started"] is False
     assert init["no_hidden_fallback"] is True
     assert shell["schema_version"] == "harness.session_shell_action/v1"
+    assert shell["permission_required"] is True
+    assert shell["permission_id"]
+    assert shell["result"]["error_type"] == "permission_required"
     assert shell["process_started"] is False
     assert shell["command_executed"] is False
     assert shell["provider_execution_started"] is False
@@ -2737,6 +2740,50 @@ def test_local_server_control_config_project_and_session_shell_routes_fail_close
     assert unshare["schema_version"] == "harness.session_unshare_action/v1"
     assert unshare["share_removed"] is False
     assert unshare["network_called"] is False
+
+
+def test_local_server_session_tool_route_uses_gateway_and_exposes_cwd(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("alpha\n", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Gateway")
+
+    cd = _route_post(
+        f"/sessions/{session.id}/tool",
+        body={"tool_id": "cd", "arguments": {"path": "src", "actor": "operator"}},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    read = _route_post(
+        f"/sessions/{session.id}/tools/read",
+        body={"arguments": {"path": "app.py"}},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    status = _route_get(
+        f"/sessions/{session.id}/status",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+        query={},
+    )
+
+    assert cd["schema_version"] == "harness.session_tool_execution_response/v1"
+    assert cd["ok"] is True
+    assert cd["cwd"]["cwd"] == "src"
+    assert read["ok"] is True
+    assert read["result"]["preview"] == "alpha\n"
+    assert status["cwd"]["cwd"] == "src"
 
 
 def test_local_server_project_sync_and_experimental_workspace_actions_fail_closed(tmp_path) -> None:

@@ -4,7 +4,9 @@ import re
 import time
 from pathlib import Path
 
+from harness.config import load_config
 from harness.memory.sqlite_store import SQLiteStore
+from harness.model_catalog import parse_model_ref, validate_model_selection
 from harness.operator_context import build_tui_dashboard
 from harness.procedure_renderer import render_procedure_event
 from rich.markup import escape
@@ -13,6 +15,7 @@ from rich.markup import escape
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
     {"id": "ui_controls", "title": "UI Controls"},
+    {"id": "model_selection", "title": "Model Selection"},
     {"id": "agent_authoring", "title": "Agent Authoring"},
     {"id": "native_agents", "title": "Native Agents"},
     {"id": "project_agents", "title": "Project Agents"},
@@ -97,6 +100,33 @@ COMMAND_PALETTE_ENTRIES = [
         "description": "Focus the read-only TUI settings catalog.",
         "mutates_when_run": False,
         "safety_note": "In-process UI state only; preferences are not persisted from the palette.",
+    },
+    {
+        "id": "ui_controls.theme_cycle",
+        "group_id": "ui_controls",
+        "title": "Switch theme",
+        "command": "ui:switch-theme",
+        "description": "Open the TUI theme picker.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only; theme choice is not persisted from the palette.",
+    },
+    {
+        "id": "ui_controls.theme_light",
+        "group_id": "ui_controls",
+        "title": "Switch to light theme",
+        "command": "ui:set-theme light",
+        "description": "Use the light TUI theme for this running app.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only; theme choice is not persisted from the palette.",
+    },
+    {
+        "id": "ui_controls.theme_dark",
+        "group_id": "ui_controls",
+        "title": "Switch to dark theme",
+        "command": "ui:set-theme dark",
+        "description": "Use the dark TUI theme for this running app.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only; theme choice is not persisted from the palette.",
     },
     {
         "id": "agent_authoring.scaffold",
@@ -383,7 +413,7 @@ TUI_VIEW_SECTIONS = [
     {
         "id": "project_overview",
         "title": "Project Overview",
-        "pane_ids": ["overview", "guidance", "commands"],
+        "pane_ids": ["overview", "models", "guidance", "commands"],
     },
     {
         "id": "sessions",
@@ -417,6 +447,7 @@ TUI_VIEW_SECTIONS = [
             "command_palette",
             "command_palette_orientation",
             "command_palette_ui_controls",
+            "command_palette_model_selection",
             "command_palette_agent_authoring",
             "command_palette_project_agents",
             "command_palette_built_in_specs",
@@ -442,10 +473,12 @@ TUI_NAVIGATION_HINTS = [
     {"key": "tab", "label": "Next"},
     {"key": "shift+tab", "label": "Previous"},
     {"key": "ctrl+p/f2", "label": "Palette"},
+    {"key": "ctrl+x m", "label": "Models"},
     {"key": "c", "label": "Collapse"},
     {"key": "shift+c", "label": "Expand"},
     {"key": "ctrl+q", "label": "Quit"},
     {"key": "enter", "label": "Send"},
+    {"key": "shift+enter", "label": "New line"},
     {"key": "safe-actions", "label": "UI-only actions"},
 ]
 
@@ -493,6 +526,9 @@ SLASH_COMMAND_ALIASES = {
     "sessions": "sessions.list",
     "session": "sessions.list",
     "settings": "ui_controls.settings",
+    "theme": "ui_controls.theme_cycle",
+    "light-mode": "ui_controls.theme_light",
+    "dark-mode": "ui_controls.theme_dark",
     "continue-session": "sessions.continue_last",
     "tail-session": "sessions.tail",
     "transcript-session": "sessions.transcript",
@@ -504,6 +540,88 @@ SLASH_COMMAND_ALIASES = {
     "policy": "runtime_evidence.policy",
     "artifacts": "runtime_evidence.artifacts",
     "wheel": "packaging_smoke.wheel",
+}
+
+
+FUNCTIONALITY_TABLE_GROUPS = [
+    {"id": "suggested", "title": "Suggested"},
+    {"id": "session", "title": "Session"},
+    {"id": "agent", "title": "Agent"},
+    {"id": "tasks", "title": "Tasks"},
+    {"id": "adapters", "title": "Adapters"},
+    {"id": "evidence", "title": "Evidence"},
+    {"id": "provider", "title": "Provider"},
+    {"id": "system", "title": "System"},
+]
+
+FUNCTIONALITY_TABLE_LAYOUT = [
+    ("suggested", ["model", "continue-session", "runs"]),
+    ("session", ["sessions", "continue-session", "tail-session", "transcript-session", "session-tools"]),
+    ("agent", ["model", "build", "plan", "general", "explore", "scaffold", "validate", "preview", "agents", "agent", "import-agent"]),
+    ("tasks", ["task", "plan-task", "tasks", "graph", "lease", "inspect-lease"]),
+    ("adapters", ["execute-read-only", "execute"]),
+    ("evidence", ["runs", "policy", "artifacts"]),
+    ("provider", ["models", "model"]),
+    ("system", ["home", "settings", "theme", "palette", "dashboard", "clear", "toggle-section", "expand-all", "help", "quickstart", "specs", "spec", "wheel"]),
+]
+
+FUNCTIONALITY_INVOKES = {
+    "model": "ctrl+x m",
+    "models": "/models",
+    "clear": "esc",
+    "palette": "ctrl+p",
+    "home": "/home",
+    "settings": "/settings",
+    "theme": "ctrl+x t",
+    "dark-mode": "/dark-mode",
+    "light-mode": "/light-mode",
+}
+
+FUNCTIONALITY_TITLES = {
+    "model": "Switch model",
+    "models": "Model catalog",
+    "sessions": "Switch session",
+    "continue-session": "Continue session",
+    "tasks": "Task queue",
+    "runs": "Runs",
+    "theme": "Switch theme",
+    "dark-mode": "Switch to dark mode",
+    "light-mode": "Switch to light mode",
+}
+
+THEME_DIALOG_ENTRIES = [
+    {
+        "id": "light",
+        "title": "Light",
+        "description": "Use a bright high-contrast Harness light theme.",
+        "textual_theme": "harness-light",
+    },
+    {
+        "id": "dark",
+        "title": "Dark",
+        "description": "Use the dark TUI theme for this running app.",
+        "textual_theme": "textual-dark",
+    },
+    {
+        "id": "system",
+        "title": "System",
+        "description": "Use Textual's standard light theme for this running app.",
+        "textual_theme": "textual-light",
+    },
+]
+
+FUNCTIONALITY_EVIDENCE = {
+    "model": "session.model_selected",
+    "models": "none",
+    "task": "task id",
+    "plan-task": "task id",
+    "lease": "lease id",
+    "execute": "run id/artifacts",
+    "execute-read-only": "run id/artifacts",
+    "continue-session": "session event/run id",
+    "tail-session": "event stream",
+    "transcript-session": "transcript",
+    "wheel": "wheelhouse path",
 }
 
 
@@ -622,6 +740,7 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
                     (
                         f"{session['id']} {session['status']} "
                         f"{session.get('title') or session.get('intent') or 'untitled'} "
+                        f"cwd={session.get('cwd') or '.'} "
                         f"model={session.get('raw_model_ref') or 'default'} "
                         f"run={session.get('active_run_id') or 'none'}"
                     )
@@ -732,9 +851,10 @@ def _active_session_ui_activation_rows(active_session: dict) -> list[str]:
     ]
 
 
-def build_command_palette(custom_commands: list[dict] | None = None) -> dict:
+def build_command_palette(custom_commands: list[dict] | None = None, model_catalog: dict | None = None) -> dict:
     groups = [dict(group) for group in COMMAND_PALETTE_GROUPS]
     entries = [_with_palette_activation(entry) for entry in COMMAND_PALETTE_ENTRIES]
+    entries.extend(_model_selection_palette_entries(model_catalog or {}))
     if custom_commands:
         groups.append({"id": "project_commands", "title": "Project Commands"})
         for command in custom_commands:
@@ -759,6 +879,45 @@ def build_command_palette(custom_commands: list[dict] | None = None) -> dict:
         "groups": groups,
         "entries": entries,
     }
+
+
+def _model_selection_palette_entries(model_catalog: dict) -> list[dict]:
+    models = model_catalog.get("models") or []
+    providers = {provider.get("provider_id"): provider for provider in model_catalog.get("providers") or []}
+    active = model_catalog.get("active_model") or {}
+    active_ref = active.get("raw_model_ref")
+    entries: list[dict] = []
+    seen_refs: set[str] = set()
+    for index, model in enumerate(models):
+        raw_ref = str(model.get("raw_model_ref") or "").strip()
+        if not raw_ref or raw_ref in seen_refs:
+            continue
+        seen_refs.add(raw_ref)
+        provider = providers.get(model.get("provider_id")) or {}
+        enabled = bool(provider.get("enabled", True))
+        credential_status = str(provider.get("credential_status") or "unknown")
+        boundary = str(provider.get("data_boundary") or (provider.get("metadata") or {}).get("data_boundary") or "unknown")
+        suffix = "active" if raw_ref == active_ref else ("enabled" if enabled else "blocked")
+        entries.append(
+            _with_palette_activation(
+                {
+                    "id": f"model_selection.select_{index}",
+                    "group_id": "model_selection",
+                    "title": f"Select model {raw_ref}",
+                    "command": f"ui:select-model {raw_ref}",
+                    "description": f"{boundary} | credentials={credential_status} | {suffix}",
+                    "mutates_when_run": True,
+                    "safety_note": "Persists active session model metadata and validation evidence only; no provider call or fallback.",
+                    "model_ref": raw_ref,
+                    "provider_id": model.get("provider_id"),
+                    "model_id": model.get("model_id"),
+                    "provider_enabled": enabled,
+                    "credential_status": credential_status,
+                    "data_boundary": boundary,
+                }
+            )
+        )
+    return entries
 
 
 _SAFE_PALETTE_UI_ACTIONS = {
@@ -803,6 +962,24 @@ _SAFE_PALETTE_UI_ACTIONS = {
         "focus_mode": "dashboard",
         "evidence_status": "ui_focus_in_memory",
         "state_fields": ["focus_mode", "active_section_id", "active_section_index"],
+    },
+    "ui_controls.theme_cycle": {
+        "type": "set_theme",
+        "theme_id": "cycle",
+        "evidence_status": "ui_theme_selected_in_memory",
+        "state_fields": ["selected_theme"],
+    },
+    "ui_controls.theme_light": {
+        "type": "set_theme",
+        "theme_id": "light",
+        "evidence_status": "ui_theme_selected_in_memory",
+        "state_fields": ["selected_theme"],
+    },
+    "ui_controls.theme_dark": {
+        "type": "set_theme",
+        "theme_id": "dark",
+        "evidence_status": "ui_theme_selected_in_memory",
+        "state_fields": ["selected_theme"],
     },
     "native_agents.select_build": {
         "type": "select_agent",
@@ -875,6 +1052,27 @@ def _palette_no_side_effect_flags() -> dict:
 
 def _with_palette_activation(entry: dict) -> dict:
     item = dict(entry)
+    if str(item.get("group_id")) == "model_selection" and item.get("model_ref"):
+        item["activation"] = {
+            "kind": "session_model_selection",
+            "supported": True,
+            "action": {
+                "type": "select_model",
+                "raw_model_ref": item["model_ref"],
+                "provider_id": item.get("provider_id"),
+                "model_id": item.get("model_id"),
+                "provider_enabled": item.get("provider_enabled"),
+                "credential_status": item.get("credential_status"),
+                "data_boundary": item.get("data_boundary"),
+                "evidence_status": "session_model_selection_requested",
+                "state_fields": ["selected_model_ref"],
+            },
+            "evidence_status": "session_model_selection_requested",
+            "policy_boundary": _model_selection_policy_boundary(),
+            "blocked_reasons": [],
+            **_palette_no_side_effect_flags(),
+        }
+        return item
     action = _SAFE_PALETTE_UI_ACTIONS.get(str(item.get("id")))
     if action:
         item["activation"] = {
@@ -923,6 +1121,26 @@ def activate_command_palette_entry(
         }
     activation = entry.get("activation") or {}
     if activation.get("kind") != "ui_action" or not activation.get("supported"):
+        if activation.get("kind") == "session_model_selection" and activation.get("supported"):
+            action = dict(activation.get("action") or {})
+            state = dict(view_state or {})
+            if action.get("raw_model_ref"):
+                state["selected_model_ref"] = action["raw_model_ref"]
+            return {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": True,
+                "entry_id": entry_id,
+                "activation_kind": "session_model_selection",
+                "action": action,
+                "ui_action_applied": False,
+                "session_model_selection_requested": True,
+                "evidence_status": action.get("evidence_status") or "session_model_selection_requested",
+                "policy_boundary": activation.get("policy_boundary") or _model_selection_policy_boundary(),
+                "blocked_reasons": [],
+                **no_side_effects,
+                "harness_state_modified": False,
+                "view_state": state,
+            }
         return {
             "schema_version": "harness.tui_palette_activation/v1",
             "ok": False,
@@ -964,6 +1182,10 @@ def activate_command_palette_entry(
         agent_id = str(action.get("agent_id") or "").strip()
         if agent_id:
             state["selected_agent_id"] = agent_id
+    elif action.get("type") == "set_theme":
+        requested_theme = str(action.get("theme_id") or "cycle")
+        current_theme = str(state.get("selected_theme") or "light")
+        state["selected_theme"] = _resolve_next_tui_theme(current_theme, requested_theme)
     local_state_changes = {
         "changed_fields": list(action.get("state_fields") or []),
         "creates_message": False,
@@ -985,6 +1207,28 @@ def activate_command_palette_entry(
         "local_state_changes": local_state_changes,
         **no_side_effects,
         "view_state": state,
+}
+
+
+def _resolve_next_tui_theme(current_theme: str, requested_theme: str) -> str:
+    themes = ["light", "dark"]
+    if requested_theme in themes:
+        return requested_theme
+    normalized_current = current_theme if current_theme in themes else "light"
+    return themes[(themes.index(normalized_current) + 1) % len(themes)]
+
+
+def _model_selection_policy_boundary() -> dict:
+    boundary = _safe_palette_policy_boundary()
+    return {
+        **boundary,
+        "kind": "session_model_selection",
+        "session_metadata_mutation_allowed": True,
+        "session_message_allowed": False,
+        "in_memory_ui_state_only": False,
+        "provider_call_allowed": False,
+        "model_execution_allowed": False,
+        "hidden_fallback_allowed": False,
     }
 
 
@@ -1076,7 +1320,7 @@ def build_tui_settings_catalog(
             else "harness session preferences <session-id> --project . --set key=value"
         ),
         "themes": [
-            {"id": "light", "textual_theme": "textual-light", "default": True},
+            {"id": "light", "textual_theme": "harness-light", "default": True},
             {"id": "dark", "textual_theme": "textual-dark", "default": False},
             {"id": "system", "textual_theme": None, "default": False},
         ],
@@ -1390,11 +1634,21 @@ def _right_panel_action_rows(state: dict) -> list[str]:
         action = latest_activation.get("action") or {}
         if action:
             rows.append(f"Action: {action.get('type') or 'unknown'}")
+        if latest_activation.get("raw_model_ref"):
+            rows.append(f"Model: {latest_activation.get('raw_model_ref')}")
+        if "session_model_selected" in latest_activation:
+            rows.append(f"Model selected: {latest_activation.get('session_model_selected')}")
+        if latest_activation.get("model_validation"):
+            validation = latest_activation["model_validation"]
+            rows.append(f"Model executable: {validation.get('executable')}")
+            if validation.get("blocked_reasons"):
+                rows.append("Model blocked: " + ", ".join(validation["blocked_reasons"]))
         rows.extend(
             [
                 f"Command started: {latest_activation.get('command_started', False)}",
                 f"Process started: {latest_activation.get('process_started', False)}",
                 f"Filesystem modified: {latest_activation.get('filesystem_modified', False)}",
+                f"Harness state modified: {latest_activation.get('harness_state_modified', False)}",
                 f"Permission granting: {latest_activation.get('permission_granting', False)}",
             ]
         )
@@ -1499,6 +1753,8 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
         f"Providers: {len(providers)}",
         f"Models: {len(models)}",
         f"No hidden fallback: {catalog.get('no_hidden_fallback', True)}",
+        "List: /models",
+        "Select: /model <number|search|provider/model>",
     ]
     if active:
         rows.append(
@@ -1508,6 +1764,7 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
         )
         if active.get("session_id"):
             rows.append(f"Switch: harness session model {active['session_id']} <provider/model> --project .")
+            rows.append("In app: /models then /model <number>")
         rows.append(f"Provider enabled: {active.get('provider_enabled')}")
         if active.get("blocked_reasons"):
             rows.append("Blocked: " + ", ".join(active["blocked_reasons"]))
@@ -1530,8 +1787,350 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
         or ["none"]
     )
     rows.append("Model refs:")
-    rows.extend([f"{model['raw_model_ref']} profile={model.get('model_profile_id') or '-'}" for model in models[:5]] or ["none"])
+    rows.extend(
+        [
+            f"{index}. {model['raw_model_ref']} profile={model.get('model_profile_id') or '-'}"
+            for index, model in enumerate(_unique_model_catalog_entries(models)[:8], start=1)
+        ]
+        or ["none"]
+    )
     return rows
+
+
+def render_model_selection_dialog(dashboard: dict, *, query: str = "", selected_index: int = 0) -> str:
+    catalog = dashboard.get("model_catalog") or {}
+    providers = {provider.get("provider_id"): provider for provider in catalog.get("providers") or []}
+    models = _model_selection_dialog_entries(dashboard, query=query)
+    active = catalog.get("active_model") or {}
+    active_ref = active.get("raw_model_ref")
+    selected_index = min(max(selected_index, 0), max(len(models) - 1, 0))
+    lines = [
+        "[bold deep_sky_blue1]Select model[/bold deep_sky_blue1]  [dim]session scope | no provider call[/dim]                 [dim]esc[/dim]",
+        f"[dim]{'─' * 76}[/dim]",
+        f"[bold steel_blue1]Search[/bold steel_blue1] {escape(query or 'type to filter')}",
+    ]
+    lines.append("")
+    if active_ref:
+        lines.append("[bold dark_orange3]Recent[/bold dark_orange3]")
+        active_provider = active.get("provider_id") or str(active_ref).split("/", 1)[0]
+        lines.append(f"  [blue]{escape(str(active_ref).split('/', 1)[-1])}[/] [dim]{escape(str(active_provider))}[/] [dim]current[/dim]")
+        lines.append("")
+    if not models:
+        lines.append("[dim]No models match.[/dim]")
+    grouped: dict[str, list[dict]] = {}
+    for model in models:
+        grouped.setdefault(str(model.get("provider_id") or "unknown"), []).append(model)
+    row_number = 0
+    for provider_id, provider_models in grouped.items():
+        provider = providers.get(provider_id) or {}
+        credential_status = str(provider.get("credential_status") or "unknown")
+        lines.append(f"[bold dark_orange3]{escape(provider_id)}[/bold dark_orange3] [dim]{escape(credential_status)}[/]")
+        for model in provider_models:
+            row_number += 1
+            raw_ref = str(model.get("raw_model_ref") or "")
+            model_name = raw_ref.split("/", 1)[-1]
+            marker = "*" if raw_ref == active_ref else " "
+            text = f"{row_number:>2}. {marker} {model_name}"
+            suffix = ""
+            if not provider.get("enabled", True):
+                suffix = " [dim]disabled[/dim]"
+            elif credential_status == "missing":
+                suffix = " [dim]credentials missing[/dim]"
+            if row_number - 1 == selected_index:
+                lines.append(f"[white on #5f87d7]{escape(('> ' + text)[:66].ljust(66))}[/]{suffix}")
+            else:
+                lines.append(f"  {escape(text)}{suffix}")
+        lines.append("")
+    lines.extend(
+        [
+            f"[dim]{'─' * 76}[/dim]",
+            "[bold steel_blue1]Enter[/bold steel_blue1] select   [bold steel_blue1]Slash[/bold steel_blue1] /model <number> or /model <name>   [bold steel_blue1]Arrows[/bold steel_blue1] move",
+            "[bold steel_blue1]Connect provider[/bold steel_blue1] ctrl+a   [bold steel_blue1]Favorite[/bold steel_blue1] ctrl+f",
+        ]
+    )
+    return "\n".join(lines).rstrip()
+
+
+def render_theme_selection_dialog(*, selected_theme: str = "light", selected_index: int = 0) -> str:
+    entries = THEME_DIALOG_ENTRIES
+    selected_index = min(max(selected_index, 0), len(entries) - 1)
+    lines = [
+        "[bold deep_sky_blue1]Switch theme[/bold deep_sky_blue1]  [dim]runtime only | no preference write[/dim]                [dim]esc[/dim]",
+        f"[dim]{'─' * 76}[/dim]",
+        "[bold dark_orange3]Theme[/bold dark_orange3]",
+    ]
+    for index, entry in enumerate(entries):
+        marker = "*" if entry["id"] == selected_theme else " "
+        current = "current" if entry["id"] == selected_theme else ""
+        text = f"{marker} {entry['title']:<10} {current:<8} {entry['description']}"
+        if index == selected_index:
+            lines.append(f"[white on #5f87d7]{escape(('> ' + text)[:76].ljust(76))}[/]")
+        else:
+            lines.append(f"  {escape(text[:74])}")
+    lines.extend(
+        [
+            "",
+            "[bold steel_blue1]Preview[/bold steel_blue1] Light uses a brighter Harness surface; System keeps Textual default.",
+            f"[dim]{'─' * 76}[/dim]",
+            "[bold steel_blue1]Enter[/bold steel_blue1] select   [bold steel_blue1]Arrows[/bold steel_blue1] move   [bold steel_blue1]Does not[/bold steel_blue1] persist preferences",
+        ]
+    )
+    return "\n".join(lines).rstrip()
+
+
+def _model_selection_dialog_entries(dashboard: dict, *, query: str = "") -> list[dict]:
+    catalog = dashboard.get("model_catalog") or {}
+    models = _unique_model_catalog_entries(catalog.get("models") or [])
+    normalized = query.strip().casefold()
+    if not normalized:
+        return models
+    return [
+        model
+        for model in models
+        if normalized in str(model.get("raw_model_ref") or "").casefold()
+        or normalized in str(model.get("model_id") or "").casefold()
+        or normalized in str(model.get("provider_id") or "").casefold()
+    ]
+
+
+def build_functionality_table(slash_commands: dict | None = None) -> dict:
+    slash_commands = slash_commands or build_slash_commands()
+    commands_by_name = {command["name"]: command for command in slash_commands["commands"]}
+    rows: list[dict] = []
+    for group_id, names in FUNCTIONALITY_TABLE_LAYOUT:
+        for name in names:
+            command = commands_by_name.get(name)
+            if command is None:
+                continue
+            row = _functionality_table_row(command, group_id)
+            row["id"] = f"{group_id}.{name}"
+            rows.append(row)
+    return {
+        "schema_version": "harness.tui_functionality_table/v1",
+        "ok": True,
+        "groups": [dict(group) for group in FUNCTIONALITY_TABLE_GROUPS],
+        "rows": rows,
+    }
+
+
+def filter_functionality_table(table: dict, query: str) -> dict:
+    normalized = query.strip().casefold()
+    if not normalized:
+        rows = [dict(row) for row in table.get("rows", [])]
+    else:
+        rows = [
+            dict(row)
+            for row in table.get("rows", [])
+            if normalized
+            in " ".join(
+                str(row.get(key) or "")
+                for key in (
+                    "title",
+                    "invoke",
+                    "slash",
+                    "group_id",
+                    "authority",
+                    "surface",
+                    "status",
+                    "evidence",
+                    "description",
+                    "safety_note",
+                )
+            ).casefold()
+        ]
+    return {
+        "schema_version": "harness.tui_functionality_filter/v1",
+        "ok": True,
+        "query": query.strip(),
+        "total_matches": len(rows),
+        "rows": rows,
+    }
+
+
+def render_functionality_table_dialog(
+    table: dict | None = None,
+    *,
+    query: str = "",
+    selected_index: int = 0,
+    limit: int = 20,
+) -> str:
+    table = table or build_functionality_table()
+    filtered = filter_functionality_table(table, query)
+    rows = filtered["rows"]
+    selected_index = min(max(selected_index, 0), max(len(rows) - 1, 0))
+    visible_limit = max(1, limit)
+    if len(rows) <= visible_limit:
+        start_index = 0
+    else:
+        start_index = max(0, min(selected_index - visible_limit + 1, len(rows) - visible_limit))
+    visible_rows = rows[start_index : start_index + visible_limit]
+    group_titles = {group["id"]: group["title"] for group in table.get("groups", [])}
+    search_label = escape(query or "type to filter")
+    lines = [
+        f"[bold deep_sky_blue1]Commands[/bold deep_sky_blue1]  [dim]{len(rows)} matches | enter runs safe UI rows or stages command text[/dim]       [dim]esc[/dim]",
+        f"[dim]{'─' * 76}[/dim]",
+        f"[bold steel_blue1]Search[/bold steel_blue1] {search_label}",
+    ]
+    if start_index > 0:
+        lines.append(f"[dim]... {start_index} previous. Use arrows to navigate.[/dim]")
+    current_group = None
+    for offset, row in enumerate(visible_rows):
+        row_index = start_index + offset
+        if row.get("group_id") != current_group:
+            current_group = row.get("group_id")
+            lines.extend(["", f"[bold dark_orange3]{escape(group_titles.get(str(current_group), str(current_group)))}[/bold dark_orange3]"])
+        title = str(row.get("title") or row.get("name") or "")
+        invoke = str(row.get("invoke") or row.get("slash") or "")
+        status = str(row.get("status") or "")
+        text = _dialog_row_text(title, invoke, status)
+        if row_index == selected_index:
+            lines.append(f"[white on #5f87d7]{escape(('> ' + text)[:76].ljust(76))}[/]")
+        else:
+            lines.append(f"  {escape(text[:74])}")
+    remaining = len(rows) - (start_index + len(visible_rows))
+    if remaining > 0:
+        lines.append(f"[dim]... {remaining} more. Use arrows to navigate.[/dim]")
+    if not rows:
+        lines.extend(["", "[dim]No commands match.[/dim]"])
+    elif rows:
+        selected = rows[selected_index]
+        lines.extend(
+            [
+                "",
+                f"[dim]{'─' * 76}[/dim]",
+                f"[bold steel_blue1]Authority[/bold steel_blue1] {escape(str(selected.get('authority') or 'unknown'))}   "
+                f"[bold steel_blue1]Surface[/bold steel_blue1] {escape(str(selected.get('surface') or 'unknown'))}",
+                f"[bold steel_blue1]Does not[/bold steel_blue1] {escape(str(selected.get('does_not') or 'hide work'))}",
+                f"[bold steel_blue1]Evidence[/bold steel_blue1] {escape(str(selected.get('evidence') or 'none'))}   "
+                f"[bold steel_blue1]Next[/bold steel_blue1] {escape(str(selected.get('next') or selected.get('slash') or ''))}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def render_command_menu_dialog(table: dict | None = None, *, query: str = "", selected_index: int = 0) -> str:
+    return render_functionality_table_dialog(table, query=query, selected_index=selected_index)
+
+
+def _functionality_table_row(command: dict, group_id: str) -> dict:
+    name = str(command["name"])
+    activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
+    authority = _functionality_authority(command)
+    slash = str(command["slash"])
+    title = FUNCTIONALITY_TITLES.get(name, str(command["title"]))
+    invoke = FUNCTIONALITY_INVOKES.get(name, slash)
+    surface = _functionality_surface(command)
+    return {
+        "name": name,
+        "group_id": group_id,
+        "title": title,
+        "invoke": invoke,
+        "slash": slash,
+        "entry_id": command.get("entry_id"),
+        "surface": surface,
+        "authority": authority,
+        "status": _functionality_status(command),
+        "evidence": FUNCTIONALITY_EVIDENCE.get(name, _functionality_default_evidence(command)),
+        "description": command.get("description"),
+        "safety_note": command.get("safety_note"),
+        "activation_kind": activation_kind,
+        "mutates_when_run": bool(command.get("mutates_when_run")),
+        "does_not": _functionality_does_not(command),
+        "next": _functionality_next(command, invoke),
+    }
+
+
+def _functionality_authority(command: dict) -> str:
+    activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
+    if activation_kind == "ui_action":
+        return "ui-only"
+    if activation_kind == "model_list":
+        return "read-only"
+    if activation_kind == "session_model_selection":
+        return "session metadata"
+    if command.get("group_id") == "registered_adapters":
+        return "registered dispatch"
+    if command.get("mutates_when_run"):
+        return "manual mutation"
+    return "read-only preview"
+
+
+def _functionality_surface(command: dict) -> str:
+    activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
+    if activation_kind == "ui_action":
+        return "dashboard"
+    if activation_kind in {"model_list", "session_model_selection"}:
+        return "dialog"
+    if command.get("group_id") == "registered_adapters":
+        return "manual command"
+    if command.get("mutates_when_run"):
+        return "chat/manual command"
+    return "command preview"
+
+
+def _functionality_status(command: dict) -> str:
+    activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
+    if activation_kind == "ui_action":
+        return "ui"
+    if activation_kind == "model_list":
+        return "read"
+    if activation_kind == "session_model_selection":
+        return "state"
+    if command.get("group_id") == "registered_adapters":
+        return "dispatch"
+    if command.get("mutates_when_run"):
+        return "action"
+    return "preview"
+
+
+def _functionality_default_evidence(command: dict) -> str:
+    if command.get("mutates_when_run"):
+        return "explicit command output"
+    return "none"
+
+
+def _functionality_does_not(command: dict) -> str:
+    activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
+    if activation_kind == "ui_action":
+        return "start process, mutate files, grant permission"
+    if activation_kind == "model_list":
+        return "call provider, execute model, mutate state"
+    if activation_kind == "session_model_selection":
+        return "call provider, execute model, hidden fallback"
+    if command.get("group_id") == "registered_adapters":
+        return "dispatch unknown adapter or unsafe metadata"
+    return "execute from this dialog"
+
+
+def _functionality_next(command: dict, invoke: str) -> str:
+    activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
+    if activation_kind == "session_model_selection":
+        return "/model <number|search|provider/model>"
+    if activation_kind == "model_list":
+        return "/models"
+    if activation_kind == "ui_action":
+        return invoke
+    return str(command.get("command") or command.get("slash") or invoke)
+
+
+def _dialog_row_text(title: str, invoke: str, status: str, *, width: int = 72) -> str:
+    left = title[:38].ljust(40)
+    middle = invoke[:20].rjust(20)
+    right = status[:10].rjust(10)
+    text = f"{left}{middle} {right}"
+    return text[:width].ljust(width)
+
+
+def _unique_model_catalog_entries(models: list[dict]) -> list[dict]:
+    unique: list[dict] = []
+    seen: set[str] = set()
+    for model in models:
+        raw_ref = str(model.get("raw_model_ref") or "").strip()
+        if not raw_ref or raw_ref in seen:
+            continue
+        seen.add(raw_ref)
+        unique.append(model)
+    return unique
 
 
 def _terminal_tab_pane_rows(dashboard: dict) -> list[str]:
@@ -1596,7 +2195,7 @@ def _right_panel_recent_rows(dashboard: dict) -> list[str]:
     rows = []
     if dashboard.get("recent_sessions"):
         session = dashboard["recent_sessions"][0]
-        rows.append(f"Session: {session['status']} | {session.get('title') or session.get('intent') or session['id']}")
+        rows.append(f"Session: {session['status']} | cwd={session.get('cwd') or '.'} | {session.get('title') or session.get('intent') or session['id']}")
     if dashboard.get("tasks"):
         task = dashboard["tasks"][0]
         rows.append(f"Task: {task['status']} | {task['title']}")
@@ -1946,6 +2545,48 @@ def build_slash_commands(palette: dict | None = None, custom_commands: list[dict
                 "custom_command": False,
             }
         )
+    commands.extend(
+        [
+            {
+                "name": "models",
+                "slash": "/models",
+                "entry_id": "model_selection.list",
+                "group_id": "model_selection",
+                "title": "List selectable models",
+                "description": "Show configured model refs with selection numbers.",
+                "command": "/models",
+                "mutates_when_run": False,
+                "safety_note": "Read-only model catalog projection; no provider call.",
+                "activation": {
+                    "kind": "model_list",
+                    "supported": True,
+                    "process_started": False,
+                    "filesystem_modified": False,
+                    "permission_granting": False,
+                },
+                "custom_command": False,
+            },
+            {
+                "name": "model",
+                "slash": "/model",
+                "entry_id": "model_selection.select",
+                "group_id": "model_selection",
+                "title": "Select session model",
+                "description": "Select the active session model by number, search, or provider/model ref.",
+                "command": "/model <number|search|provider/model>",
+                "mutates_when_run": True,
+                "safety_note": "Persists active session model metadata and validation evidence only; no provider call or fallback.",
+                "activation": {
+                    "kind": "session_model_selection",
+                    "supported": True,
+                    "process_started": False,
+                    "filesystem_modified": False,
+                    "permission_granting": False,
+                },
+                "custom_command": False,
+            },
+        ]
+    )
     for command in custom_commands or []:
         commands.append(
             {
@@ -2652,13 +3293,14 @@ def _render_composer_status(dashboard: dict, selected_agent_id: str | None = Non
     active_model = model_catalog.get("active_model") or {}
     composer_context = active_session.get("composer_context") or {}
     session_id = active_session.get("id") or "new session"
+    cwd = (active_session.get("cwd") or {}).get("cwd") if isinstance(active_session.get("cwd"), dict) else active_session.get("cwd")
     agent_id = selected_agent_id or active_session.get("agent_id") or "default"
     model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref") or "default"
     attachment_count = composer_context.get("attachment_count", 0)
     context_tokens = composer_context.get("total_estimated_tokens", 0)
     return (
-        f"Composer: multiline | Agent selector: palette select build/plan | Submit: ctrl+enter | Continue: harness \"...\" --continue | "
-        f"Session: {session_id} | Agent: {agent_id} | Model: {model_ref} | Attachments: {attachment_count} | Context est: {context_tokens} tokens"
+        f"Models: /models or ctrl+x m | Select: /model <number|name> | Current model: {model_ref} | Session: {session_id} | cwd={cwd or '.'} | Agent: {agent_id} | "
+        f"Submit: enter | New line: shift+enter | Attachments: {attachment_count} | Context est: {context_tokens} tokens"
     )
 
 
@@ -2675,7 +3317,7 @@ def _render_session_rail(dashboard: dict) -> str:
         title = str(session.get("title") or session.get("id") or "untitled")
         status = str(session.get("status") or "unknown")
         lines.append(f"{marker} {title[:22]}")
-        lines.append(f"  {session.get('id')} {status}")
+        lines.append(f"  {session.get('id')} {status} cwd={session.get('cwd') or '.'}")
     lines.extend(["", 'Continue: harness "..." --continue'])
     return "\n".join(lines)
 
@@ -2687,19 +3329,20 @@ def create_read_only_tui_app(project_root: Path):
 def create_harness_app(project_root: Path, *, codex_like: bool = False):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Horizontal, Vertical, VerticalScroll
+    from textual.containers import Container, Horizontal, VerticalScroll
     from textual.css.query import NoMatches
+    from textual.theme import Theme
     from textual.widgets import Footer, Header, Static, TextArea
     from harness.chat import ChatSessionState, handle_chat_input
 
     dashboard = build_tui_dashboard(project_root)
     panes = build_tui_panes(dashboard)
-    palette = build_command_palette()
-    slash_commands = build_slash_commands(palette)
+    initial_palette = build_command_palette(model_catalog=dashboard.get("model_catalog") or {})
+    slash_commands = build_slash_commands(initial_palette)
     initial_view = build_right_panel_model(
         dashboard,
         {
-            "palette": palette,
+            "palette": initial_palette,
             "active_section_index": 0,
             "collapsed_section_ids": set(),
             "active_orchestrator": "coding_orchestrator",
@@ -2709,6 +3352,28 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         "dashboard",
     )
     initial_messages = [build_chat_welcome_message(project_root)]
+
+    harness_light_theme = Theme(
+        name="harness-light",
+        primary="#0b5cad",
+        secondary="#6a4fb3",
+        accent="#d97706",
+        foreground="#111827",
+        background="#fffdf7",
+        surface="#ffffff",
+        panel="#f2f6ff",
+        warning="#b45309",
+        error="#b91c1c",
+        success="#047857",
+        dark=False,
+        luminosity_spread=0.22,
+        text_alpha=1.0,
+        variables={
+            "block-cursor-foreground": "#ffffff",
+            "block-cursor-background": "#0b5cad",
+            "input-selection-background": "#bfdbfe",
+        },
+    )
 
     class HarnessPromptInput(TextArea):
         def __init__(self, *, placeholder: str, id: str) -> None:
@@ -2724,10 +3389,33 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self.load_text(text)
 
         def on_key(self, event) -> None:
-            if event.key in {"ctrl+enter", "ctrl+j"}:
+            if event.key == "ctrl+x":
+                event.prevent_default()
+                event.stop()
+                self.app.action_leader_key()
+            elif self.app.dialog_visible and event.key in {"down", "up"}:
+                event.prevent_default()
+                event.stop()
+                self.app.action_move_dialog_selection(1 if event.key == "down" else -1)
+            elif self.app.dialog_visible and event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.app.action_activate_dialog_selection()
+            elif self.app.leader_key_active:
+                if self.app.is_leader_shortcut(event.key, event.character):
+                    event.prevent_default()
+                    event.stop()
+                    self.app.action_handle_leader_key(event.key, event.character)
+                else:
+                    self.app.action_cancel_leader_key()
+            elif event.key in {"ctrl+enter", "ctrl+j"}:
                 event.prevent_default()
                 event.stop()
                 self.app.action_submit_prompt()
+            elif event.key == "shift+enter":
+                event.prevent_default()
+                event.stop()
+                self.insert("\n")
             elif event.key == "enter" and self.app.should_insert_slash_suggestion:
                 event.prevent_default()
                 event.stop()
@@ -2741,6 +3429,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 event.prevent_default()
                 event.stop()
                 self.app.action_activate_selected_palette_entry()
+            elif event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.app.action_submit_prompt()
             elif event.key in {"ctrl+up", "ctrl+down"}:
                 event.prevent_default()
                 event.stop()
@@ -2764,31 +3456,38 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
     class HarnessUnifiedApp(App):
         ENABLE_COMMAND_PALETTE = False
-        theme = "textual-light"
+        theme = "harness-light"
         CSS = """
+        Screen {
+            layers: base overlay;
+        }
+
         #layout {
             height: 1fr;
         }
 
         #chat {
             width: 2fr;
-            border: round $surface;
+            border: round $primary;
             margin: 1 0 1 1;
             padding: 1;
+            background: $surface;
         }
 
         #session-rail {
             width: 32;
-            border: round $surface;
+            border: round $secondary;
             margin: 1 0 1 1;
             padding: 1;
+            background: $panel;
         }
 
         #side {
             width: 1fr;
-            border: round $surface;
+            border: round $secondary;
             margin: 1 1 1 0;
             padding: 1;
+            background: $panel;
         }
 
         #prompt {
@@ -2799,16 +3498,39 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         #composer-status {
             margin: 0 1;
             padding: 0 1;
-            border: round $surface;
+            border: round $primary;
+            background: $surface;
         }
 
         #slash-status {
             margin: 0 1;
             padding: 0 1;
-            border: round $surface;
+            border: round $accent;
+            background: $surface;
         }
 
         #slash-status.hidden {
+            display: none;
+        }
+
+        #dialog-overlay {
+            layer: overlay;
+            width: 100%;
+            height: 100%;
+            align: center middle;
+            background: transparent;
+        }
+
+        #dialog-panel {
+            width: 84;
+            height: auto;
+            max-height: 88%;
+            padding: 1 2;
+            border: round $accent;
+            background: $surface;
+        }
+
+        #dialog-overlay.hidden {
             display: none;
         }
 
@@ -2838,11 +3560,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             Binding("escape", "clear_search", "Clear input", priority=True),
             Binding("tab", "section_next", "Next section", priority=True),
             Binding("shift+tab,backtab", "section_previous", "Previous section", priority=True),
+            Binding("ctrl+x", "leader_key", "Leader", priority=True),
             Binding("ctrl+p,f2", "toggle_palette_focus", "Palette focus", priority=True),
         ]
 
         def __init__(self) -> None:
             super().__init__()
+            self.register_theme(harness_light_theme)
+            self.theme = "harness-light"
             self._messages = [dict(message) for message in initial_messages]
             self._chat_state = ChatSessionState(codex_like_mode=codex_like)
             self._latest_response: dict = {}
@@ -2855,7 +3580,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._request_started_at: float | None = None
             self._prompt_history: list[str] = []
             self._prompt_history_index: int | None = None
+            self._leader_key_active = False
+            self._dialog_visible = False
+            self._dialog_kind = ""
+            self._dialog_query = ""
+            self._dialog_selected_index = 0
             self._selected_agent_id = "plan"
+            self._selected_theme_id = "light"
             self._dashboard_cache: dict | None = dict(dashboard)
             self._dashboard_cache_at = time.monotonic()
             self._refresh_timer = None
@@ -2879,6 +3610,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         def palette_focus_active(self) -> bool:
             return self._focus_mode == "palette"
 
+        @property
+        def leader_key_active(self) -> bool:
+            return self._leader_key_active
+
+        @property
+        def dialog_visible(self) -> bool:
+            return self._dialog_visible
+
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
             with Horizontal(id="layout"):
@@ -2890,12 +3629,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     yield Static(render_right_panel_status(initial_view), id="search-status")
                     yield Static(_render_navigation_hints(initial_view), id="palette-status")
                     yield Static("", id="pane-container")
+            with Container(id="dialog-overlay", classes="hidden"):
+                yield Static("", id="dialog-panel")
             yield Static("", id="slash-status", classes="hidden")
             yield Static(_render_composer_status(dashboard, self._selected_agent_id), id="composer-status")
             yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
             yield Footer()
 
         def on_mount(self) -> None:
+            self._apply_theme_selection(self._selected_theme_id)
             self.query_one("#prompt", TextArea).focus()
             self._render_chat()
             self._render_current_view()
@@ -2907,6 +3649,28 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 timer.stop()
 
         def on_key(self, event) -> None:
+            if event.key == "ctrl+x":
+                event.prevent_default()
+                event.stop()
+                self.action_leader_key()
+                return
+            if self._dialog_visible and event.key in {"down", "up"}:
+                event.prevent_default()
+                event.stop()
+                self.action_move_dialog_selection(1 if event.key == "down" else -1)
+                return
+            if self._dialog_visible and event.key == "enter":
+                event.prevent_default()
+                event.stop()
+                self.action_activate_dialog_selection()
+                return
+            if self._leader_key_active:
+                if self.is_leader_shortcut(event.key, event.character):
+                    event.prevent_default()
+                    event.stop()
+                    self.action_handle_leader_key(event.key, event.character)
+                    return
+                self.action_cancel_leader_key()
             if isinstance(self.focused, TextArea):
                 return
             if event.character == "c":
@@ -2918,9 +3682,69 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 event.stop()
                 self.action_expand_all_sections()
 
+        def action_leader_key(self) -> None:
+            self._leader_key_active = True
+            self._dialog_query = ""
+            self._dialog_selected_index = 0
+            self._show_functionality_dialog()
+            self._render_palette_activation_status("Leader: m Models.", ok=True)
+
+        def is_leader_shortcut(self, key: str, character: str | None = None) -> bool:
+            pressed = (character or key or "").casefold()
+            return pressed in {"m", "t"}
+
+        def action_cancel_leader_key(self) -> None:
+            self._leader_key_active = False
+
+        def action_handle_leader_key(self, key: str, character: str | None = None) -> None:
+            pressed = (character or key or "").casefold()
+            self._leader_key_active = False
+            if pressed == "m":
+                self._show_models_list(source="leader", slash="ctrl+x m")
+                return
+            if pressed == "t":
+                self._show_theme_dialog()
+                return
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": False,
+                "entry_id": f"leader.{pressed or 'unknown'}",
+                "activation_kind": "leader_key",
+                "ui_action_applied": False,
+                "source": "leader",
+                "slash": "ctrl+x",
+                "slash_consumed": True,
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "evidence_status": "leader_key_unknown",
+                "policy_boundary": _safe_palette_policy_boundary(),
+                "blocked_reasons": ["leader_key_unknown"],
+                **_palette_no_side_effect_flags(),
+            }
+            self._hide_dialog()
+            self._render_palette_activation_status(f"Unknown leader key: {pressed or key}.", ok=False)
+            self._render_current_view()
+
         def on_text_area_changed(self, event: TextArea.Changed) -> None:
             if event.text_area.id == "prompt":
                 self._slash_suggestion_index = 0
+                if self._dialog_kind == "models":
+                    model_query = event.text_area.text.strip()
+                    if model_query == "/model" or model_query.startswith("/model "):
+                        model_query = model_query.removeprefix("/model").strip()
+                    elif model_query == "/models" or model_query.startswith("/models "):
+                        model_query = ""
+                    if model_query != self._dialog_query:
+                        self._dialog_selected_index = 0
+                    self._dialog_query = model_query
+                    self._show_model_dialog(query=model_query, selected_index=self._dialog_selected_index)
+                elif self._dialog_kind == "commands":
+                    command_query = event.text_area.text.strip()
+                    if command_query != self._dialog_query:
+                        self._dialog_selected_index = 0
+                    self._dialog_query = command_query
+                    self._show_functionality_dialog(query=command_query, selected_index=self._dialog_selected_index)
                 self._render_current_view()
                 self._render_slash_suggestions(event.text_area.text)
 
@@ -2928,6 +3752,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             prompt = self.query_one("#prompt", TextArea)
             if self._focus_mode == "palette":
                 self.action_activate_selected_palette_entry()
+                return
+            if self._activate_models_slash_command(prompt.value):
+                return
+            if self._activate_model_slash_command(prompt.value):
+                return
+            if prompt.value.strip() == "/theme":
+                prompt.value = ""
+                self._show_theme_dialog()
+                self._render_palette_activation_status("Select a theme with arrows, then enter.", ok=True)
                 return
             if self._activate_safe_slash_command(prompt.value):
                 return
@@ -3031,6 +3864,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self.exit()
 
         def action_clear_search(self) -> None:
+            if self._dialog_visible or self._leader_key_active:
+                self._leader_key_active = False
+                self._hide_dialog()
+                return
             prompt = self.query_one("#prompt", TextArea)
             if prompt.value:
                 prompt.value = ""
@@ -3053,6 +3890,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def action_activate_selected_palette_entry(self) -> None:
             prompt = self.query_one("#prompt", TextArea)
+            palette = self._palette_snapshot()
             filtered = filter_command_palette(palette, prompt.value)
             entry = filtered["entries"][0] if filtered["entries"] else None
             if entry is None:
@@ -3064,6 +3902,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                             "focus_mode": self._focus_mode,
                             "active_section_index": self._section_cursor_index,
                             "collapsed_section_ids": self._collapsed_section_ids,
+                            "selected_theme": self._selected_theme_id,
                         },
                     ),
                     "source": "palette_enter",
@@ -3074,6 +3913,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("No matching palette action.", ok=False)
                 self._render_current_view()
                 return
+            if entry.get("id") == "ui_controls.theme_cycle":
+                prompt.value = ""
+                self._show_theme_dialog()
+                self._render_palette_activation_status("Select a theme with arrows, then enter.", ok=True)
+                return
             activation = activate_command_palette_entry(
                 palette,
                 str(entry["id"]),
@@ -3081,6 +3925,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "focus_mode": self._focus_mode,
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
+                    "selected_theme": self._selected_theme_id,
                 },
             )
             self._latest_palette_activation = {
@@ -3092,13 +3937,37 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             }
             if activation.get("ok"):
                 state = activation.get("view_state") or {}
-                self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
-                self._section_cursor_index = int(state.get("active_section_index") or 0)
-                self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
-                self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
-                prompt.value = str(state.get("query", ""))
-                self._record_palette_activation_event(activation, source="palette")
-                self._render_palette_activation_status(f"Activated {entry['id']}.", ok=True)
+                if activation.get("activation_kind") == "session_model_selection":
+                    activation = self._persist_model_selection(activation, source="palette")
+                    self._latest_palette_activation = {
+                        **activation,
+                        "source": "palette_enter",
+                        "enter_consumed": True,
+                        "chat_submitted": False,
+                        "slash_suggestion_inserted": False,
+                    }
+                    if activation.get("ok"):
+                        self._focus_mode = "dashboard"
+                        prompt.value = ""
+                        self._render_palette_activation_status(
+                            f"Selected model {activation.get('raw_model_ref')}.",
+                            ok=True,
+                        )
+                    else:
+                        self._focus_mode = "palette"
+                        self._render_palette_activation_status(
+                            f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
+                            ok=False,
+                        )
+                else:
+                    self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
+                    self._section_cursor_index = int(state.get("active_section_index") or 0)
+                    self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
+                    self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
+                    self._apply_theme_selection(str(state.get("selected_theme") or self._selected_theme_id))
+                    prompt.value = str(state.get("query", ""))
+                    self._record_palette_activation_event(activation, source="palette")
+                    self._render_palette_activation_status(f"Activated {entry['id']}.", ok=True)
             else:
                 self._focus_mode = "palette"
                 self._render_palette_activation_status(
@@ -3106,6 +3975,519 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     ok=False,
                 )
             self._render_current_view()
+
+        def _activate_model_slash_command(self, value: str) -> bool:
+            request = value.strip()
+            if not (request == "/model" or request.startswith("/model ")):
+                return False
+            prompt = self.query_one("#prompt", TextArea)
+            query = request.removeprefix("/model").strip()
+            if not query:
+                self._focus_mode = "dashboard"
+                self._section_cursor_index = _section_index("project_overview")
+                prompt.value = "/model "
+                try:
+                    prompt.cursor_position = len(prompt.value)
+                except AttributeError:
+                    pass
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_palette_activation/v1",
+                    "ok": True,
+                    "entry_id": "slash.model",
+                    "activation_kind": "model_picker_help",
+                    "ui_action_applied": True,
+                    "source": "slash",
+                    "slash": "/model",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                    "evidence_status": "ui_focus_in_memory",
+                    "policy_boundary": _safe_palette_policy_boundary(),
+                    "blocked_reasons": [],
+                    **_palette_no_side_effect_flags(),
+                }
+                self._show_model_dialog()
+                self._render_palette_activation_status("Type /model <provider/model> or /model <search>.", ok=True)
+                self._render_current_view()
+                return True
+
+            palette = self._palette_snapshot()
+            model_entries = [entry for entry in palette.get("entries", []) if entry.get("group_id") == "model_selection"]
+            matches: list[dict]
+            if query.isdigit():
+                index = int(query)
+                matches = [model_entries[index - 1]] if 1 <= index <= len(model_entries) else []
+            else:
+                lowered = query.casefold()
+                matches = [
+                    entry
+                    for entry in model_entries
+                    if lowered in str(entry.get("model_ref") or "").casefold()
+                    or lowered in str(entry.get("title") or "").casefold()
+                    or lowered in str(entry.get("description") or "").casefold()
+                    or lowered in str(entry.get("provider_id") or "").casefold()
+                    or lowered in str(entry.get("model_id") or "").casefold()
+                ]
+            exact = [
+                entry
+                for entry in matches
+                if query == str(entry.get("model_ref") or "")
+                or query == str(entry.get("model_id") or "")
+            ]
+            if len(exact) == 1:
+                matches = exact
+            if len(matches) != 1:
+                prompt.value = query
+                self._focus_mode = "palette"
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_palette_activation/v1",
+                    "ok": False,
+                    "entry_id": "slash.model",
+                    "activation_kind": "session_model_selection",
+                    "ui_action_applied": False,
+                    "source": "slash",
+                    "slash": "/model",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                    "evidence_status": "session_model_selection_needs_unique_match",
+                    "policy_boundary": _model_selection_policy_boundary(),
+                    "blocked_reasons": ["model_match_missing" if not matches else "model_match_ambiguous"],
+                    "match_count": len(matches),
+                    **_palette_no_side_effect_flags(),
+                }
+                if matches:
+                    visible = ", ".join(str(entry.get("model_ref")) for entry in matches[:4])
+                    self._render_palette_activation_status(f"Model query matched {len(matches)} models: {visible}.", ok=False)
+                else:
+                    self._render_palette_activation_status(f"No model matched {query}.", ok=False)
+                self._show_model_dialog(query=query)
+                self._render_current_view()
+                return True
+
+            entry = matches[0]
+            activation = activate_command_palette_entry(
+                palette,
+                str(entry["id"]),
+                {
+                    "focus_mode": self._focus_mode,
+                    "active_section_index": self._section_cursor_index,
+                    "collapsed_section_ids": self._collapsed_section_ids,
+                },
+            )
+            activation = self._persist_model_selection(activation, source="slash")
+            self._latest_palette_activation = {
+                **activation,
+                "source": "slash",
+                "slash": "/model",
+                "slash_consumed": True,
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+            }
+            if activation.get("ok"):
+                self._focus_mode = "dashboard"
+                prompt.value = ""
+                self._hide_dialog()
+                self._render_palette_activation_status(f"Selected model {activation.get('raw_model_ref')}.", ok=True)
+            else:
+                self._focus_mode = "palette"
+                prompt.value = query
+                self._show_model_dialog(query=query)
+                self._render_palette_activation_status(
+                    f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
+                    ok=False,
+                )
+            self._render_current_view()
+            return True
+
+        def _activate_models_slash_command(self, value: str) -> bool:
+            request = value.strip()
+            if request not in {"/models", "/models list"}:
+                return False
+            prompt = self.query_one("#prompt", TextArea)
+            self._show_models_list(source="slash", slash="/models")
+            prompt.value = ""
+            return True
+
+        def _show_models_list(self, *, source: str, slash: str) -> None:
+            dashboard = self._dashboard_snapshot(force=True)
+            models = _unique_model_catalog_entries((dashboard.get("model_catalog") or {}).get("models") or [])
+            active = ((dashboard.get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+            lines = ["Models:"]
+            if not models:
+                lines.append("none")
+            for index, model in enumerate(models[:12], start=1):
+                raw_ref = str(model.get("raw_model_ref") or "")
+                marker = "*" if raw_ref == active else " "
+                lines.append(f"{index}. {marker} {raw_ref}")
+            lines.extend(["Select: /model <number>", "Search: /model <name>", "Exact: /model <provider/model>"])
+            self._messages.append({"role": "assistant", "title": "Model Selection", "lines": lines})
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": True,
+                "entry_id": "slash.models",
+                "activation_kind": "model_list",
+                "ui_action_applied": True,
+                "source": source,
+                "slash": slash,
+                "slash_consumed": True,
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "evidence_status": "model_list_rendered",
+                "policy_boundary": _safe_palette_policy_boundary(),
+                "blocked_reasons": [],
+                "model_count": len(models),
+                **_palette_no_side_effect_flags(),
+            }
+            self._show_model_dialog()
+            self._render_chat()
+            self._render_palette_activation_status("Listed models. Select with /model <number>.", ok=True)
+            self._render_current_view()
+
+        def _show_model_dialog(self, *, query: str = "", selected_index: int = 0) -> None:
+            dashboard = self._dashboard_snapshot()
+            self._dialog_query = query
+            self._dialog_selected_index = selected_index
+            self._show_dialog(
+                render_model_selection_dialog(dashboard, query=query, selected_index=selected_index),
+                kind="models",
+            )
+
+        def _show_functionality_dialog(self, *, query: str = "", selected_index: int = 0) -> None:
+            self._dialog_query = query
+            self._dialog_selected_index = selected_index
+            self._show_dialog(
+                render_command_menu_dialog(build_functionality_table(slash_commands), query=query, selected_index=selected_index),
+                kind="commands",
+            )
+
+        def action_move_dialog_selection(self, step: int) -> None:
+            if not self._dialog_visible:
+                return
+            row_count = self._dialog_row_count()
+            if row_count <= 0:
+                self._dialog_selected_index = 0
+            else:
+                self._dialog_selected_index = (self._dialog_selected_index + step) % row_count
+            if self._dialog_kind == "models":
+                self._show_model_dialog(query=self._dialog_query, selected_index=self._dialog_selected_index)
+            elif self._dialog_kind == "commands":
+                self._show_functionality_dialog(query=self._dialog_query, selected_index=self._dialog_selected_index)
+            elif self._dialog_kind == "themes":
+                self._show_theme_dialog(selected_index=self._dialog_selected_index)
+
+        def action_activate_dialog_selection(self) -> None:
+            if self._dialog_kind == "models":
+                self._activate_selected_model_dialog_entry()
+            elif self._dialog_kind == "commands":
+                self._activate_selected_functionality_row()
+            elif self._dialog_kind == "themes":
+                self._activate_selected_theme_dialog_entry()
+
+        def _dialog_row_count(self) -> int:
+            if self._dialog_kind == "models":
+                return len(_model_selection_dialog_entries(self._dashboard_snapshot(), query=self._dialog_query))
+            if self._dialog_kind == "commands":
+                table = build_functionality_table(slash_commands)
+                return len(filter_functionality_table(table, self._dialog_query)["rows"])
+            if self._dialog_kind == "themes":
+                return len(THEME_DIALOG_ENTRIES)
+            return 0
+
+        def _activate_selected_model_dialog_entry(self) -> None:
+            dashboard = self._dashboard_snapshot()
+            models = _model_selection_dialog_entries(dashboard, query=self._dialog_query)
+            if not models:
+                self._render_palette_activation_status("No model selected.", ok=False)
+                return
+            selected_index = min(max(self._dialog_selected_index, 0), len(models) - 1)
+            raw_ref = str(models[selected_index].get("raw_model_ref") or "")
+            if not raw_ref:
+                self._render_palette_activation_status("Selected model has no model ref.", ok=False)
+                return
+            prompt = self.query_one("#prompt", TextArea)
+            prompt.value = f"/model {raw_ref}"
+            self._activate_model_slash_command(prompt.value)
+
+        def _activate_selected_functionality_row(self) -> None:
+            table = build_functionality_table(slash_commands)
+            rows = filter_functionality_table(table, self._dialog_query)["rows"]
+            if not rows:
+                self._render_palette_activation_status("No command selected.", ok=False)
+                return
+            selected_index = min(max(self._dialog_selected_index, 0), len(rows) - 1)
+            self._activate_functionality_row(rows[selected_index])
+
+        def _activate_functionality_row(self, row: dict) -> None:
+            slash = str(row.get("slash") or "")
+            prompt = self.query_one("#prompt", TextArea)
+            self._leader_key_active = False
+            if slash == "/model":
+                prompt.value = "/model "
+                try:
+                    prompt.cursor_position = len(prompt.value)
+                except AttributeError:
+                    pass
+                self._show_model_dialog()
+                self._render_palette_activation_status("Type a model search or use arrows, then enter.", ok=True)
+                return
+            if slash == "/models":
+                prompt.value = ""
+                self._show_models_list(source="command_table", slash="/models")
+                return
+            if slash == "/theme":
+                prompt.value = ""
+                self._show_theme_dialog()
+                self._render_palette_activation_status("Select a theme with arrows, then enter.", ok=True)
+                return
+            if self._activate_safe_slash_command(slash):
+                self._hide_dialog()
+                return
+            prompt.value = f"{slash} "
+            try:
+                prompt.cursor_position = len(prompt.value)
+            except AttributeError:
+                pass
+            self._hide_dialog()
+            self._render_palette_activation_status(f"Command ready: {slash}. Fill arguments, then submit.", ok=True)
+
+        def _show_theme_dialog(self, *, selected_index: int | None = None) -> None:
+            if selected_index is None:
+                selected_index = next(
+                    (index for index, entry in enumerate(THEME_DIALOG_ENTRIES) if entry["id"] == self._selected_theme_id),
+                    0,
+                )
+            self._dialog_query = ""
+            self._dialog_selected_index = selected_index
+            self._show_dialog(
+                render_theme_selection_dialog(
+                    selected_theme=self._selected_theme_id,
+                    selected_index=selected_index,
+                ),
+                kind="themes",
+            )
+
+        def _activate_selected_theme_dialog_entry(self) -> None:
+            index = min(max(self._dialog_selected_index, 0), len(THEME_DIALOG_ENTRIES) - 1)
+            theme_id = str(THEME_DIALOG_ENTRIES[index]["id"])
+            self._apply_theme_selection(theme_id)
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": True,
+                "entry_id": f"ui_controls.theme_{theme_id}",
+                "activation_kind": "ui_action",
+                "action": {"type": "set_theme", "theme_id": theme_id},
+                "ui_action_applied": True,
+                "source": "theme_dialog",
+                "slash_consumed": False,
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "evidence_status": "ui_theme_selected_in_memory",
+                "policy_boundary": _safe_palette_policy_boundary(),
+                "blocked_reasons": [],
+                "local_state_changes": {
+                    "changed_fields": ["selected_theme"],
+                    "creates_message": False,
+                    "starts_request": False,
+                    "executes_command": False,
+                    "mutates_filesystem": False,
+                    "grants_permission": False,
+                },
+                **_palette_no_side_effect_flags(),
+            }
+            self._hide_dialog()
+            self._render_palette_activation_status(f"Selected theme {theme_id}.", ok=True)
+            self._render_current_view()
+
+        def _show_dialog(self, content: str, *, kind: str) -> None:
+            try:
+                overlay = self.query_one("#dialog-overlay", Container)
+                panel = self.query_one("#dialog-panel", Static)
+            except NoMatches:
+                return
+            panel.update(content)
+            overlay.remove_class("hidden")
+            self._dialog_visible = True
+            self._dialog_kind = kind
+
+        def _hide_dialog(self) -> None:
+            try:
+                overlay = self.query_one("#dialog-overlay", Container)
+                panel = self.query_one("#dialog-panel", Static)
+            except NoMatches:
+                self._dialog_visible = False
+                self._dialog_kind = ""
+                return
+            panel.update("")
+            overlay.add_class("hidden")
+            self._dialog_visible = False
+            self._dialog_kind = ""
+
+        def _persist_model_selection(self, activation: dict, *, source: str) -> dict:
+            action = activation.get("action") or {}
+            raw_model_ref = str(action.get("raw_model_ref") or "").strip()
+            no_side_effects = _palette_no_side_effect_flags()
+            if not raw_model_ref:
+                return {
+                    **activation,
+                    "ok": False,
+                    "blocked_reasons": ["model_ref_missing"],
+                    "error": "Model ref missing.",
+                    **no_side_effects,
+                    "harness_state_modified": False,
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "hidden_provider_fallback": False,
+                    "hidden_model_fallback": False,
+                    "no_hidden_fallback": True,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+            try:
+                dashboard = self._dashboard_snapshot(force=True)
+                active_session = dashboard.get("active_session") or {}
+                session_id = active_session.get("id")
+                if not session_id:
+                    return {
+                        **activation,
+                        "ok": False,
+                        "raw_model_ref": raw_model_ref,
+                        "blocked_reasons": ["session_missing"],
+                        "error": "No active session exists for model selection.",
+                        **no_side_effects,
+                        "harness_state_modified": False,
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "hidden_provider_fallback": False,
+                        "hidden_model_fallback": False,
+                        "no_hidden_fallback": True,
+                        "permission_granting": False,
+                        "authority_granting": False,
+                    }
+                cfg = load_config(project_root)
+                validation = validate_model_selection(cfg, raw_model_ref)
+                parsed = parse_model_ref(raw_model_ref)
+                store = SQLiteStore(project_root)
+                validation_payload = validation.model_dump(mode="json")
+                if not validation.executable:
+                    store.append_store_event(
+                        "session",
+                        str(session_id),
+                        "session.model_validation",
+                        {
+                            **validation_payload,
+                            "source": "tui_model_picker",
+                            "summary": "Model selection blocked before execution.",
+                            "provider_execution_started": False,
+                            "model_execution_started": False,
+                            "network_accessed": False,
+                            "hidden_provider_fallback": False,
+                            "hidden_model_fallback": False,
+                            "no_hidden_fallback": True,
+                            "permission_granting": False,
+                            "authority_granting": False,
+                        },
+                        session_id=str(session_id),
+                        redaction_state="not_required",
+                    )
+                    self._dashboard_snapshot(force=True)
+                    return {
+                        **activation,
+                        "ok": False,
+                        "raw_model_ref": raw_model_ref,
+                        "session_id": str(session_id),
+                        "session_model_selected": False,
+                        "model_validation": validation_payload,
+                        "blocked_reasons": validation.blocked_reasons,
+                        "evidence_status": "session_model_selection_blocked",
+                        "harness_state_modified": True,
+                        "session_event_persisted": True,
+                        "source": source,
+                        **no_side_effects,
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "hidden_provider_fallback": False,
+                        "hidden_model_fallback": False,
+                        "no_hidden_fallback": True,
+                        "permission_granting": False,
+                        "authority_granting": False,
+                    }
+                session = store.update_session_model(
+                    str(session_id),
+                    raw_model_ref=raw_model_ref,
+                    provider_id=parsed["provider_id"],
+                    model_id=parsed["model_id"],
+                    model_variant=parsed["variant"],
+                )
+                store.append_store_event(
+                    "session",
+                    session.id,
+                    "session.model_validation",
+                    {
+                        **validation_payload,
+                        "source": "tui_model_picker",
+                        "summary": "Model selection validated." if validation.executable else "Model selection blocked before execution.",
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "hidden_provider_fallback": False,
+                        "hidden_model_fallback": False,
+                        "no_hidden_fallback": True,
+                        "permission_granting": False,
+                        "authority_granting": False,
+                    },
+                    session_id=session.id,
+                    redaction_state="not_required",
+                )
+                self._dashboard_snapshot(force=True)
+                return {
+                    **activation,
+                    "ok": validation.executable,
+                    "raw_model_ref": raw_model_ref,
+                    "session_id": session.id,
+                    "session_model_selected": True,
+                    "model_validation": validation_payload,
+                    "blocked_reasons": validation.blocked_reasons,
+                    "evidence_status": "session_model_selection_persisted",
+                    "harness_state_modified": True,
+                    "session_event_persisted": True,
+                    "source": source,
+                    **no_side_effects,
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "hidden_provider_fallback": False,
+                    "hidden_model_fallback": False,
+                    "no_hidden_fallback": True,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+            except Exception as exc:
+                return {
+                    **activation,
+                    "ok": False,
+                    "raw_model_ref": raw_model_ref,
+                    "blocked_reasons": ["session_model_selection_error"],
+                    "error": str(exc),
+                    **no_side_effects,
+                    "harness_state_modified": False,
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "hidden_provider_fallback": False,
+                    "hidden_model_fallback": False,
+                    "no_hidden_fallback": True,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
 
         def _record_palette_activation_event(self, activation: dict, *, source: str) -> None:
             if not activation.get("ok"):
@@ -3172,12 +4554,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     return False
                 prompt = self.query_one("#prompt", TextArea)
                 result = activate_command_palette_entry(
-                    palette,
+                    self._palette_snapshot(),
                     str(command["entry_id"]),
                     {
                         "focus_mode": self._focus_mode,
                         "active_section_index": self._section_cursor_index,
                         "collapsed_section_ids": self._collapsed_section_ids,
+                        "selected_theme": self._selected_theme_id,
                     },
                 )
                 if not result.get("ok"):
@@ -3196,6 +4579,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._section_cursor_index = int(state.get("active_section_index") or 0)
                 self._collapsed_section_ids = set(normalize_tui_collapsed_sections(state.get("collapsed_section_ids")))
                 self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
+                self._apply_theme_selection(str(state.get("selected_theme") or self._selected_theme_id))
                 prompt.value = str(state.get("query", ""))
                 self._record_palette_activation_event(result, source="slash")
                 self._render_palette_activation_status(f"Activated {command['slash']}.", ok=True)
@@ -3298,7 +4682,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             return build_right_panel_model(
                 refreshed_dashboard,
                 {
-                    "palette": palette,
+                    "palette": self._palette_snapshot(refreshed_dashboard),
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
                     "active_orchestrator": self._chat_state.selected_orchestrator_id or "coding_orchestrator",
@@ -3312,10 +4696,30 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "latest_response": self._latest_response,
                     "latest_palette_activation": self._latest_palette_activation,
                     "selected_agent_id": self._selected_agent_id,
+                    "selected_theme": self._selected_theme_id,
                 },
                 prompt.value,
                 focus_mode=self._focus_mode,
             )
+
+        def _palette_snapshot(self, dashboard_snapshot: dict | None = None) -> dict:
+            snapshot = dashboard_snapshot or self._dashboard_snapshot()
+            return build_command_palette(model_catalog=snapshot.get("model_catalog") or {})
+
+        def _apply_theme_selection(self, theme_id: str) -> None:
+            if theme_id not in {"light", "dark", "system"}:
+                return
+            self._selected_theme_id = theme_id
+            textual_theme = {
+                "light": "harness-light",
+                "dark": "textual-dark",
+                "system": "textual-light",
+            }[theme_id]
+            self.theme = textual_theme
+            # Harness sets the theme after mount from UI actions; Textual's class-level
+            # theme default does not refresh runtime CSS in this nested app without
+            # explicitly applying the watcher.
+            self._watch_theme(textual_theme)
 
         def _render_current_view(self) -> None:
             try:
