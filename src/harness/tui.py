@@ -5,6 +5,15 @@ import time
 from pathlib import Path
 
 from harness.config import load_config
+from harness.left_pane import (
+    build_left_pane_view,
+    left_pane_list_item_labels,
+    left_pane_visible_items,
+    render_left_pane_detail,
+    render_left_pane_footer,
+    render_left_pane_header,
+    selected_left_pane_item,
+)
 from harness.memory.sqlite_store import (
     SESSION_SCHEMA_REPAIR_MESSAGE,
     SQLiteStore,
@@ -13,6 +22,14 @@ from harness.memory.sqlite_store import (
 from harness.model_catalog import parse_model_ref, validate_model_selection
 from harness.operator_context import build_session_pane_projection, build_tui_dashboard
 from harness.procedure_renderer import render_procedure_event
+from harness.right_pane import (
+    COCKPIT_SECTION_IDS,
+    build_right_pane_cockpit_model,
+    render_right_pane_cockpit,
+    render_right_pane_detail,
+    render_right_pane_status,
+    render_right_pane_top_context,
+)
 from rich.markup import escape
 from textual.markup import MarkupError
 
@@ -20,9 +37,10 @@ from textual.markup import MarkupError
 SESSION_PREVIOUS_KEYS = {"alt+up", "option+up", "meta+up", "ctrl+left", "ctrl+pageup"}
 SESSION_NEXT_KEYS = {"alt+down", "option+down", "meta+down", "ctrl+right", "ctrl+pagedown"}
 SESSION_DELETE_KEYS = {"ctrl+d"}
-ENTER_KEYS = {"enter", "numpad_enter", "ctrl+j", "ctrl+m"}
-SHIFT_ENTER_KEYS = {"shift+enter", "shift+numpad_enter"}
+ENTER_KEYS = {"enter", "numpad_enter", "ctrl+m"}
+PROMPT_NEWLINE_KEYS = {"shift+enter", "shift+numpad_enter", "ctrl+j"}
 SESSION_PANE_FILTERS = ("open", "running", "archived", "all")
+COMPOSER_FOOTER_HINTS = "Enter send · Shift+Enter newline · Ctrl+X M models · / commands · ? shortcuts"
 
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
@@ -495,27 +513,25 @@ TUI_NAVIGATION_HINTS = [
 ]
 
 TUI_FOCUS_MODES = frozenset({"dashboard", "palette"})
-RIGHT_PANEL_SECTION_IDS = (
-    "action",
-    "now",
-    "sessions",
-    "progress",
-    "queue",
-    "recent",
-    "adapters",
-    "project",
-    "assistant",
-    "next",
-    "commands",
-)
+RIGHT_PANEL_SECTION_IDS = COCKPIT_SECTION_IDS
 RIGHT_PANEL_SECTION_ALIASES = {
-    "project_overview": "project",
-    "queue_daemon": "queue",
-    "runtime_evidence": "recent",
-    "agents_specs": "adapters",
-    "settings": "project",
+    "action": "active_work",
+    "now": "context",
+    "sessions": "context",
+    "progress": "active_work",
+    "queue": "orchestrations",
+    "recent": "evidence",
+    "adapters": "context",
+    "project": "context",
+    "assistant": "context",
+    "next": "attention",
+    "project_overview": "context",
+    "queue_daemon": "orchestrations",
+    "runtime_evidence": "evidence",
+    "agents_specs": "context",
+    "settings": "context",
     "command_palette": "commands",
-    "safety": "next",
+    "safety": "attention",
 }
 
 SLASH_COMMAND_ALIASES = {
@@ -1268,7 +1284,7 @@ def _section_index(section_id: object) -> int:
 def _right_panel_resolve_section_id(section_id: object) -> str:
     value = str(section_id or "").strip()
     value = RIGHT_PANEL_SECTION_ALIASES.get(value, value)
-    return value if value in RIGHT_PANEL_SECTION_IDS else "action"
+    return value if value in RIGHT_PANEL_SECTION_IDS else "active_work"
 
 
 def _right_panel_section_index(section_id: object) -> int:
@@ -1505,76 +1521,7 @@ def build_right_panel_model(
     query: str,
     focus_mode: str,
 ) -> dict:
-    state = view_state or {}
-    mode = focus_mode if focus_mode in TUI_FOCUS_MODES else "dashboard"
-    normalized_query = query.strip().casefold()
-    collapsed_ids = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids", set())))
-    palette = state.get("palette") or build_command_palette()
-    sections = _right_panel_base_sections(dashboard, state)
-    command_matches = _right_panel_command_rows(palette, query, mode=mode)
-    if mode == "palette" or normalized_query:
-        command_section = {
-            "id": "commands",
-            "title": "Commands",
-            "rows": command_matches or ["No matching commands."],
-        }
-        sections = [*sections, command_section]
-    if normalized_query and mode == "dashboard":
-        sections = _filter_right_panel_sections(sections, normalized_query)
-    for section in sections:
-        section["collapsed"] = section["id"] in collapsed_ids
-        section["match_count"] = len(section.get("rows", []))
-    requested_active_id = state.get("active_section_id")
-    active_section_id = _right_panel_resolve_section_id(requested_active_id) if requested_active_id else None
-    if active_section_id and not any(section["id"] == active_section_id for section in sections):
-        active_section_id = None
-    if not active_section_id:
-        try:
-            active_index = int(state.get("active_section_index", 0) or 0)
-        except (TypeError, ValueError):
-            active_index = 0
-        active_section_id = sections[active_index % len(sections)]["id"] if sections else None
-    active_index = next((index for index, section in enumerate(sections) if section["id"] == active_section_id), 0)
-    empty_state = None
-    if not sections:
-        empty_state = {
-            "title": "No matches",
-            "message": "No matches. Try /help, tasks, runs, adapters.",
-            "query": query.strip(),
-        }
-    live_activity = dashboard.get("live_activity") or {}
-    live_signal = "responding" if state.get("request_in_flight") else live_activity.get("active_signal") or "idle"
-    live_counts = live_activity.get("counts") or {}
-    return {
-        "schema_version": "harness.tui_right_panel/v1",
-        "ok": True,
-        "mode": mode,
-        "query": query.strip(),
-        "sections": sections,
-        "active_section_id": active_section_id,
-        "active_section_index": active_index,
-        "active_signal": live_signal,
-        "collapsed_section_ids": sorted(collapsed_ids),
-        "empty_state": empty_state,
-        "summary": {
-            "initialized": bool(dashboard.get("initialized")),
-            "tasks_total": dashboard["summary"]["tasks_total"],
-            "active_leases": dashboard["summary"]["active_leases"],
-            "recent_runs": dashboard["summary"]["recent_runs"],
-            "registered_adapters": len(dashboard.get("registered_adapters", [])),
-            "active_signal": live_signal,
-            "ready": live_counts.get("ready", 0),
-            "running": live_counts.get("running", 0),
-            "blocked": live_counts.get("blocked", 0),
-            "waiting_approval": live_counts.get("waiting_approval", 0),
-        },
-        "live_activity": live_activity,
-        "search": {
-            "context_matches": sum(section.get("match_count", 0) for section in sections),
-            "command_matches": len(command_matches),
-        },
-        "navigation_hints": [dict(hint) for hint in TUI_NAVIGATION_HINTS],
-    }
+    return build_right_pane_cockpit_model(dashboard, view_state, query, focus_mode)
 
 
 def _right_panel_base_sections(dashboard: dict, state: dict) -> list[dict]:
@@ -2537,25 +2484,7 @@ def _filter_right_panel_sections(sections: list[dict], normalized_query: str) ->
 
 
 def render_right_panel(model: dict) -> str:
-    if model.get("empty_state"):
-        return escape(str(model["empty_state"]["message"]))
-    lines = []
-    active_id = model.get("active_section_id")
-    for section in model["sections"]:
-        marker = ">" if section["id"] == active_id else " "
-        collapsed = section.get("collapsed", False)
-        if section["id"] == active_id:
-            lines.append(f"[bold reverse]{escape(marker + ' ' + str(section['title']))}[/bold reverse]")
-        else:
-            lines.append(f"[bold steel_blue1]{escape(marker + ' ' + str(section['title']))}[/bold steel_blue1]")
-        if collapsed:
-            lines.append("  [dim]- hidden[/dim]")
-            lines.append("")
-            continue
-        for row in section.get("rows", []):
-            lines.append(_render_right_panel_row(str(row)))
-        lines.append("")
-    return "\n".join(lines).strip()
+    return render_right_pane_cockpit(model)
 
 
 def _render_right_panel_row(row: str) -> str:
@@ -2566,49 +2495,11 @@ def _render_right_panel_row(row: str) -> str:
 
 
 def render_right_panel_detail(model: dict, section_id: str | None = None) -> str:
-    if model.get("empty_state"):
-        return escape(str(model["empty_state"]["message"]))
-    active_id = _right_panel_resolve_section_id(section_id or model.get("active_section_id"))
-    section = next((item for item in model.get("sections", []) if item.get("id") == active_id), None)
-    if section is None:
-        section = (model.get("sections") or [{}])[0]
-    title = str(section.get("title") or "Context")
-    lines = [
-        f"[bold deep_sky_blue1]{escape(title)} detail[/bold deep_sky_blue1]",
-        "[dim]Read-only persisted Harness projection. No command, provider, shell, Docker, adapter, filesystem, or permission action is started.[/dim]",
-        "",
-        f"[bold]Signal:[/bold] {escape(str(model.get('active_signal') or 'idle'))}",
-        f"[bold]Mode:[/bold] {escape(str(model.get('mode') or 'dashboard'))}",
-        f"[bold]Query:[/bold] {escape(str(model.get('query') or 'ready'))}",
-        "",
-    ]
-    for row in section.get("rows", []):
-        lines.append(_render_right_panel_row(str(row)))
-    policy = (model.get("live_activity") or {}).get("policy_boundary") or {}
-    if policy:
-        lines.extend(
-            [
-                "",
-                "[bold]Boundary:[/bold] read-only",
-                f"  [dim]-[/dim] process={escape(str(policy.get('process_started', False)))} "
-                f"fs={escape(str(policy.get('filesystem_modified', False)))} "
-                f"shell={escape(str(policy.get('shell_started', False)))} "
-                f"docker={escape(str(policy.get('docker_started', False)))} "
-                f"perm={escape(str(policy.get('permission_granting', False)))}",
-            ]
-        )
-    return "\n".join(lines).strip()
+    return render_right_pane_detail(model, section_id)
 
 
 def render_right_panel_status(model: dict) -> str:
-    mode = model.get("mode", "dashboard")
-    query = model.get("query") or "ready"
-    signal = model.get("active_signal") or (model.get("summary") or {}).get("active_signal") or "idle"
-    summary = model.get("summary") or {}
-    counts = f"{summary.get('ready', 0)} ready / {summary.get('running', 0)} running / {summary.get('blocked', 0)} blocked"
-    if mode == "palette":
-        return f"Context | palette | {model['search']['command_matches']} commands | {_status_label(signal)} | {query}"
-    return f"Context | live | {_status_label(signal)} | {counts} | {query}"
+    return render_right_pane_status(model)
 
 
 def build_codex_mode_model(project_root: Path, run_id: str | None = None) -> dict:
@@ -3592,6 +3483,8 @@ def _render_section_content(section: dict) -> str:
 
 
 def _render_navigation_hints(view: dict) -> str:
+    if view.get("cockpit_schema_version"):
+        return render_right_pane_top_context(view)
     return " | ".join(f"{hint['key']}: {hint['label']}" for hint in view["navigation_hints"])
 
 
@@ -3616,8 +3509,6 @@ def _render_composer_status(
     active_model = model_catalog.get("active_model") or {}
     composer_context = active_session.get("composer_context") or {}
     operator = active_session.get("operator") or {}
-    session_id = active_session.get("id") or "new session"
-    cwd = (active_session.get("cwd") or {}).get("cwd") if isinstance(active_session.get("cwd"), dict) else active_session.get("cwd")
     agent_id = selected_agent_id or active_session.get("agent_id") or "default"
     model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref") or "default"
     attachment_count = composer_context.get("attachment_count", 0)
@@ -3630,11 +3521,9 @@ def _render_composer_status(
     if command and len(str(command)) > 48:
         command = f"{str(command)[:45]}..."
     approval_detail = f" command={command}" if waiting and command else ""
-    return (
-        f"Models: /models or ctrl+x m | Select: /model <number|name> | Current model: {model_ref} | Session: {session_id} | cwd={cwd or '.'} | "
-        f"Operator: {phase}{approval}{approval_detail} | Agent: {agent_id} | "
-        f"Submit: enter | New line: shift+enter | Attachments: {attachment_count} | Context est: {context_tokens} tokens"
-    )
+    cwd = operator.get("cwd") or active_session.get("cwd") or "."
+    cwd_detail = f" cwd={cwd}" if cwd and cwd != "." else ""
+    return f"Model {model_ref} · Agent {agent_id} · Operator: {phase}{approval}{cwd_detail}{approval_detail} · ctx {context_tokens} · attachments {attachment_count}"
 
 
 def _render_session_rail(dashboard: dict, *, selected_index: int = 0) -> str:
@@ -3766,7 +3655,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
     from textual.containers import Container, Horizontal, Vertical, VerticalScroll
     from textual.css.query import NoMatches
     from textual.theme import Theme
-    from textual.widgets import Footer, Header, Label, ListItem, ListView, Static, TextArea
+    from textual.widgets import Header, Label, ListItem, ListView, Static, TextArea
     from harness.chat import ChatSessionState, handle_chat_input
 
     dashboard = build_tui_dashboard(project_root)
@@ -3777,10 +3666,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         dashboard,
         {
             "palette": initial_palette,
-            "active_section_index": 0,
+            "active_section_id": "active_work",
+            "active_section_index": _right_panel_section_index("active_work"),
             "collapsed_section_ids": set(),
             "active_orchestrator": "coding_orchestrator",
             "chat_mode": "live" if codex_like else "normal",
+            "right_pane_mode": "overview",
         },
         "",
         "dashboard",
@@ -3861,7 +3752,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 event.prevent_default()
                 event.stop()
                 self.app.action_submit_prompt()
-            elif event.key in SHIFT_ENTER_KEYS:
+            elif event.key in PROMPT_NEWLINE_KEYS:
                 event.prevent_default()
                 event.stop()
                 self.insert("\n")
@@ -3940,7 +3831,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         }
 
         #session-list > ListItem {
-            height: 1;
+            height: auto;
+            min-height: 3;
             padding: 0 1;
         }
 
@@ -3959,15 +3851,21 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         }
 
         #prompt {
-            margin: 0 1 1 1;
+            margin: 0 1;
             height: 5;
         }
 
         #composer-status {
             margin: 0 1;
-            padding: 0 1;
-            border: round $primary;
+            padding: 0 1 0 1;
             background: $surface;
+        }
+
+        #composer-footer {
+            margin: 0 1 1 1;
+            padding: 0 1;
+            background: $surface;
+            color: $text-muted;
         }
 
         #slash-status {
@@ -4044,15 +3942,22 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._latest_response: dict = {}
             self._latest_palette_activation: dict = {}
             self._focus_mode = "dashboard"
-            self._active_section_id = "action"
+            self._right_pane_mode = "overview"
+            self._show_all_orchestrations = False
+            self._selected_orchestration_id: str | None = None
+            self._selected_graph_node_id: str | None = None
+            self._pinned_orchestration_id: str | None = None
+            self._active_section_id = "active_work"
             self._collapsed_section_ids: set[str] = set()
-            self._section_cursor_index = 0
+            self._section_cursor_index = _right_panel_section_index("active_work")
             self._session_cursor_index = 0
             self._selected_session_id: str | None = None
             self._session_filter = "open"
             self._session_query = ""
             self._session_search_active = False
             self._left_pane_focused = False
+            self._left_pane_mode = "sessions"
+            self._left_selected_item_id: str | None = None
             self._slash_suggestion_index = 0
             self._request_in_flight = False
             self._request_started_at: float | None = None
@@ -4125,14 +4030,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 id="composer-status",
             )
             yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
-            yield Footer()
+            yield Static(COMPOSER_FOOTER_HINTS, id="composer-footer")
 
         def on_mount(self) -> None:
             self._apply_theme_selection(self._selected_theme_id)
             self.query_one("#prompt", TextArea).focus()
             self._render_chat()
             self._render_current_view()
-            self._refresh_timer = self.set_interval(2.0, self._refresh_live_view)
+            self._refresh_timer = self.set_interval(0.25, self._refresh_live_view)
 
         def on_unmount(self) -> None:
             timer = self._refresh_timer
@@ -4184,6 +4089,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     return
                 self.action_cancel_leader_key()
             if isinstance(self.focused, TextArea):
+                return
+            if self._handle_right_pane_key(event):
                 return
             if event.character == "c":
                 event.prevent_default()
@@ -4420,8 +4327,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             else:
                 self._focus_mode = "dashboard"
                 self._collapsed_section_ids.clear()
-                self._section_cursor_index = 0
-                self._active_section_id = "action"
+                self._right_pane_mode = "overview"
+                self._show_all_orchestrations = False
+                self._section_cursor_index = _right_panel_section_index("active_work")
+                self._active_section_id = "active_work"
                 self._render_current_view()
 
         def action_section_next(self) -> None:
@@ -4429,6 +4338,181 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def action_section_previous(self) -> None:
             self._move_section_cursor(-1)
+
+        def _handle_right_pane_key(self, event) -> bool:
+            pressed = str(event.character or event.key or "")
+            key = str(event.key or "")
+            if key in ENTER_KEYS:
+                event.prevent_default()
+                event.stop()
+                self.action_open_right_panel_detail()
+                return True
+            if pressed in {"?", "/?"} or key == "?":
+                event.prevent_default()
+                event.stop()
+                self.action_show_right_panel_shortcuts()
+                return True
+            if pressed.isdigit() and pressed != "0":
+                event.prevent_default()
+                event.stop()
+                self.action_select_orchestration_index(int(pressed) - 1)
+                return True
+            normalized = pressed.casefold()
+            if normalized == "o":
+                event.prevent_default()
+                event.stop()
+                self.action_set_right_pane_mode("overview")
+                return True
+            if normalized == "g":
+                event.prevent_default()
+                event.stop()
+                self.action_toggle_graph_mode()
+                return True
+            if normalized == "e":
+                event.prevent_default()
+                event.stop()
+                self.action_set_right_pane_mode("evidence")
+                return True
+            if normalized == "p":
+                event.prevent_default()
+                event.stop()
+                self.action_focus_right_pane_section("active_work")
+                return True
+            if normalized == "a":
+                event.prevent_default()
+                event.stop()
+                self.action_focus_attention_node()
+                return True
+            if normalized == "r":
+                event.prevent_default()
+                event.stop()
+                self.action_set_right_pane_mode("evidence")
+                self.action_focus_right_pane_section("evidence")
+                return True
+            if normalized == "f":
+                event.prevent_default()
+                event.stop()
+                self.action_focus_attention_node()
+                return True
+            if key == "space" or pressed == " ":
+                event.prevent_default()
+                event.stop()
+                self.action_toggle_pinned_orchestration()
+                return True
+            return False
+
+        def action_set_right_pane_mode(self, mode: str) -> None:
+            self._right_pane_mode = mode if mode in {"overview", "graph", "evidence"} else "overview"
+            if self._right_pane_mode != "graph":
+                self._show_all_orchestrations = False
+            default_section = "graph" if self._right_pane_mode == "graph" else "evidence" if self._right_pane_mode == "evidence" else "active_work"
+            self.action_focus_right_pane_section(default_section, render=False)
+            self._render_current_view()
+
+        def action_toggle_graph_mode(self) -> None:
+            if self._right_pane_mode == "graph":
+                self._show_all_orchestrations = not self._show_all_orchestrations
+            else:
+                self._right_pane_mode = "graph"
+                self._show_all_orchestrations = False
+            self.action_focus_right_pane_section("graph", render=False)
+            self._render_current_view()
+
+        def action_focus_right_pane_section(self, section_id: str, *, render: bool = True) -> None:
+            resolved = _right_panel_resolve_section_id(section_id)
+            self._active_section_id = resolved
+            self._section_cursor_index = _right_panel_section_index(resolved)
+            if render:
+                self._render_current_view()
+
+        def action_select_orchestration_index(self, index: int) -> None:
+            view = self._current_view()
+            instances = view.get("orchestration_instances") or []
+            if not instances:
+                self._render_palette_activation_status("No orchestration to select.", ok=False)
+                return
+            selected = instances[max(0, min(index, len(instances) - 1))]
+            self._selected_orchestration_id = str(selected.get("orchestration_id") or "")
+            graph = next(
+                (item for item in view.get("all_graphs") or [] if item.get("orchestration_id") == self._selected_orchestration_id),
+                None,
+            )
+            self._selected_graph_node_id = (graph or {}).get("selected_node_id")
+            self._right_pane_mode = "overview"
+            self._show_all_orchestrations = False
+            self.action_focus_right_pane_section("active_work", render=False)
+            self._render_current_view()
+
+        def action_focus_attention_node(self) -> None:
+            view = self._current_view()
+            graph = view.get("graph") or {}
+            node_id = None
+            for candidate in graph.get("attention_node_ids") or []:
+                node_id = candidate
+                break
+            if node_id is None:
+                for candidate in graph.get("active_node_ids") or []:
+                    node_id = candidate
+                    break
+            if node_id is None and graph.get("nodes"):
+                node_id = graph["nodes"][0].get("id")
+            self._selected_graph_node_id = str(node_id) if node_id else None
+            self._active_section_id = "node_details"
+            self._section_cursor_index = _right_panel_section_index("node_details")
+            if self._right_pane_mode == "overview":
+                self._right_pane_mode = "graph"
+            self._render_current_view()
+
+        def action_toggle_pinned_orchestration(self) -> None:
+            if self._selected_orchestration_id and self._pinned_orchestration_id != self._selected_orchestration_id:
+                self._pinned_orchestration_id = self._selected_orchestration_id
+                self._render_palette_activation_status("Pinned orchestration.", ok=True)
+            else:
+                self._pinned_orchestration_id = None
+                self._render_palette_activation_status("Unpinned orchestration.", ok=True)
+            self._render_current_view()
+
+        def action_show_right_panel_shortcuts(self) -> None:
+            view = self._current_view()
+            self._show_dialog(render_right_panel_detail({**view, "shortcuts_visible": True}, "shortcuts"), kind="right_panel_shortcuts")
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": True,
+                "entry_id": "right_panel.shortcuts",
+                "activation_kind": "ui_action",
+                "ui_action_applied": True,
+                "source": "right_panel_shortcuts",
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "evidence_status": "right_panel_shortcuts_rendered",
+                "policy_boundary": _safe_palette_policy_boundary(),
+                "blocked_reasons": [],
+                **_palette_no_side_effect_flags(),
+            }
+            self._render_palette_activation_status("Opened right-panel shortcuts.", ok=True)
+            self._render_current_view()
+
+        def action_open_right_panel_detail(self) -> None:
+            view = self._current_view()
+            self._show_dialog(render_right_panel_detail(view), kind="right_panel_detail")
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": True,
+                "entry_id": "right_panel.detail",
+                "activation_kind": "ui_action",
+                "ui_action_applied": True,
+                "source": "right_panel_enter",
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "evidence_status": "right_panel_detail_rendered",
+                "policy_boundary": _safe_palette_policy_boundary(),
+                "blocked_reasons": [],
+                **_palette_no_side_effect_flags(),
+            }
+            self._render_palette_activation_status("Opened right-panel detail.", ok=True)
+            self._render_current_view()
 
         def action_session_next(self) -> None:
             self._move_session_cursor(1)
@@ -4469,17 +4553,22 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if key in {"up", "k"}:
                 event.prevent_default()
                 event.stop()
-                self._move_session_pane_selection(-1)
+                self._move_left_pane_selection(-1)
                 return True
             if key in {"down", "j"}:
                 event.prevent_default()
                 event.stop()
-                self._move_session_pane_selection(1)
+                self._move_left_pane_selection(1)
                 return True
             if key == "enter":
                 event.prevent_default()
                 event.stop()
-                self.action_switch_to_selected_session()
+                self.action_activate_left_nav_selection()
+                return True
+            if character in {"1", "2", "3", "4"}:
+                event.prevent_default()
+                event.stop()
+                self.action_set_left_pane_mode(int(character) - 1)
                 return True
             if key == "escape":
                 event.prevent_default()
@@ -4501,7 +4590,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if character == "a":
                 event.prevent_default()
                 event.stop()
-                self.action_archive_selected_session()
+                if self._left_pane_mode == "sessions":
+                    self.action_archive_selected_session()
+                else:
+                    self._render_palette_activation_status("Archive applies to sessions.", ok=False)
                 return True
             if character == "r":
                 event.prevent_default()
@@ -4521,7 +4613,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if character == "e":
                 event.prevent_default()
                 event.stop()
-                self.action_open_session_rename_dialog()
+                if self._left_pane_mode == "sessions":
+                    self.action_open_session_rename_dialog()
+                else:
+                    self._render_palette_activation_status("Rename applies to sessions.", ok=False)
                 return True
             if character == "F" or key == "shift+f":
                 event.prevent_default()
@@ -4541,7 +4636,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             if character == "g":
                 event.prevent_default()
                 event.stop()
-                self._show_agent_dialog()
+                if not self.action_go_to_active_orchestration():
+                    self._show_agent_dialog()
+                return True
+            if character == "b":
+                event.prevent_default()
+                event.stop()
+                self.action_go_to_first_blocked_item()
                 return True
             return False
 
@@ -4578,12 +4679,171 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             )
             return projection
 
+        def _left_pane_projection(
+            self,
+            dashboard_snapshot: dict | None = None,
+            right_view: dict | None = None,
+        ) -> dict:
+            dashboard_view = dashboard_snapshot or self._dashboard_snapshot()
+            cockpit_view = right_view or self._current_view()
+            view = build_left_pane_view(
+                dashboard_view,
+                {
+                    "left_pane_mode": self._left_pane_mode,
+                    "left_selected_item_id": f"session:{self._selected_session_id}"
+                    if self._left_pane_mode == "sessions" and self._selected_session_id
+                    else self._left_selected_item_id,
+                    "session_filter": self._session_filter,
+                    "selected_session_id": self._selected_session_id or self._chat_state.session_id,
+                    "active_session_id": self._chat_state.session_id,
+                    "selected_orchestration_id": self._selected_orchestration_id,
+                    "model_profile": self._selected_agent_id,
+                },
+                self._session_query,
+                right_pane_model=cockpit_view,
+            )
+            self._left_selected_item_id = view.get("selected_item_id")
+            if self._left_pane_mode == "sessions" and self._left_selected_item_id:
+                prefix = "session:"
+                if str(self._left_selected_item_id).startswith(prefix):
+                    self._selected_session_id = str(self._left_selected_item_id)[len(prefix) :]
+            return view
+
         def _selected_session_row(self) -> dict | None:
             projection = self._session_pane_projection()
             selected_id = projection.get("selected_session_id")
             return next((session for session in projection.get("sessions", []) if session.get("id") == selected_id), None)
 
         def _move_session_pane_selection(self, step: int) -> None:
+            self._move_left_pane_selection(step)
+
+        def _move_left_pane_selection(self, step: int) -> None:
+            view = self._left_pane_projection()
+            items = left_pane_visible_items(view)
+            if not items:
+                self._left_selected_item_id = None
+                self._session_cursor_index = 0
+                self._render_current_view()
+                return
+            current = self._left_selected_item_id or view.get("selected_item_id") or items[0].get("nav_id")
+            current_index = next((index for index, item in enumerate(items) if item.get("nav_id") == current), 0)
+            selected = items[(current_index + step) % len(items)]
+            self._left_selected_item_id = str(selected.get("nav_id") or "")
+            if selected.get("kind") == "session":
+                self._selected_session_id = str(selected.get("id") or "")
+                self._session_cursor_index = (current_index + step) % len(items)
+            self._render_current_view()
+
+        def action_set_left_pane_mode(self, index: int) -> None:
+            modes = ("sessions", "orchestrations", "agents", "queue")
+            self._left_pane_mode = modes[max(0, min(index, len(modes) - 1))]
+            self._left_selected_item_id = None
+            self._session_search_active = False
+            self._render_current_view()
+
+        def action_activate_left_nav_selection(self) -> None:
+            view = self._left_pane_projection()
+            item = selected_left_pane_item(view)
+            if item is None:
+                self._render_palette_activation_status("No navigator item selected.", ok=False)
+                return
+            kind = item.get("kind")
+            if kind == "session":
+                self._activate_session_nav_item(item)
+                return
+            if kind == "orchestration":
+                self._activate_orchestration_nav_item(item)
+                return
+            if kind == "agent":
+                self._activate_agent_nav_item(item)
+                return
+            if kind == "queue_task":
+                self._activate_queue_nav_item(item)
+                return
+            self._render_palette_activation_status("Navigator item is not openable.", ok=False)
+
+        def _activate_session_nav_item(self, item: dict) -> None:
+            session_id = str(item.get("id") or "")
+            if not session_id:
+                self._render_palette_activation_status("No session selected.", ok=False)
+                return
+            self._chat_state.session_id = session_id
+            self._selected_session_id = session_id
+            if item.get("agent_id"):
+                self._selected_agent_id = str(item.get("agent_id"))
+            self._right_pane_mode = "overview"
+            self.action_focus_right_pane_section("context", render=False)
+            self._render_palette_activation_status(f"Switched to {item.get('title') or session_id}.", ok=True)
+            self._render_current_view()
+
+        def _activate_orchestration_nav_item(self, item: dict) -> None:
+            orchestration_id = str(item.get("id") or "")
+            if not orchestration_id:
+                self._render_palette_activation_status("No orchestration selected.", ok=False)
+                return
+            self._selected_orchestration_id = orchestration_id
+            self._right_pane_mode = "overview"
+            self._show_all_orchestrations = False
+            self.action_focus_right_pane_section("active_work", render=False)
+            self._render_palette_activation_status(f"Inspecting {item.get('title') or orchestration_id}.", ok=True)
+            self._render_current_view()
+
+        def _activate_agent_nav_item(self, item: dict) -> None:
+            orchestration_id = item.get("current_orchestration_id")
+            task_id = item.get("current_task_id")
+            if orchestration_id:
+                self._selected_orchestration_id = str(orchestration_id)
+            if task_id:
+                self._selected_graph_node_id = f"task:{task_id}"
+            self._right_pane_mode = "graph"
+            self._show_all_orchestrations = False
+            self.action_focus_right_pane_section("node_details", render=False)
+            self._render_palette_activation_status(f"Inspecting agent {item.get('label') or item.get('id')}.", ok=True)
+            self._render_current_view()
+
+        def _activate_queue_nav_item(self, item: dict) -> None:
+            if item.get("orchestration_id"):
+                self._selected_orchestration_id = str(item["orchestration_id"])
+            if item.get("id"):
+                self._selected_graph_node_id = str(item["id"])
+            self._right_pane_mode = "graph"
+            self._show_all_orchestrations = False
+            section = "attention" if item.get("state") == "blocked" else "node_details"
+            self.action_focus_right_pane_section(section, render=False)
+            self._render_palette_activation_status(f"Inspecting task {item.get('title') or item.get('id')}.", ok=True)
+            self._render_current_view()
+
+        def action_go_to_active_orchestration(self) -> bool:
+            view = self._left_pane_projection()
+            candidates = [
+                item
+                for item in view.get("orchestrations") or []
+                if item.get("state") in {"running", "blocked"}
+            ]
+            if not candidates:
+                return False
+            selected = candidates[0]
+            self._left_pane_mode = "orchestrations"
+            self._left_selected_item_id = f"orchestration:{selected['id']}"
+            self._activate_orchestration_nav_item({"kind": "orchestration", **selected})
+            return True
+
+        def action_go_to_first_blocked_item(self) -> None:
+            view = self._left_pane_projection()
+            blocked = [
+                item
+                for item in (view.get("queue") or {}).get("items") or []
+                if item.get("state") == "blocked"
+            ]
+            if not blocked:
+                self._render_palette_activation_status("No blocked queue item.", ok=False)
+                return
+            selected = blocked[0]
+            self._left_pane_mode = "queue"
+            self._left_selected_item_id = str(selected.get("id") or "")
+            self._activate_queue_nav_item({"kind": "queue_task", **selected})
+
+        def _move_session_pane_selection_old(self, step: int) -> None:
             projection = self._session_pane_projection()
             sessions = projection.get("sessions") or []
             if not sessions:
@@ -4601,6 +4861,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("No session selected.", ok=False)
                 return
             self._chat_state.session_id = str(row["id"])
+            self._left_selected_item_id = f"session:{row['id']}"
             self._selected_agent_id = str(row.get("agent_id") or self._selected_agent_id)
             self._render_palette_activation_status(f"Switched to {row.get('display_title') or row['id']}.", ok=True)
             self._render_current_view()
@@ -4617,6 +4878,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status(f"New session failed: {exc}", ok=False)
                 return
             self._selected_session_id = session.id
+            self._left_selected_item_id = f"session:{session.id}"
             self._chat_state.session_id = session.id
             self._session_filter = "open"
             self._session_query = ""
@@ -4657,6 +4919,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status(f"Restore failed: {exc}", ok=False)
                 return
             self._selected_session_id = session.id
+            self._left_selected_item_id = f"session:{session.id}"
             self._chat_state.session_id = session.id
             if self._session_filter == "archived":
                 self._session_filter = "open"
@@ -4695,6 +4958,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status(f"Fork failed: {exc}", ok=False)
                 return
             self._selected_session_id = child.id
+            self._left_selected_item_id = f"session:{child.id}"
             self._chat_state.session_id = child.id
             self._session_filter = "open"
             self._dashboard_snapshot(force=True)
@@ -4740,6 +5004,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             )
             remaining = projection.get("sessions") or []
             self._selected_session_id = projection.get("selected_session_id")
+            self._left_selected_item_id = f"session:{self._selected_session_id}" if self._selected_session_id else None
             if self._chat_state.session_id == removed_session_id:
                 self._chat_state.session_id = self._selected_session_id
             if not remaining:
@@ -5706,9 +5971,23 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def _move_section_cursor(self, step: int) -> None:
             view = self._current_view()
+            graph = view.get("graph") or {}
+            nodes = graph.get("nodes") or []
+            if nodes and self._right_pane_mode in {"overview", "graph", "evidence"}:
+                ordered = sorted(nodes, key=lambda item: ((item.get("row") or 0), item.get("lane_id") or "", item.get("id") or ""))
+                node_ids = [str(item.get("id")) for item in ordered if item.get("id")]
+                if node_ids:
+                    current = self._selected_graph_node_id or graph.get("selected_node_id") or node_ids[0]
+                    current_index = node_ids.index(current) if current in node_ids else 0
+                    self._selected_graph_node_id = node_ids[(current_index + step) % len(node_ids)]
+                    if self._right_pane_mode in {"graph", "evidence"}:
+                        self._active_section_id = "node_details"
+                        self._section_cursor_index = _right_panel_section_index("node_details")
+                    self._render_current_view()
+                    return
             if not view["sections"]:
                 self._section_cursor_index = 0
-                self._active_section_id = "action"
+                self._active_section_id = "active_work"
                 return
             self._section_cursor_index = (self._section_cursor_index + step) % len(view["sections"])
             self._active_section_id = str(view["sections"][self._section_cursor_index]["id"])
@@ -5731,6 +6010,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             current_index = next((index for index, session in enumerate(sessions) if session.get("id") == current_id), 0)
             self._session_cursor_index = (current_index + step) % len(sessions)
             self._selected_session_id = str(sessions[self._session_cursor_index].get("id") or "")
+            self._left_selected_item_id = f"session:{self._selected_session_id}"
             self._chat_state.session_id = self._selected_session_id
             self._focus_mode = "dashboard"
             self._active_section_id = "sessions"
@@ -5751,6 +6031,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "active_section_id": self._active_section_id,
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
+                    "right_pane_mode": self._right_pane_mode,
+                    "show_all_orchestrations": self._show_all_orchestrations,
+                    "selected_orchestration_id": self._selected_orchestration_id,
+                    "selected_graph_node_id": self._selected_graph_node_id,
+                    "pinned_orchestration_id": self._pinned_orchestration_id,
                     "active_orchestrator": self._chat_state.selected_orchestrator_id or "coding_orchestrator",
                     "chat_mode": "live" if self._chat_state.codex_like_mode else "normal",
                     "pending_action_contract": self._chat_state.pending_action_contract.to_payload()
@@ -5818,8 +6103,16 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             try:
                 if self._request_in_flight:
                     self._render_chat()
-                self._dashboard_snapshot(force=True)
-                self._render_current_view()
+                needs_full_refresh = (
+                    self._request_in_flight
+                    or self._dashboard_cache is None
+                    or time.monotonic() - self._dashboard_cache_at >= 1.5
+                )
+                self._dashboard_snapshot(force=False)
+                if needs_full_refresh:
+                    self._render_current_view()
+                else:
+                    self._render_right_pane_only()
                 self._live_refresh_failures = 0
             except NoMatches:
                 return
@@ -5852,7 +6145,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
         def _clamp_section_cursor(self, view: dict) -> None:
             if not view["sections"]:
                 self._section_cursor_index = 0
-                self._active_section_id = "action"
+                self._active_section_id = "active_work"
             elif self._section_cursor_index >= len(view["sections"]):
                 self._section_cursor_index = len(view["sections"]) - 1
                 self._active_section_id = str(view["sections"][self._section_cursor_index]["id"])
@@ -5860,7 +6153,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._active_section_id = str(view["active_section_id"])
                 self._section_cursor_index = int(view.get("active_section_index") or self._section_cursor_index)
 
-        def _render_session_pane(self, dashboard_snapshot: dict | None = None) -> None:
+        def _render_session_pane(self, dashboard_snapshot: dict | None = None, right_view: dict | None = None) -> None:
             try:
                 header = self.query_one("#session-pane-header", Static)
                 session_list = self.query_one("#session-list", ListView)
@@ -5868,33 +6161,33 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 actions = self.query_one("#session-pane-actions", Static)
             except NoMatches:
                 return
-            projection = self._session_pane_projection()
-            active_id = self._chat_state.session_id
-            sessions = projection.get("sessions") or []
-            selected_id = projection.get("selected_session_id")
+            projection = self._left_pane_projection(dashboard_snapshot=dashboard_snapshot, right_view=right_view)
+            items = left_pane_visible_items(projection)
             items = [
-                ListItem(
-                    Label(
-                        _session_pane_row_label(
-                            session,
-                            selected=session.get("id") == selected_id,
-                            active=session.get("id") == active_id,
-                        )
-                    )
-                )
-                for session in sessions
+                ListItem(Label(label))
+                for label in left_pane_list_item_labels(projection, width=32)
             ]
             session_list.clear()
             if items:
                 session_list.extend(items)
-            selected_index = next((index for index, session in enumerate(sessions) if session.get("id") == selected_id), None)
+            selected_index = next(
+                (
+                    index
+                    for index, item in enumerate(left_pane_visible_items(projection))
+                    if item.get("nav_id") == projection.get("selected_item_id")
+                ),
+                None,
+            )
             try:
                 session_list.index = selected_index
             except Exception:
                 pass
-            header.update(_render_session_pane_header(projection, focused=self._left_pane_focused))
-            detail.update(_render_session_pane_detail(projection))
-            actions.update(_render_session_pane_actions(search_active=self._session_search_active, query=self._session_query))
+            header.update(render_left_pane_header(projection, width=32, focused=self._left_pane_focused))
+            detail.update(render_left_pane_detail(projection, width=32))
+            if self._session_search_active:
+                actions.update(_render_session_pane_actions(search_active=True, query=self._session_query))
+            else:
+                actions.update(render_left_pane_footer(projection, width=32))
 
         def _render_chat(self) -> None:
             working_seconds = None
@@ -5911,15 +6204,30 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def _render_view(self, view: dict) -> None:
             self._clamp_section_cursor(view)
+            self._selected_orchestration_id = view.get("selected_orchestration_id") or self._selected_orchestration_id
+            self._selected_graph_node_id = view.get("selected_node_id") or self._selected_graph_node_id
+            self._pinned_orchestration_id = view.get("pinned_orchestration_id") or self._pinned_orchestration_id
+            self._show_all_orchestrations = bool(view.get("show_all_orchestrations", self._show_all_orchestrations))
             self.query_one("#search-status", Static).update(render_right_panel_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
             refreshed_dashboard = self._dashboard_snapshot()
-            self._render_session_pane(refreshed_dashboard)
+            self._render_session_pane(refreshed_dashboard, right_view=view)
             self.query_one("#composer-status", Static).update(
                 _render_composer_status(refreshed_dashboard, self._selected_agent_id, self._chat_state.session_id)
             )
             container = self.query_one("#pane-container", Static)
             container.update(render_right_panel(view))
+
+        def _render_right_pane_only(self) -> None:
+            view = self._current_view()
+            self._clamp_section_cursor(view)
+            self._selected_orchestration_id = view.get("selected_orchestration_id") or self._selected_orchestration_id
+            self._selected_graph_node_id = view.get("selected_node_id") or self._selected_graph_node_id
+            self._pinned_orchestration_id = view.get("pinned_orchestration_id") or self._pinned_orchestration_id
+            self._show_all_orchestrations = bool(view.get("show_all_orchestrations", self._show_all_orchestrations))
+            self.query_one("#search-status", Static).update(render_right_panel_status(view))
+            self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
+            self.query_one("#pane-container", Static).update(render_right_panel(view))
 
     return HarnessUnifiedApp()
 

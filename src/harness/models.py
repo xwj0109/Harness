@@ -374,6 +374,7 @@ class EventStreamType(str, Enum):
     TASK = "task"
     ARTIFACT = "artifact"
     PERMISSION = "permission"
+    ORCHESTRATION = "orchestration"
 
 
 class TokenUsageSnapshot(BaseModel):
@@ -649,6 +650,158 @@ class ArtifactProvenanceRecord(BaseModel):
     redaction_state: str = "unknown"
     lineage: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
+
+
+GraphNodeKind = Literal[
+    "objective",
+    "task",
+    "agent",
+    "approval_gate",
+    "adapter_run",
+    "artifact",
+    "verification",
+    "blocker",
+]
+
+GraphEdgeKind = Literal[
+    "contains",
+    "depends_on",
+    "assigned_to",
+    "leased_by",
+    "dispatches",
+    "requires_approval",
+    "produces",
+    "consumes",
+    "reviews",
+    "verifies",
+    "blocked_by",
+    "continues_to",
+]
+
+GraphEntityState = Literal["ready", "running", "blocked", "failed", "completed", "waiting"]
+RightPaneCockpitMode = Literal["overview", "graph", "evidence"]
+
+
+class OrchestrationInstance(BaseModel):
+    schema_version: str = "harness.orchestration_instance/v1"
+    orchestration_id: str
+    objective_id: str
+    title: str
+    state: Literal["ready", "running", "blocked", "failed", "completed"]
+    assigned_workbench: str | None = None
+    assigned_agents: list[str] = Field(default_factory=list)
+    active_task_id: str | None = None
+    attention_task_id: str | None = None
+    last_event_seq: int = 0
+    updated_at: str
+
+
+class GraphNode(BaseModel):
+    schema_version: str = "harness.graph_node/v1"
+    id: str
+    kind: GraphNodeKind
+    title: str
+    state: GraphEntityState = "waiting"
+    entity_id: str | None = None
+    entity_kind: str | None = None
+    lane_id: str | None = None
+    row: int | None = None
+    active: bool = False
+    attention: bool = False
+    symbol: str | None = None
+    detail_rows: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphEdge(BaseModel):
+    schema_version: str = "harness.graph_edge/v1"
+    id: str
+    source_node_id: str
+    target_node_id: str
+    kind: GraphEdgeKind
+    title: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentLane(BaseModel):
+    schema_version: str = "harness.agent_lane/v1"
+    id: str
+    title: str
+    agent_id: str | None = None
+    row: int = 0
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphEvent(BaseModel):
+    schema_version: str = "harness.graph_event/v1"
+    seq: int
+    orchestration_id: str
+    objective_id: str | None = None
+    event_type: str
+    entity_id: str | None = None
+    timestamp: str
+    summary: str | None = None
+
+
+class LiveOrchestrationGraph(BaseModel):
+    schema_version: str = "harness.live_orchestration_graph/v1"
+    orchestration_id: str
+    revision: int = 1
+    nodes: list[GraphNode] = Field(default_factory=list)
+    edges: list[GraphEdge] = Field(default_factory=list)
+    lanes: list[AgentLane] = Field(default_factory=list)
+    selected_node_id: str | None = None
+    active_node_ids: list[str] = Field(default_factory=list)
+    attention_node_ids: list[str] = Field(default_factory=list)
+    timeline_tail: list[GraphEvent] = Field(default_factory=list)
+
+
+class CockpitTopBarView(BaseModel):
+    schema_version: str = "harness.cockpit_top_bar/v1"
+    app_label: str = "Harness"
+    live: bool = True
+    state: str = "idle"
+    mode: RightPaneCockpitMode = "overview"
+    queue_ready: int = 0
+    queue_active: int = 0
+    queue_blocked: int = 0
+    project: str
+    branch: str = "unknown"
+    model: str = "default"
+
+
+class RightPaneCockpitModel(BaseModel):
+    schema_version: str = "harness.right_pane_cockpit/v1"
+    ok: bool = True
+    mode: RightPaneCockpitMode = "overview"
+    focus_mode: str = "dashboard"
+    query: str = ""
+    project: str
+    branch: str = "unknown"
+    model_label: str = "default"
+    live_state: str = "idle"
+    initialized: bool = False
+    orchestration_instances: list[OrchestrationInstance] = Field(default_factory=list)
+    selected_orchestration_id: str | None = None
+    pinned_orchestration_id: str | None = None
+    selected_node_id: str | None = None
+    top_bar: CockpitTopBarView
+    graph: LiveOrchestrationGraph | None = None
+    all_graphs: list[LiveOrchestrationGraph] = Field(default_factory=list)
+    active_work: dict[str, Any] = Field(default_factory=dict)
+    attention: list[str] = Field(default_factory=list)
+    evidence_rows: list[str] = Field(default_factory=list)
+    footer: str = "1-9 switch · G graph · E evidence · Enter details · ? shortcuts"
+    shortcuts_visible: bool = False
+    sections: list[dict[str, Any]] = Field(default_factory=list)
+    active_section_id: str | None = None
+    active_section_index: int = 0
+    active_signal: str = "idle"
+    summary: dict[str, Any] = Field(default_factory=dict)
+    live_activity: dict[str, Any] = Field(default_factory=dict)
+    search: dict[str, Any] = Field(default_factory=dict)
+    navigation_hints: list[dict[str, Any]] = Field(default_factory=list)
+    empty_state: dict[str, Any] | None = None
 
 
 class OrchestrationProgressTask(BaseModel):

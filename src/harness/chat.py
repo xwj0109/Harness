@@ -947,7 +947,13 @@ def _handle_intent_routed(
     chat_model: ChatModel | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    natural_language_response = _natural_language_route_response(raw, project_root, state, progress_callback=progress_callback)
+    natural_language_response = _natural_language_route_response(
+        raw,
+        project_root,
+        state,
+        progress_callback=progress_callback,
+        defer_fuzzy_test_route=chat_model is not None,
+    )
     if natural_language_response is not None:
         return natural_language_response
     managed_action_response = _maybe_run_managed_action(raw, project_root, state)
@@ -1037,7 +1043,10 @@ def _begin_operator_turn(raw: str, project_root: Path, state: ChatSessionState) 
     try:
         store, session_id = _ensure_chat_session(project_root, state)
         session = store.get_session(session_id)
-        cfg = load_config(project_root)
+        try:
+            cfg = load_config(project_root)
+        except FileNotFoundError:
+            cfg = default_config()
         active_tools = _operator_active_tools()
         turn_state = create_turn_state_from_session(
             project_root=project_root,
@@ -1170,6 +1179,7 @@ def _natural_language_route_response(
     state: ChatSessionState,
     *,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    defer_fuzzy_test_route: bool = False,
 ) -> dict[str, Any] | None:
     route = route_natural_language(
         raw,
@@ -1178,6 +1188,8 @@ def _natural_language_route_response(
         context_excludes=_chat_context_excludes(project_root),
     )
     if route.intent in {NaturalLanguageIntent.UNSUPPORTED, NaturalLanguageIntent.DIRECT_SLASH_COMMAND}:
+        return None
+    if defer_fuzzy_test_route and route.intent == NaturalLanguageIntent.RUN_TESTS and " -k " in str(route.proposed_command or ""):
         return None
     _emit_progress(progress_callback, "procedure", "Ran natural-language routing")
     _emit_progress(progress_callback, "procedure", f"- intent: {route.intent.value}")
@@ -2145,6 +2157,8 @@ def _fallback_approval_card(request: ChatToolRequest, result: Any) -> dict[str, 
 
 
 def _try_execute_model_session_tool(project_root: Path, state: ChatSessionState, request: ChatToolRequest) -> Any | None:
+    if request.tool == "shell":
+        return None
     try:
         get_session_tool_descriptor(request.tool)
     except KeyError:

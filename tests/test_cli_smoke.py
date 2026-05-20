@@ -936,10 +936,15 @@ def test_tui_model_picker_persists_session_model_without_provider_execution(tmp_
         async with app.run_test(size=(130, 44)) as pilot:
             prompt = app.query_one("#prompt", TextArea)
             composer_status = app.query_one("#composer-status", Static)
+            composer_footer = app.query_one("#composer-footer", Static)
             initial_messages = len(app._messages)
 
-            assert f"Session: {session.id}" in str(composer_status.content)
-            assert "Current model: codex_cli/gpt-5.5" in str(composer_status.content)
+            assert "Model codex_cli/gpt-5.5" in str(composer_status.content)
+            assert "Agent plan" in str(composer_status.content)
+            assert f"Session: {session.id}" not in str(composer_status.content)
+            assert "Enter send · Shift+Enter newline · Ctrl+X M models · / commands · ? shortcuts" in str(
+                composer_footer.content
+            )
 
             await pilot.press("ctrl+p")
             for char in "qwen":
@@ -1062,8 +1067,9 @@ def test_tui_models_slash_lists_numbered_models_and_selects_by_number(tmp_path) 
             dialog = app.query_one("#dialog-panel", Static)
             initial_messages = len(app._messages)
 
-            assert "Models: /models or ctrl+x m" in str(composer_status.content)
-            assert "Select: /model <number|name>" in str(composer_status.content)
+            assert "Model codex_cli/gpt-5.5" in str(composer_status.content)
+            assert "Agent plan" in str(composer_status.content)
+            assert "Select: /model <number|name>" not in str(composer_status.content)
 
             prompt.value = "/model"
             await pilot.press("ctrl+enter")
@@ -1691,7 +1697,7 @@ def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
     assert sessions["activation_kind"] == "ui_action"
     assert sessions["ui_action_applied"] is True
     assert sessions["view_state"]["focus_mode"] == "dashboard"
-    assert sessions["view_state"]["active_section_id"] == "sessions"
+    assert sessions["view_state"]["active_section_id"] == "context"
     assert sessions["evidence_status"] == "ui_focus_in_memory"
     assert sessions["policy_boundary"]["kind"] == "safe_ui_activation"
     assert sessions["policy_boundary"]["command_execution_allowed"] is False
@@ -1759,8 +1765,8 @@ def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
     assert missing["session_message_created"] is False
     assert toggle["ok"] is True
     assert toggle["evidence_status"] == "ui_section_toggle_in_memory"
-    assert toggle["view_state"]["active_section_id"] == "queue"
-    assert toggle["view_state"]["collapsed_section_ids"] == ["queue"]
+    assert toggle["view_state"]["active_section_id"] == "evidence"
+    assert toggle["view_state"]["collapsed_section_ids"] == ["evidence"]
     assert toggle["local_state_changes"]["changed_fields"] == ["active_section_id", "collapsed_section_ids"]
     assert toggle["local_state_changes"]["creates_message"] is False
     assert toggle["request_started"] is False
@@ -1787,7 +1793,7 @@ def test_tui_command_palette_activation_applies_only_safe_ui_actions() -> None:
     assert settings["ok"] is True
     assert settings["evidence_status"] == "ui_focus_in_memory"
     assert settings["view_state"]["focus_mode"] == "dashboard"
-    assert settings["view_state"]["active_section_id"] == "project"
+    assert settings["view_state"]["active_section_id"] == "context"
     assert settings["view_state"]["requested_section_id"] == "settings"
     assert select_build["ok"] is True
     assert select_build["evidence_status"] == "ui_agent_selected_in_memory"
@@ -2011,34 +2017,34 @@ def test_tui_right_panel_defaults_to_compact_live_context_without_mutation(tmp_p
     rendered = render_right_panel(model)
 
     assert model["schema_version"] == "harness.tui_right_panel/v1"
+    assert model["cockpit_schema_version"] == "harness.right_pane_cockpit/v1"
     assert [section["id"] for section in model["sections"]] == [
-        "action",
-        "now",
-        "sessions",
-        "progress",
-        "queue",
-        "recent",
-        "adapters",
-        "project",
-        "assistant",
-        "next",
+        "orchestrations",
+        "active_work",
+        "graph",
+        "attention",
+        "evidence",
+        "context",
+        "shortcuts",
     ]
-    assert model["active_section_id"] == "action"
+    assert model["active_section_id"] == "active_work"
     assert model["active_signal"] == "setup_needed"
     assert model["summary"]["initialized"] is False
-    assert "Action" in rendered
+    assert "ORCHESTRATIONS" in rendered
+    assert "Active Work" in rendered
     assert "State:" in rendered
     assert "needs setup" in rendered
-    assert "Model: codex_cli" in rendered
-    assert "Safety: action contracts" in rendered
-    assert "No sessions yet." in rendered
+    assert "Model: default" in rendered
+    assert "Surface: read-only cockpit" in rendered
+    assert "No assigned orchestrations." in rendered
     assert "/init" in rendered
-    assert "summarize this repo" in rendered
+    assert "create or select an objective" in rendered
     assert "Panes:" not in rendered
     assert "IDs:" not in rendered
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" not in rendered
     assert "no_openai_api_usage" not in rendered
-    assert render_right_panel_status(model) == "Context | live | needs setup | 0 ready / 0 running / 0 blocked | ready"
+    assert "Harness" in render_right_panel_status(model)
+    assert "Q 0R/0A/0B" in render_right_panel_status(model)
     assert not (tmp_path / ".harness").exists()
 
 
@@ -2097,14 +2103,14 @@ def test_tui_right_panel_surfaces_assistant_context_and_pending_action(tmp_path)
     )
     rendered = render_right_panel(model)
 
-    assert model["active_section_id"] == "action"
+    assert model["active_section_id"] == "active_work"
     assert "Tools: read_file" in rendered
     assert "Context: harness_state, repo_tree" in rendered
     assert "State: needs confirmation" in rendered
     assert "Pending: Create Harness objective: improve chat" in rendered
     assert "Tool: create objective" in rendered
     assert "Risk: control plane write" in rendered
-    assert "Confirm: yes or /confirm" in rendered
+    assert "Next: confirm or cancel in chat" in rendered
     assert not (tmp_path / ".harness").exists()
 
 
@@ -2132,9 +2138,8 @@ def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirma
     )
     rendered = render_right_panel(model)
 
-    assert model["active_section_id"] == "action"
-    assert "Latest action" in rendered
-    assert "Status: succeeded" in rendered
+    assert model["active_section_id"] == "active_work"
+    assert "Latest action: succeeded" in rendered
     assert "run_managed123" not in rendered
     assert "Report: final_report.md" in rendered
     assert "Confirm: yes or /confirm" not in rendered
@@ -2164,11 +2169,8 @@ def test_tui_right_panel_surfaces_latest_safe_ui_activation(tmp_path) -> None:
     )
     rendered = render_right_panel(model)
 
-    assert model["active_section_id"] == "action"
-    assert "State: UI updated" in rendered
-    assert "Action: UI Controls Settings" in rendered
-    assert "Status: succeeded" in rendered
-    assert "Kind: focus section" in rendered
+    assert model["active_section_id"] == "active_work"
+    assert "Last UI: ui controls settings" in rendered
     assert "Flags:" not in rendered
     assert not (tmp_path / ".harness").exists()
 
@@ -2206,9 +2208,9 @@ def test_tui_right_panel_sessions_surface_latest_persisted_ui_activation(tmp_pat
     )
     rendered = render_right_panel(model)
 
-    assert model["active_section_id"] == "sessions"
+    assert model["active_section_id"] == "context"
     assert dashboard["active_session"]["latest_ui_activation"]["entry_id"] == "ui_controls.settings"
-    assert "UI: UI Controls Settings" in rendered
+    assert "Session: Session UI action" in rendered
     assert "UI flags:" not in rendered
 
 
@@ -2220,14 +2222,14 @@ def test_tui_right_panel_search_and_palette_are_progressive(tmp_path) -> None:
     palette_focus = build_right_panel_model(dashboard, {"palette": palette}, "execute-read-only", "palette")
     missing = build_right_panel_model(dashboard, {"palette": palette}, "does-not-exist", "dashboard")
 
-    assert [section["id"] for section in task_search["sections"]] == ["queue", "commands"]
-    assert "Queue" in render_right_panel(task_search)
+    assert [section["id"] for section in task_search["sections"]] == ["graph", "commands"]
+    assert "Graph is projected from objectives, tasks, runs, and artifacts." in render_right_panel(task_search)
     assert "harness tasks list --project ." in render_right_panel(task_search)
-    assert palette_focus["mode"] == "palette"
-    assert "project" in [section["id"] for section in palette_focus["sections"]]
+    assert palette_focus["mode"] == "overview"
+    assert "context" in [section["id"] for section in palette_focus["sections"]]
     assert palette_focus["sections"][-1]["id"] == "commands"
     assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in render_right_panel(palette_focus)
-    assert render_right_panel_status(palette_focus).startswith("Context | palette | 1 commands")
+    assert "1 commands" in render_right_panel_status(palette_focus)
     assert missing["empty_state"]["message"] == "No matches. Try /help, tasks, runs, adapters."
     assert "No matches. Try /help, tasks, runs, adapters." in render_right_panel(missing)
     assert not (tmp_path / ".harness").exists()
@@ -2285,7 +2287,7 @@ def test_tui_right_panel_attention_surfaces_active_lease_before_idle(tmp_path) -
     assert dashboard["live_activity"]["active_signal"] == "running"
     assert model["active_signal"] == "running"
     assert "State: running" in rendered
-    assert "Work: Lease this" in rendered
+    assert "Task: Lease this" in rendered
     assert lease.id not in rendered
     assert task.id not in rendered
 
@@ -2380,13 +2382,13 @@ def test_tui_right_panel_active_section_id_collapse_and_detail_are_ui_only(tmp_p
     )
     detail = render_right_panel_detail(focused)
 
-    assert settings["view_state"]["active_section_id"] == "project"
+    assert settings["view_state"]["active_section_id"] == "context"
     assert settings["view_state"]["requested_section_id"] == "settings"
-    assert focused["active_section_id"] == "project"
-    queue = next(section for section in collapsed["sections"] if section["id"] == "queue")
+    assert focused["active_section_id"] == "context"
+    queue = next(section for section in collapsed["sections"] if section["id"] == "orchestrations")
     assert queue["collapsed"] is True
-    assert collapsed["collapsed_section_ids"] == ["queue"]
-    assert "Project detail" in detail
+    assert collapsed["collapsed_section_ids"] == ["orchestrations"]
+    assert "Context detail" in detail
     assert "Read-only persisted Harness projection" in detail
     assert "process=False" in detail
     assert settings["process_started"] is False
@@ -2505,14 +2507,14 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             assert prompt.value == ""
             assert str(slash_status.content) == ""
 
-            assert app._section_cursor_index == 0
+            assert app._section_cursor_index == 1
             await pilot.press("tab")
             await pilot.pause()
-            assert app._section_cursor_index == 1
+            assert app._section_cursor_index == 2
 
             await pilot.press("shift+tab")
             await pilot.pause()
-            assert app._section_cursor_index == 0
+            assert app._section_cursor_index == 1
 
             assert app._focus_mode == "dashboard"
             await pilot.press("ctrl+p")
@@ -2604,7 +2606,7 @@ def test_tui_palette_enter_activates_safe_actions_without_chat_or_process(tmp_pa
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
-            assert app._section_cursor_index == 2
+            assert app._section_cursor_index == 5
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2633,7 +2635,7 @@ def test_tui_palette_enter_activates_safe_actions_without_chat_or_process(tmp_pa
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "palette"
-            assert app._section_cursor_index == 2
+            assert app._section_cursor_index == 5
             assert prompt.value == "execute-read-only"
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2710,15 +2712,19 @@ def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkey
         async with app.run_test(size=(120, 44)) as pilot:
             prompt = app.query_one("#prompt", TextArea)
             composer_status = app.query_one("#composer-status", Static)
+            composer_footer = app.query_one("#composer-footer", Static)
             session_detail = app.query_one("#session-pane-detail", Static)
 
-            assert "Models: /models or ctrl+x m" in str(composer_status.content)
-            assert "Select: /model <number|name>" in str(composer_status.content)
-            assert f"Session: {session.id}" in str(composer_status.content)
-            assert "Agent: plan" in str(composer_status.content)
-            assert "Current model: codex_cli/gpt-5.5" in str(composer_status.content)
-            assert "Attachments: 1" in str(composer_status.content)
-            assert "Context est:" in str(composer_status.content)
+            assert "Model codex_cli/gpt-5.5" in str(composer_status.content)
+            assert "Agent plan" in str(composer_status.content)
+            assert "attachments 1" in str(composer_status.content)
+            assert "ctx " in str(composer_status.content)
+            assert "Models: /models or ctrl+x m" not in str(composer_status.content)
+            assert "Select: /model <number|name>" not in str(composer_status.content)
+            assert f"Session: {session.id}" not in str(composer_status.content)
+            assert "Enter send · Shift+Enter newline · Ctrl+X M models · / commands · ? shortcuts" in str(
+                composer_footer.content
+            )
             assert "Composer session" in str(session_detail.content)
             assert session.id not in str(session_detail.content)
 
@@ -2777,6 +2783,42 @@ def test_tui_composer_ctrl_m_enter_alias_submits_chat(tmp_path, monkeypatch) -> 
     asyncio.run(run_pilot())
 
 
+def test_tui_composer_ctrl_j_inserts_newline(tmp_path, monkeypatch) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    def fake_handle_chat_input(request, project_root, chat_state, progress_callback=None):
+        assert request == "alpha\nbeta"
+        return {"ok": True, "kind": "fake", "title": "Assistant", "lines": ["done"]}
+
+    monkeypatch.setattr("harness.chat.handle_chat_input", fake_handle_chat_input)
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(120, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+
+            for char in "alpha":
+                await pilot.press(char)
+            await pilot.press("ctrl+j")
+            for char in "beta":
+                await pilot.press(char)
+            await pilot.pause()
+
+            assert prompt.value == "alpha\nbeta"
+            assert app._prompt_history == []
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._prompt_history == ["alpha\nbeta"]
+            assert prompt.value == ""
+
+            await pilot.pause(0.5)
+            assert app._request_in_flight is False
+
+    asyncio.run(run_pilot())
+
+
 def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
     pytest.importorskip("textual")
     from textual.widgets import TextArea
@@ -2795,7 +2837,7 @@ def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "palette"
-            assert app._collapsed_section_ids == {"queue"}
+            assert app._collapsed_section_ids == {"orchestrations"}
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2848,7 +2890,7 @@ def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
-            assert app._section_cursor_index == 7
+            assert app._section_cursor_index == 5
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -2886,7 +2928,7 @@ def test_tui_settings_slash_command_routes_to_safe_ui_action(tmp_path) -> None:
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
-            assert app._section_cursor_index == 7
+            assert app._section_cursor_index == 5
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -3144,7 +3186,7 @@ def test_tui_safe_slash_activation_persists_session_event_when_active(tmp_path) 
             await pilot.press("enter")
             await pilot.pause()
 
-            assert app._section_cursor_index == 7
+            assert app._section_cursor_index == 5
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert app._request_in_flight is False
@@ -3192,10 +3234,10 @@ def test_tui_safe_slash_commands_focus_dashboard_sections_without_chat(tmp_path)
             initial_messages = len(app._messages)
 
             for slash, section_index, entry_id in [
-                ("/home", 7, "orientation.home"),
-                ("/sessions", 2, "sessions.list"),
-                ("/tasks", 4, "objectives_tasks.list_tasks"),
-                ("/runs", 5, "runtime_evidence.runs"),
+                ("/home", 5, "orientation.home"),
+                ("/sessions", 5, "sessions.list"),
+                ("/tasks", 0, "objectives_tasks.list_tasks"),
+                ("/runs", 4, "runtime_evidence.runs"),
             ]:
                 prompt.value = ""
                 await pilot.press(*list(slash))
@@ -3316,7 +3358,7 @@ def test_tui_safe_ui_control_slash_commands_mutate_only_local_state(tmp_path) ->
             app._section_cursor_index = 4
             await pilot.press("enter")
             await pilot.pause()
-            assert app._collapsed_section_ids == {"queue"}
+            assert app._collapsed_section_ids == {"orchestrations"}
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
             assert_safe_ui_control("/toggle-section", "ui_controls.toggle_section", ["active_section_id", "collapsed_section_ids"])
@@ -3366,7 +3408,7 @@ def test_tui_phase3_agent_selector_switches_build_and_plan_without_execution(tmp
             assert app._latest_palette_activation["permission_granting"] is False
             assert app._request_in_flight is False
             assert len(app._messages) == initial_messages
-            assert "Agent: build" in str(composer_status.content)
+            assert "Agent build" in str(composer_status.content)
 
             prompt.value = "select plan agent"
             await pilot.press("enter")
@@ -3378,7 +3420,7 @@ def test_tui_phase3_agent_selector_switches_build_and_plan_without_execution(tmp
             assert app._latest_palette_activation["provider_started"] is False
             assert app._latest_palette_activation["shell_started"] is False
             assert len(app._messages) == initial_messages
-            assert "Agent: plan" in str(composer_status.content)
+            assert "Agent plan" in str(composer_status.content)
 
     asyncio.run(run_pilot())
 

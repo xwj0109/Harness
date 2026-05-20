@@ -17,6 +17,7 @@ harness --project . --plain
 harness --project . --plain --codex-like
 harness home --project .
 harness home --project . --output json
+harness core run "smoke test core loop" --mode dry_run --project . --output json
 harness doctor --release --project . --output json
 harness tui-home set-image ~/Pictures/home.png --width 80 --output json
 harness quickstart agent --project .
@@ -32,6 +33,8 @@ The unified app is a conversational operator shell over explicit harness actions
 The dashboard, palette, and slash-command sections remain passive read-only context. They show project state, summary counts, imported agents, tasks, active leases, daemon events, recent runs, safety reminders, static generated terminal pixel art, local in-memory search over loaded dashboard and command metadata, session-local section collapse, and palette-only focus. They do not execute commands, spawn subprocesses, invoke a shell, copy commands to the clipboard, mutate harness state, persist UI preferences, load image files at runtime, or call providers. `home` and `quickstart agent` remain read-only/non-mutating orientation commands. `tui-home set-image` is an explicit local visual-customization command that imports the provided image into tracked static TUI art files; it does not touch project runtime state, execute adapters, preflight backends, or expose image contents.
 
 `harness --output json` includes registered adapters for compatibility plus the richer capability catalog, runtime controls summary, explicit memory summary, and orchestration progress summary when project state exists. These fields are app context only; they do not grant execution authority.
+
+`harness core run` is the minimal headless backend loop for one vertical slice. It creates existing Harness project state when needed, records a session/objective/task, acquires a lease, dispatches only through the registered adapter dispatcher, writes append-only run evidence and manifests when a run is created, and returns a concise JSON summary. The initial modes are `dry_run`, `repo_planning`, and `codex_isolated_edit`; the Codex-backed modes still fail closed without scoped hosted-boundary approval.
 
 ## Agent Authoring
 

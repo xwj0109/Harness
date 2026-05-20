@@ -57,6 +57,14 @@ harness --project . --plain
 harness --project . --plain --codex-like
 ```
 
+During backend stabilization, TUI/frontend work is frozen and should be treated as experimental operator surface over the backend rather than the canonical execution path. New execution behavior should go through the headless core loop first:
+
+```bash
+harness core run "smoke test core loop" --mode dry_run --project . --output json
+```
+
+The core loop is intentionally narrow: goal, session/objective/task records, lease, registered adapter dispatch, run evidence/events/artifacts/manifest when execution is allowed, and a stable final summary. `repo_planning` and `codex_isolated_edit` remain blocked without valid hosted-boundary approval; the core loop does not add hosted fallback, paid fallback, ambient shell, network, Docker, MCP, plugins, browser, email, calendar, or active repository mutation.
+
 The default app shows project state, dashboard sections, search and palette context, safety reminders, recent runs, active leases, registered adapters, and a chat prompt in one surface. The dashboard side is passive and read-only. The prompt side is the explicit action layer: it can inspect state, select an orchestrator, draft visible objective/task graphs, ask for confirmation, acquire daemon run-once leases, and dispatch already-leased tasks only through registered adapters.
 
 `harness --output json` returns the same read-only `harness.chat/v1` context without launching the terminal UI. `harness --plain` starts the line-oriented chat fallback for tests and terminals where Textual is unsuitable. `--codex-like` starts the session in foreground action mode, where one explicit confirmation can create Harness records and drive registered-adapter dispatch for the approved task or graph. Textual is a normal install dependency for the app experience; it is no longer an optional operator path.

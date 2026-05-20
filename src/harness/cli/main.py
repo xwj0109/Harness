@@ -55,6 +55,7 @@ from harness.context_chunks import (
     rebuild_memory_context_chunks,
     rebuild_repo_file_context_chunks,
 )
+from harness.core_service import HarnessCoreService
 from harness.context_pack import pack_chat_context
 from harness.context_policy import decide_context_transmission
 from harness.context_retrieval import LexicalContextRetriever
@@ -239,6 +240,7 @@ tools_app = typer.Typer(help="Harness tool capability descriptors.")
 capabilities_app = typer.Typer(help="Read-only Harness capability catalog.")
 sandbox_app = typer.Typer(help="Read-only sandbox profile descriptors.")
 controls_app = typer.Typer(help="Local runtime execution controls.")
+core_app = typer.Typer(help="Minimal headless core loop.")
 memory_app = typer.Typer(help="Explicit local memory records.")
 baseline_app = typer.Typer(help="Local run evidence baselines.")
 evals_app = typer.Typer(help="Local evidence-only eval suites.")
@@ -285,6 +287,7 @@ app.add_typer(tools_app, name="tools")
 app.add_typer(capabilities_app, name="capabilities")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(controls_app, name="controls")
+app.add_typer(core_app, name="core")
 app.add_typer(memory_app, name="memory")
 app.add_typer(baseline_app, name="baseline")
 app.add_typer(evals_app, name="evals")
@@ -3904,6 +3907,30 @@ def controls_breaker_reset(
         _emit_json(payload)
         return
     typer.echo(f"Reset breaker {breaker.adapter_id}: {breaker.status.value}")
+
+
+@core_app.command("run")
+def core_run(
+    goal: Annotated[str, typer.Argument(help="Operator goal to run through the headless core loop.")],
+    mode: Annotated[str, typer.Option("--mode", help="Core mode: dry_run, repo_planning, or codex_isolated_edit.")] = "dry_run",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    result = HarnessCoreService().start_goal(
+        goal,
+        mode=mode,
+        project_root=project_root,
+        output_format=output.value,
+    )
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    typer.echo(result.summary.summary_text if result.summary is not None else f"Decision: {result.decision}")
+    if not result.ok:
+        raise typer.Exit(code=1)
 
 
 def _validate_control_target(target_kind: KillSwitchTargetKind, target_id: str) -> None:
@@ -8567,6 +8594,9 @@ def _doctor_result(project_root: Path, *, release: bool = False, repair: bool = 
             _doctor_dockerfile_validation(checks, project_root, config)
         _doctor_sandbox_safety(checks, config)
 
+    if not release and not repair:
+        checks = _filter_standard_doctor_pass_checks(checks)
+
     return {
         "schema_version": "harness.doctor/v1",
         "project_root": str(project_root),
@@ -8580,6 +8610,21 @@ def _doctor_result(project_root: Path, *, release: bool = False, repair: bool = 
 
 def _add_check(checks: list[dict], check_id: str, status: str, message: str, details: dict | None = None) -> None:
     checks.append({"id": check_id, "status": status, "message": message, "details": details or {}})
+
+
+def _filter_standard_doctor_pass_checks(checks: list[dict]) -> list[dict]:
+    extended_ids = {
+        "schema_current",
+        "required_session_tables",
+        "required_event_tables",
+        "artifact_directory",
+        "tool_registry",
+        "shell_config",
+        "session_permission_tables",
+        "session_status_projection",
+        "session_cwd",
+    }
+    return [check for check in checks if check["id"] not in extended_ids or check["status"] != "pass"]
 
 
 def _doctor_session_schema(checks: list[dict], project_root: Path, *, repair: bool) -> None:

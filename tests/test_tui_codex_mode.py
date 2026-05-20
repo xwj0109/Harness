@@ -389,6 +389,7 @@ def test_codex_like_app_keeps_transcript_and_context_together(tmp_path) -> None:
             assert "Harness chat" not in str(chat.content)
             assert "Assistant" in str(side.content)
             assert "Mode: live" in str(side.content)
-            assert "Context |" in str(status.content)
+            assert "Harness" in str(status.content)
+            assert "Q 0R/0A/0B" in str(status.content)
 
     asyncio.run(run_pilot())
