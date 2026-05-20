@@ -9,6 +9,7 @@ from harness.cli.main import app
 from harness.core_projection import (
     build_core_blocked_state_projection,
     build_core_run_projection,
+    build_core_task_projection,
     list_core_run_events,
 )
 from harness.core_service import HarnessCoreService
@@ -66,6 +67,196 @@ def test_core_blocked_repo_planning_projection_has_reasons_and_no_run_id(tmp_pat
     assert projection.policy_sha256
     assert any("hosted_provider_codex" in reason for reason in projection.blocked_reasons)
     assert projection.next_commands
+
+
+def test_core_inspect_task_cli_inspects_blocked_repo_planning(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("plan a small change", mode="repo_planning", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_blocked_state_projection/v1"
+    assert payload["ok"] is False
+    assert payload["run_id"] is None
+    assert payload["task_id"] == result.task_id
+    assert payload["lease_id"] == result.lease_id
+    assert payload["adapter_id"] == "repo_planning"
+    assert payload["task_type"] == "repo_planning"
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["policy_sha256"]
+    assert any("hosted_provider_codex" in reason for reason in payload["blocked_reasons"])
+    assert any(command.startswith("harness core inspect-task ") for command in payload["next_commands"])
+    assert any(command.startswith("harness daemon inspect-lease ") for command in payload["next_commands"])
+
+
+def test_core_inspect_task_cli_inspects_blocked_codex_isolated_edit(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("make a small change", mode="codex_isolated_edit", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_blocked_state_projection/v1"
+    assert payload["ok"] is False
+    assert payload["run_id"] is None
+    assert payload["task_id"] == result.task_id
+    assert payload["lease_id"] == result.lease_id
+    assert payload["adapter_id"] == "codex_isolated_edit"
+    assert payload["task_type"] == "codex_code_edit"
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert any("hosted_provider_codex" in reason for reason in payload["blocked_reasons"])
+
+
+def test_core_inspect_task_cli_returns_completed_task_projection_for_dry_run(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 0, inspect.output
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_task_projection/v1"
+    assert payload["ok"] is True
+    assert payload["task_id"] == result.task_id
+    assert payload["run_id"] == result.run_id
+    assert payload["lease_id"] == result.lease_id
+    assert payload["adapter_id"] == "dry_run"
+    assert payload["task_type"] == "phase_1a_test"
+    assert payload["status"] == "succeeded"
+    assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["manifest"] == str(result.manifest)
+    assert payload["artifact_ids"]
+    assert payload["blocked_reasons"] == []
+    assert payload["errors"] == []
+
+
+def test_core_inspect_task_cli_missing_task_fails_closed_with_structured_json(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", "task_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload == {
+        "schema_version": "harness.core_projection_error/v1",
+        "ok": False,
+        "task_id": "task_missing",
+        "project_root": str(tmp_path.resolve()),
+        "error": "Task not found: task_missing",
+    }
+
+
+def test_core_inspect_task_cli_unblocked_no_run_task_fails_closed(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task("ready task", metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"})
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", task.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload == {
+        "schema_version": "harness.core_projection_error/v1",
+        "ok": False,
+        "task_id": task.id,
+        "project_root": str(tmp_path.resolve()),
+        "error": f"Task has no blocked state and no run evidence: {task.id}",
+    }
+
+
+def test_core_inspect_task_cli_does_not_initialize_project_state(tmp_path) -> None:
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", "task_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_projection_error/v1"
+    assert payload["ok"] is False
+    assert payload["task_id"] == "task_missing"
+    assert "Project state not initialized" in payload["error"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_core_inspect_task_cli_does_not_read_artifact_bodies(tmp_path, monkeypatch) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    body_path = tmp_path / ".harness" / "runs" / result.run_id / "task_body_should_not_be_read.txt"
+    body_path.write_text("TASK_BODY_SECRET_SHOULD_NOT_APPEAR", encoding="utf-8")
+    SQLiteStore(tmp_path).register_artifact(
+        result.run_id,
+        kind="task_body_probe",
+        path=body_path,
+        metadata={"purpose": "prove task projection does not read artifact bodies"},
+        producer="test",
+        redaction_state="redacted",
+    )
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == body_path:
+            raise AssertionError("task projection must not read artifact bodies")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 0, inspect.output
+    payload = json.loads(inspect.output)
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "task_body_probe" not in serialized
+    assert "TASK_BODY_SECRET_SHOULD_NOT_APPEAR" not in serialized
+    assert payload["artifact_ids"]
+
+
+def test_core_inspect_task_cli_json_shape_is_deterministic(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("plan a small change", mode="repo_planning", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert list(payload) == sorted(payload)
+    for key in (
+        "schema_version",
+        "ok",
+        "task_id",
+        "objective_id",
+        "task_type",
+        "adapter_id",
+        "status",
+        "decision",
+        "lease_id",
+        "run_id",
+        "approval_id",
+        "policy_sha256",
+        "blocked_reasons",
+        "errors",
+        "next_commands",
+    ):
+        assert key in payload
 
 
 def test_core_projection_does_not_read_artifact_bodies(tmp_path, monkeypatch) -> None:
@@ -205,3 +396,16 @@ def test_core_inspect_run_cli_json_shape_is_deterministic(tmp_path) -> None:
     assert payload["lease_id"] == run_payload["lease_id"]
     assert payload["adapter_id"] == "dry_run"
     assert payload["decision"] == "dry_run_no_tool_execution"
+
+
+def test_core_task_projection_helper_returns_completed_dry_run_task(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    projection = build_core_task_projection(tmp_path, result.task_id)
+
+    assert projection.schema_version == "harness.core_task_projection/v1"
+    assert projection.ok is True
+    assert projection.task_id == result.task_id
+    assert projection.run_id == result.run_id
+    assert projection.lease_id == result.lease_id
+    assert projection.decision == "dry_run_no_tool_execution"

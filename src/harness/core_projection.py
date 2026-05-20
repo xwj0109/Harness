@@ -51,15 +51,24 @@ class CoreEventProjection(BaseModel):
 
 class CoreTaskProjection(BaseModel):
     schema_version: str = CORE_TASK_PROJECTION_SCHEMA_VERSION
+    ok: bool = True
     task_id: str
     objective_id: str | None = None
+    lease_id: str | None = None
     run_id: str | None = None
     adapter_id: str | None = None
     task_type: str | None = None
     status: str
+    decision: str
+    manifest: str | None = None
+    artifact_ids: list[str] = Field(default_factory=list)
     approval_id: str | None = None
+    policy_sha256: str | None = None
     required_approvals: list[str] = Field(default_factory=list)
     approval_state: str | None = None
+    errors: list[str] = Field(default_factory=list)
+    blocked_reasons: list[str] = Field(default_factory=list)
+    next_commands: list[str] = Field(default_factory=list)
 
 
 class CoreBlockedStateProjection(BaseModel):
@@ -145,6 +154,44 @@ def list_core_run_events(project_root: Path, run_id: str) -> list[CoreEventProje
     return [_event_projection(event) for event in store.list_events(run_id)]
 
 
+def build_core_task_projection(project_root: Path, task_id: str) -> CoreTaskProjection:
+    root = Path(project_root).resolve()
+    store = _store_for_projection(root)
+    task = store.get_task(task_id)
+    lease = _latest_lease(store, task.id)
+    run = _safe_get_run(store, task.run_id)
+    manifest_path: str | None = None
+    artifact_ids: list[str] = []
+    policy_sha256: str | None = None
+    approval_id: str | None = None
+    if run is not None:
+        manifest = store.build_run_manifest(run.id)
+        manifest_path = _manifest_path(root, run.id)
+        artifact_ids = [artifact.id for artifact in store.list_artifacts(run.id)]
+        policy_sha256 = manifest.effective_policy_sha256 or _policy_sha256_from_events(store, run.id)
+        approval_id = run.approval_id or manifest.approval_id
+    return CoreTaskProjection(
+        ok=True,
+        task_id=task.id,
+        objective_id=task.objective_id,
+        lease_id=lease.id if lease is not None else None,
+        run_id=task.run_id,
+        adapter_id=_adapter_id(task),
+        task_type=_task_type(task),
+        status=task.status.value,
+        decision=_decision_for_task(task, run),
+        manifest=manifest_path,
+        artifact_ids=artifact_ids,
+        approval_id=approval_id,
+        policy_sha256=policy_sha256,
+        required_approvals=list(task.required_approvals),
+        approval_state=task.approval_state,
+        errors=[],
+        blocked_reasons=[],
+        next_commands=_next_commands(root, run_id=task.run_id, task_id=task.id, lease_id=lease.id if lease else None),
+    )
+
+
 def build_core_blocked_state_projection(project_root: Path, task_id: str) -> CoreBlockedStateProjection:
     root = Path(project_root).resolve()
     store = _store_for_projection(root)
@@ -214,10 +261,12 @@ def _task_projection(task: TaskRecord) -> CoreTaskProjection:
     return CoreTaskProjection(
         task_id=task.id,
         objective_id=task.objective_id,
+        lease_id=None,
         run_id=task.run_id,
         adapter_id=_adapter_id(task),
         task_type=_task_type(task),
         status=task.status.value,
+        decision=_decision_for_task(task, None),
         approval_id=None,
         required_approvals=list(task.required_approvals),
         approval_state=task.approval_state,
@@ -229,6 +278,15 @@ def _safe_get_task(store: SQLiteStore, task_id: str | None) -> TaskRecord | None
         return None
     try:
         return store.get_task(task_id)
+    except KeyError:
+        return None
+
+
+def _safe_get_run(store: SQLiteStore, run_id: str | None) -> RunRecord | None:
+    if run_id is None:
+        return None
+    try:
+        return store.get_run(run_id)
     except KeyError:
         return None
 
@@ -273,6 +331,16 @@ def _decision_for_run(run: RunRecord) -> str:
     if run.status in {"failed", "rejected", "blocked"}:
         return f"{run.task_type or 'run'}_{run.status}"
     return run.status
+
+
+def _decision_for_task(task: TaskRecord, run: RunRecord | None) -> str:
+    if run is not None:
+        return _decision_for_run(run)
+    if task.status.value in {"blocked", "waiting_approval"}:
+        return "blocked"
+    if task.status.value == "succeeded":
+        return "task_succeeded"
+    return f"task_{task.status.value}"
 
 
 def _run_errors(run: RunRecord) -> list[str]:
@@ -355,6 +423,7 @@ def _next_commands(project_root: Path, *, run_id: str | None, task_id: str | Non
             ]
         )
     if task_id is not None:
+        commands.append(f"harness core inspect-task {task_id} --project {project} --output json")
         commands.append(f"harness tasks inspect {task_id} --project {project} --output json")
     if lease_id is not None:
         commands.append(f"harness daemon inspect-lease {lease_id} --project {project} --output json")

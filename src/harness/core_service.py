@@ -428,7 +428,7 @@ class HarnessCoreService:
             task_id=task_id,
             adapter_id=adapter_id,
             errors=errors,
-            next_commands=[],
+            next_commands=self._next_commands(Path(project_root).resolve(), None, task_id, None),
             summary=summary,
             task=task,
         )
@@ -445,6 +445,7 @@ class HarnessCoreService:
                 ]
             )
         if task_id is not None:
+            commands.append(f"harness core inspect-task {task_id} --project {project} --output json")
             commands.append(f"harness tasks inspect {task_id} --project {project} --output json")
         if lease_id is not None:
             commands.append(f"harness daemon inspect-lease {lease_id} --project {project} --output json")

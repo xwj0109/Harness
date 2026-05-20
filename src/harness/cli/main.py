@@ -56,7 +56,7 @@ from harness.context_chunks import (
     rebuild_repo_file_context_chunks,
 )
 from harness.core_service import HarnessCoreService
-from harness.core_projection import build_core_run_projection
+from harness.core_projection import build_core_blocked_state_projection, build_core_run_projection, build_core_task_projection
 from harness.context_pack import pack_chat_context
 from harness.context_policy import decide_context_transmission
 from harness.context_retrieval import LexicalContextRetriever
@@ -3994,6 +3994,61 @@ def core_inspect_run(
             typer.echo(f"  - {reason}")
     if not projection.ok:
         raise typer.Exit(code=1)
+
+
+@core_app.command("inspect-task")
+def core_inspect_task(
+    task_id: Annotated[str, typer.Argument(help="Task id to inspect through the canonical core projection.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        task_projection = build_core_task_projection(project_root, task_id)
+        if task_projection.run_id is not None:
+            payload = task_projection.model_dump(mode="json")
+            exit_code = 0 if task_projection.ok else 1
+        else:
+            blocked_projection = build_core_blocked_state_projection(project_root, task_id)
+            if not blocked_projection.blocked_reasons:
+                payload = {
+                    "schema_version": "harness.core_projection_error/v1",
+                    "ok": False,
+                    "task_id": task_id,
+                    "project_root": str(project_root),
+                    "error": f"Task has no blocked state and no run evidence: {task_id}",
+                }
+                exit_code = 1
+            else:
+                payload = blocked_projection.model_dump(mode="json")
+                exit_code = 1
+    except KeyError as exc:
+        payload = {
+            "schema_version": "harness.core_projection_error/v1",
+            "ok": False,
+            "task_id": task_id,
+            "project_root": str(project_root),
+            "error": str(exc).strip("'"),
+        }
+        exit_code = 1
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=exit_code)
+    if payload.get("schema_version") == "harness.core_projection_error/v1":
+        typer.echo(payload["error"])
+        raise typer.Exit(code=exit_code)
+    typer.echo(f"Task: {payload.get('task_id') or 'none'}")
+    typer.echo(f"Status: {payload.get('status') or 'none'}")
+    typer.echo(f"Decision: {payload.get('decision') or 'none'}")
+    typer.echo(f"Run: {payload.get('run_id') or 'none'}")
+    typer.echo(f"Lease: {payload.get('lease_id') or 'none'}")
+    typer.echo(f"Adapter: {payload.get('adapter_id') or 'none'}")
+    blocked_reasons = payload.get("blocked_reasons") or []
+    if blocked_reasons:
+        typer.echo("Blocked:")
+        for reason in blocked_reasons:
+            typer.echo(f"  - {reason}")
+    raise typer.Exit(code=exit_code)
 
 
 def _validate_control_target(target_kind: KillSwitchTargetKind, target_id: str) -> None:

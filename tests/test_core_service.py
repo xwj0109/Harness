@@ -32,6 +32,7 @@ def test_core_service_dry_run_creates_task_lease_run_manifest_and_events(tmp_pat
     assert result.summary is not None
     assert result.summary.event_count >= 1
     assert {"events", "transcript", "final_report", "manifest"} <= set(result.summary.artifact_kinds)
+    assert any(command.startswith("harness core inspect-task ") for command in result.next_commands)
 
     store = SQLiteStore(tmp_path)
     task = store.get_task(result.task_id)
@@ -80,6 +81,8 @@ def test_core_service_repo_planning_without_hosted_approval_is_blocked(tmp_path)
     assert result.manifest is None
     assert result.adapter_id == "repo_planning"
     assert any("hosted_provider_codex" in error for error in result.errors)
+    assert any(command.startswith("harness core inspect-task ") for command in result.next_commands)
+    assert any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
     assert SQLiteStore(tmp_path).list_runs() == []
 
 
@@ -99,6 +102,8 @@ def test_core_service_isolated_edit_without_hosted_approval_is_blocked(tmp_path)
     assert result.manifest is None
     assert result.adapter_id == "codex_isolated_edit"
     assert any("hosted_provider_codex" in error for error in result.errors)
+    assert any(command.startswith("harness core inspect-task ") for command in result.next_commands)
+    assert any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
     assert SQLiteStore(tmp_path).list_runs() == []
 
 
