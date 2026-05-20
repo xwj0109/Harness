@@ -56,7 +56,12 @@ from harness.context_chunks import (
     rebuild_repo_file_context_chunks,
 )
 from harness.core_service import HarnessCoreService
-from harness.core_projection import build_core_blocked_state_projection, build_core_run_projection, build_core_task_projection
+from harness.core_projection import (
+    build_core_blocked_state_projection,
+    build_core_run_events_projection,
+    build_core_run_projection,
+    build_core_task_projection,
+)
 from harness.context_pack import pack_chat_context
 from harness.context_policy import decide_context_transmission
 from harness.context_retrieval import LexicalContextRetriever
@@ -4048,6 +4053,38 @@ def core_inspect_task(
         typer.echo("Blocked:")
         for reason in blocked_reasons:
             typer.echo(f"  - {reason}")
+    raise typer.Exit(code=exit_code)
+
+
+@core_app.command("inspect-events")
+def core_inspect_events(
+    run_id: Annotated[str, typer.Argument(help="Run id whose events should be inspected through the canonical core projection.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        projection = build_core_run_events_projection(project_root, run_id)
+        payload = projection.model_dump(mode="json")
+        exit_code = 0
+    except KeyError as exc:
+        payload = {
+            "schema_version": "harness.core_projection_error/v1",
+            "ok": False,
+            "run_id": run_id,
+            "project_root": str(project_root),
+            "errors": [str(exc).strip("'")],
+        }
+        exit_code = 1
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=exit_code)
+    if payload.get("schema_version") == "harness.core_projection_error/v1":
+        for error in payload["errors"]:
+            typer.echo(error)
+        raise typer.Exit(code=exit_code)
+    typer.echo(f"Run: {payload['run_id']}")
+    typer.echo(f"Events: {payload['event_count']}")
     raise typer.Exit(code=exit_code)
 
 

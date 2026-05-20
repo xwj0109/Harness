@@ -440,6 +440,7 @@ class HarnessCoreService:
             commands.extend(
                 [
                     f"harness show {run_id} --project {project} --output json",
+                    f"harness core inspect-events {run_id} --project {project} --output json",
                     f"harness events {run_id} --project {project} --jsonl",
                     f"harness artifacts list {run_id} --project {project} --output json",
                 ]

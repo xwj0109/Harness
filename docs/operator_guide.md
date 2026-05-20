@@ -62,12 +62,15 @@ During backend stabilization, TUI/frontend work is frozen and should be treated 
 ```bash
 harness core run "smoke test core loop" --mode dry_run --project . --output json
 harness core inspect-run <run_id> --project . --output json
+harness core inspect-events <run_id> --project . --output json
 harness core inspect-task <task_id> --project . --output json
 ```
 
 The core loop is intentionally narrow: goal, session/objective/task records, lease, registered adapter dispatch, run evidence/events/artifacts/manifest when execution is allowed, and a stable final summary. `repo_planning` and `codex_isolated_edit` remain blocked without valid hosted-boundary approval; the core loop does not add hosted fallback, paid fallback, ambient shell, network, Docker, MCP, plugins, browser, email, calendar, or active repository mutation.
 
 `harness core inspect-run` is the first canonical read-only projection over persisted run evidence. It reports ids, task/lease/adapter status, manifest path, artifact metadata, policy hash, errors, blocked reasons, and next commands without reading artifact bodies or expanding any UI surface.
+
+`harness core inspect-events` renders sanitized persisted run events through the same projection layer. It is read-only and does not initialize project state, execute work, or read artifact bodies.
 
 `harness core inspect-task` uses the same projection layer for task-first evidence, including no-run blocked states from missing hosted approval. It is read-only: it does not initialize project state, acquire leases, dispatch adapters, call providers, run shell/Docker/network work, or read artifact bodies.
 

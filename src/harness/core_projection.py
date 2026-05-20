@@ -14,6 +14,7 @@ from harness.security import is_secret_path, sanitize_for_logging
 
 CORE_RUN_PROJECTION_SCHEMA_VERSION = "harness.core_run_projection/v1"
 CORE_EVENT_PROJECTION_SCHEMA_VERSION = "harness.core_event_projection/v1"
+CORE_RUN_EVENTS_PROJECTION_SCHEMA_VERSION = "harness.core_run_events_projection/v1"
 CORE_ARTIFACT_PROJECTION_SCHEMA_VERSION = "harness.core_artifact_projection/v1"
 CORE_BLOCKED_STATE_PROJECTION_SCHEMA_VERSION = "harness.core_blocked_state_projection/v1"
 CORE_TASK_PROJECTION_SCHEMA_VERSION = "harness.core_task_projection/v1"
@@ -40,6 +41,7 @@ class CoreEventProjection(BaseModel):
     run_id: str
     task_id: str | None = None
     seq: int | None = None
+    kind: str
     event_type: str
     level: str
     message: str
@@ -47,6 +49,18 @@ class CoreEventProjection(BaseModel):
     redaction_state: str
     created_at: datetime
     payload: dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class CoreRunEventsProjection(BaseModel):
+    schema_version: str = CORE_RUN_EVENTS_PROJECTION_SCHEMA_VERSION
+    ok: bool
+    run_id: str
+    project_root: Path
+    events: list[CoreEventProjection] = Field(default_factory=list)
+    event_count: int = 0
+    next_commands: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
 
 
 class CoreTaskProjection(BaseModel):
@@ -154,6 +168,20 @@ def list_core_run_events(project_root: Path, run_id: str) -> list[CoreEventProje
     return [_event_projection(event) for event in store.list_events(run_id)]
 
 
+def build_core_run_events_projection(project_root: Path, run_id: str) -> CoreRunEventsProjection:
+    root = Path(project_root).resolve()
+    events = list_core_run_events(root, run_id)
+    return CoreRunEventsProjection(
+        ok=True,
+        run_id=run_id,
+        project_root=root,
+        events=events,
+        event_count=len(events),
+        next_commands=_next_commands(root, run_id=run_id, task_id=_task_id_from_events(events), lease_id=None),
+        errors=[],
+    )
+
+
 def build_core_task_projection(project_root: Path, task_id: str) -> CoreTaskProjection:
     root = Path(project_root).resolve()
     store = _store_for_projection(root)
@@ -242,18 +270,21 @@ def _artifact_projection(artifact: ArtifactRecord) -> CoreArtifactProjection:
 
 def _event_projection(event: EventRecord) -> CoreEventProjection:
     payload = sanitize_for_logging(event.payload)
+    metadata = payload if isinstance(payload, dict) else {}
     return CoreEventProjection(
         event_id=event.id,
         run_id=event.run_id,
         task_id=event.task_id,
         seq=event.seq,
+        kind=event.event_type,
         event_type=event.event_type,
         level=event.level,
         message=str(sanitize_for_logging(event.message)),
         visibility=event.visibility.value,
         redaction_state=event.redaction_state.value,
         created_at=event.created_at,
-        payload=payload if isinstance(payload, dict) else {},
+        payload=metadata,
+        metadata=metadata,
     )
 
 
@@ -418,6 +449,7 @@ def _next_commands(project_root: Path, *, run_id: str | None, task_id: str | Non
         commands.extend(
             [
                 f"harness core inspect-run {run_id} --project {project} --output json",
+                f"harness core inspect-events {run_id} --project {project} --output json",
                 f"harness events {run_id} --project {project} --jsonl",
                 f"harness artifacts list {run_id} --project {project} --output json",
             ]
@@ -428,6 +460,13 @@ def _next_commands(project_root: Path, *, run_id: str | None, task_id: str | Non
     if lease_id is not None:
         commands.append(f"harness daemon inspect-lease {lease_id} --project {project} --output json")
     return commands
+
+
+def _task_id_from_events(events: list[CoreEventProjection]) -> str | None:
+    for event in events:
+        if event.task_id:
+            return event.task_id
+    return None
 
 
 def _dedupe(values: Any) -> list[str]:
