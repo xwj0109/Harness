@@ -876,6 +876,219 @@ def test_legacy_show_json_redacts_secret_like_metadata(tmp_path) -> None:
     assert "[REDACTED_SECRET]" in serialized
 
 
+def test_legacy_tasks_inspect_json_wraps_core_evidence_for_dry_run_task(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    expected_bundle = build_core_evidence_bundle(tmp_path, task_id=result.task_id).model_dump(mode="json")
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    payload = json.loads(inspected.output)
+    assert payload["schema_version"] == "harness.tasks_inspect/v2"
+    assert payload["ok"] is True
+    assert payload["task_id"] == result.task_id
+    assert payload["run_id"] == result.run_id
+    assert payload["mode"] == "dry_run"
+    assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["task"]["id"] == result.task_id
+    assert payload["core_evidence"] == expected_bundle
+    assert any(command.startswith("harness core inspect-evidence --task ") for command in payload["next_commands"])
+
+
+def test_legacy_tasks_inspect_json_wraps_blocked_foreground_plan_task(tmp_path) -> None:
+    routed = runner.invoke(
+        app,
+        ["plan this change", "--agent", "plan", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert routed.exit_code == 1
+    routed_payload = json.loads(routed.output)
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", routed_payload["task_id"], "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 1
+    payload = json.loads(inspected.output)
+    assert payload["schema_version"] == "harness.tasks_inspect/v2"
+    assert payload["ok"] is False
+    assert payload["task_id"] == routed_payload["task_id"]
+    assert payload["run_id"] is None
+    assert payload["mode"] == "repo_planning"
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["task"]["id"] == routed_payload["task_id"]
+    assert payload["core_evidence"]["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert payload["core_evidence"]["task_id"] == routed_payload["task_id"]
+    assert payload["core_evidence"]["blocked_state"]["schema_version"] == "harness.core_blocked_state_projection/v1"
+    assert any("hosted_provider_codex" in reason for reason in payload["core_evidence"]["blocked_state"]["blocked_reasons"])
+
+
+def test_legacy_tasks_inspect_json_wraps_blocked_foreground_build_task(tmp_path) -> None:
+    routed = runner.invoke(
+        app,
+        ["make this change", "--agent", "build", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert routed.exit_code == 1
+    routed_payload = json.loads(routed.output)
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", routed_payload["task_id"], "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 1
+    payload = json.loads(inspected.output)
+    assert payload["schema_version"] == "harness.tasks_inspect/v2"
+    assert payload["ok"] is False
+    assert payload["task_id"] == routed_payload["task_id"]
+    assert payload["run_id"] is None
+    assert payload["mode"] == "codex_isolated_edit"
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["core_evidence"]["blocked_state"]["adapter_id"] == "codex_isolated_edit"
+    assert any("hosted_provider_codex" in reason for reason in payload["core_evidence"]["blocked_state"]["blocked_reasons"])
+
+
+def test_legacy_tasks_inspect_json_missing_task_fails_closed(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", "task_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 1
+    payload = json.loads(inspected.output)
+    assert payload == {
+        "schema_version": "harness.tasks_inspect/v2",
+        "ok": False,
+        "project_root": str(tmp_path.resolve()),
+        "task_id": "task_missing",
+        "error": "Task not found: task_missing",
+        "errors": ["Task not found: task_missing"],
+    }
+
+
+def test_legacy_tasks_inspect_json_missing_project_state_does_not_initialize(tmp_path) -> None:
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", "task_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 1
+    payload = json.loads(inspected.output)
+    assert payload["schema_version"] == "harness.tasks_inspect/v2"
+    assert payload["ok"] is False
+    assert "Project state not initialized" in payload["error"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_legacy_tasks_inspect_text_output_is_unchanged(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    inspected = runner.invoke(app, ["tasks", "inspect", result.task_id, "--project", str(tmp_path)])
+
+    assert inspected.exit_code == 0, inspected.output
+    assert "\nTask\n" in inspected.output
+    assert "\nScope\n" in inspected.output
+    assert "\nGates\n" in inspected.output
+    assert "\nExecution\n" in inspected.output
+    assert "harness.tasks_inspect/v2" not in inspected.output
+    assert "core_evidence" not in inspected.output
+
+
+def test_legacy_tasks_inspect_keeps_list_and_status_shapes_unchanged(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+    created = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Legacy shape task", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert created.exit_code == 0, created.output
+    task_id = json.loads(created.output)["task"]["id"]
+
+    listed = runner.invoke(app, ["tasks", "list", "--project", str(tmp_path), "--output", "json"])
+    updated = runner.invoke(
+        app,
+        ["tasks", "status", task_id, "succeeded", "--project", str(tmp_path), "--output", "json"],
+    )
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert listed.exit_code == 0, listed.output
+    assert json.loads(listed.output)["schema_version"] == "harness.tasks/v1"
+    assert updated.exit_code == 0, updated.output
+    assert json.loads(updated.output)["schema_version"] == "harness.task/v1"
+    assert inspected.exit_code == 0, inspected.output
+    inspect_payload = json.loads(inspected.output)
+    assert inspect_payload["schema_version"] == "harness.tasks_inspect/v2"
+    assert inspect_payload["task"]["id"] == task_id
+    assert inspect_payload["core_evidence"] is None
+    assert "no blocked state and no run evidence" in inspect_payload["core_evidence_error"]
+
+
+def test_legacy_tasks_inspect_json_does_not_read_artifact_bodies(tmp_path, monkeypatch) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    body_path = tmp_path / ".harness" / "runs" / result.run_id / "legacy_task_body_should_not_be_read.txt"
+    body_path.write_text("LEGACY_TASK_BODY_SECRET_SHOULD_NOT_APPEAR", encoding="utf-8")
+    SQLiteStore(tmp_path).register_artifact(
+        result.run_id,
+        kind="legacy_task_body_probe",
+        path=body_path,
+        metadata={"purpose": "prove legacy task inspect does not read artifact bodies"},
+        producer="test",
+        redaction_state="redacted",
+    )
+    original_open = Path.open
+
+    def guarded_open(self, *args, **kwargs):
+        if self == body_path:
+            raise AssertionError("legacy task inspect JSON must not read artifact bodies")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    serialized = json.dumps(json.loads(inspected.output), sort_keys=True)
+    assert "legacy_task_body_probe" in serialized
+    assert "LEGACY_TASK_BODY_SECRET_SHOULD_NOT_APPEAR" not in serialized
+
+
+def test_legacy_tasks_inspect_json_redacts_secret_like_metadata(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    metadata_path = tmp_path / ".harness" / "runs" / result.run_id / "legacy_task_metadata_probe.txt"
+    metadata_path.write_text("metadata body", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    store.register_artifact(
+        result.run_id,
+        kind="legacy_task_metadata_probe",
+        path=metadata_path,
+        metadata={"token": secret},
+        producer="test",
+        redaction_state="redacted",
+    )
+    store.append_event(result.run_id, "info", "legacy_task_secret_probe", f"token {secret}", {"token": secret})
+
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    serialized = json.dumps(json.loads(inspected.output), sort_keys=True)
+    assert secret not in serialized
+    assert "[REDACTED_SECRET]" in serialized
+
+
 def test_core_projection_missing_run_cli_fails_closed_with_structured_error(tmp_path) -> None:
     SQLiteStore(tmp_path).initialize()
     result = runner.invoke(

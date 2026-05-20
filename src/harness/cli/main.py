@@ -160,6 +160,7 @@ from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, DockerImageManager
 from harness.sandbox_profiles import build_sandbox_profile_catalog, get_sandbox_profile
+from harness.security import sanitize_for_logging
 from harness.security_explanations import render_blocked_state
 from harness.session_events import (
     SessionEventKind,
@@ -1350,6 +1351,76 @@ def tasks_graph(
 @tasks_app.command("inspect")
 def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
+    if output == OutputFormat.JSON:
+        try:
+            projection = build_core_evidence_bundle(project_root, task_id=task_id)
+            task = SQLiteStore(project_root).get_task(task_id)
+            payload = {
+                "schema_version": "harness.tasks_inspect/v2",
+                "ok": projection.ok,
+                "project_root": str(project_root),
+                "task_id": projection.task_id,
+                "run_id": projection.run_id,
+                "mode": projection.mode,
+                "decision": projection.decision,
+                "status": projection.status,
+                "manifest": projection.manifest,
+                "errors": projection.errors,
+                "next_commands": projection.next_commands,
+                "task": sanitize_for_logging(task.model_dump(mode="json")),
+                "core_evidence": projection.model_dump(mode="json"),
+            }
+            _emit_json(payload)
+            raise typer.Exit(code=0 if projection.ok else 1)
+        except ValueError as exc:
+            message = str(exc).strip("'")
+            try:
+                task = SQLiteStore(project_root).get_task(task_id)
+            except KeyError as task_exc:
+                message = str(task_exc).strip("'")
+                _emit_json(
+                    {
+                        "schema_version": "harness.tasks_inspect/v2",
+                        "ok": False,
+                        "project_root": str(project_root),
+                        "task_id": task_id,
+                        "error": message,
+                        "errors": [message],
+                    }
+                )
+                raise typer.Exit(code=1) from task_exc
+            _emit_json(
+                {
+                    "schema_version": "harness.tasks_inspect/v2",
+                    "ok": True,
+                    "project_root": str(project_root),
+                    "task_id": task.id,
+                    "run_id": task.run_id,
+                    "mode": task.metadata.get("execution_adapter") or task.metadata.get("task_type"),
+                    "decision": f"task_{task.status.value}",
+                    "status": task.status.value,
+                    "manifest": None,
+                    "errors": [],
+                    "next_commands": [],
+                    "task": sanitize_for_logging(task.model_dump(mode="json")),
+                    "core_evidence": None,
+                    "core_evidence_error": message,
+                }
+            )
+            raise typer.Exit(code=0) from exc
+        except KeyError as exc:
+            message = str(exc).strip("'")
+            _emit_json(
+                {
+                    "schema_version": "harness.tasks_inspect/v2",
+                    "ok": False,
+                    "project_root": str(project_root),
+                    "task_id": task_id,
+                    "error": message,
+                    "errors": [message],
+                }
+            )
+            raise typer.Exit(code=1) from exc
     _require_initialized(project_root)
     try:
         task = SQLiteStore(project_root).get_task(task_id)

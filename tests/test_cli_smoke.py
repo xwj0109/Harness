@@ -6181,7 +6181,9 @@ def test_cli_tasks_add_list_inspect_and_status_support_json(tmp_path) -> None:
         ["tasks", "inspect", task["id"], "--project", str(tmp_path), "--output", "json"],
     )
     assert inspected.exit_code == 0
-    assert json.loads(inspected.output)["task"]["id"] == task["id"]
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["schema_version"] == "harness.tasks_inspect/v2"
+    assert inspected_payload["task"]["id"] == task["id"]
 
     updated = runner.invoke(
         app,

@@ -72,7 +72,7 @@ The core loop is intentionally narrow: goal, session/objective/task records, lea
 
 `harness core inspect-evidence` is the canonical bundled read-only projection for future surfaces. It accepts exactly one of `--run` or `--task` and returns the run, task, blocked-state, event, artifact-metadata, manifest, error, and next-command projections available for that id without assembling them in a UI layer.
 
-`harness show <run_id> --output json` now wraps that same bundled run evidence under `core_evidence` in a `harness.show/v2` compatibility response. The text form of `harness show`, run listing/tailing, event streaming, task inspection, and artifact commands are intentionally unchanged.
+`harness show <run_id> --output json` now wraps that same bundled run evidence under `core_evidence` in a `harness.show/v2` compatibility response. `harness tasks inspect <task_id> --output json` returns `harness.tasks_inspect/v2` with `core_evidence` when a completed run or blocked no-run state exists. The text forms of `harness show` and `harness tasks inspect`, plus run/task listing, task mutation, tailing, event streaming, and artifact commands, are intentionally unchanged.
 
 `harness core inspect-run` is the first canonical read-only projection over persisted run evidence. It reports ids, task/lease/adapter status, manifest path, artifact metadata, policy hash, errors, blocked reasons, and next commands without reading artifact bodies or expanding any UI surface.
 
@@ -857,7 +857,8 @@ harness tasks retry task_abc123def456 --project . --output json
 
 Task commands use stable JSON wrappers:
 
-- `harness.task/v1` for add, inspect, and status updates.
+- `harness.task/v1` for add and status updates.
+- `harness.tasks_inspect/v2` for single-task JSON inspection; `core_evidence` contains the canonical evidence bundle when available.
 - `harness.tasks/v1` for list output.
 - `harness.task_graph/v1` for graph output.
 - `harness.task_run_next/v1` for manual next-task selection.
