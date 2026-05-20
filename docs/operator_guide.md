@@ -61,12 +61,16 @@ During backend stabilization, TUI/frontend work is frozen and should be treated 
 
 ```bash
 harness core run "smoke test core loop" --mode dry_run --project . --output json
+harness core inspect-evidence --run <run_id> --project . --output json
+harness core inspect-evidence --task <task_id> --project . --output json
 harness core inspect-run <run_id> --project . --output json
 harness core inspect-events <run_id> --project . --output json
 harness core inspect-task <task_id> --project . --output json
 ```
 
 The core loop is intentionally narrow: goal, session/objective/task records, lease, registered adapter dispatch, run evidence/events/artifacts/manifest when execution is allowed, and a stable final summary. `repo_planning` and `codex_isolated_edit` remain blocked without valid hosted-boundary approval; the core loop does not add hosted fallback, paid fallback, ambient shell, network, Docker, MCP, plugins, browser, email, calendar, or active repository mutation.
+
+`harness core inspect-evidence` is the canonical bundled read-only projection for future surfaces. It accepts exactly one of `--run` or `--task` and returns the run, task, blocked-state, event, artifact-metadata, manifest, error, and next-command projections available for that id without assembling them in a UI layer.
 
 `harness core inspect-run` is the first canonical read-only projection over persisted run evidence. It reports ids, task/lease/adapter status, manifest path, artifact metadata, policy hash, errors, blocked reasons, and next commands without reading artifact bodies or expanding any UI surface.
 

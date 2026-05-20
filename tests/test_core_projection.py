@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from harness.cli.main import app
 from harness.core_projection import (
+    build_core_evidence_bundle,
     build_core_run_events_projection,
     build_core_blocked_state_projection,
     build_core_run_projection,
@@ -41,6 +42,8 @@ def test_core_projection_inspects_dry_run_execution(tmp_path) -> None:
     assert projection.policy_sha256
     assert projection.errors == []
     assert projection.blocked_reasons == []
+    assert any(command.startswith("harness core inspect-evidence --run ") for command in projection.next_commands)
+    assert any(command.startswith("harness core inspect-evidence --task ") for command in projection.next_commands)
     assert any(command.startswith("harness core inspect-run ") for command in projection.next_commands)
     assert any(command.startswith("harness core inspect-events ") for command in projection.next_commands)
     assert projection.task is not None
@@ -76,6 +79,7 @@ def test_core_blocked_repo_planning_projection_has_reasons_and_no_run_id(tmp_pat
     assert projection.decision == "execution_adapter_rejected"
     assert projection.policy_sha256
     assert any("hosted_provider_codex" in reason for reason in projection.blocked_reasons)
+    assert any(command.startswith("harness core inspect-evidence --task ") for command in projection.next_commands)
     assert projection.next_commands
 
 
@@ -147,6 +151,7 @@ def test_core_inspect_task_cli_returns_completed_task_projection_for_dry_run(tmp
     assert payload["artifact_ids"]
     assert payload["blocked_reasons"] == []
     assert payload["errors"] == []
+    assert any(command.startswith("harness core inspect-evidence --task ") for command in payload["next_commands"])
 
 
 def test_core_inspect_task_cli_missing_task_fails_closed_with_structured_json(tmp_path) -> None:
@@ -346,6 +351,7 @@ def test_core_inspect_events_cli_returns_deterministic_json(tmp_path) -> None:
     assert payload["event_count"] == len(payload["events"])
     assert payload["event_count"] >= 1
     assert payload["errors"] == []
+    assert any(command.startswith("harness core inspect-evidence --run ") for command in payload["next_commands"])
     assert any(command.startswith("harness core inspect-run ") for command in payload["next_commands"])
     event = payload["events"][0]
     for key in (
@@ -452,6 +458,292 @@ def test_core_inspect_events_cli_redacts_secret_like_metadata(tmp_path) -> None:
     serialized = json.dumps(json.loads(inspect.output), sort_keys=True)
     assert secret not in serialized
     assert "[REDACTED_SECRET]" in serialized
+
+
+def test_core_evidence_bundle_dry_run_by_run_id(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    bundle = build_core_evidence_bundle(tmp_path, run_id=result.run_id)
+
+    assert bundle.schema_version == "harness.core_evidence_bundle_projection/v1"
+    assert bundle.ok is True
+    assert bundle.project_root == tmp_path.resolve()
+    assert bundle.run_id == result.run_id
+    assert bundle.task_id == result.task_id
+    assert bundle.mode == "dry_run"
+    assert bundle.decision == "dry_run_no_tool_execution"
+    assert bundle.status == "completed"
+    assert bundle.run is not None
+    assert bundle.run.run_id == result.run_id
+    assert bundle.task is not None
+    assert bundle.task.task_id == result.task_id
+    assert bundle.events is not None
+    assert bundle.events.event_count >= 1
+    assert bundle.artifacts
+    assert bundle.manifest == str(result.manifest)
+    assert bundle.errors == []
+    assert any(command.startswith("harness core inspect-evidence --run ") for command in bundle.next_commands)
+
+
+def test_core_evidence_bundle_dry_run_by_task_id(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 0, inspect.output
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert payload["ok"] is True
+    assert payload["run_id"] == result.run_id
+    assert payload["task_id"] == result.task_id
+    assert payload["mode"] == "dry_run"
+    assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["run"]["run_id"] == result.run_id
+    assert payload["task"]["task_id"] == result.task_id
+    assert payload["events"]["event_count"] >= 1
+    assert payload["artifacts"]
+    assert payload["manifest"] == str(result.manifest)
+
+
+def test_core_evidence_bundle_blocked_repo_planning_by_task_id(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("plan a small change", mode="repo_planning", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert payload["ok"] is False
+    assert payload["run_id"] is None
+    assert payload["task_id"] == result.task_id
+    assert payload["mode"] == "repo_planning"
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["run"] is None
+    assert payload["task"]["task_id"] == result.task_id
+    assert payload["blocked_state"]["task_id"] == result.task_id
+    assert payload["events"] is None
+    assert payload["artifacts"] == []
+    assert payload["manifest"] is None
+    assert any("hosted_provider_codex" in reason for reason in payload["blocked_state"]["blocked_reasons"])
+
+
+def test_core_evidence_bundle_blocked_codex_isolated_edit_by_task_id(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("make a small change", mode="codex_isolated_edit", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--task", result.task_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert payload["ok"] is False
+    assert payload["run_id"] is None
+    assert payload["task_id"] == result.task_id
+    assert payload["mode"] == "codex_isolated_edit"
+    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["blocked_state"]["adapter_id"] == "codex_isolated_edit"
+    assert any("hosted_provider_codex" in reason for reason in payload["blocked_state"]["blocked_reasons"])
+
+
+def test_core_inspect_evidence_missing_run_fails_closed_with_structured_json(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--run", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload == {
+        "schema_version": "harness.core_projection_error/v1",
+        "ok": False,
+        "project_root": str(tmp_path.resolve()),
+        "run_id": "run_missing",
+        "task_id": None,
+        "error": "Run not found: run_missing",
+        "errors": ["Run not found: run_missing"],
+    }
+
+
+def test_core_inspect_evidence_missing_task_fails_closed_with_structured_json(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--task", "task_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload == {
+        "schema_version": "harness.core_projection_error/v1",
+        "ok": False,
+        "project_root": str(tmp_path.resolve()),
+        "run_id": None,
+        "task_id": "task_missing",
+        "error": "Task not found: task_missing",
+        "errors": ["Task not found: task_missing"],
+    }
+
+
+def test_core_inspect_evidence_rejects_both_run_and_task(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspect = runner.invoke(
+        app,
+        [
+            "core",
+            "inspect-evidence",
+            "--run",
+            "run_one",
+            "--task",
+            "task_one",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_projection_error/v1"
+    assert payload["ok"] is False
+    assert payload["run_id"] == "run_one"
+    assert payload["task_id"] == "task_one"
+    assert payload["error"] == "Exactly one of run_id or task_id is required."
+
+
+def test_core_inspect_evidence_rejects_neither_run_nor_task(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_projection_error/v1"
+    assert payload["ok"] is False
+    assert payload["run_id"] is None
+    assert payload["task_id"] is None
+    assert payload["error"] == "Exactly one of run_id or task_id is required."
+
+
+def test_core_inspect_evidence_missing_project_state_does_not_initialize(tmp_path) -> None:
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--run", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 1
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_projection_error/v1"
+    assert payload["ok"] is False
+    assert "Project state not initialized" in payload["error"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_core_inspect_evidence_does_not_read_artifact_bodies(tmp_path, monkeypatch) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    body_path = tmp_path / ".harness" / "runs" / result.run_id / "bundle_body_should_not_be_read.txt"
+    body_path.write_text("BUNDLE_BODY_SECRET_SHOULD_NOT_APPEAR", encoding="utf-8")
+    SQLiteStore(tmp_path).register_artifact(
+        result.run_id,
+        kind="bundle_body_probe",
+        path=body_path,
+        metadata={"purpose": "prove bundle projection does not read artifact bodies"},
+        producer="test",
+        redaction_state="redacted",
+    )
+    original_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == body_path:
+            raise AssertionError("bundle projection must not read artifact bodies")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--run", result.run_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 0, inspect.output
+    serialized = json.dumps(json.loads(inspect.output), sort_keys=True)
+    assert "bundle_body_probe" in serialized
+    assert "BUNDLE_BODY_SECRET_SHOULD_NOT_APPEAR" not in serialized
+
+
+def test_core_inspect_evidence_redacts_secret_like_metadata(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    metadata_path = tmp_path / ".harness" / "runs" / result.run_id / "bundle_metadata_probe.txt"
+    metadata_path.write_text("metadata body", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    store.register_artifact(
+        result.run_id,
+        kind="bundle_metadata_probe",
+        path=metadata_path,
+        metadata={"token": secret},
+        producer="test",
+        redaction_state="redacted",
+    )
+    store.append_event(result.run_id, "info", "bundle_secret_probe", f"token {secret}", {"token": secret})
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--run", result.run_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 0, inspect.output
+    serialized = json.dumps(json.loads(inspect.output), sort_keys=True)
+    assert secret not in serialized
+    assert "[REDACTED_SECRET]" in serialized
+
+
+def test_core_inspect_evidence_cli_json_shape_is_deterministic(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    inspect = runner.invoke(
+        app,
+        ["core", "inspect-evidence", "--run", result.run_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspect.exit_code == 0, inspect.output
+    payload = json.loads(inspect.output)
+    assert payload["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert list(payload) == sorted(payload)
+    for key in (
+        "schema_version",
+        "ok",
+        "project_root",
+        "run_id",
+        "task_id",
+        "mode",
+        "decision",
+        "status",
+        "run",
+        "task",
+        "blocked_state",
+        "events",
+        "artifacts",
+        "manifest",
+        "errors",
+        "next_commands",
+    ):
+        assert key in payload
 
 
 def test_core_projection_missing_run_cli_fails_closed_with_structured_error(tmp_path) -> None:

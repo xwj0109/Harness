@@ -13,6 +13,7 @@ from harness.security import is_secret_path, sanitize_for_logging
 
 
 CORE_RUN_PROJECTION_SCHEMA_VERSION = "harness.core_run_projection/v1"
+CORE_EVIDENCE_BUNDLE_PROJECTION_SCHEMA_VERSION = "harness.core_evidence_bundle_projection/v1"
 CORE_EVENT_PROJECTION_SCHEMA_VERSION = "harness.core_event_projection/v1"
 CORE_RUN_EVENTS_PROJECTION_SCHEMA_VERSION = "harness.core_run_events_projection/v1"
 CORE_ARTIFACT_PROJECTION_SCHEMA_VERSION = "harness.core_artifact_projection/v1"
@@ -127,6 +128,25 @@ class CoreRunProjection(BaseModel):
     task: CoreTaskProjection | None = None
 
 
+class CoreEvidenceBundleProjection(BaseModel):
+    schema_version: str = CORE_EVIDENCE_BUNDLE_PROJECTION_SCHEMA_VERSION
+    ok: bool
+    project_root: Path
+    run_id: str | None = None
+    task_id: str | None = None
+    mode: str | None = None
+    decision: str
+    status: str
+    run: CoreRunProjection | None = None
+    task: CoreTaskProjection | None = None
+    blocked_state: CoreBlockedStateProjection | None = None
+    events: CoreRunEventsProjection | None = None
+    artifacts: list[CoreArtifactProjection] = Field(default_factory=list)
+    manifest: str | None = None
+    errors: list[str] = Field(default_factory=list)
+    next_commands: list[str] = Field(default_factory=list)
+
+
 def build_core_run_projection(project_root: Path, run_id: str) -> CoreRunProjection:
     root = Path(project_root).resolve()
     store = _store_for_projection(root)
@@ -161,6 +181,20 @@ def build_core_run_projection(project_root: Path, run_id: str) -> CoreRunProject
     )
 
 
+def build_core_evidence_bundle(
+    project_root: Path,
+    *,
+    run_id: str | None = None,
+    task_id: str | None = None,
+) -> CoreEvidenceBundleProjection:
+    root = Path(project_root).resolve()
+    if bool(run_id) == bool(task_id):
+        raise ValueError("Exactly one of run_id or task_id is required.")
+    if run_id is not None:
+        return _evidence_bundle_for_run(root, run_id)
+    return _evidence_bundle_for_task(root, str(task_id))
+
+
 def list_core_run_events(project_root: Path, run_id: str) -> list[CoreEventProjection]:
     root = Path(project_root).resolve()
     store = _store_for_projection(root)
@@ -179,6 +213,91 @@ def build_core_run_events_projection(project_root: Path, run_id: str) -> CoreRun
         event_count=len(events),
         next_commands=_next_commands(root, run_id=run_id, task_id=_task_id_from_events(events), lease_id=None),
         errors=[],
+    )
+
+
+def _evidence_bundle_for_run(project_root: Path, run_id: str) -> CoreEvidenceBundleProjection:
+    run_projection = build_core_run_projection(project_root, run_id)
+    task_projection = build_core_task_projection(project_root, run_projection.task_id) if run_projection.task_id else None
+    events_projection = build_core_run_events_projection(project_root, run_id)
+    commands = _bundle_next_commands(
+        Path(project_root).resolve(),
+        run_id=run_projection.run_id,
+        task_id=run_projection.task_id,
+        lease_id=run_projection.lease_id,
+    )
+    return CoreEvidenceBundleProjection(
+        ok=run_projection.ok and (task_projection.ok if task_projection is not None else True) and events_projection.ok,
+        project_root=Path(project_root).resolve(),
+        run_id=run_projection.run_id,
+        task_id=run_projection.task_id,
+        mode=_mode_from_projection(run_projection.adapter_id, run_projection.task_type),
+        decision=run_projection.decision,
+        status=run_projection.status,
+        run=run_projection,
+        task=task_projection,
+        blocked_state=None,
+        events=events_projection,
+        artifacts=list(run_projection.artifacts),
+        manifest=run_projection.manifest,
+        errors=[*run_projection.errors, *(task_projection.errors if task_projection is not None else []), *events_projection.errors],
+        next_commands=commands,
+    )
+
+
+def _evidence_bundle_for_task(project_root: Path, task_id: str) -> CoreEvidenceBundleProjection:
+    task_projection = build_core_task_projection(project_root, task_id)
+    if task_projection.run_id is not None:
+        run_projection = build_core_run_projection(project_root, task_projection.run_id)
+        events_projection = build_core_run_events_projection(project_root, task_projection.run_id)
+        commands = _bundle_next_commands(
+            Path(project_root).resolve(),
+            run_id=task_projection.run_id,
+            task_id=task_projection.task_id,
+            lease_id=task_projection.lease_id,
+        )
+        return CoreEvidenceBundleProjection(
+            ok=task_projection.ok and run_projection.ok and events_projection.ok,
+            project_root=Path(project_root).resolve(),
+            run_id=task_projection.run_id,
+            task_id=task_projection.task_id,
+            mode=_mode_from_projection(task_projection.adapter_id, task_projection.task_type),
+            decision=run_projection.decision,
+            status=task_projection.status,
+            run=run_projection,
+            task=task_projection,
+            blocked_state=None,
+            events=events_projection,
+            artifacts=list(run_projection.artifacts),
+            manifest=run_projection.manifest,
+            errors=[*task_projection.errors, *run_projection.errors, *events_projection.errors],
+            next_commands=commands,
+        )
+    blocked_projection = build_core_blocked_state_projection(project_root, task_id)
+    if not blocked_projection.blocked_reasons:
+        raise ValueError(f"Task has no blocked state and no run evidence: {task_id}")
+    commands = _bundle_next_commands(
+        Path(project_root).resolve(),
+        run_id=None,
+        task_id=task_projection.task_id,
+        lease_id=blocked_projection.lease_id or task_projection.lease_id,
+    )
+    return CoreEvidenceBundleProjection(
+        ok=False,
+        project_root=Path(project_root).resolve(),
+        run_id=None,
+        task_id=task_projection.task_id,
+        mode=_mode_from_projection(task_projection.adapter_id, task_projection.task_type),
+        decision=blocked_projection.decision,
+        status=blocked_projection.status or task_projection.status,
+        run=None,
+        task=task_projection,
+        blocked_state=blocked_projection,
+        events=None,
+        artifacts=[],
+        manifest=None,
+        errors=[*task_projection.errors, *blocked_projection.errors],
+        next_commands=commands,
     )
 
 
@@ -446,6 +565,7 @@ def _next_commands(project_root: Path, *, run_id: str | None, task_id: str | Non
     project = str(Path(project_root).resolve())
     commands: list[str] = []
     if run_id is not None:
+        commands.append(f"harness core inspect-evidence --run {run_id} --project {project} --output json")
         commands.extend(
             [
                 f"harness core inspect-run {run_id} --project {project} --output json",
@@ -455,11 +575,26 @@ def _next_commands(project_root: Path, *, run_id: str | None, task_id: str | Non
             ]
         )
     if task_id is not None:
+        commands.append(f"harness core inspect-evidence --task {task_id} --project {project} --output json")
         commands.append(f"harness core inspect-task {task_id} --project {project} --output json")
         commands.append(f"harness tasks inspect {task_id} --project {project} --output json")
     if lease_id is not None:
         commands.append(f"harness daemon inspect-lease {lease_id} --project {project} --output json")
     return commands
+
+
+def _bundle_next_commands(project_root: Path, *, run_id: str | None, task_id: str | None, lease_id: str | None) -> list[str]:
+    return _next_commands(project_root, run_id=run_id, task_id=task_id, lease_id=lease_id)
+
+
+def _mode_from_projection(adapter_id: str | None, task_type: str | None) -> str | None:
+    if adapter_id == "dry_run" or task_type == "phase_1a_test":
+        return "dry_run"
+    if adapter_id == "repo_planning" or task_type == "repo_planning":
+        return "repo_planning"
+    if adapter_id == "codex_isolated_edit" or task_type == "codex_code_edit":
+        return "codex_isolated_edit"
+    return adapter_id or task_type
 
 
 def _task_id_from_events(events: list[CoreEventProjection]) -> str | None:

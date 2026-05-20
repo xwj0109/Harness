@@ -57,6 +57,7 @@ from harness.context_chunks import (
 )
 from harness.core_service import HarnessCoreService
 from harness.core_projection import (
+    build_core_evidence_bundle,
     build_core_blocked_state_projection,
     build_core_run_events_projection,
     build_core_run_projection,
@@ -4085,6 +4086,42 @@ def core_inspect_events(
         raise typer.Exit(code=exit_code)
     typer.echo(f"Run: {payload['run_id']}")
     typer.echo(f"Events: {payload['event_count']}")
+    raise typer.Exit(code=exit_code)
+
+
+@core_app.command("inspect-evidence")
+def core_inspect_evidence(
+    run_id: Annotated[str | None, typer.Option("--run", help="Run id to bundle through the canonical core projection.")] = None,
+    task_id: Annotated[str | None, typer.Option("--task", help="Task id to bundle through the canonical core projection.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        projection = build_core_evidence_bundle(project_root, run_id=run_id, task_id=task_id)
+        payload = projection.model_dump(mode="json")
+        exit_code = 0 if projection.ok else 1
+    except (KeyError, ValueError) as exc:
+        message = str(exc).strip("'")
+        payload = {
+            "schema_version": "harness.core_projection_error/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "run_id": run_id,
+            "task_id": task_id,
+            "error": message,
+            "errors": [message],
+        }
+        exit_code = 1
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        raise typer.Exit(code=exit_code)
+    if payload.get("schema_version") == "harness.core_projection_error/v1":
+        typer.echo(payload["error"])
+        raise typer.Exit(code=exit_code)
+    typer.echo(f"Evidence: {payload.get('run_id') or payload.get('task_id')}")
+    typer.echo(f"Status: {payload.get('status')}")
+    typer.echo(f"Decision: {payload.get('decision')}")
     raise typer.Exit(code=exit_code)
 
 

@@ -440,12 +440,14 @@ class HarnessCoreService:
             commands.extend(
                 [
                     f"harness show {run_id} --project {project} --output json",
+                    f"harness core inspect-evidence --run {run_id} --project {project} --output json",
                     f"harness core inspect-events {run_id} --project {project} --output json",
                     f"harness events {run_id} --project {project} --jsonl",
                     f"harness artifacts list {run_id} --project {project} --output json",
                 ]
             )
         if task_id is not None:
+            commands.append(f"harness core inspect-evidence --task {task_id} --project {project} --output json")
             commands.append(f"harness core inspect-task {task_id} --project {project} --output json")
             commands.append(f"harness tasks inspect {task_id} --project {project} --output json")
         if lease_id is not None:
