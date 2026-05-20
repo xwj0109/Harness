@@ -425,6 +425,26 @@ def foreground_prompt(
 ) -> None:
     project_root = resolve_project_root(project)
     resolved_prompt, resolved_agent = _resolve_foreground_agent_selection(prompt, agent_id)
+    core_mode = _foreground_core_mode_from_agent(agent_id, mode)
+    if core_mode is not None and _foreground_core_route_allowed(
+        output=output,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        fail_on_dirty=fail_on_dirty,
+        continue_session=continue_session,
+        session_id=session_id,
+        fork_session=fork_session,
+        title=title,
+        file_refs=files or [],
+        no_session=no_session,
+    ):
+        result = _run_foreground_core_service(
+            resolved_prompt,
+            project_root,
+            core_mode=core_mode,
+            output=output,
+        )
+        raise typer.Exit(code=0 if result.get("ok") else 1)
     if mode == ForegroundMode.AUTO and resolved_agent in _NATIVE_AGENT_ALIASES and not no_session:
         result = _run_native_agent_alias_session(
             resolved_prompt,
@@ -6546,6 +6566,68 @@ def _require_initialized(project_root: Path) -> None:
 
 
 _NATIVE_AGENT_ALIASES = {"build", "plan", "general", "explore"}
+
+
+def _foreground_core_mode_from_agent(agent_id: str | None, foreground_mode: ForegroundMode) -> str | None:
+    if foreground_mode != ForegroundMode.AUTO:
+        return None
+    if agent_id == "plan":
+        return "repo_planning"
+    if agent_id == "build":
+        return "codex_isolated_edit"
+    return None
+
+
+def _foreground_core_route_allowed(
+    *,
+    output: OutputFormat,
+    model: str | None,
+    reasoning_effort: str | None,
+    fail_on_dirty: bool,
+    continue_session: bool,
+    session_id: str | None,
+    fork_session: bool,
+    title: str | None,
+    file_refs: list[Path],
+    no_session: bool,
+) -> bool:
+    return (
+        output == OutputFormat.JSON
+        and model is None
+        and reasoning_effort is None
+        and not fail_on_dirty
+        and not continue_session
+        and session_id is None
+        and not fork_session
+        and title is None
+        and not file_refs
+        and not no_session
+    )
+
+
+def core_result_to_cli_payload(result) -> dict:
+    return result.model_dump(mode="json")
+
+
+def _run_foreground_core_service(
+    goal: str,
+    project_root: Path,
+    *,
+    core_mode: str,
+    output: OutputFormat,
+) -> dict:
+    result = HarnessCoreService().start_goal(
+        goal,
+        mode=core_mode,
+        project_root=project_root,
+        output_format=output.value,
+    )
+    payload = core_result_to_cli_payload(result)
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return payload
+    typer.echo(result.summary.summary_text if result.summary is not None else f"Decision: {result.decision}")
+    return payload
 
 
 def _resolve_foreground_agent_selection(prompt: str, agent_id: str | None) -> tuple[str, str | None]:
