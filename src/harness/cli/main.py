@@ -56,6 +56,7 @@ from harness.context_chunks import (
     rebuild_repo_file_context_chunks,
 )
 from harness.core_service import HarnessCoreService
+from harness.core_projection import build_core_run_projection
 from harness.context_pack import pack_chat_context
 from harness.context_policy import decide_context_transmission
 from harness.context_retrieval import LexicalContextRetriever
@@ -3950,6 +3951,48 @@ def core_run(
         return
     typer.echo(result.summary.summary_text if result.summary is not None else f"Decision: {result.decision}")
     if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@core_app.command("inspect-run")
+def core_inspect_run(
+    run_id: Annotated[str, typer.Argument(help="Run id to inspect through the canonical core projection.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.JSON,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        projection = build_core_run_projection(project_root, run_id)
+    except KeyError as exc:
+        payload = {
+            "schema_version": "harness.core_projection_error/v1",
+            "ok": False,
+            "run_id": run_id,
+            "project_root": str(project_root),
+            "error": str(exc).strip("'"),
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            raise typer.Exit(code=1) from exc
+        typer.echo(payload["error"])
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(projection.model_dump(mode="json"))
+        if not projection.ok:
+            raise typer.Exit(code=1)
+        return
+    typer.echo(f"Run: {projection.run_id}")
+    typer.echo(f"Status: {projection.status}")
+    typer.echo(f"Decision: {projection.decision}")
+    typer.echo(f"Task: {projection.task_id or 'none'}")
+    typer.echo(f"Lease: {projection.lease_id or 'none'}")
+    typer.echo(f"Adapter: {projection.adapter_id or 'none'}")
+    typer.echo(f"Manifest: {projection.manifest or 'none'}")
+    if projection.blocked_reasons:
+        typer.echo("Blocked:")
+        for reason in projection.blocked_reasons:
+            typer.echo(f"  - {reason}")
+    if not projection.ok:
         raise typer.Exit(code=1)
 
 
