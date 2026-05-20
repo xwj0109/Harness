@@ -854,8 +854,42 @@ def events_command(
     project: ProjectOption = Path("."),
     jsonl: Annotated[bool, typer.Option("--jsonl", help="Emit raw JSONL events.")] = False,
     follow: Annotated[bool, typer.Option("--follow", "-f", help="Follow until the run or session reaches a terminal state.")] = False,
+    output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
+    if output == OutputFormat.JSON and not jsonl and not follow:
+        try:
+            projection = build_core_run_events_projection(project_root, run_or_session_id)
+        except KeyError as exc:
+            message = str(exc).strip("'")
+            _emit_json(
+                {
+                    "schema_version": "harness.events_inspect/v2",
+                    "ok": False,
+                    "project_root": str(project_root),
+                    "run_id": run_or_session_id,
+                    "event_count": 0,
+                    "events": [],
+                    "core_events": None,
+                    "error": message,
+                    "errors": [message],
+                }
+            )
+            raise typer.Exit(code=1) from exc
+        _emit_json(
+            {
+                "schema_version": "harness.events_inspect/v2",
+                "ok": projection.ok,
+                "project_root": str(project_root),
+                "run_id": projection.run_id,
+                "event_count": projection.event_count,
+                "events": [event.model_dump(mode="json") for event in projection.events],
+                "next_commands": projection.next_commands,
+                "errors": projection.errors,
+                "core_events": projection.model_dump(mode="json"),
+            }
+        )
+        raise typer.Exit(code=0 if projection.ok else 1)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
     try:

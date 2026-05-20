@@ -1089,6 +1089,142 @@ def test_legacy_tasks_inspect_json_redacts_secret_like_metadata(tmp_path) -> Non
     assert "[REDACTED_SECRET]" in serialized
 
 
+def test_legacy_events_json_wraps_core_event_projection(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    expected_projection = build_core_run_events_projection(tmp_path, result.run_id).model_dump(mode="json")
+
+    inspected = runner.invoke(
+        app,
+        ["events", result.run_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    payload = json.loads(inspected.output)
+    assert payload["schema_version"] == "harness.events_inspect/v2"
+    assert payload["ok"] is True
+    assert payload["run_id"] == result.run_id
+    assert payload["project_root"] == str(tmp_path.resolve())
+    assert payload["event_count"] == len(payload["events"])
+    assert payload["event_count"] >= 1
+    assert payload["core_events"] == expected_projection
+    assert any(command.startswith("harness core inspect-events ") for command in payload["next_commands"])
+
+
+def test_legacy_events_json_missing_run_fails_closed(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    inspected = runner.invoke(
+        app,
+        ["events", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 1
+    payload = json.loads(inspected.output)
+    assert payload == {
+        "schema_version": "harness.events_inspect/v2",
+        "ok": False,
+        "project_root": str(tmp_path.resolve()),
+        "run_id": "run_missing",
+        "event_count": 0,
+        "events": [],
+        "core_events": None,
+        "error": "Run not found: run_missing",
+        "errors": ["Run not found: run_missing"],
+    }
+
+
+def test_legacy_events_json_missing_project_state_does_not_initialize(tmp_path) -> None:
+    inspected = runner.invoke(
+        app,
+        ["events", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 1
+    payload = json.loads(inspected.output)
+    assert payload["schema_version"] == "harness.events_inspect/v2"
+    assert payload["ok"] is False
+    assert "Project state not initialized" in payload["error"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_legacy_events_text_and_jsonl_paths_are_unchanged(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    text = runner.invoke(app, ["events", result.run_id, "--project", str(tmp_path)])
+    jsonl = runner.invoke(app, ["events", result.run_id, "--project", str(tmp_path), "--jsonl"])
+    jsonl_with_output = runner.invoke(
+        app,
+        ["events", result.run_id, "--project", str(tmp_path), "--jsonl", "--output", "json"],
+    )
+
+    assert text.exit_code == 0, text.output
+    assert "dry_run_no_tool_execution" in text.output
+    assert "harness.events_inspect/v2" not in text.output
+    assert jsonl.exit_code == 0, jsonl.output
+    assert jsonl_with_output.exit_code == 0, jsonl_with_output.output
+    assert jsonl_with_output.output == jsonl.output
+    first_event = json.loads(jsonl.output.splitlines()[0])
+    assert first_event["schema_version"] == "harness.event/v1"
+    assert first_event["type"] == "dry_run_no_tool_execution"
+
+
+def test_legacy_events_follow_path_remains_tail_behavior(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    followed = runner.invoke(app, ["events", result.run_id, "--project", str(tmp_path), "--follow"])
+
+    assert followed.exit_code == 0, followed.output
+    assert "dry_run_no_tool_execution" in followed.output
+    assert "harness.events_inspect/v2" not in followed.output
+
+
+def test_legacy_events_json_does_not_read_artifact_bodies(tmp_path, monkeypatch) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    body_path = tmp_path / ".harness" / "runs" / result.run_id / "legacy_events_body_should_not_be_read.txt"
+    body_path.write_text("LEGACY_EVENTS_BODY_SECRET_SHOULD_NOT_APPEAR", encoding="utf-8")
+    SQLiteStore(tmp_path).register_artifact(
+        result.run_id,
+        kind="legacy_events_body_probe",
+        path=body_path,
+        metadata={"purpose": "prove legacy events inspect does not read artifact bodies"},
+        producer="test",
+        redaction_state="redacted",
+    )
+    original_open = Path.open
+
+    def guarded_open(self, *args, **kwargs):
+        if self == body_path:
+            raise AssertionError("legacy events JSON must not read artifact bodies")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    inspected = runner.invoke(
+        app,
+        ["events", result.run_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    serialized = json.dumps(json.loads(inspected.output), sort_keys=True)
+    assert "LEGACY_EVENTS_BODY_SECRET_SHOULD_NOT_APPEAR" not in serialized
+
+
+def test_legacy_events_json_redacts_secret_like_metadata(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    SQLiteStore(tmp_path).append_event(result.run_id, "info", "legacy_events_secret_probe", f"token {secret}", {"token": secret})
+
+    inspected = runner.invoke(
+        app,
+        ["events", result.run_id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    serialized = json.dumps(json.loads(inspected.output), sort_keys=True)
+    assert secret not in serialized
+    assert "[REDACTED_SECRET]" in serialized
+
+
 def test_core_projection_missing_run_cli_fails_closed_with_structured_error(tmp_path) -> None:
     SQLiteStore(tmp_path).initialize()
     result = runner.invoke(
