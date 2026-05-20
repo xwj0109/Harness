@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from harness.config import HARNESS_DIR
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import ArtifactRecord, EventRecord, RunRecord, TaskLease, TaskRecord
+from harness.policy import effective_policy_sha256, resolve_run_effective_policy
 from harness.security import is_secret_path, sanitize_for_logging
 
 
@@ -153,12 +154,11 @@ def build_core_run_projection(project_root: Path, run_id: str) -> CoreRunProject
     run = store.get_run(run_id)
     task = _safe_get_task(store, run.task_id)
     lease = _latest_lease(store, task.id if task is not None else run.task_id)
-    manifest = store.build_run_manifest(run.id)
     artifacts = [_artifact_projection(artifact) for artifact in store.list_artifacts(run.id)]
     errors = _run_errors(run)
     blocked_reasons = _blocked_reasons_for_run(store, run, task, lease)
     adapter_id = _adapter_id(task)
-    policy_sha256 = manifest.effective_policy_sha256 or _policy_sha256_from_events(store, run.id)
+    policy_sha256 = _policy_sha256_for_run(store, run)
     return CoreRunProjection(
         ok=not errors and not blocked_reasons,
         run_id=run.id,
@@ -172,7 +172,7 @@ def build_core_run_projection(project_root: Path, run_id: str) -> CoreRunProject
         manifest=_manifest_path(root, run.id),
         artifact_ids=[artifact.artifact_id for artifact in artifacts],
         artifacts=artifacts,
-        approval_id=run.approval_id or manifest.approval_id,
+        approval_id=run.approval_id,
         policy_sha256=policy_sha256,
         errors=errors,
         blocked_reasons=blocked_reasons,
@@ -312,11 +312,10 @@ def build_core_task_projection(project_root: Path, task_id: str) -> CoreTaskProj
     policy_sha256: str | None = None
     approval_id: str | None = None
     if run is not None:
-        manifest = store.build_run_manifest(run.id)
         manifest_path = _manifest_path(root, run.id)
         artifact_ids = [artifact.id for artifact in store.list_artifacts(run.id)]
-        policy_sha256 = manifest.effective_policy_sha256 or _policy_sha256_from_events(store, run.id)
-        approval_id = run.approval_id or manifest.approval_id
+        policy_sha256 = _policy_sha256_for_run(store, run)
+        approval_id = run.approval_id
     return CoreTaskProjection(
         ok=True,
         task_id=task.id,
@@ -547,6 +546,10 @@ def _policy_sha256_from_events(store: SQLiteStore, run_id: str) -> str | None:
         if value:
             return str(sanitize_for_logging(str(value)))
     return None
+
+
+def _policy_sha256_for_run(store: SQLiteStore, run: RunRecord) -> str:
+    return _policy_sha256_from_events(store, run.id) or effective_policy_sha256(resolve_run_effective_policy(run, None))
 
 
 def _manifest_path(project_root: Path, run_id: str) -> str | None:

@@ -3875,11 +3875,14 @@ def test_cli_runs_and_show_support_json_output(tmp_path) -> None:
     show = runner.invoke(app, ["show", run_id, "--project", str(tmp_path), "--output", "json"])
     assert show.exit_code == 0
     show_payload = json.loads(show.output)
-    assert show_payload["schema_version"] == "harness.manifest/v1.1"
+    assert show_payload["schema_version"] == "harness.show/v2"
+    assert show_payload["ok"] is True
     assert show_payload["run_id"] == run_id
-    assert show_payload["run_mode"] == "dev"
-    assert show_payload["effective_policy_sha256"]
-    assert {artifact["kind"] for artifact in show_payload["artifacts"]} >= {
+    assert show_payload["core_evidence"]["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert show_payload["core_evidence"]["run_id"] == run_id
+    assert show_payload["core_evidence"]["run"]["schema_version"] == "harness.core_run_projection/v1"
+    assert show_payload["core_evidence"]["run"]["policy_sha256"]
+    assert {artifact["kind"] for artifact in show_payload["core_evidence"]["artifacts"]} >= {
         "events",
         "transcript",
         "final_report",

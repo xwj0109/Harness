@@ -274,8 +274,14 @@ def test_golden_manifest_and_show_evidence_contract(tmp_path) -> None:
     shown = _json_result(["show", run_id, "--project", str(tmp_path), "--output", "json"])
     normalized_manifest = _normalize(manifest, tmp_path)
     normalized_shown = _normalize(shown, tmp_path)
+    normalized_evidence = normalized_shown["core_evidence"]
 
-    assert normalized_shown == normalized_manifest
+    assert normalized_shown["schema_version"] == "harness.show/v2"
+    assert normalized_shown["ok"] is True
+    assert normalized_shown["run_id"] == "<RUN_ID>"
+    assert normalized_evidence["schema_version"] == "harness.core_evidence_bundle_projection/v1"
+    assert normalized_evidence["run_id"] == normalized_manifest["run_id"]
+    assert normalized_evidence["manifest"] == "<PROJECT_ROOT>/.harness/runs/<RUN_ID>/manifest.json"
     assert normalized_manifest["schema_version"] == "harness.manifest/v1.1"
     assert normalized_manifest["run_id"] == "<RUN_ID>"
     assert normalized_manifest["run_mode"] == "dev"

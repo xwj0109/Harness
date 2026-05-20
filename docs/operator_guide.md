@@ -72,6 +72,8 @@ The core loop is intentionally narrow: goal, session/objective/task records, lea
 
 `harness core inspect-evidence` is the canonical bundled read-only projection for future surfaces. It accepts exactly one of `--run` or `--task` and returns the run, task, blocked-state, event, artifact-metadata, manifest, error, and next-command projections available for that id without assembling them in a UI layer.
 
+`harness show <run_id> --output json` now wraps that same bundled run evidence under `core_evidence` in a `harness.show/v2` compatibility response. The text form of `harness show`, run listing/tailing, event streaming, task inspection, and artifact commands are intentionally unchanged.
+
 `harness core inspect-run` is the first canonical read-only projection over persisted run evidence. It reports ids, task/lease/adapter status, manifest path, artifact metadata, policy hash, errors, blocked reasons, and next commands without reading artifact bodies or expanding any UI surface.
 
 `harness core inspect-events` renders sanitized persisted run events through the same projection layer. It is read-only and does not initialize project state, execute work, or read artifact bodies.

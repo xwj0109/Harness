@@ -976,6 +976,39 @@ def quickstart_agent(project: ProjectOption = Path("."), output: OutputOption = 
 @app.command()
 def show(run_id: str, project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
+    if output == OutputFormat.JSON:
+        try:
+            projection = build_core_evidence_bundle(project_root, run_id=run_id)
+        except KeyError as exc:
+            message = str(exc).strip("'")
+            _emit_json(
+                {
+                    "schema_version": "harness.show/v2",
+                    "ok": False,
+                    "project_root": str(project_root),
+                    "run_id": run_id,
+                    "error": message,
+                    "errors": [message],
+                }
+            )
+            raise typer.Exit(code=1) from exc
+        _emit_json(
+            {
+                "schema_version": "harness.show/v2",
+                "ok": projection.ok,
+                "project_root": str(project_root),
+                "run_id": projection.run_id,
+                "task_id": projection.task_id,
+                "mode": projection.mode,
+                "decision": projection.decision,
+                "status": projection.status,
+                "manifest": projection.manifest,
+                "errors": projection.errors,
+                "next_commands": projection.next_commands,
+                "core_evidence": projection.model_dump(mode="json"),
+            }
+        )
+        return
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
     try:
@@ -983,13 +1016,6 @@ def show(run_id: str, project: ProjectOption = Path("."), output: OutputOption =
     except KeyError as exc:
         raise typer.BadParameter(str(exc)) from exc
     run_dir = store.runs_dir / run_id
-    if output == OutputFormat.JSON:
-        manifest_path = run_dir / "manifest.json"
-        if manifest_path.exists():
-            _emit_json(json.loads(manifest_path.read_text(encoding="utf-8")))
-        else:
-            _emit_json(store.build_run_manifest(run_id).model_dump(mode="json"))
-        return
     typer.echo(f"Run: {record.id}")
     typer.echo(f"Status: {record.status}")
     typer.echo(f"Goal: {record.goal or ''}")

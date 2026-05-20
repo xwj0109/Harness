@@ -746,6 +746,136 @@ def test_core_inspect_evidence_cli_json_shape_is_deterministic(tmp_path) -> None
         assert key in payload
 
 
+def test_legacy_show_json_wraps_core_evidence_bundle(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    expected_bundle = build_core_evidence_bundle(tmp_path, run_id=result.run_id).model_dump(mode="json")
+
+    shown = runner.invoke(app, ["show", result.run_id, "--project", str(tmp_path), "--output", "json"])
+
+    assert shown.exit_code == 0, shown.output
+    payload = json.loads(shown.output)
+    assert payload["schema_version"] == "harness.show/v2"
+    assert payload["ok"] is True
+    assert payload["run_id"] == result.run_id
+    assert payload["task_id"] == result.task_id
+    assert payload["mode"] == "dry_run"
+    assert payload["decision"] == "dry_run_no_tool_execution"
+    assert payload["core_evidence"] == expected_bundle
+    assert payload["manifest"] == expected_bundle["manifest"]
+    assert any(command.startswith("harness core inspect-evidence --run ") for command in payload["next_commands"])
+
+
+def test_legacy_show_json_missing_run_fails_closed_with_structured_json(tmp_path) -> None:
+    SQLiteStore(tmp_path).initialize()
+
+    shown = runner.invoke(app, ["show", "run_missing", "--project", str(tmp_path), "--output", "json"])
+
+    assert shown.exit_code == 1
+    payload = json.loads(shown.output)
+    assert payload == {
+        "schema_version": "harness.show/v2",
+        "ok": False,
+        "project_root": str(tmp_path.resolve()),
+        "run_id": "run_missing",
+        "error": "Run not found: run_missing",
+        "errors": ["Run not found: run_missing"],
+    }
+
+
+def test_legacy_show_json_missing_project_state_does_not_initialize(tmp_path) -> None:
+    shown = runner.invoke(app, ["show", "run_missing", "--project", str(tmp_path), "--output", "json"])
+
+    assert shown.exit_code == 1
+    payload = json.loads(shown.output)
+    assert payload["schema_version"] == "harness.show/v2"
+    assert payload["ok"] is False
+    assert "Project state not initialized" in payload["error"]
+    assert not (tmp_path / ".harness").exists()
+
+
+def test_legacy_show_text_output_is_unchanged(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    shown = runner.invoke(app, ["show", result.run_id, "--project", str(tmp_path)])
+
+    assert shown.exit_code == 0, shown.output
+    assert f"Run: {result.run_id}" in shown.output
+    assert "Status: completed" in shown.output
+    assert "Artifacts:" in shown.output
+    assert "final_report" in shown.output
+    assert "harness.show/v2" not in shown.output
+    assert "core_evidence" not in shown.output
+
+
+def test_legacy_show_migration_leaves_runs_list_and_tail_shapes_unchanged(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+
+    listed = runner.invoke(app, ["runs", "--project", str(tmp_path), "--output", "json"])
+    tailed = runner.invoke(app, ["runs", "tail", result.run_id, "--project", str(tmp_path), "--jsonl"])
+
+    assert listed.exit_code == 0, listed.output
+    list_payload = json.loads(listed.output)
+    assert list_payload["schema_version"] == "harness.runs/v1"
+    assert any(run["id"] == result.run_id for run in list_payload["runs"])
+    assert tailed.exit_code == 0, tailed.output
+    first_event = json.loads(tailed.output.splitlines()[0])
+    assert first_event["schema_version"] == "harness.event/v1"
+    assert first_event["type"] == "dry_run_no_tool_execution"
+
+
+def test_legacy_show_json_does_not_read_artifact_bodies(tmp_path, monkeypatch) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    body_path = tmp_path / ".harness" / "runs" / result.run_id / "legacy_show_body_should_not_be_read.txt"
+    body_path.write_text("LEGACY_SHOW_BODY_SECRET_SHOULD_NOT_APPEAR", encoding="utf-8")
+    SQLiteStore(tmp_path).register_artifact(
+        result.run_id,
+        kind="legacy_show_body_probe",
+        path=body_path,
+        metadata={"purpose": "prove legacy show projection does not read artifact bodies"},
+        producer="test",
+        redaction_state="redacted",
+    )
+    original_open = Path.open
+
+    def guarded_open(self, *args, **kwargs):
+        if self == body_path:
+            raise AssertionError("legacy show JSON must not read artifact bodies")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    shown = runner.invoke(app, ["show", result.run_id, "--project", str(tmp_path), "--output", "json"])
+
+    assert shown.exit_code == 0, shown.output
+    serialized = json.dumps(json.loads(shown.output), sort_keys=True)
+    assert "legacy_show_body_probe" in serialized
+    assert "LEGACY_SHOW_BODY_SECRET_SHOULD_NOT_APPEAR" not in serialized
+
+
+def test_legacy_show_json_redacts_secret_like_metadata(tmp_path) -> None:
+    result = HarnessCoreService().start_goal("smoke test core loop", mode="dry_run", project_root=tmp_path)
+    secret = "sk-abcdefghijklmnopqrstuvwxyz"
+    metadata_path = tmp_path / ".harness" / "runs" / result.run_id / "legacy_show_metadata_probe.txt"
+    metadata_path.write_text("metadata body", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    store.register_artifact(
+        result.run_id,
+        kind="legacy_show_metadata_probe",
+        path=metadata_path,
+        metadata={"token": secret},
+        producer="test",
+        redaction_state="redacted",
+    )
+    store.append_event(result.run_id, "info", "legacy_show_secret_probe", f"token {secret}", {"token": secret})
+
+    shown = runner.invoke(app, ["show", result.run_id, "--project", str(tmp_path), "--output", "json"])
+
+    assert shown.exit_code == 0, shown.output
+    serialized = json.dumps(json.loads(shown.output), sort_keys=True)
+    assert secret not in serialized
+    assert "[REDACTED_SECRET]" in serialized
+
+
 def test_core_projection_missing_run_cli_fails_closed_with_structured_error(tmp_path) -> None:
     SQLiteStore(tmp_path).initialize()
     result = runner.invoke(
