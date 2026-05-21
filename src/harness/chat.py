@@ -74,6 +74,8 @@ from harness.session_tools import (
     execute_session_tool,
     get_session_tool_descriptor,
     persist_session_tool_denial,
+    session_tool_catalog_projection,
+    session_tool_descriptor_payload,
 )
 from harness.task_operator_bridge import apply_operator_task_permission_resolution
 from harness.test_runner import DockerTestRunner, RunTestsDecision
@@ -1818,7 +1820,7 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
 
 
 def _model_tool_specs_payload() -> list[dict[str, Any]]:
-    session_specs = [descriptor.model_dump(mode="json") for descriptor in default_session_tool_descriptors()]
+    session_specs = [session_tool_descriptor_payload(descriptor) for descriptor in default_session_tool_descriptors()]
     legacy_gated = [
         spec
         for spec in chat_tool_specs_payload()
@@ -1991,9 +1993,15 @@ def _ensure_chat_session(project_root: Path, state: ChatSessionState) -> tuple[S
 
 
 def _session_tools_response(project_root: Path) -> dict[str, Any]:
-    descriptors = default_session_tool_descriptors()
+    payload = session_tool_catalog_projection(project_root=project_root)
+    descriptors = payload["tools"]
     lines = [
-        f"{descriptor.id}: side_effect={descriptor.side_effect.value} permission_required={str(descriptor.permission_required).lower()} enabled={str(descriptor.enabled).lower()}"
+        (
+            f"{descriptor['id']}: side_effect={descriptor['side_effect']} "
+            f"permission_required={str(descriptor['permission_required']).lower()} "
+            f"enabled={str(descriptor['policy']['enabled']).lower()} "
+            f"maturity={','.join(descriptor['policy']['maturity'])}"
+        )
         for descriptor in descriptors
     ]
     return _response(
@@ -2001,7 +2009,14 @@ def _session_tools_response(project_root: Path) -> dict[str, Any]:
         "Session Tools",
         lines,
         ok=True,
-        extra={"project_root": str(project_root), "tools": [descriptor.model_dump(mode="json") for descriptor in descriptors]},
+        extra={
+            "project_root": str(project_root),
+            "session_tools_schema_version": payload["schema_version"],
+            "policy_projection_schema_version": payload["policy_projection_schema_version"],
+            "policy_source": payload["policy_source"],
+            "permission_granting": payload["permission_granting"],
+            "tools": payload["tools"],
+        },
     )
 
 

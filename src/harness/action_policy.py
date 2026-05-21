@@ -8,6 +8,7 @@ from harness.action_router import (
     ManagedActionRisk,
     ManagedActionRoute,
 )
+from harness.governance.protected_paths import protected_apply_path_match
 from harness.security import is_secret_path
 
 
@@ -73,8 +74,9 @@ def _path_policy_reasons(route: ManagedActionRoute, project_root: Path) -> list[
             continue
         if any(part == ".." for part in candidate.parts):
             reasons.append(f"{key} must not traverse outside the project.")
-        if candidate.parts and candidate.parts[0] in {".git", ".harness"}:
-            reasons.append(f"{key} must not target {candidate.parts[0]}.")
+        protected_match = protected_apply_path_match(candidate)
+        if protected_match is not None:
+            reasons.append(f"{key} targets protected Harness governance path: {protected_match.path}")
         if is_secret_path(candidate):
             reasons.append(f"{key} is secret-like and cannot be managed automatically.")
         resolved = (project_root / candidate).resolve()
@@ -88,4 +90,3 @@ def _path_policy_reasons(route: ManagedActionRoute, project_root: Path) -> list[
         if Path(filename).suffix not in {str(item) for item in allowed_extensions}:
             reasons.append(f"File extension is not allowed for this action: {Path(filename).suffix}")
     return reasons
-

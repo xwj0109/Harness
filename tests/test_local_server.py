@@ -32,6 +32,7 @@ from harness.memory.sqlite_store import SQLiteStore
 from harness.models import EventStreamType, SessionPermissionBoundaryKind, SessionPermissionScope, SessionPermissionStatus
 from harness.operator_loop import create_turn_state_from_session, persist_turn_finished, persist_turn_started
 from harness.operator_models import HarnessAgentPhase
+from harness.process_supervisor import get_process_supervisor
 
 
 runner = CliRunner()
@@ -309,6 +310,7 @@ def test_local_server_routes_require_token_and_return_store_projections(tmp_path
 
     assert _authorized("Bearer local-token", "local-token") is True
     assert _authorized("Bearer wrong", "local-token") is False
+    assert _authorized(None, "local-token") is False
     health = _route_get("/health", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
     global_health = _route_get("/global/health", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
     global_config = _route_get("/global/config", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
@@ -1077,9 +1079,10 @@ def test_local_server_post_persists_session_prompt_without_execution(tmp_path) -
     assert prompt_async["async_accepted"] is True
     assert prompt_async["waited_for_response"] is False
     assert prompt_async["assistant_response_started"] is False
-    assert prompt_async["execution_started"] is False
-    assert prompt_async["provider_execution_started"] is False
-    assert prompt_async["model_execution_started"] is False
+    assert prompt_async["execution_started"] is True
+    assert prompt_async["provider_execution_started"] is True
+    assert prompt_async["model_execution_started"] is True
+    assert prompt_async["turn_id"]
     assert prompt_async["permission_granting"] is False
     assert prompt_async["authority_granting"] is False
     assert prompt_async["no_hidden_fallback"] is True
@@ -1411,6 +1414,90 @@ def test_local_server_real_http_auth_post_and_sse_flow(tmp_path) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_local_server_real_http_errors_are_shaped_and_bounded(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    server = create_local_http_server(
+        tmp_path,
+        host="127.0.0.1",
+        port=0,
+        token="test-token",
+        max_body_bytes=24,
+        cors_origin="http://localhost:3000",
+    )
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{host}:{port}"
+    try:
+        with pytest.raises(HTTPError) as unauthorized_error:
+            _http_json(f"{base_url}/health")
+        unauthorized = _http_error_json(unauthorized_error.value)
+        assert unauthorized["schema_version"] == "harness.local_server_error/v1"
+        assert unauthorized["status"] == 401
+        assert unauthorized["error_code"] == "unauthorized"
+        assert unauthorized["permission_granting"] is False
+
+        invalid_request = Request(f"{base_url}/sessions", data=b'{"title":', method="POST")
+        invalid_request.add_header("Authorization", "Bearer test-token")
+        invalid_request.add_header("Content-Type", "application/json")
+        with pytest.raises(HTTPError) as invalid_error:
+            urlopen(invalid_request, timeout=5)
+        invalid = _http_error_json(invalid_error.value)
+        assert invalid["status"] == 400
+        assert invalid["error_code"] == "invalid_json"
+        assert "Invalid JSON body" in invalid["error"]
+
+        large_request = Request(f"{base_url}/sessions", data=b'{"title":"this body is too large"}', method="POST")
+        large_request.add_header("Authorization", "Bearer test-token")
+        large_request.add_header("Content-Type", "application/json")
+        with pytest.raises(HTTPError) as large_error:
+            urlopen(large_request, timeout=5)
+        large = _http_error_json(large_error.value)
+        assert large["status"] == 413
+        assert large["error_code"] == "request_body_too_large"
+        assert large_error.value.headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
+        assert large_error.value.headers["X-Harness-Max-Request-Body-Bytes"] == "24"
+
+        with pytest.raises(HTTPError) as not_found_error:
+            _http_json(f"{base_url}/missing", token="test-token")
+        not_found = _http_error_json(not_found_error.value)
+        assert not_found["status"] == 404
+        assert not_found["error_code"] == "not_found"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_local_server_close_resets_supervised_processes(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    server = create_local_http_server(tmp_path, host="127.0.0.1", port=0, token="test-token")
+    supervisor = get_process_supervisor(tmp_path)
+    result_holder: dict[str, object] = {}
+
+    def run_process() -> None:
+        result_holder["result"] = supervisor.run(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=tmp_path,
+            timeout_seconds=60,
+            owner="test.local_server_shutdown",
+        )
+
+    thread = threading.Thread(target=run_process, daemon=True)
+    thread.start()
+    for _ in range(100):
+        if supervisor.active_process_ids():
+            break
+        thread.join(timeout=0.01)
+    assert supervisor.active_process_ids()
+
+    server.server_close()
+    thread.join(timeout=5)
+
+    assert not supervisor.active_process_ids()
+    assert result_holder["result"].status == "failed"
 
 
 def test_harness_attach_reads_existing_server_without_project_filesystem_access(tmp_path, monkeypatch) -> None:
@@ -2758,6 +2845,10 @@ def test_local_server_control_config_project_and_session_shell_routes_fail_close
     assert shell["approval_card"]["tool_id"] == "shell"
     assert shell["approval_card"]["command"] == "echo should-not-run"
     assert shell["approval_card"]["cwd"] == "."
+    assert shell["approval_card"]["descriptor_ref"]["tool_id"] == "shell"
+    assert shell["approval_card"]["descriptor_ref"]["permission_key"] == "tool.shell.execution"
+    assert shell["approval_card"]["policy"]["permission_key"] == "tool.shell.execution"
+    assert shell["approval_card"]["policy"]["replay_policy"] == "rerun_forbidden"
     assert shell["result"]["error_type"] == "permission_required"
     assert shell["process_started"] is False
     assert shell["command_executed"] is False
@@ -2911,6 +3002,45 @@ def test_local_server_session_prompt_uses_chat_operator_loop_event_sequence(tmp_
     assert shell_prompt["approval_card"]["command"] == "python3 -m pytest tests/test_session_tools.py -q"
     assert shell_prompt["execution_started"] is False
     assert shell_prompt["operator_status"]["phase"] == "waiting_approval"
+
+
+def test_local_server_session_tools_catalog_exposes_policy_projection(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Tool catalog")
+
+    global_tools = _route_get("/tools", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    session_tools = _route_get(
+        f"/sessions/{session.id}/tools",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    shell = _route_get(
+        f"/sessions/{session.id}/tools/shell",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert global_tools["schema_version"] == "harness.session_tools/v1"
+    assert global_tools["policy_projection_schema_version"] == "harness.session_tool_policy_projection/v1"
+    assert session_tools["session_id"] == session.id
+    assert session_tools["tools"] == global_tools["tools"]
+    by_id = {tool["id"]: tool for tool in global_tools["tools"]}
+    assert by_id["read"]["policy"]["enabled"] is True
+    assert by_id["read"]["policy"]["maturity"] == ["implemented"]
+    assert by_id["web-fetch"]["policy"]["enabled"] is False
+    assert by_id["web-fetch"]["policy"]["disabled_reason"] == "Missing project configuration: web_tools.enabled, web_tools.fetch_enabled"
+    assert by_id["plugin-tool"]["policy"]["enabled"] is False
+    assert "disabled_by_default" in by_id["plugin-tool"]["policy"]["maturity"]
+    assert shell["tools"][0]["id"] == "shell"
+    assert shell["tools"][0]["policy"]["permission_key"] == "tool.shell.execution"
 
 
 def test_local_server_status_projection_reports_persisted_active_turn(tmp_path) -> None:
@@ -3370,6 +3500,7 @@ def test_local_server_session_status_and_abort_share_cli_lifecycle_contract(tmp_
     assert before["status"] == "active"
     assert before["message_count"] == 1
     assert before["child_session_ids"] == [child.id]
+    assert before["planning_mode"] == {"active": False}
     assert before["terminal"] is False
     assert before["process_running"] is False
     assert before["permission_granting"] is False
@@ -4728,6 +4859,10 @@ def _http_text(url: str, *, token: str) -> str:
     request.add_header("Authorization", f"Bearer {token}")
     with urlopen(request, timeout=5) as response:
         return response.read().decode("utf-8")
+
+
+def _http_error_json(error: HTTPError) -> dict[str, object]:
+    return json.loads(error.read().decode("utf-8"))
 
 
 def _png_bytes(*, width: int, height: int) -> bytes:

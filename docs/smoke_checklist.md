@@ -15,6 +15,73 @@ git log --oneline --decorate -5
 pytest -q
 ```
 
+## Verify Governance Authority Evidence
+
+```bash
+harness governance gates --output json
+harness governance tasks create smoke-governance \
+  --agent repo_inspector \
+  --goal "Smoke governed evidence" \
+  --base main \
+  --project . \
+  --output json
+harness governance tasks show "$GOVERNANCE_TASK_ID" --project . --output json
+harness governance context build --task "$GOVERNANCE_TASK_ID" --project . --output json
+harness governance tests plan "$GOVERNANCE_TASK_ID" --project . --output json
+harness governance tests run "$GOVERNANCE_TASK_ID" --project . --output json
+harness governance data-audit --project . --output json
+```
+
+Create a minimal apply-back request after replacing the placeholder ids and hash with the task/context/test evidence produced above:
+
+```bash
+cat > /tmp/harness-applyback-request.json <<'EOF'
+{
+  "task_id": "task_abc123",
+  "segment_id": "seg_1",
+  "context_pack_hash": "context-pack-sha256",
+  "approval_id": "approval_abc123",
+  "allowed_paths": ["src/product/**"],
+  "changed_files": ["src/product/example.py"],
+  "diff_summary": {
+    "files": ["src/product/example.py"],
+    "file_count": 1,
+    "added_lines": 1,
+    "removed_lines": 0
+  },
+  "test_evidence": {
+    "task_id": "task_abc123",
+    "segment_id": "seg_1",
+    "context_pack_hash": "context-pack-sha256",
+    "status": "pass",
+    "generated_at": "2099-01-01T00:00:00Z"
+  },
+  "network_policy": {"mode": "disabled"}
+}
+EOF
+harness governance applyback validate --input /tmp/harness-applyback-request.json --project . --output json
+```
+
+Expected governance properties:
+
+- `governance gates` returns `harness.governance.gate_registry/v1` and exposes the protected apply-back pattern source.
+- Governed task commands return `harness.governance_task/v1` or `harness.governance_tasks/v1` and do not start adapters or providers.
+- Context/test commands write local evidence and do not grant apply-back or hosted-boundary authority.
+- `governance data-audit` returns `harness.data_inventory/v1` with a propose-only cleanup plan and does not delete or repair evidence.
+- `governance applyback validate` returns `harness.governance_applyback_verdict/v1`, includes `policy_hash`, `approval_id`, `diff_summary`, `changed_files`, and `gate_ids`, and reports no granted permission, no future authority, and no active repo mutation.
+
+To smoke the merge-check path on a disposable branch, run:
+
+```bash
+harness governance merge-check "$BRANCH_UNDER_REVIEW" --base main --project . --output json
+```
+
+Expected merge-check properties:
+
+- The command returns `harness.governance.merge_check/v1` and writes local evidence under `.harness/governance/merge-check/`.
+- It fails closed on protected path edits, stale branches, secret-like added text, unsafe subprocess strings, permission widening, network/sandbox widening, deletion-heavy diffs, and failing governance tests.
+- It does not merge, push, comment on pull requests, call providers, acquire leases, execute adapters, start hidden work, or mutate active repo files.
+
 ## Verify Packaging and Distribution
 
 ```bash

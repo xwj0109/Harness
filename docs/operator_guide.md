@@ -184,6 +184,79 @@ harness approvals add \
 
 These approvals are still hosted-boundary approvals only. They can satisfy `supervised-codex` autonomy checks when task type, adapter, workbench, objective, and autonomy scope match the stored profile and the profile is not expired, revoked, or over its run/runtime/context budget. Legacy hosted approvals without `--autonomy-scope supervised-codex` remain valid for manual hosted-boundary flows, but they do not satisfy strict autonomous Codex dispatch. They do not permit apply-back, active repository writes, arbitrary shell, arbitrary network, paid fallback, task type expansion, or approval renewal.
 
+## Governance Authority Layer
+
+Governance is the Harness authority layer for scoped work, context packs, test evidence, protected paths, network quarantine, apply-back, promotion, and merge readiness. It is not a convenience wrapper around Git, CI, or provider execution. Governance commands record or inspect local evidence; they do not grant hosted-boundary approval, execute adapters, call providers, merge branches, push commits, comment on pull requests, or mutate active repository files unless another explicit Harness mutation path has independently approved that action.
+
+Inspect the canonical gate registry and protected apply-back path source:
+
+```bash
+harness governance gates --output json
+```
+
+The JSON wrapper is `harness.governance.gate_registry/v1`. It names hard gates such as `no_protected_writes`, `allowed_paths_respected`, `segment_context_pack_present`, `test_evidence_fresh`, `applyback_bound_to_segment`, `promotion_not_quarantined`, and `promotion_network_policy_valid`.
+
+Create and inspect a governed task record:
+
+```bash
+harness governance tasks create governance-slice \
+  --agent repo_inspector \
+  --goal "Wire governed change evidence" \
+  --base main \
+  --project . \
+  --output json
+harness governance tasks show task_abc123 --project . --output json
+harness governance tasks list --project . --output json
+```
+
+Governed task records use `harness.governance_task/v1`. They bind a task id to a branch, base SHA, worktree path, agent id, permission profile, sandbox profile, goal, allowed paths, expected artifacts, optional context pack hash, and later test/merge-check evidence. Creating a governed task records control-plane state; it does not start a model, checkout arbitrary work, run tests, or dispatch an adapter.
+
+Build context and test evidence for that task:
+
+```bash
+harness governance context build --task task_abc123 --project . --output json
+harness governance tests plan task_abc123 --project . --output json
+harness governance tests run task_abc123 --project . --output json
+```
+
+The JSON wrappers are `harness.governance_context_pack/v1`, `harness.governance_test_plan/v1`, and `harness.governance_test_run/v1`. The context pack records the governed task context hash. The test planner chooses local commands for the task type and records gate ids. The test runner writes local evidence and updates task metadata. These commands do not widen permissions, grant apply-back, or authorize future work by themselves.
+
+Run merge readiness checks:
+
+```bash
+harness governance merge-check feature/governed-change --base main --project . --output json
+```
+
+The JSON wrapper is `harness.governance.merge_check/v1`. Merge-check requires a clean working tree, compares the requested branch to the base, scans for protected path changes, secret-like added text, dangerous execution strings, authority drift, provider permission widening, sandbox/network widening, deletion-heavy diffs, core deletions, vendored third-party changes, and the governance test command. It writes local evidence under `.harness/governance/merge-check/` and returns a pass, request-changes, or reject verdict.
+
+Merge-check does not merge, push, comment on pull requests, call providers, acquire leases, execute registered adapters, start background work, grant approvals, or mutate the active repository. A passing merge-check is evidence for a human or a later explicit workflow; it is not an instruction to integrate the branch.
+
+Inspect local data and cleanup eligibility:
+
+```bash
+harness governance data-audit --project . --output json
+```
+
+The JSON wrappers are `harness.data_inventory/v1` and `harness.data_cleanup_proposal/v1`. The command inventories local Harness state and proposes retention cleanup. It does not delete files, prune SQLite rows, modify artifacts, or repair evidence.
+
+Validate network policy and quarantine evidence:
+
+```bash
+harness governance network validate --policy /tmp/network-policy.json --project . --output json
+harness governance network check-url https://docs.example.com/page --policy /tmp/network-policy.json --project . --output json
+harness governance network quarantine https://docs.example.com/report.pdf --policy /tmp/network-policy.json --project . --output json
+```
+
+The JSON wrappers are `harness.governance_network_policy_check/v1`, `harness.governance_network_check_url/v1`, and `harness.governance_download_quarantine/v1`. Network policy evidence requires a task id, allowlist, request log path, quarantine path, approval id, expiration, request logging, quarantine, and metadata-service blocking. Network artifacts remain unpromoted until separate review evidence approves them.
+
+Validate apply-back and promotion:
+
+```bash
+harness governance applyback validate --input /tmp/applyback-request.json --project . --output json
+```
+
+The JSON wrapper is `harness.governance_applyback_verdict/v1`. The request must bind the proposed promotion to a `task_id`, `segment_id` or `objective_id`, `context_pack_hash`, `approval_id`, `allowed_paths`, `changed_files`, `diff_summary`, and fresh passing `test_evidence`. Protected path hits require matching exception evidence. Quarantined artifacts are rejected unless visual, security, or quality review evidence has promoted them. The output includes `policy_hash`, `approval_id`, `diff_summary`, `changed_files`, `gate_ids`, hard-gate results, and explicit `operator_authority` fields showing that the command wrote durable evidence only and did not grant permission, future authority, or active repo mutation.
+
 Blocked-state explanations are normalized across CLI, chat, and the TUI. `daemon inspect-lease`, `daemon execute`, `capabilities inspect`, `progress`, chat prompts such as “why is this blocked?” and “security blockers”, and the TUI right panel can show stable codes including `missing_approval`, `disabled_adapter`, `unsafe_metadata`, `unknown_adapter`, `sandbox_profile_mismatch`, `breaker_open`, and `forbidden_path_or_secret_like_content`. These explanations are read-only summaries of existing evidence; they do not create approvals, tasks, leases, runs, memory, artifacts, or execution.
 
 `harness quickstart agent` prints the exact command sequence for the MVP agent path:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hmac
 import hashlib
 import mimetypes
+import os
 import re
 import secrets
 import sqlite3
@@ -19,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from harness import __version__
 from harness.command_catalog import build_command_catalog, command_action_unsupported
 from harness.config import load_config
+from harness.event_broker import reset_event_broker, subscribe_global_events, subscribe_store_events
 from harness.memory.sqlite_store import (
     SESSION_SCHEMA_REPAIR_MESSAGE,
     SQLiteStore,
@@ -36,15 +39,25 @@ from harness.models import (
 )
 from harness.operator_loop import session_operator_status_projection
 from harness.paths import is_excluded_relative, relative_to_project, resolve_project_root, resolve_under_project
+from harness.process_supervisor import reset_process_supervisor
 from harness.security import assert_not_secret_path, is_secret_path, redact_secret_text, sanitize_for_logging
 from harness.session_cwd import CwdResolutionError, cwd_recovery_message, session_cwd_payload
 from harness.session_replay import build_session_replay_projection
+from harness.session_runtime import (
+    SessionPromptQueuePolicy,
+    SessionPromptRequest,
+    SessionRuntimeManager,
+    SessionRuntimePhase,
+    reset_session_runtime_state,
+)
 from harness.session_share import build_local_session_share_snapshot, hosted_share_unsupported
 from harness.session_tools import (
     build_session_approval_card,
     execute_session_tool,
     pending_session_tool_call_from_permission,
     persist_session_tool_denial,
+    session_tool_catalog_projection,
+    session_planning_mode_projection,
 )
 from harness.task_operator_bridge import apply_operator_task_permission_resolution
 from harness.tui import build_tui_settings_catalog
@@ -53,6 +66,17 @@ from harness.workspace_catalog import build_workspace_catalog, build_workspace_c
 
 LOCAL_SERVER_SCHEMA_VERSION = "harness.local_server/v1"
 OPENAPI_SCHEMA_VERSION = "harness.local_server.openapi/v1"
+LOCAL_SERVER_ERROR_SCHEMA_VERSION = "harness.local_server_error/v1"
+DEFAULT_MAX_REQUEST_BODY_BYTES = 1_048_576
+DEFAULT_CORS_ORIGIN = "http://127.0.0.1"
+
+
+class LocalServerHTTPError(ValueError):
+    def __init__(self, status: HTTPStatus, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error_code = error_code
+        self.message = message
 
 
 def generate_server_token() -> str:
@@ -101,7 +125,21 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                     "scheme": "bearer",
                     "description": "Local token supplied when starting `harness serve`.",
                 }
-            }
+            },
+            "schemas": {
+                "LocalServerError": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "error", "error_code", "status"],
+                    "properties": {
+                        "schema_version": {"const": LOCAL_SERVER_ERROR_SCHEMA_VERSION},
+                        "ok": {"const": False},
+                        "error": {"type": "string"},
+                        "error_code": {"type": "string"},
+                        "status": {"type": "integer"},
+                        "permission_granting": {"const": False},
+                    },
+                }
+            },
         },
         "paths": {
             "/health": {"get": {"summary": "Health check", "security": bearer, "responses": _json_response()}},
@@ -326,6 +364,7 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                 }
             },
             "/commands": {"get": {"summary": "Discover project command templates without executing them", "security": bearer, "responses": _json_response()}},
+            "/tools": {"get": {"summary": "List Harness session tool descriptors with policy projections", "security": bearer, "responses": _json_response()}},
             "/commands/run": {"post": {"summary": "Fail-closed placeholder for user-defined command execution", "security": bearer, "responses": _json_response(status="501")}},
             "/pr/checkout": {"post": {"summary": "Fail-closed placeholder for PR checkout without network or git mutation", "security": bearer, "responses": _json_response(status="501")}},
             "/pr/run": {"post": {"summary": "Fail-closed placeholder for PR checkout and run without network, git mutation, or adapter execution", "security": bearer, "responses": _json_response(status="501")}},
@@ -582,12 +621,32 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                 }
             },
             "/sessions/{session_id}/tool": {
+                "get": {
+                    "summary": "List Harness session tool descriptors with policy projections",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(status="200"),
+                },
                 "post": {
                     "summary": "Run a session tool through the same gateway used by CLI and chat",
                     "security": bearer,
                     "parameters": [_path_param("session_id")],
                     "responses": _json_response(status="200"),
                 }
+            },
+            "/sessions/{session_id}/tools": {
+                "get": {
+                    "summary": "List Harness session tool descriptors with policy projections",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(status="200"),
+                },
+                "post": {
+                    "summary": "Run a session tool through the same gateway used by CLI and chat",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(status="200"),
+                },
             },
             "/sessions/{session_id}/parts/{part_id}/correct": {
                 "post": {
@@ -816,6 +875,8 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             "permission_granting": False,
             "no_hidden_fallback": True,
             "authority": "local_persistence_no_execution",
+            "max_request_body_bytes": DEFAULT_MAX_REQUEST_BODY_BYTES,
+            "cors_default_origin": DEFAULT_CORS_ORIGIN,
         },
     }
     return _add_opencode_session_aliases(spec)
@@ -825,26 +886,59 @@ def serve_local_http(project_root: Path, *, host: str, port: int, token: str) ->
     create_local_http_server(project_root, host=host, port=port, token=token).serve_forever()
 
 
-def create_local_http_server(project_root: Path, *, host: str, port: int, token: str) -> ThreadingHTTPServer:
+class HarnessLocalHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler], *, project_root: Path) -> None:
+        super().__init__(server_address, handler_class)
+        self.project_root = Path(project_root).resolve()
+        self._harness_closed = False
+
+    def server_close(self) -> None:
+        if not self._harness_closed:
+            self._harness_closed = True
+            reset_event_broker(self.project_root)
+            reset_session_runtime_state(self.project_root)
+            reset_process_supervisor(self.project_root)
+        super().server_close()
+
+
+def create_local_http_server(
+    project_root: Path,
+    *,
+    host: str,
+    port: int,
+    token: str,
+    max_body_bytes: int | None = None,
+    cors_origin: str | None = None,
+) -> ThreadingHTTPServer:
     project_root = resolve_project_root(project_root)
     store = SQLiteStore(project_root)
     cfg = load_config(project_root)
+    request_body_limit = max(0, int(max_body_bytes if max_body_bytes is not None else _env_int("HARNESS_SERVER_MAX_BODY_BYTES", DEFAULT_MAX_REQUEST_BODY_BYTES)))
+    allowed_origin = cors_origin or os.environ.get("HARNESS_SERVER_CORS_ORIGIN") or DEFAULT_CORS_ORIGIN
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "HarnessLocalServer/0.1"
 
         def do_GET(self) -> None:  # noqa: N802
             if not _authorized(self.headers.get("Authorization"), token):
-                self._write_json({"ok": False, "error": "Unauthorized."}, status=HTTPStatus.UNAUTHORIZED)
+                self._write_error(HTTPStatus.UNAUTHORIZED, "unauthorized", "Unauthorized.")
                 return
             parsed = urlparse(self.path)
             try:
                 normalized_path = _normalize_opencode_session_path(parsed.path)
                 if normalized_path.startswith("/sessions/") and normalized_path.endswith("/events/stream"):
                     _ensure_session_schema_ready(store)
+                    if _query_flag(parse_qs(parsed.query), "live"):
+                        self._write_live_session_sse(store, normalized_path, parse_qs(parsed.query))
+                        return
                     self._write_sse(build_session_sse_stream(store, normalized_path))
                     return
                 if normalized_path in {"/event", "/global/event"}:
+                    if _query_flag(parse_qs(parsed.query), "live"):
+                        self._write_live_global_sse(store, project_root)
+                        return
                     self._write_sse(build_global_event_sse_stream(store, project_root))
                     return
                 payload = _route_get(
@@ -857,24 +951,24 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
                     port=port,
                 )
             except KeyError as exc:
-                self._write_json({"ok": False, "error": str(exc).strip("'")}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", str(exc).strip("'"))
                 return
             except ValueError as exc:
-                self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._write_error(HTTPStatus.BAD_REQUEST, "bad_request", str(exc))
                 return
             except sqlite3.Error as exc:
                 if is_missing_session_schema_error(exc):
-                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, "session_schema_missing", SESSION_SCHEMA_REPAIR_MESSAGE)
                     return
                 raise
             if payload is None:
-                self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", "Not found.")
                 return
             self._write_json(payload)
 
         def do_POST(self) -> None:  # noqa: N802
             if not _authorized(self.headers.get("Authorization"), token):
-                self._write_json({"ok": False, "error": "Unauthorized."}, status=HTTPStatus.UNAUTHORIZED)
+                self._write_error(HTTPStatus.UNAUTHORIZED, "unauthorized", "Unauthorized.")
                 return
             parsed = urlparse(self.path)
             try:
@@ -888,25 +982,28 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
                     host=host,
                     port=port,
                 )
+            except LocalServerHTTPError as exc:
+                self._write_error(exc.status, exc.error_code, exc.message)
+                return
             except KeyError as exc:
-                self._write_json({"ok": False, "error": str(exc).strip("'")}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", str(exc).strip("'"))
                 return
             except ValueError as exc:
-                self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._write_error(HTTPStatus.BAD_REQUEST, "bad_request", str(exc))
                 return
             except sqlite3.Error as exc:
                 if is_missing_session_schema_error(exc):
-                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, "session_schema_missing", SESSION_SCHEMA_REPAIR_MESSAGE)
                     return
                 raise
             if payload is None:
-                self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", "Not found.")
                 return
             self._write_json(payload, status=HTTPStatus.CREATED)
 
         def do_PUT(self) -> None:  # noqa: N802
             if not _authorized(self.headers.get("Authorization"), token):
-                self._write_json({"ok": False, "error": "Unauthorized."}, status=HTTPStatus.UNAUTHORIZED)
+                self._write_error(HTTPStatus.UNAUTHORIZED, "unauthorized", "Unauthorized.")
                 return
             parsed = urlparse(self.path)
             try:
@@ -920,66 +1017,72 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
                     host=host,
                     port=port,
                 )
+            except LocalServerHTTPError as exc:
+                self._write_error(exc.status, exc.error_code, exc.message)
+                return
             except KeyError as exc:
-                self._write_json({"ok": False, "error": str(exc).strip("'")}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", str(exc).strip("'"))
                 return
             except ValueError as exc:
-                self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._write_error(HTTPStatus.BAD_REQUEST, "bad_request", str(exc))
                 return
             except sqlite3.Error as exc:
                 if is_missing_session_schema_error(exc):
-                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, "session_schema_missing", SESSION_SCHEMA_REPAIR_MESSAGE)
                     return
                 raise
             if payload is None:
-                self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", "Not found.")
                 return
             self._write_json(payload, status=HTTPStatus.OK)
 
         def do_PATCH(self) -> None:  # noqa: N802
             if not _authorized(self.headers.get("Authorization"), token):
-                self._write_json({"ok": False, "error": "Unauthorized."}, status=HTTPStatus.UNAUTHORIZED)
+                self._write_error(HTTPStatus.UNAUTHORIZED, "unauthorized", "Unauthorized.")
                 return
             parsed = urlparse(self.path)
             try:
                 body = self._read_json_body()
                 payload = _route_patch(parsed.path, body=body, store=store, cfg=cfg)
+            except LocalServerHTTPError as exc:
+                self._write_error(exc.status, exc.error_code, exc.message)
+                return
             except KeyError as exc:
-                self._write_json({"ok": False, "error": str(exc).strip("'")}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", str(exc).strip("'"))
                 return
             except ValueError as exc:
-                self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._write_error(HTTPStatus.BAD_REQUEST, "bad_request", str(exc))
                 return
             except sqlite3.Error as exc:
                 if is_missing_session_schema_error(exc):
-                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, "session_schema_missing", SESSION_SCHEMA_REPAIR_MESSAGE)
                     return
                 raise
             if payload is None:
-                self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", "Not found.")
                 return
             self._write_json(payload, status=HTTPStatus.OK)
 
         def do_DELETE(self) -> None:  # noqa: N802
             if not _authorized(self.headers.get("Authorization"), token):
-                self._write_json({"ok": False, "error": "Unauthorized."}, status=HTTPStatus.UNAUTHORIZED)
+                self._write_error(HTTPStatus.UNAUTHORIZED, "unauthorized", "Unauthorized.")
                 return
             parsed = urlparse(self.path)
             try:
                 payload = _route_delete(parsed.path, store=store)
             except KeyError as exc:
-                self._write_json({"ok": False, "error": str(exc).strip("'")}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", str(exc).strip("'"))
                 return
             except ValueError as exc:
-                self._write_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                self._write_error(HTTPStatus.BAD_REQUEST, "bad_request", str(exc))
                 return
             except sqlite3.Error as exc:
                 if is_missing_session_schema_error(exc):
-                    self._write_json({"ok": False, "error": SESSION_SCHEMA_REPAIR_MESSAGE}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    self._write_error(HTTPStatus.INTERNAL_SERVER_ERROR, "session_schema_missing", SESSION_SCHEMA_REPAIR_MESSAGE)
                     return
                 raise
             if payload is None:
-                self._write_json({"ok": False, "error": "Not found."}, status=HTTPStatus.NOT_FOUND)
+                self._write_error(HTTPStatus.NOT_FOUND, "not_found", "Not found.")
                 return
             self._write_json(payload, status=HTTPStatus.OK)
 
@@ -993,15 +1096,29 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             return
 
         def _read_json_body(self) -> dict[str, Any]:
-            length = int(self.headers.get("Content-Length") or "0")
+            try:
+                length = int(self.headers.get("Content-Length") or "0")
+            except ValueError as exc:
+                raise LocalServerHTTPError(HTTPStatus.BAD_REQUEST, "invalid_content_length", "Invalid Content-Length header.") from exc
+            if length < 0:
+                raise LocalServerHTTPError(HTTPStatus.BAD_REQUEST, "invalid_content_length", "Invalid Content-Length header.")
+            if length > request_body_limit:
+                raise LocalServerHTTPError(
+                    HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                    "request_body_too_large",
+                    f"Request body exceeds {request_body_limit} bytes.",
+                )
             raw = self.rfile.read(length) if length else b"{}"
             try:
                 payload = json.loads(raw.decode("utf-8") or "{}")
             except json.JSONDecodeError as exc:
-                raise ValueError(f"Invalid JSON body: {exc.msg}") from exc
+                raise LocalServerHTTPError(HTTPStatus.BAD_REQUEST, "invalid_json", f"Invalid JSON body: {exc.msg}") from exc
             if not isinstance(payload, dict):
-                raise ValueError("JSON body must be an object.")
+                raise LocalServerHTTPError(HTTPStatus.BAD_REQUEST, "invalid_json", "JSON body must be an object.")
             return payload
+
+        def _write_error(self, status: HTTPStatus, error_code: str, message: str) -> None:
+            self._write_json(_local_server_error(status, error_code, message), status=status)
 
         def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
             body = json.dumps(payload, indent=2, sort_keys=True, default=str).encode("utf-8")
@@ -1022,13 +1139,65 @@ def create_local_http_server(project_root: Path, *, host: str, port: int, token:
             self.end_headers()
             self.wfile.write(data)
 
+        def _write_live_session_sse(self, store: SQLiteStore, path: str, query: dict[str, list[str]]) -> None:
+            session_id = _session_id_from_sse_path(path)
+            store.get_session(session_id)
+            after_seq = _sse_after_seq(query, self.headers.get("Last-Event-ID"))
+            subscription = subscribe_store_events(store, EventStreamType.SESSION, session_id, after_seq=after_seq)
+            ready = _session_sse_ready_event(session_id)
+            try:
+                self._write_live_sse_headers()
+                self._write_sse_chunk(ready)
+                while True:
+                    event = subscription.next(timeout=15.0)
+                    if event is None:
+                        self._write_sse_chunk(_sse_heartbeat_event())
+                        continue
+                    self._write_sse_chunk(_session_sse_event(event))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                subscription.close()
+
+        def _write_live_global_sse(self, store: SQLiteStore, project_root: Path) -> None:
+            subscription = subscribe_global_events(project_root)
+            for event in _global_session_events(store):
+                subscription.enqueue(event)
+            ready = _global_sse_ready_event(project_root)
+            try:
+                self._write_live_sse_headers()
+                self._write_sse_chunk(ready)
+                while True:
+                    event = subscription.next(timeout=15.0)
+                    if event is None:
+                        self._write_sse_chunk(_sse_heartbeat_event())
+                        continue
+                    self._write_sse_chunk(_global_sse_event(project_root, event.id, event))
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            finally:
+                subscription.close()
+
+        def _write_live_sse_headers(self, *, status: HTTPStatus = HTTPStatus.OK) -> None:
+            self.send_response(status.value)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self._write_common_headers()
+            self.end_headers()
+
+        def _write_sse_chunk(self, body: str) -> None:
+            self.wfile.write(body.encode("utf-8"))
+            self.wfile.flush()
+
         def _write_common_headers(self) -> None:
-            self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1")
+            self.send_header("Access-Control-Allow-Origin", allowed_origin)
             self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
             self.send_header("X-Harness-Permission-Granting", "false")
+            self.send_header("X-Harness-Max-Request-Body-Bytes", str(request_body_limit))
 
-    return ThreadingHTTPServer((host, port), Handler)
+    return HarnessLocalHTTPServer((host, port), Handler, project_root=project_root)
 
 
 def _route_get(
@@ -1236,6 +1405,12 @@ def _route_get(
         return build_tui_settings_catalog()
     if path in {"/commands", "/command"}:
         return build_command_catalog(project_root)
+    if path == "/tools":
+        return session_tool_catalog_projection(project_root=project_root)
+    if path.startswith("/tools/"):
+        tool_id = path.removeprefix("/tools/").strip("/")
+        if tool_id:
+            return session_tool_catalog_projection(project_root=project_root, tool_id=tool_id)
     if path == "/permission":
         return _global_permission_queue_projection(store)
     if path == "/question":
@@ -1282,6 +1457,18 @@ def _route_get(
             }
         if len(parts) == 3 and parts[2] == "status":
             return _session_status_projection(store, parts[1])
+        if len(parts) == 3 and parts[2] in {"tool", "tools"}:
+            store.get_session(parts[1])
+            return {
+                **session_tool_catalog_projection(project_root=project_root),
+                "session_id": parts[1],
+            }
+        if len(parts) == 4 and parts[2] in {"tool", "tools"}:
+            store.get_session(parts[1])
+            return {
+                **session_tool_catalog_projection(project_root=project_root, tool_id=parts[3]),
+                "session_id": parts[1],
+            }
         if len(parts) == 3 and parts[2] == "children":
             return _session_children_projection(store, parts[1])
         if len(parts) == 3 and parts[2] == "replay":
@@ -1596,18 +1783,34 @@ def _route_post(
                 _body_model_ref(body),
                 source="local_server_prompt_async",
             )
+            message_payload = _append_server_user_message(store, session_id, content, agent_id=agent_id)
+            runtime_acceptance = SessionRuntimeManager.for_store(store).submit_prompt(
+                SessionPromptRequest(
+                    session_id=session_id,
+                    content=content,
+                    mode="async",
+                    queue_policy=SessionPromptQueuePolicy.FOLLOW_UP,
+                    agent_id=agent_id,
+                    model_ref=_body_model_ref(body),
+                    message_id=message_payload["message"]["id"],
+                    part_id=message_payload["part"]["id"],
+                    metadata={"source": "local_server_prompt_async"},
+                )
+            )
             return {
                 "schema_version": "harness.local_server_prompt_async/v1",
                 "ok": True,
                 "session_id": session_id,
                 "model_validation": model_validation,
-                **_append_server_user_message(store, session_id, content, agent_id=agent_id),
+                **message_payload,
+                "runtime": runtime_acceptance.model_dump(mode="json"),
                 "async_accepted": True,
                 "waited_for_response": False,
                 "assistant_response_started": False,
-                "execution_started": False,
-                "provider_execution_started": False,
-                "model_execution_started": False,
+                "execution_started": runtime_acceptance.execution_started,
+                "provider_execution_started": runtime_acceptance.execution_started,
+                "model_execution_started": runtime_acceptance.execution_started,
+                "turn_id": runtime_acceptance.runtime.active_turn_id,
                 "permission_granting": False,
                 "authority_granting": False,
                 "no_hidden_fallback": True,
@@ -2343,16 +2546,26 @@ def _api_session_compact_projection(store: SQLiteStore, session_id: str, body: d
 
 def _api_session_wait_projection(store: SQLiteStore, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
     session = store.get_session(session_id)
+    timeout = _optional_body_float(body, "timeout")
+    runtime = SessionRuntimeManager.for_store(store).wait(session_id, timeout=timeout if timeout is not None else 0.0)
+    running = runtime.phase in {
+        SessionRuntimePhase.RUNNING,
+        SessionRuntimePhase.WAITING_PERMISSION,
+        SessionRuntimePhase.COMPACTING,
+        SessionRuntimePhase.RETRY_WAIT,
+        SessionRuntimePhase.ABORTING,
+    }
     return {
         "schema_version": "harness.api_session_wait/v1",
         "ok": True,
         "session_id": session_id,
         "session": session.model_dump(mode="json"),
         "requested": sanitize_for_logging(body),
-        "waited": False,
-        "agent_loop_running": False,
-        "provider_execution_started": False,
-        "execution_started": False,
+        "runtime": runtime.model_dump(mode="json"),
+        "waited": timeout is not None and timeout > 0,
+        "agent_loop_running": running,
+        "provider_execution_started": runtime.execution_enabled,
+        "execution_started": runtime.execution_enabled,
         "permission_granting": False,
         "no_hidden_fallback": True,
     }
@@ -2983,6 +3196,7 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
     events = store.list_session_store_events(session.id)
     messages = store.list_session_messages(session.id)
     children = store.list_child_sessions(session.id)
+    runtime = SessionRuntimeManager.for_store(store).status(session.id)
     try:
         cwd = session_cwd_payload(store.project_root, session.metadata, load_config(store.project_root).context_excludes)
     except Exception:
@@ -3006,6 +3220,7 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
         "message_count": len(messages),
         "event_count": len(events),
         "cwd": cwd,
+        "planning_mode": session_planning_mode_projection(session.metadata),
         "operator": session_operator_status_projection(
             store,
             session.id,
@@ -3013,11 +3228,12 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
             cwd=str(cwd.get("cwd") or "."),
             active_tools=_operator_active_tools(),
         ),
+        "runtime": runtime.model_dump(mode="json"),
         "child_session_ids": [child.id for child in children],
         "latest_ui_activation": _latest_session_ui_activation(store, session.id),
         "terminal": session.status
         in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED, SessionStatus.ARCHIVED},
-        "process_running": False,
+        "process_running": runtime.process_running,
         "permission_granting": False,
     }
 
@@ -3064,6 +3280,7 @@ def _latest_session_ui_activation(store: SQLiteStore, session_id: str) -> dict[s
 
 def _sessions_status_projection(store: SQLiteStore) -> dict[str, Any]:
     sessions = store.list_sessions()
+    runtime_manager = SessionRuntimeManager.for_store(store)
     status_by_session = {session.id: session.status.value for session in sessions}
     active_session_ids = [
         session.id
@@ -3080,6 +3297,7 @@ def _sessions_status_projection(store: SQLiteStore) -> dict[str, Any]:
                 "status": session.status.value,
                 "active_run_id": session.active_run_id,
                 "active_task_id": session.active_task_id,
+                "runtime": runtime_manager.status(session.id).model_dump(mode="json"),
                 "updated_at": session.updated_at.isoformat(),
             }
             for session in sessions
@@ -3289,6 +3507,7 @@ def _reply_to_session_permission(
     resumed_result = None
     task_operator_resume = None
     resume_skipped_reason = None
+    runtime_resolution = None
     if status == SessionPermissionStatus.DENIED:
         denial = persist_session_tool_denial(store, session_id, permission_id, feedback=reason)
         model_visible_error = denial.get("model_visible_error")
@@ -3323,6 +3542,12 @@ def _reply_to_session_permission(
                 status=status,
                 resumed_result=resumed_result,
             )
+    runtime_resolution = SessionRuntimeManager.for_store(store).permission_resolved(
+        session_id,
+        permission_id,
+        decision=status.value,
+        resumed=bool(resumed_result),
+    )
     permissions = store.list_session_permissions(session_id)
     snapshot = _session_permission_snapshot_payload(session_id, permissions, store=store)
     tool_execution_started = bool(resumed_result and resumed_result.get("ok"))
@@ -3338,6 +3563,7 @@ def _reply_to_session_permission(
         "pending_tool_call": pending_tool_call,
         "resumed_result": resumed_result,
         "task_operator_resume": task_operator_resume,
+        "runtime": runtime_resolution.model_dump(mode="json"),
         "resume_skipped_reason": resume_skipped_reason,
         "denial": denial,
         "model_visible_error": model_visible_error,
@@ -4709,6 +4935,19 @@ def _optional_body_int(body: dict[str, Any], key: str) -> int | None:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Invalid integer body field: {key}") from exc
+    if parsed < 0:
+        raise ValueError(f"Body field must be non-negative: {key}")
+    return parsed
+
+
+def _optional_body_float(body: dict[str, Any], key: str) -> float | None:
+    value = body.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid number body field: {key}") from exc
     if parsed < 0:
         raise ValueError(f"Body field must be non-negative: {key}")
     return parsed
@@ -6397,14 +6636,37 @@ def _session_unshare_unsupported(session_id: str) -> dict[str, Any]:
     }
 
 
-def build_session_sse_stream(store: SQLiteStore, path: str) -> str:
+def _query_flag(query: dict[str, list[str]], name: str) -> bool:
+    values = query.get(name)
+    if not values:
+        return False
+    return any(value.lower() not in {"0", "false", "no", "off"} for value in values)
+
+
+def _sse_after_seq(query: dict[str, list[str]], last_event_id: str | None) -> int | None:
+    for key in ("since_seq", "after_seq"):
+        for value in query.get(key, []):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    if last_event_id:
+        try:
+            return int(last_event_id)
+        except ValueError:
+            return None
+    return None
+
+
+def _session_id_from_sse_path(path: str) -> str:
     path = _normalize_opencode_session_path(path)
     parts = [part for part in path.split("/") if part]
     if len(parts) != 4 or parts[0] != "sessions" or parts[2] != "events" or parts[3] != "stream":
         raise ValueError("Unsupported SSE path.")
-    session_id = parts[1]
-    store.get_session(session_id)
-    events = store.list_store_events(EventStreamType.SESSION, session_id)
+    return parts[1]
+
+
+def _session_sse_ready_event(session_id: str) -> str:
     lines = [
         "event: harness.ready",
         "data: "
@@ -6420,20 +6682,20 @@ def build_session_sse_stream(store: SQLiteStore, path: str) -> str:
         ),
         "",
     ]
-    for event in events:
-        lines.extend(
-            [
-                f"id: {event.seq}",
-                f"event: {event.kind}",
-                "data: " + json.dumps(event.model_dump(mode="json"), sort_keys=True, default=str),
-                "",
-            ]
-        )
     return "\n".join(lines) + "\n"
 
 
-def build_global_event_sse_stream(store: SQLiteStore, project_root: Path) -> str:
-    events = _global_session_events(store)
+def _session_sse_event(event: Any) -> str:
+    lines = [
+        f"id: {event.seq}",
+        f"event: {event.kind}",
+        "data: " + json.dumps(event.model_dump(mode="json"), sort_keys=True, default=str),
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _global_sse_ready_event(project_root: Path) -> str:
     lines = [
         "event: server.connected",
         "data: "
@@ -6450,30 +6712,73 @@ def build_global_event_sse_stream(store: SQLiteStore, project_root: Path) -> str
         ),
         "",
     ]
-    for index, event in enumerate(events, start=1):
-        lines.extend(
-            [
-                f"id: {index}",
-                f"event: {event.kind}",
-                "data: "
-                + json.dumps(
-                    {
-                        "directory": str(project_root),
-                        "project": project_root.name,
-                        "workspace": str(project_root),
-                        "payload": event.model_dump(mode="json"),
-                    },
-                    sort_keys=True,
-                    default=str,
-                ),
-                "",
-            ]
-        )
     return "\n".join(lines) + "\n"
 
 
+def _global_sse_event(project_root: Path, event_id: int | str, event: Any) -> str:
+    lines = [
+        f"id: {event_id}",
+        f"event: {event.kind}",
+        "data: "
+        + json.dumps(
+            {
+                "directory": str(project_root),
+                "project": project_root.name,
+                "workspace": str(project_root),
+                "payload": event.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            default=str,
+        ),
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _sse_heartbeat_event() -> str:
+    return "event: harness.heartbeat\ndata: {}\n\n"
+
+
+def build_session_sse_stream(store: SQLiteStore, path: str) -> str:
+    session_id = _session_id_from_sse_path(path)
+    store.get_session(session_id)
+    events = store.list_store_events(EventStreamType.SESSION, session_id)
+    return _session_sse_ready_event(session_id) + "".join(_session_sse_event(event) for event in events)
+
+
+def build_global_event_sse_stream(store: SQLiteStore, project_root: Path) -> str:
+    events = _global_session_events(store)
+    return _global_sse_ready_event(project_root) + "".join(
+        _global_sse_event(project_root, index, event) for index, event in enumerate(events, start=1)
+    )
+
+
 def _authorized(header: str | None, token: str) -> bool:
-    return bool(token) and header == f"Bearer {token}"
+    if not token or not header:
+        return False
+    expected = f"Bearer {token}"
+    return hmac.compare_digest(header.encode("utf-8"), expected.encode("utf-8"))
+
+
+def _local_server_error(status: HTTPStatus, error_code: str, message: str) -> dict[str, Any]:
+    return {
+        "schema_version": LOCAL_SERVER_ERROR_SCHEMA_VERSION,
+        "ok": False,
+        "status": int(status.value),
+        "error_code": error_code,
+        "error": sanitize_for_logging(message),
+        "permission_granting": False,
+    }
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 def _json_response(*, status: str = "200") -> dict[str, Any]:

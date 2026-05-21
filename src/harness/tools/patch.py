@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from harness.governance.protected_paths import is_protected_apply_path
 from harness.paths import PathSecurityError, is_excluded_relative, relative_to_project, resolve_under_project
 from harness.security import SecretBlockedError, assert_not_secret_path
 from harness.tools.base import ToolContext, ToolResult, ToolSpec
@@ -241,7 +242,4 @@ def normalized_patch_path(path: str) -> str:
 
 
 def _is_blocked_edit_path(relative_path: str) -> bool:
-    blocked_prefixes = (".harness/", ".git/", "secrets/")
-    if relative_path in {".harness", ".git", "secrets"}:
-        return True
-    return relative_path.startswith(blocked_prefixes)
+    return is_protected_apply_path(relative_path)

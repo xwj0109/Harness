@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shutil
 import sqlite3
 import uuid
@@ -88,6 +89,9 @@ from harness.policy import (
 )
 from harness.sandbox_profiles import sandbox_profile_dict
 from harness.security import SecretBlockedError, is_secret_path, redact_secret_text, sanitize_for_logging, scan_text_for_secrets
+
+
+logger = logging.getLogger(__name__)
 from harness.security_explanations import explanations_from_eligibility, explanations_from_security_decision
 
 LEGACY_TASK_STATUS_VALUES = {
@@ -5190,7 +5194,7 @@ class SQLiteStore:
                     timestamp,
                 ),
             )
-        return StoredEventRecord(
+        event = StoredEventRecord(
             id=event_id,
             stream_type=stream_value,
             stream_id=stream_id,
@@ -5210,6 +5214,13 @@ class SQLiteStore:
             artifact_refs=sanitized_artifact_refs,
             created_at=parse_dt(timestamp),
         )
+        try:
+            from harness.event_broker import get_event_broker
+
+            get_event_broker(self.project_root).publish(event)
+        except Exception:
+            logger.exception("Failed to publish persisted store event: %s", event.id)
+        return event
 
     def _next_store_event_seq(self, conn: sqlite3.Connection, stream_type: str, stream_id: str) -> int:
         row = conn.execute(

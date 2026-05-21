@@ -1,0 +1,478 @@
+{
+  "cases": {
+    "default": {
+      "policy_fields": [
+        "boundary_kind",
+        "disabled_reason",
+        "enabled",
+        "execution_supported",
+        "maturity",
+        "permission_key",
+        "permission_required",
+        "planning_only",
+        "policy_reasons",
+        "policy_source",
+        "replay_policy",
+        "required_client_capability",
+        "required_config",
+        "required_model_capability",
+        "risk",
+        "schema_version",
+        "tool_id"
+      ],
+      "policy_projection_schema_version": "harness.session_tool_policy_projection/v1",
+      "representative_tools": {
+        "mcp": {
+          "descriptor_enabled": false,
+          "policy": {
+            "boundary_kind": "mcp",
+            "disabled_reason": "mcp is registered for catalog parity, but execution is not implemented yet; add a Harness adapter, evidence path, and permission policy before enabling it.",
+            "enabled": false,
+            "execution_supported": false,
+            "maturity": [
+              "disabled_by_default",
+              "planning_only",
+              "config_missing"
+            ],
+            "permission_key": "tool.mcp.execution",
+            "permission_required": true,
+            "planning_only": true,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [
+              "mcp.servers"
+            ],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "extension_boundary"
+        },
+        "mcp-resource": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "mcp",
+            "disabled_reason": "Missing project configuration: mcp.servers",
+            "enabled": false,
+            "execution_supported": true,
+            "maturity": [
+              "implemented",
+              "config_missing"
+            ],
+            "permission_key": "tool.mcp_resource.execution",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [
+              "mcp.servers[].resources"
+            ],
+            "required_model_capability": null,
+            "risk": "medium"
+          },
+          "tool_class": "extension_boundary"
+        },
+        "patch": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "active_repo_write",
+            "disabled_reason": null,
+            "enabled": true,
+            "execution_supported": true,
+            "maturity": [
+              "planning_only"
+            ],
+            "permission_key": "tool.patch.active_repo_write",
+            "permission_required": true,
+            "planning_only": true,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "active_repo_write"
+        },
+        "plan-enter": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "local_only",
+            "disabled_reason": "Requires client capability: planning_mode",
+            "enabled": false,
+            "execution_supported": true,
+            "maturity": [
+              "implemented",
+              "client_unsupported"
+            ],
+            "permission_key": "tool.plan_enter.session",
+            "permission_required": false,
+            "planning_only": false,
+            "replay_policy": "event_and_preview",
+            "required_client_capability": "planning_mode",
+            "required_config": [],
+            "required_model_capability": null,
+            "risk": "low"
+          },
+          "tool_class": "session_local"
+        },
+        "plugin-tool": {
+          "descriptor_enabled": false,
+          "policy": {
+            "boundary_kind": "local_only",
+            "disabled_reason": "plugin-tool is registered for catalog parity, but execution is not implemented yet; add a Harness adapter, evidence path, and permission policy before enabling it.",
+            "enabled": false,
+            "execution_supported": false,
+            "maturity": [
+              "disabled_by_default",
+              "planning_only",
+              "config_missing"
+            ],
+            "permission_key": "tool.plugin.execution",
+            "permission_required": true,
+            "planning_only": true,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [
+              "plugins.enabled",
+              "plugin registry origin/version/scope metadata"
+            ],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "extension_boundary"
+        },
+        "read": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "local_only",
+            "disabled_reason": null,
+            "enabled": true,
+            "execution_supported": true,
+            "maturity": [
+              "implemented"
+            ],
+            "permission_key": "tool.read.project_file",
+            "permission_required": false,
+            "planning_only": false,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [],
+            "required_model_capability": null,
+            "risk": "low"
+          },
+          "tool_class": "read_only_project"
+        },
+        "shell": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "shell",
+            "disabled_reason": null,
+            "enabled": true,
+            "execution_supported": true,
+            "maturity": [
+              "implemented"
+            ],
+            "permission_key": "tool.shell.execution",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "rerun_forbidden",
+            "required_client_capability": null,
+            "required_config": [],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "execution"
+        },
+        "skill-load": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "local_only",
+            "disabled_reason": "Missing project configuration: skills.enabled, skills.project",
+            "enabled": false,
+            "execution_supported": true,
+            "maturity": [
+              "implemented",
+              "config_missing"
+            ],
+            "permission_key": "tool.skill_load.session",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [
+              "skills.enabled",
+              "skills.project"
+            ],
+            "required_model_capability": null,
+            "risk": "medium"
+          },
+          "tool_class": "session_local"
+        },
+        "task": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "local_only",
+            "disabled_reason": "Requires client capability: background_tasks",
+            "enabled": false,
+            "execution_supported": true,
+            "maturity": [
+              "implemented",
+              "client_unsupported",
+              "model_unsupported"
+            ],
+            "permission_key": "tool.task.execution",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "event_and_preview",
+            "required_client_capability": "background_tasks",
+            "required_config": [
+              "subagent profiles",
+              "model tool_delegation capability"
+            ],
+            "required_model_capability": "tool_delegation",
+            "risk": "medium"
+          },
+          "tool_class": "execution"
+        },
+        "web-fetch": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "external_network",
+            "disabled_reason": "Missing project configuration: web_tools.enabled, web_tools.fetch_enabled",
+            "enabled": false,
+            "execution_supported": true,
+            "maturity": [
+              "implemented",
+              "config_missing"
+            ],
+            "permission_key": "tool.web_fetch.external_network",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [
+              "web_tools.enabled",
+              "web_tools.fetch_enabled"
+            ],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "external_network"
+        },
+        "web-search": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "external_network",
+            "disabled_reason": "Missing project configuration: web_tools.enabled, web_tools.search_enabled, web_tools.search_endpoint_url",
+            "enabled": false,
+            "execution_supported": true,
+            "maturity": [
+              "implemented",
+              "config_missing"
+            ],
+            "permission_key": "tool.web_search.external_network",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [
+              "web_tools.enabled",
+              "web_tools.search_enabled",
+              "web_tools.search_provider or web_tools.search_endpoint_url"
+            ],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "external_network"
+        },
+        "write": {
+          "descriptor_enabled": true,
+          "policy": {
+            "boundary_kind": "active_repo_write",
+            "disabled_reason": null,
+            "enabled": true,
+            "execution_supported": true,
+            "maturity": [
+              "implemented"
+            ],
+            "permission_key": "tool.write.active_repo_write",
+            "permission_required": true,
+            "planning_only": false,
+            "replay_policy": "artifact_for_large_output",
+            "required_client_capability": null,
+            "required_config": [],
+            "required_model_capability": null,
+            "risk": "high"
+          },
+          "tool_class": "active_repo_write"
+        }
+      },
+      "schema_version": "harness.session_tools/v1",
+      "tool_ids": [
+        "pwd",
+        "cd",
+        "ls",
+        "read",
+        "glob",
+        "find",
+        "grep",
+        "git-diff",
+        "repo-overview",
+        "artifact-read",
+        "lsp-diagnostics",
+        "lsp-symbols",
+        "lsp-definition",
+        "lsp-references",
+        "todo",
+        "question",
+        "plan-enter",
+        "plan-exit",
+        "policy-explain",
+        "invalid",
+        "shell",
+        "pty",
+        "docker-test",
+        "patch",
+        "edit",
+        "write",
+        "direct-write",
+        "managed-action",
+        "web-fetch",
+        "web-search",
+        "repo-clone",
+        "mcp",
+        "mcp-resource",
+        "plugin-tool",
+        "skill-load",
+        "task",
+        "task-status"
+      ]
+    },
+    "mcp_resource": {
+      "mcp": {
+        "descriptor_enabled": false,
+        "policy": {
+          "boundary_kind": "mcp",
+          "disabled_reason": "mcp is registered for catalog parity, but execution is not implemented yet; add a Harness adapter, evidence path, and permission policy before enabling it.",
+          "enabled": false,
+          "execution_supported": false,
+          "maturity": [
+            "disabled_by_default",
+            "planning_only"
+          ],
+          "permission_key": "tool.mcp.execution",
+          "permission_required": true,
+          "planning_only": true,
+          "replay_policy": "artifact_for_large_output",
+          "required_client_capability": null,
+          "required_config": [
+            "mcp.servers"
+          ],
+          "required_model_capability": null,
+          "risk": "high"
+        },
+        "tool_class": "extension_boundary"
+      },
+      "mcp-resource": {
+        "descriptor_enabled": true,
+        "policy": {
+          "boundary_kind": "mcp",
+          "disabled_reason": null,
+          "enabled": true,
+          "execution_supported": true,
+          "maturity": [
+            "implemented"
+          ],
+          "permission_key": "tool.mcp_resource.execution",
+          "permission_required": true,
+          "planning_only": false,
+          "replay_policy": "artifact_for_large_output",
+          "required_client_capability": null,
+          "required_config": [
+            "mcp.servers[].resources"
+          ],
+          "required_model_capability": null,
+          "risk": "medium"
+        },
+        "tool_class": "extension_boundary"
+      }
+    },
+    "skill_enabled": {
+      "skill-load": {
+        "descriptor_enabled": true,
+        "policy": {
+          "boundary_kind": "local_only",
+          "disabled_reason": null,
+          "enabled": true,
+          "execution_supported": true,
+          "maturity": [
+            "implemented"
+          ],
+          "permission_key": "tool.skill_load.session",
+          "permission_required": true,
+          "planning_only": false,
+          "replay_policy": "artifact_for_large_output",
+          "required_client_capability": null,
+          "required_config": [
+            "skills.enabled",
+            "skills.project"
+          ],
+          "required_model_capability": null,
+          "risk": "medium"
+        },
+        "tool_class": "session_local"
+      }
+    },
+    "web_enabled": {
+      "web-fetch": {
+        "descriptor_enabled": true,
+        "policy": {
+          "boundary_kind": "external_network",
+          "disabled_reason": null,
+          "enabled": true,
+          "execution_supported": true,
+          "maturity": [
+            "implemented"
+          ],
+          "permission_key": "tool.web_fetch.external_network",
+          "permission_required": true,
+          "planning_only": false,
+          "replay_policy": "artifact_for_large_output",
+          "required_client_capability": null,
+          "required_config": [
+            "web_tools.enabled",
+            "web_tools.fetch_enabled"
+          ],
+          "required_model_capability": null,
+          "risk": "high"
+        },
+        "tool_class": "external_network"
+      },
+      "web-search": {
+        "descriptor_enabled": true,
+        "policy": {
+          "boundary_kind": "external_network",
+          "disabled_reason": null,
+          "enabled": true,
+          "execution_supported": true,
+          "maturity": [
+            "implemented"
+          ],
+          "permission_key": "tool.web_search.external_network",
+          "permission_required": true,
+          "planning_only": false,
+          "replay_policy": "artifact_for_large_output",
+          "required_client_capability": null,
+          "required_config": [
+            "web_tools.enabled",
+            "web_tools.search_enabled",
+            "web_tools.search_provider or web_tools.search_endpoint_url"
+          ],
+          "required_model_capability": null,
+          "risk": "high"
+        },
+        "tool_class": "external_network"
+      }
+    }
+  },
+  "schema_version": "harness.session_tool_catalog_golden/v1"
+}

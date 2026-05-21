@@ -251,6 +251,47 @@ Scoped hosted approval profiles can constrain autonomous Codex use by task type,
 
 Under `supervised-codex`, `harness act` can dispatch `repo_planning` and `codex_isolated_edit` only when scoped hosted approvals exist for the exact task type, adapter, objective/workbench scope, and autonomy scope. Isolated edits still run in isolated workspaces, reviewer/final-synthesis tasks run as local evidence-producing tasks, and apply-back remains a separate higher boundary that is denied unless an explicit apply-back policy later permits it.
 
+## Governance Authority
+
+```bash
+harness governance gates --output json
+harness governance tasks create governance-slice \
+  --agent repo_inspector \
+  --goal "Wire governed change evidence" \
+  --base main \
+  --project . \
+  --output json
+harness governance tasks list --project . --output json
+harness governance tasks show task_abc123 --project . --output json
+harness governance context build --task task_abc123 --project . --output json
+harness governance tests plan task_abc123 --project . --output json
+harness governance tests run task_abc123 --project . --output json
+harness governance merge-check feature/governed-change --base main --project . --output json
+harness governance data-audit --project . --output json
+harness governance network validate --policy /tmp/network-policy.json --project . --output json
+harness governance network check-url https://docs.example.com/page --policy /tmp/network-policy.json --project . --output json
+harness governance network quarantine https://docs.example.com/report.pdf --policy /tmp/network-policy.json --project . --output json
+harness governance applyback validate --input /tmp/applyback-request.json --project . --output json
+harness governance tasks close task_abc123 --project . --output json
+```
+
+Governance is an authority layer, not a helper command group. These commands create or inspect the evidence Harness uses to decide whether work is within scope, whether context and tests are bound to a governed task segment, whether network and quarantine rules were followed, and whether promotion is allowed. Governance evidence narrows or blocks authority; it does not create provider approvals, grant future permissions, start hidden work, or bypass the normal session, task, adapter, approval, sandbox, and protected-path boundaries.
+
+The core JSON schemas are:
+
+- `harness.governance.gate_registry/v1` for `governance gates`.
+- `harness.governance_task/v1` and `harness.governance_tasks/v1` for governed task records.
+- `harness.governance_context_pack/v1` for context packs.
+- `harness.governance_test_plan/v1` and `harness.governance_test_run/v1` for test evidence.
+- `harness.governance.merge_check/v1` for merge-check evidence.
+- `harness.data_inventory/v1` and `harness.data_cleanup_proposal/v1` for data audit output.
+- `harness.governance_network_policy_check/v1`, `harness.governance_network_check_url/v1`, and `harness.governance_download_quarantine/v1` for network policy evidence.
+- `harness.governance_applyback_verdict/v1` for apply-back and promotion verdicts.
+
+`governance merge-check` is a fail-closed evidence command. It runs local checks, writes local evidence under `.harness/governance/`, and exits nonzero for blocking verdicts. It does not merge branches, push commits, comment on pull requests, call providers, start adapters, execute arbitrary shell commands, or mutate the active repository.
+
+`governance applyback validate` validates an input request that includes `task_id`, `segment_id` or `objective_id`, `context_pack_hash`, `approval_id`, `allowed_paths`, `changed_files`, `diff_summary`, and fresh passing `test_evidence`. Protected path hits require explicit exception evidence. Quarantined artifacts are rejected unless a visual, security, or quality review has promoted them. The command writes durable evidence only; its payload explicitly reports that it did not grant permission, future authority, or active repo mutation.
+
 ## Packaging Smoke
 
 ```bash

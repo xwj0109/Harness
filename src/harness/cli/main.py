@@ -79,6 +79,26 @@ from harness.daemon_adapters import execute_read_only_summary_lease
 from harness.execution import execute_lease, list_execution_adapter_descriptors
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.evals import run_safety_smoke, run_security_check, run_security_layer_audit
+from harness.governance.applyback import load_applyback_request, write_applyback_evidence
+from harness.governance.context import build_governance_context_pack
+from harness.governance.data_inventory import build_data_inventory
+from harness.governance.gate_registry import gate_registry_payload
+from harness.governance.merge_check import run_governance_merge_check
+from harness.governance.network import (
+    evaluate_network_request,
+    load_network_policy,
+    validate_network_policy,
+    write_download_quarantine_record,
+    write_network_policy_check,
+    write_network_request_log,
+)
+from harness.governance.tasks import (
+    close_governance_task,
+    create_governance_task,
+    list_governance_tasks,
+    load_governance_task,
+)
+from harness.governance.test_plan import plan_governance_tests, run_governance_tests
 from harness.integrity import run_integrity_check
 from harness.intent_router import IntentRoute, route_instruction
 from harness.isolation import ActiveRepoDirtyError
@@ -180,7 +200,12 @@ from harness.session_timeline import (
 from harness.session_replay import build_session_replay_projection
 from harness.session_share import build_local_session_share_snapshot, hosted_share_unsupported
 from harness.session_cwd import CwdResolutionError, CwdResolver, cwd_recovery_message, session_cwd_from_metadata
-from harness.session_tools import default_session_tool_descriptors, execute_session_tool, get_session_tool_descriptor
+from harness.session_tools import (
+    default_session_tool_descriptors,
+    execute_session_tool,
+    get_session_tool_descriptor,
+    session_tool_catalog_projection,
+)
 from harness.spec_loader import (
     SpecBundleError,
     diff_builtin_to_custom_spec_registry,
@@ -255,6 +280,12 @@ evals_app = typer.Typer(help="Local evidence-only eval suites.")
 security_app = typer.Typer(help="Local metadata-only security detections.")
 integrity_app = typer.Typer(help="Local package and evidence integrity checks.")
 traces_app = typer.Typer(help="Local run trace export.")
+governance_app = typer.Typer(help="Governance authority, gates, and evidence.")
+governance_tasks_app = typer.Typer(help="Governed task branch and worktree records.")
+governance_context_app = typer.Typer(help="Governance context pack evidence.")
+governance_tests_app = typer.Typer(help="Governance test plans and evidence.")
+governance_network_app = typer.Typer(help="Network policy and quarantine evidence.")
+governance_applyback_app = typer.Typer(help="Apply-back and promotion governance evidence.")
 autonomy_app = typer.Typer(help="Autonomy policy profiles and decisions.")
 autonomy_policy_app = typer.Typer(help="Autonomy policy profile inspection.")
 daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
@@ -302,6 +333,7 @@ app.add_typer(evals_app, name="evals")
 app.add_typer(security_app, name="security")
 app.add_typer(integrity_app, name="integrity")
 app.add_typer(traces_app, name="traces")
+app.add_typer(governance_app, name="governance")
 app.add_typer(autonomy_app, name="autonomy")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
@@ -313,6 +345,11 @@ tests_app.add_typer(tests_image_app, name="image")
 web_app.add_typer(web_client_app, name="client")
 specs_app.add_typer(specs_preview_app, name="preview")
 autonomy_app.add_typer(autonomy_policy_app, name="policy")
+governance_app.add_typer(governance_tasks_app, name="tasks")
+governance_app.add_typer(governance_context_app, name="context")
+governance_app.add_typer(governance_tests_app, name="tests")
+governance_app.add_typer(governance_network_app, name="network")
+governance_app.add_typer(governance_applyback_app, name="applyback")
 
 ProjectOption = Annotated[Path, typer.Option("--project", help="Project root path.")]
 TaskStatusArg = Annotated[TaskStatus, typer.Argument(help="Task status.")]
@@ -2108,6 +2145,351 @@ def policy_explain(
     _print_kv("Reasons", "; ".join(policy.forbidden_reasons) if policy.forbidden_reasons else "none")
 
 
+@governance_app.command("gates")
+def governance_gates(output: OutputOption = OutputFormat.TEXT) -> None:
+    payload = gate_registry_payload()
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo("Harness Governance Gates")
+    typer.echo(f"Schema: {payload['schema_version']}")
+    typer.echo(f"Protected path source: {payload['protected_apply_patterns_source']}")
+    typer.echo("Gates:")
+    for gate in payload["gates"]:
+        typer.echo(f"  - {gate['id']} [{gate['layer']}]: {gate['description']}")
+
+
+@governance_tasks_app.command("create")
+def governance_tasks_create(
+    slug: Annotated[str, typer.Argument(help="Governed task slug.")],
+    agent: Annotated[str, typer.Option("--agent", help="Built-in agent id that owns this task.")],
+    goal: Annotated[str, typer.Option("--goal", help="Task goal.")],
+    base: Annotated[str, typer.Option("--base", help="Base branch or ref for the governed worktree.")] = "main",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = create_governance_task(project_root, slug=slug, agent_id=agent, goal=goal, base=base)
+    except ValueError as exc:
+        _emit_task_error("harness.governance_task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.to_dict())
+        return
+    typer.echo(f"Created governance task {result.task.id}")
+    typer.echo(f"Branch: {result.governance.branch}")
+    typer.echo(f"Worktree: {result.governance.worktree_path}")
+
+
+@governance_tasks_app.command("list")
+def governance_tasks_list(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    results = list_governance_tasks(project_root)
+    payload = {
+        "schema_version": "harness.governance_tasks/v1",
+        "ok": True,
+        "tasks": [result.to_dict() for result in results],
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    if not results:
+        typer.echo("No governance tasks found.")
+        return
+    _print_tsv(["task_id", "status", "agent", "branch", "slug"])
+    for result in results:
+        _print_tsv_row(
+            [
+                result.task.id,
+                result.governance.status,
+                result.governance.agent,
+                result.governance.branch,
+                result.governance.slug,
+            ]
+        )
+
+
+@governance_tasks_app.command("show")
+def governance_tasks_show(
+    task_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = load_governance_task(project_root, task_id)
+    except KeyError as exc:
+        _emit_task_error("harness.governance_task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.to_dict())
+        return
+    _print_section("Governance Task")
+    _print_kv("Task", result.task.id)
+    _print_kv("Status", result.governance.status)
+    _print_kv("Agent", result.governance.agent)
+    _print_kv("Branch", result.governance.branch)
+    _print_kv("Worktree", result.governance.worktree_path)
+    _print_kv("Goal", result.governance.goal)
+
+
+@governance_tasks_app.command("close")
+def governance_tasks_close(
+    task_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = close_governance_task(project_root, task_id)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.governance_task/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.to_dict())
+        return
+    typer.echo(f"Closed governance task {result.task.id}")
+
+
+@governance_context_app.command("build")
+def governance_context_build(
+    task_id: Annotated[str, typer.Option("--task", help="Governance task id.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = build_governance_context_pack(project_root, task_id)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.governance_context_pack/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Governance context pack: {result.path}")
+    typer.echo(f"SHA256: {result.sha256}")
+
+
+@governance_tests_app.command("plan")
+def governance_tests_plan(
+    task_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = plan_governance_tests(project_root, task_id)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.governance_test_plan/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Governance test plan: {result.task_id}")
+    typer.echo(f"Task type: {result.task_type}")
+    typer.echo(f"Policy hash: {result.policy_hash}")
+    for test in result.payload.get("tests", []):
+        typer.echo(f"- {test['category']}/{test['name']}: {' '.join(test['command'])}")
+
+
+@governance_tests_app.command("run")
+def governance_tests_run(
+    task_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = run_governance_tests(project_root, task_id)
+    except (KeyError, ValueError) as exc:
+        _emit_task_error("harness.governance_test_run/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo(f"Governance test run: {result.run_id}")
+    typer.echo(f"Status: {result.status}")
+    typer.echo(f"Evidence: {result.path}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@governance_app.command("merge-check")
+def governance_merge_check(
+    branch: Annotated[str, typer.Argument(help="Branch or ref to check.")],
+    base: Annotated[str, typer.Option("--base", help="Base branch or ref.")] = "main",
+    strict: Annotated[bool, typer.Option("--strict", help="Escalate warning findings to request_changes.")] = False,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    result = run_governance_merge_check(project_root, branch=branch, base=base, strict=strict)
+    if output == OutputFormat.JSON:
+        _emit_json(result.payload)
+    else:
+        typer.echo(result.payload.get("summary", "Merge-check completed."))
+        typer.echo(f"Verdict: {result.payload.get('verdict')}")
+        typer.echo(f"Evidence: {result.path}")
+    if result.exit_code:
+        raise typer.Exit(code=result.exit_code)
+
+
+@governance_app.command("data-audit")
+def governance_data_audit(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    report = build_data_inventory(project_root)
+    payload = report.to_dict()
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    summary = payload["summary"]
+    proposal = payload["cleanup_proposal"]
+    typer.echo("Harness data audit: read-only")
+    typer.echo(f"Schema: {payload['schema_version']}")
+    typer.echo(f"Items: {summary['item_count']}")
+    typer.echo(f"Expired: {summary['expired_count']}")
+    typer.echo(f"Blocked: {summary['blocker_count']}")
+    typer.echo(f"Eligible cleanup: {summary['cleanup_candidate_count']}")
+    typer.echo(f"Mutation allowed: {proposal['mutation_allowed']}")
+
+
+@governance_applyback_app.command("validate")
+def governance_applyback_validate(
+    input_path: Annotated[Path, typer.Option("--input", help="Path to an apply-back request JSON object.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        request = load_applyback_request(input_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        _emit_task_error("harness.governance_applyback_verdict/v1", str(exc), output)
+        raise typer.Exit(code=1) from exc
+    result = write_applyback_evidence(project_root, request)
+    if output == OutputFormat.JSON:
+        _emit_json(result.payload)
+    else:
+        typer.echo("Apply-back governance verdict")
+        typer.echo(f"Verdict: {result.verdict}")
+        typer.echo(f"Policy hash: {result.policy_hash}")
+        typer.echo(f"Evidence: {result.path}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@governance_network_app.command("validate")
+def governance_network_validate(
+    policy: Annotated[Path, typer.Option("--policy", help="Path to a governance network policy JSON file.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        loaded = load_network_policy(policy)
+    except (OSError, ValueError) as exc:
+        _emit_task_error("harness.governance_network_policy_check/v1", str(exc), output)
+        raise typer.Exit(code=1) from exc
+    result = write_network_policy_check(project_root, loaded)
+    if output == OutputFormat.JSON:
+        _emit_json(result.to_dict())
+        return
+    typer.echo("Network policy check")
+    typer.echo(f"Policy: {loaded.policy_id}")
+    typer.echo(f"Status: {'pass' if result.ok else 'fail'}")
+    typer.echo(f"Evidence: {result.path}")
+    if result.errors:
+        typer.echo(f"Errors: {'; '.join(result.errors)}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@governance_network_app.command("check-url")
+def governance_network_check_url(
+    url: Annotated[str, typer.Argument(help="URL to evaluate against the policy.")],
+    policy: Annotated[Path, typer.Option("--policy", help="Path to a governance network policy JSON file.")],
+    method: Annotated[str, typer.Option("--method", help="HTTP method.")] = "GET",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        loaded = load_network_policy(policy)
+    except (OSError, ValueError) as exc:
+        _emit_task_error("harness.governance_network_decision/v1", str(exc), output)
+        raise typer.Exit(code=1) from exc
+    validation = validate_network_policy(loaded)
+    decision = evaluate_network_request(loaded, url, method=method)
+    log_path = write_network_request_log(project_root, loaded, [decision])
+    payload = {
+        "schema_version": "harness.governance_network_check_url/v1",
+        "ok": validation.ok and bool(decision["allowed"]),
+        "validation": validation.to_dict(),
+        "decision": decision,
+        "request_log_path": str(log_path),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+    else:
+        typer.echo(f"Decision: {'allow' if decision['allowed'] else 'deny'}")
+        typer.echo(f"Reason: {decision['reason']}")
+        typer.echo(f"Request log: {log_path}")
+    if not payload["ok"]:
+        raise typer.Exit(code=1)
+
+
+@governance_network_app.command("quarantine")
+def governance_network_quarantine(
+    source_url: Annotated[str, typer.Argument(help="Source URL for the downloaded artifact.")],
+    policy: Annotated[Path, typer.Option("--policy", help="Path to a governance network policy JSON file.")],
+    artifact_path: Annotated[str | None, typer.Option("--artifact-path", help="Existing artifact path, if already written.")] = None,
+    sha256: Annotated[str | None, typer.Option("--sha256", help="Artifact SHA256, if known.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        loaded = load_network_policy(policy)
+    except (OSError, ValueError) as exc:
+        _emit_task_error("harness.governance_download_quarantine/v1", str(exc), output)
+        raise typer.Exit(code=1) from exc
+    validation = validate_network_policy(loaded)
+    if not validation.ok:
+        _emit_task_error("harness.governance_download_quarantine/v1", "; ".join(validation.errors), output)
+        raise typer.Exit(code=1)
+    decision = evaluate_network_request(loaded, source_url)
+    if not decision["allowed"]:
+        _emit_task_error("harness.governance_download_quarantine/v1", str(decision["reason"]), output)
+        raise typer.Exit(code=1)
+    record = write_download_quarantine_record(
+        project_root,
+        loaded,
+        source_url=source_url,
+        artifact_path=artifact_path,
+        sha256=sha256,
+    )
+    if output == OutputFormat.JSON:
+        _emit_json(record)
+        return
+    typer.echo("Download quarantine record")
+    typer.echo(f"Policy: {loaded.policy_id}")
+    typer.echo(f"Quarantine path: {record['quarantine_path']}")
+
+
 @autonomy_policy_app.command("inspect")
 def autonomy_policy_inspect(
     profile: Annotated[str, typer.Option("--profile", help="Built-in autonomy profile id.")] = "manual",
@@ -3162,12 +3544,7 @@ def sessions_tools(
         raise typer.Exit(code=1) from exc
     if plan_only:
         descriptors = [descriptor for descriptor in descriptors if descriptor.allowed_in_plan_agent]
-    payload = {
-        "schema_version": "harness.session_tools/v1",
-        "ok": True,
-        "permission_granting": False,
-        "tools": [descriptor.model_dump(mode="json") for descriptor in descriptors],
-    }
+    payload = session_tool_catalog_projection(project_root=project_root, tool_id=tool_id, plan_only=plan_only)
     if output == OutputFormat.JSON:
         _emit_json(payload)
         return
@@ -3176,15 +3553,20 @@ def sessions_tools(
     if not descriptors:
         typer.echo("No session tools matched.")
         return
-    _print_tsv(["tool", "side_effect", "boundary", "permission", "plan"])
-    for descriptor in descriptors:
+    _print_tsv(["tool", "side_effect", "boundary", "permission", "enabled", "maturity", "reason"])
+    descriptors_by_id = {descriptor.id: descriptor for descriptor in descriptors}
+    for tool in payload["tools"]:
+        descriptor = descriptors_by_id[tool["id"]]
+        policy = tool["policy"]
         _print_tsv_row(
             [
-                descriptor.id,
+                tool["id"],
                 descriptor.side_effect.value,
                 descriptor.boundary_kind.value,
                 descriptor.permission_key,
-                "yes" if descriptor.allowed_in_plan_agent else "no",
+                "yes" if policy["enabled"] else "no",
+                ",".join(policy["maturity"]),
+                policy["disabled_reason"] or "",
             ]
         )
 
