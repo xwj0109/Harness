@@ -4,7 +4,6 @@ import re
 import time
 from pathlib import Path
 
-from harness.config import load_config
 from harness.left_pane import (
     build_left_pane_view,
     left_pane_list_item_labels,
@@ -19,7 +18,6 @@ from harness.memory.sqlite_store import (
     SQLiteStore,
     is_missing_session_schema_error,
 )
-from harness.model_catalog import parse_model_ref, validate_model_selection
 from harness.operator_context import build_session_pane_projection, build_tui_dashboard
 from harness.procedure_renderer import render_procedure_event
 from harness.right_pane import (
@@ -3649,16 +3647,18 @@ def create_read_only_tui_app(project_root: Path):
     return create_harness_app(project_root)
 
 
-def create_harness_app(project_root: Path, *, codex_like: bool = False):
+def create_harness_app(project_root: Path, *, codex_like: bool = False, app_service=None):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Container, Horizontal, Vertical, VerticalScroll
     from textual.css.query import NoMatches
     from textual.theme import Theme
     from textual.widgets import Header, Label, ListItem, ListView, Static, TextArea
-    from harness.chat import ChatSessionState, handle_chat_input
+    from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
+    from harness.core_service import HarnessAppService
 
-    dashboard = build_tui_dashboard(project_root)
+    service = app_service or HarnessAppService(project_root)
+    dashboard = service.dashboard()
     panes = build_tui_panes(dashboard)
     initial_palette = build_command_palette(model_catalog=dashboard.get("model_catalog") or {})
     slash_commands = build_slash_commands(initial_palette)
@@ -3935,6 +3935,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def __init__(self) -> None:
             super().__init__()
+            self._app_service = service
             self.register_theme(harness_light_theme)
             self.theme = "harness-light"
             self._messages = [dict(message) for message in initial_messages]
@@ -3977,6 +3978,16 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._dashboard_cache_at = time.monotonic()
             self._refresh_timer = None
             self._live_refresh_failures = 0
+            self._global_event_subscription = None
+            self._session_event_subscription = None
+            self._session_event_subscription_id: str | None = None
+            self._last_closed_session_event_subscription = None
+            self._event_refresh_dirty = False
+            self._event_refresh_count = 0
+            self._event_seen_ids: set[str] = set()
+            self._transient_session_events: list[dict] = []
+            self._event_stream_status = "starting"
+            self._event_stream_failures = 0
 
         @property
         def slash_suggestions_visible(self) -> bool:
@@ -4037,12 +4048,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self.query_one("#prompt", TextArea).focus()
             self._render_chat()
             self._render_current_view()
-            self._refresh_timer = self.set_interval(0.25, self._refresh_live_view)
+            self._start_event_subscriptions()
+            self._refresh_timer = self.set_interval(1.5, self._refresh_live_view)
 
         def on_unmount(self) -> None:
             timer = self._refresh_timer
             if timer is not None and hasattr(timer, "stop"):
                 timer.stop()
+            self._close_event_subscriptions()
 
         def on_key(self, event) -> None:
             if self.session_text_dialog_active:
@@ -4212,9 +4225,25 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 return
             self._prompt_history.append(request)
             self._prompt_history_index = None
+            use_runtime_prompt = self._should_use_runtime_prompt(request)
+            session_error: dict | None = None
+            session_id: str | None = None
+            if use_runtime_prompt:
+                try:
+                    session_id = self._ensure_runtime_prompt_session(request)
+                except Exception as exc:
+                    session_error = {
+                        "ok": False,
+                        "kind": "runtime_prompt_error",
+                        "title": "Prompt Not Submitted",
+                        "lines": [
+                            SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc),
+                        ],
+                    }
             self._messages.append({"role": "user", "title": request, "lines": []})
             stream_index = len(self._messages)
-            self._messages.append({"role": "assistant", "title": "Assistant", "lines": ["Starting model turn..."]})
+            placeholder = "Queuing runtime turn..." if use_runtime_prompt and session_error is None else "Starting model turn..."
+            self._messages.append({"role": "assistant", "title": "Assistant", "lines": [placeholder]})
             prompt.value = ""
             self._slash_suggestion_index = 0
             self._render_slash_suggestions("")
@@ -4223,7 +4252,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._request_started_at = time.monotonic()
             self._render_chat()
             self._render_current_view()
-            self.run_worker(lambda: self._run_chat_request(request, stream_index), thread=True)
+            if session_error is not None:
+                self._finish_chat_request(stream_index, session_error)
+            elif use_runtime_prompt and session_id is not None:
+                self.run_worker(lambda: self._run_runtime_prompt_request(request, stream_index, session_id), thread=True)
+            else:
+                self.run_worker(lambda: self._run_chat_request(request, stream_index), thread=True)
 
         def action_cycle_prompt_history(self, step: int) -> None:
             if not self._prompt_history:
@@ -4251,6 +4285,80 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                     "lines": [error],
                 }
             self.call_from_thread(self._finish_chat_request, stream_index, response)
+
+        def _run_runtime_prompt_request(self, request: str, stream_index: int, session_id: str) -> None:
+            try:
+                dashboard = self._app_service.dashboard(selected_session_id=session_id)
+                active_session = dashboard.get("active_session") or {}
+                active_model = dashboard.get("active_model") or {}
+                raw_model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref")
+                response = self._app_service.prompt_async(
+                    session_id,
+                    {
+                        "content": request,
+                        "agent_id": self._selected_agent_id or active_session.get("agent_id"),
+                        "raw_model_ref": raw_model_ref,
+                        "queue_policy": "follow_up",
+                        "source": "tui_prompt_submit",
+                        "tui_submit": True,
+                        "metadata": {"cwd": "."},
+                    },
+                )
+                message = _runtime_prompt_response_to_tui_response(response)
+            except Exception as exc:
+                error = SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)
+                message = {
+                    "ok": False,
+                    "kind": "runtime_prompt_error",
+                    "title": "Prompt Not Submitted",
+                    "lines": [error],
+                }
+            self.call_from_thread(self._finish_chat_request, stream_index, message)
+
+        def _should_use_runtime_prompt(self, request: str) -> bool:
+            if request.startswith("/"):
+                return False
+            try:
+                if not self._dashboard_snapshot().get("initialized"):
+                    return False
+            except Exception:
+                return False
+            if (
+                self._chat_state.pending_draft is not None
+                or self._chat_state.pending_orchestration is not None
+                or self._chat_state.pending_execute_lease_id is not None
+                or self._chat_state.pending_action_contract is not None
+                or self._chat_state.pending_session_tool_call is not None
+                or self._chat_state.pending_hosted_approval
+            ):
+                return False
+            if getattr(self._chat_state.operator_runtime.phase, "value", "idle") != "idle":
+                return False
+            try:
+                return route_chat_intent(request).get("intent") == "unsupported"
+            except Exception:
+                return False
+
+        def _ensure_runtime_prompt_session(self, request: str) -> str:
+            selected_id = self._selected_session_id or self._chat_state.session_id
+            if selected_id:
+                return selected_id
+            title = request[:64].strip() or "New session"
+            result = self._app_service.create_session(
+                {
+                    "title": title,
+                    "intent": "tui_prompt_session",
+                    "metadata": {"created_by": "tui_prompt_submit", "cwd": "."},
+                    "agent_id": self._selected_agent_id,
+                }
+            )
+            session = result["session"]
+            session_id = str(session["id"])
+            self._selected_session_id = session_id
+            self._chat_state.session_id = session_id
+            self._left_selected_item_id = f"session:{session_id}"
+            self._session_filter = "open"
+            return session_id
 
         def _append_stream_update(self, stream_index: int, update: dict) -> None:
             if stream_index >= len(self._messages):
@@ -4281,7 +4389,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 existing_lines = [
                     str(line)
                     for line in self._messages[stream_index].get("lines", [])
-                    if str(line).strip() and str(line).strip() != "Starting model turn..."
+                    if str(line).strip() and str(line).strip() not in {"Starting model turn...", "Queuing runtime turn..."}
                 ]
             final_message = _chat_response_to_tui_message(response)
             if existing_lines:
@@ -4665,13 +4773,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def _session_pane_projection(self) -> dict:
             selected_id = self._selected_session_id or self._chat_state.session_id
-            projection = build_session_pane_projection(
-                project_root,
+            projection = self._app_service.session_pane(
                 selected_session_id=selected_id,
                 status_filter=self._session_filter,
                 query=self._session_query,
             )
             self._selected_session_id = projection.get("selected_session_id")
+            self._sync_session_event_subscription()
             sessions = projection.get("sessions") or []
             self._session_cursor_index = next(
                 (index for index, session in enumerate(sessions) if session.get("id") == self._selected_session_id),
@@ -4868,24 +4976,26 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def action_create_blank_session(self) -> None:
             try:
-                store = SQLiteStore.open_initialized(project_root)
-                session = store.create_session(
-                    title="New session",
-                    intent="tui_blank_session",
-                    metadata={"created_by": "tui_session_pane", "cwd": "."},
+                result = self._app_service.create_session(
+                    {
+                        "title": "New session",
+                        "intent": "tui_blank_session",
+                        "metadata": {"created_by": "tui_session_pane", "cwd": "."},
+                    }
                 )
             except Exception as exc:
                 self._render_palette_activation_status(f"New session failed: {exc}", ok=False)
                 return
-            self._selected_session_id = session.id
-            self._left_selected_item_id = f"session:{session.id}"
-            self._chat_state.session_id = session.id
+            session = result["session"]
+            self._selected_session_id = session["id"]
+            self._left_selected_item_id = f"session:{session['id']}"
+            self._chat_state.session_id = session["id"]
             self._session_filter = "open"
             self._session_query = ""
             self._session_search_active = False
             self.query_one("#prompt", TextArea).value = ""
             self._dashboard_snapshot(force=True)
-            self._render_palette_activation_status(f"Created session {session.id}.", ok=True)
+            self._render_palette_activation_status(f"Created session {session['id']}.", ok=True)
             self._render_current_view()
 
         def action_archive_selected_session(self) -> None:
@@ -4897,7 +5007,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("Selected session is already archived.", ok=False)
                 return
             try:
-                SQLiteStore.open_initialized(project_root).archive_session(str(row["id"]))
+                self._app_service.archive_session(str(row["id"]))
             except Exception as exc:
                 self._render_palette_activation_status(f"Archive failed: {exc}", ok=False)
                 return
@@ -4914,13 +5024,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("Selected session is not archived.", ok=False)
                 return
             try:
-                session = SQLiteStore.open_initialized(project_root).restore_session(str(row["id"]))
+                result = self._app_service.restore_session(str(row["id"]))
             except Exception as exc:
                 self._render_palette_activation_status(f"Restore failed: {exc}", ok=False)
                 return
-            self._selected_session_id = session.id
-            self._left_selected_item_id = f"session:{session.id}"
-            self._chat_state.session_id = session.id
+            session = result["session"]
+            self._selected_session_id = session["id"]
+            self._left_selected_item_id = f"session:{session['id']}"
+            self._chat_state.session_id = session["id"]
             if self._session_filter == "archived":
                 self._session_filter = "open"
             self._dashboard_snapshot(force=True)
@@ -4936,7 +5047,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("Only running or waiting sessions can be aborted here.", ok=False)
                 return
             try:
-                SQLiteStore.open_initialized(project_root).cancel_session(str(row["id"]), reason="tui_session_pane")
+                self._app_service.abort_session(str(row["id"]), {"reason": "tui_session_pane"})
             except Exception as exc:
                 self._render_palette_activation_status(f"Abort failed: {exc}", ok=False)
                 return
@@ -4950,19 +5061,20 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("No session selected.", ok=False)
                 return
             try:
-                child = SQLiteStore.open_initialized(project_root).fork_session(
+                result = self._app_service.fork_session(
                     str(row["id"]),
-                    title=f"Fork of {row.get('display_title') or row['id']}",
+                    {"title": f"Fork of {row.get('display_title') or row['id']}"},
                 )
             except Exception as exc:
                 self._render_palette_activation_status(f"Fork failed: {exc}", ok=False)
                 return
-            self._selected_session_id = child.id
-            self._left_selected_item_id = f"session:{child.id}"
-            self._chat_state.session_id = child.id
+            child = result["session"]
+            self._selected_session_id = child["id"]
+            self._left_selected_item_id = f"session:{child['id']}"
+            self._chat_state.session_id = child["id"]
             self._session_filter = "open"
             self._dashboard_snapshot(force=True)
-            self._render_palette_activation_status(f"Forked session {child.id}.", ok=True)
+            self._render_palette_activation_status(f"Forked session {child['id']}.", ok=True)
             self._render_current_view()
 
         def action_cycle_session_filter(self) -> None:
@@ -4996,8 +5108,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
 
         def _after_session_removed_or_hidden(self, removed_session_id: str) -> None:
             self._dashboard_snapshot(force=True)
-            projection = build_session_pane_projection(
-                project_root,
+            projection = self._app_service.session_pane(
                 selected_session_id=None,
                 status_filter=self._session_filter,
                 query=self._session_query,
@@ -5283,8 +5394,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._render_current_view()
 
         def _show_model_dialog(self, *, query: str = "", selected_index: int = 0) -> None:
-            dashboard = build_tui_dashboard(
-                project_root,
+            dashboard = self._app_service.dashboard(
                 selected_session_id=self._selected_session_id or self._chat_state.session_id,
             )
             self._dialog_query = query
@@ -5383,7 +5493,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._render_palette_activation_status("Cannot hard delete the active in-flight session.", ok=False)
                 return
             try:
-                counts = SQLiteStore.open_initialized(project_root).hard_delete_session(session_id)
+                result = self._app_service.hard_delete_session(session_id)
+                counts = result["counts"]
             except Exception as exc:
                 self._hide_dialog()
                 self._render_palette_activation_status(f"Hard delete failed: {exc}", ok=False)
@@ -5417,7 +5528,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 self._refresh_text_dialog()
                 return
             try:
-                SQLiteStore.open_initialized(project_root).update_session_title(session_id, title)
+                self._app_service.update_session_title(session_id, title)
             except Exception as exc:
                 self._hide_dialog()
                 self._render_palette_activation_status(f"Rename failed: {exc}", ok=False)
@@ -5539,21 +5650,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             selected_agent = entries[index]
             agent_value = None if selected_agent == "default" else selected_agent
             try:
-                store = SQLiteStore.open_initialized(project_root)
-                session = store.update_session(str(row["id"]), agent_id=agent_value)
-                store.append_store_event(
-                    "session",
-                    session.id,
-                    "agent.selected",
-                    {
-                        "agent_id": agent_value,
-                        "source": "tui_session_pane",
-                        "process_started": False,
-                        "permission_granting": False,
-                    },
-                    session_id=session.id,
-                    redaction_state="not_required",
-                )
+                self._app_service.update_session_agent(str(row["id"]), agent_value, source="tui_session_pane")
             except Exception as exc:
                 self._render_palette_activation_status(f"Agent selection failed: {exc}", ok=False)
                 return
@@ -5667,32 +5764,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                         "permission_granting": False,
                         "authority_granting": False,
                     }
-                cfg = load_config(project_root)
-                validation = validate_model_selection(cfg, raw_model_ref)
-                parsed = parse_model_ref(raw_model_ref)
-                store = SQLiteStore.open_initialized(project_root)
-                validation_payload = validation.model_dump(mode="json")
-                if not validation.executable:
-                    store.append_store_event(
-                        "session",
-                        str(session_id),
-                        "session.model_validation",
-                        {
-                            **validation_payload,
-                            "source": "tui_model_picker",
-                            "summary": "Model selection blocked before execution.",
-                            "provider_execution_started": False,
-                            "model_execution_started": False,
-                            "network_accessed": False,
-                            "hidden_provider_fallback": False,
-                            "hidden_model_fallback": False,
-                            "no_hidden_fallback": True,
-                            "permission_granting": False,
-                            "authority_granting": False,
-                        },
-                        session_id=str(session_id),
-                        redaction_state="not_required",
-                    )
+                result = self._app_service.update_session_model_selection(
+                    str(session_id),
+                    raw_model_ref,
+                    source="tui_model_picker",
+                )
+                validation_payload = result["model_validation"]
+                if not result.get("session_model_selected"):
                     self._dashboard_snapshot(force=True)
                     return {
                         **activation,
@@ -5701,7 +5779,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                         "session_id": str(session_id),
                         "session_model_selected": False,
                         "model_validation": validation_payload,
-                        "blocked_reasons": validation.blocked_reasons,
+                        "blocked_reasons": result.get("blocked_reasons") or [],
                         "evidence_status": "session_model_selection_blocked",
                         "harness_state_modified": True,
                         "session_event_persisted": True,
@@ -5716,42 +5794,16 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                         "permission_granting": False,
                         "authority_granting": False,
                     }
-                session = store.update_session_model(
-                    str(session_id),
-                    raw_model_ref=raw_model_ref,
-                    provider_id=parsed["provider_id"],
-                    model_id=parsed["model_id"],
-                    model_variant=parsed["variant"],
-                )
-                store.append_store_event(
-                    "session",
-                    session.id,
-                    "session.model_validation",
-                    {
-                        **validation_payload,
-                        "source": "tui_model_picker",
-                        "summary": "Model selection validated." if validation.executable else "Model selection blocked before execution.",
-                        "provider_execution_started": False,
-                        "model_execution_started": False,
-                        "network_accessed": False,
-                        "hidden_provider_fallback": False,
-                        "hidden_model_fallback": False,
-                        "no_hidden_fallback": True,
-                        "permission_granting": False,
-                        "authority_granting": False,
-                    },
-                    session_id=session.id,
-                    redaction_state="not_required",
-                )
+                session = result["session"]
                 self._dashboard_snapshot(force=True)
                 return {
                     **activation,
-                    "ok": validation.executable,
+                    "ok": True,
                     "raw_model_ref": raw_model_ref,
-                    "session_id": session.id,
+                    "session_id": session["id"],
                     "session_model_selected": True,
                     "model_validation": validation_payload,
-                    "blocked_reasons": validation.blocked_reasons,
+                    "blocked_reasons": result.get("blocked_reasons") or [],
                     "evidence_status": "session_model_selection_persisted",
                     "harness_state_modified": True,
                     "session_event_persisted": True,
@@ -5994,8 +6046,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
             self._render_current_view()
 
         def _move_session_cursor(self, step: int) -> None:
-            projection = build_session_pane_projection(
-                project_root,
+            projection = self._app_service.session_pane(
                 selected_session_id=self._chat_state.session_id or self._selected_session_id,
                 status_filter="open",
                 query="",
@@ -6137,7 +6188,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False):
                 or selected_session_id != self._dashboard_cache_session_id
                 or now - self._dashboard_cache_at >= 1.5
             ):
-                self._dashboard_cache = build_tui_dashboard(project_root, selected_session_id=selected_session_id)
+                self._dashboard_cache = self._app_service.dashboard(selected_session_id=selected_session_id)
                 self._dashboard_cache_session_id = selected_session_id
                 self._dashboard_cache_at = now
             return self._dashboard_cache
@@ -6289,4 +6340,40 @@ def _chat_response_to_tui_message(response: dict, *, debug: bool = False) -> dic
         "role": "assistant",
         "title": response.get("title") or response.get("kind") or "Harness",
         "lines": lines,
+    }
+
+
+def _runtime_prompt_response_to_tui_response(response: dict) -> dict:
+    runtime = response.get("runtime") if isinstance(response.get("runtime"), dict) else {}
+    runtime_state = runtime.get("runtime") if isinstance(runtime.get("runtime"), dict) else {}
+    if not response.get("ok") or not response.get("accepted"):
+        lines = [
+            str(response.get("error") or runtime.get("reason") or "Runtime rejected the prompt."),
+            str(response.get("guidance") or "Create a new session or fork the current one before retrying."),
+        ]
+        return {
+            "ok": False,
+            "kind": "runtime_prompt_rejected",
+            "title": "Prompt Rejected",
+            "lines": [line for line in lines if line.strip()],
+            "runtime": runtime,
+        }
+    phase = runtime_state.get("phase") or runtime.get("phase") or "queued"
+    prompt_id = response.get("prompt_id") or runtime.get("prompt_id")
+    lines = [
+        f"Session: {response.get('session_id')}",
+        f"Prompt: {prompt_id or 'accepted'}",
+        f"Runtime: {phase}",
+    ]
+    if runtime.get("worker_started") or response.get("execution_started"):
+        lines.append("Worker: started")
+    else:
+        lines.append("Worker: queued")
+    lines.append("Transcript will refresh from persisted session messages and events.")
+    return {
+        "ok": True,
+        "kind": "runtime_prompt_submitted",
+        "title": "Prompt Submitted",
+        "lines": lines,
+        "runtime": runtime,
     }

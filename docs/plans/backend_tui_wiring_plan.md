@@ -2,6 +2,13 @@
 
 Status: draft
 
+Progress:
+
+- Slice 1 read-projection service facade started: `HarnessAppService` now exposes health, dashboard, session pane, sessions, session status, messages, events, runtime status, permissions, questions, TUI settings, and process-local event subscriptions.
+- Slice 2 TUI read path started: `create_harness_app()` now uses an injectable `HarnessAppService` for initial dashboard, dashboard cache refreshes, session pane projections, model dialog dashboard reads, and session cursor navigation reads.
+- Slice 3 TUI session mutations started: session create, archive, restore, abort/cancel, fork, hard delete, rename, agent selection, and model selection now route through `HarnessAppService` from the TUI.
+- Slice 4 runtime prompt submission started: plain natural TUI prompts now resolve/create a session, persist the user message, and queue `SessionRuntimeManager` through `HarnessAppService.prompt_async()` while slash/UI and explicit action-contract prompts stay on the existing local chat path.
+
 Goal: make the Harness backend and Textual TUI operate as one reliable local operator app. The user should be able to start `harness`, inspect state, create and switch sessions, send prompts, stream assistant progress, resolve permissions, manage session metadata, and recover from failures without hidden execution, stale views, or split-brain state between direct `SQLiteStore` calls and the local backend/runtime.
 
 ## Current State

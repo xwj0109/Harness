@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
+from harness import __version__
+from harness.event_broker import EventSubscription, subscribe_global_events, subscribe_store_events
 from pydantic import BaseModel, Field
 
 from harness.execution import (
@@ -12,21 +15,959 @@ from harness.execution import (
     REPO_PLANNING_TASK_TYPE,
     execute_lease,
 )
+from harness.config import load_config
 from harness.memory.sqlite_store import DRY_RUN_EXECUTION_ADAPTER, DRY_RUN_TASK_TYPE, SQLiteStore
+from harness.model_catalog import parse_model_ref, validate_model_selection
 from harness.models import (
     EventRecord,
+    EventStreamType,
     ObjectiveRecord,
+    RedactionState,
     RunRecord,
+    SessionMessageRole,
+    SessionPermissionStatus,
+    SessionPartKind,
     SessionSpec,
+    SessionStatus,
     TaskLease,
     run_mode_for_task_type,
 )
+from harness.operator_context import build_session_pane_projection, build_tui_dashboard
+from harness.operator_loop import session_operator_status_projection
 from harness.security import sanitize_for_logging
+from harness.session_cwd import session_cwd_payload
+from harness.session_runtime import SessionPromptQueuePolicy, SessionPromptRequest, SessionRuntimeManager
+from harness.session_tools import (
+    build_session_approval_card,
+    session_planning_mode_projection,
+)
+from harness.tui import build_tui_settings_catalog
 
 
 CORE_SCHEMA_VERSION = "harness.core_run/v1"
+APP_SERVICE_SCHEMA_VERSION = "harness.app_service/v1"
 CORE_OWNER = "core_service"
 SUPPORTED_CORE_MODES = {"dry_run", "repo_planning", "codex_isolated_edit"}
+
+
+class HarnessAppService:
+    """Shared app-facing backend facade for TUI and local-server projections."""
+
+    def __init__(
+        self,
+        project_root: Path,
+        *,
+        store: SQLiteStore | None = None,
+        runtime: SessionRuntimeManager | None = None,
+        execution_enabled: bool = True,
+    ) -> None:
+        self.project_root = Path(project_root).resolve()
+        self.store = store or SQLiteStore(self.project_root)
+        self.runtime = runtime
+        self.execution_enabled = execution_enabled
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "schema_version": APP_SERVICE_SCHEMA_VERSION,
+            "ok": True,
+            "healthy": True,
+            "version": __version__,
+            "project_root": str(self.project_root),
+            "initialized": self.initialized,
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    @property
+    def initialized(self) -> bool:
+        return self.store.db_path.exists()
+
+    def dashboard(self, *, selected_session_id: str | None = None) -> dict[str, Any]:
+        return build_tui_dashboard(self.project_root, selected_session_id=selected_session_id)
+
+    def session_pane(
+        self,
+        *,
+        selected_session_id: str | None,
+        status_filter: str,
+        query: str,
+    ) -> dict[str, Any]:
+        return build_session_pane_projection(
+            self.project_root,
+            selected_session_id=selected_session_id,
+            status_filter=status_filter,
+            query=query,
+        )
+
+    def list_sessions(self) -> dict[str, Any]:
+        if not self.initialized:
+            return self._uninitialized_payload("harness.sessions/v1", sessions=[])
+        sessions = self.store.list_sessions()
+        return {
+            "schema_version": "harness.sessions/v1",
+            "ok": True,
+            "sessions": [session.model_dump(mode="json") for session in sessions],
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def create_session(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.create_session(
+            title=_optional_text(body, "title") or "New session",
+            intent=_optional_text(body, "intent"),
+            metadata=dict(body.get("metadata") or {}),
+            agent_id=_optional_text(body, "agent_id"),
+            raw_model_ref=_optional_text(body, "raw_model_ref"),
+        )
+        return {
+            "schema_version": "harness.session_create/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "session_id": session.id,
+            "session_created": True,
+            "messages_mutated": False,
+            "parts_mutated": False,
+            "execution_started": False,
+            "process_started": False,
+            "filesystem_modified": True,
+            "active_repo_modified": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def archive_session(self, session_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.archive_session(session_id)
+        return {
+            "schema_version": "harness.session_archive/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "archived": True,
+            "hard_deleted": False,
+            "messages_deleted": False,
+            "parts_deleted": False,
+            "events_deleted": False,
+            "execution_started": False,
+            "process_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def restore_session(self, session_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.restore_session(session_id)
+        return {
+            "schema_version": "harness.session_restore/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "restored": True,
+            "execution_started": False,
+            "process_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def abort_session(self, session_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._require_initialized()
+        reason = _optional_text(body or {}, "reason") or "tui_session_pane"
+        session = self.store.cancel_session(session_id, reason=reason)
+        return {
+            "schema_version": "harness.session_abort/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "aborted": True,
+            "cancelled": True,
+            "process_stopped": False,
+            "runtime_abort_requested": False,
+            "execution_started": False,
+            "process_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def fork_session(self, session_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._require_initialized()
+        body = body or {}
+        child = self.store.fork_session(
+            session_id,
+            message_id=_optional_text(body, "message_id"),
+            title=_optional_text(body, "title"),
+            metadata=dict(body.get("metadata") or {}),
+        )
+        return {
+            "schema_version": "harness.session_fork/v1",
+            "ok": True,
+            "session_id": session_id,
+            "child_session_id": child.id,
+            "child": child.model_dump(mode="json"),
+            "session": child.model_dump(mode="json"),
+            "execution_started": False,
+            "process_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def hard_delete_session(self, session_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        counts = self.store.hard_delete_session(session_id)
+        return {
+            "schema_version": "harness.session_hard_delete/v1",
+            "ok": True,
+            "session_id": session_id,
+            "counts": counts,
+            "deletion_counts": counts,
+            "hard_deleted": True,
+            "active_repo_modified": False,
+            "process_started": False,
+            "filesystem_modified": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def update_session_title(self, session_id: str, title: str | None) -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.update_session_title(session_id, title)
+        return {
+            "schema_version": "harness.session_update/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "title_updated": True,
+            "model_updated": False,
+            "agent_updated": False,
+            "messages_mutated": False,
+            "parts_mutated": False,
+            "execution_started": False,
+            "process_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def update_session_agent(self, session_id: str, agent_id: str | None, *, source: str = "app_service") -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.update_session(session_id, agent_id=agent_id)
+        event = self.store.append_store_event(
+            EventStreamType.SESSION,
+            session.id,
+            "agent.selected",
+            {
+                "agent_id": agent_id,
+                "source": source,
+                "process_started": False,
+                "permission_granting": False,
+            },
+            session_id=session.id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+        return {
+            "schema_version": "harness.session_update/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "event": event.model_dump(mode="json"),
+            "title_updated": False,
+            "model_updated": False,
+            "agent_updated": True,
+            "messages_mutated": False,
+            "parts_mutated": False,
+            "execution_started": False,
+            "process_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def update_session_model_selection(
+        self,
+        session_id: str,
+        raw_model_ref: str,
+        *,
+        source: str = "app_service_model_picker",
+    ) -> dict[str, Any]:
+        self._require_initialized()
+        clean_ref = str(raw_model_ref or "").strip()
+        if not clean_ref:
+            raise ValueError("Missing model ref.")
+        cfg = load_config(self.project_root)
+        validation = validate_model_selection(cfg, clean_ref)
+        validation_payload = validation.model_dump(mode="json")
+        if not validation.executable:
+            event = self._append_model_validation_event(
+                session_id,
+                validation_payload,
+                source=source,
+            )
+            return {
+                "schema_version": "harness.session_update/v1",
+                "ok": False,
+                "session": self.store.get_session(session_id).model_dump(mode="json"),
+                "raw_model_ref": clean_ref,
+                "model_validation": validation_payload,
+                "blocked_reasons": validation.blocked_reasons,
+                "session_model_selected": False,
+                "session_event_persisted": True,
+                "event": event.model_dump(mode="json"),
+                "title_updated": False,
+                "model_updated": False,
+                "messages_mutated": False,
+                "parts_mutated": False,
+                "execution_started": False,
+                "process_started": False,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "network_accessed": False,
+                "hidden_provider_fallback": False,
+                "hidden_model_fallback": False,
+                "no_hidden_fallback": True,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+        parsed = parse_model_ref(clean_ref)
+        session = self.store.update_session_model(
+            session_id,
+            raw_model_ref=clean_ref,
+            provider_id=parsed["provider_id"],
+            model_id=parsed["model_id"],
+            model_variant=parsed["variant"],
+        )
+        event = self._append_model_validation_event(
+            session.id,
+            validation_payload,
+            source=source,
+        )
+        return {
+            "schema_version": "harness.session_update/v1",
+            "ok": True,
+            "session": session.model_dump(mode="json"),
+            "raw_model_ref": clean_ref,
+            "model_validation": validation_payload,
+            "blocked_reasons": validation.blocked_reasons,
+            "session_model_selected": True,
+            "session_event_persisted": True,
+            "event": event.model_dump(mode="json"),
+            "title_updated": False,
+            "model_updated": True,
+            "messages_mutated": False,
+            "parts_mutated": False,
+            "execution_started": False,
+            "process_started": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def append_message(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._require_initialized()
+        self.store.get_session(session_id)
+        content = _message_content_from_body(body)
+        if not content:
+            raise ValueError("Missing required message content.")
+        role = _optional_text(body, "role") or SessionMessageRole.USER.value
+        agent_id = _optional_text(body, "agent_id") or _optional_text(body, "agent")
+        message = self.store.append_session_message(
+            session_id,
+            SessionMessageRole(role),
+            content,
+            agent_id=agent_id,
+        )
+        part = self.store.append_session_part(
+            session_id,
+            message.id,
+            SessionPartKind.TEXT,
+            text=content,
+            metadata={
+                "source": _optional_text(body, "source") or "app_service",
+                **(dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}),
+            },
+            redaction_state=RedactionState.REDACTED,
+        )
+        return {
+            "schema_version": "harness.session_message_append/v1",
+            "ok": True,
+            "session_id": session_id,
+            "message": message.model_dump(mode="json"),
+            "part": part.model_dump(mode="json"),
+            "messages_mutated": True,
+            "parts_mutated": True,
+            "execution_started": False,
+            "process_started": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def prompt_async(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._submit_prompt(session_id, body, mode="async")
+
+    def submit_prompt(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._submit_prompt(session_id, body, mode="sync")
+
+    def sessions_status(self) -> dict[str, Any]:
+        if not self.initialized:
+            return self._uninitialized_payload(
+                "harness.sessions_status/v1",
+                status_by_session={},
+                sessions=[],
+                active_session_ids=[],
+                session_count=0,
+            )
+        sessions = self.store.list_sessions()
+        runtime_manager = self._runtime_manager()
+        active_session_ids = [
+            session.id
+            for session in sessions
+            if session.status
+            not in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED, SessionStatus.ARCHIVED}
+        ]
+        return {
+            "schema_version": "harness.sessions_status/v1",
+            "ok": True,
+            "status_by_session": {session.id: session.status.value for session in sessions},
+            "sessions": [
+                {
+                    "session_id": session.id,
+                    "status": session.status.value,
+                    "active_run_id": session.active_run_id,
+                    "active_task_id": session.active_task_id,
+                    "runtime": runtime_manager.status(session.id).model_dump(mode="json"),
+                    "updated_at": session.updated_at.isoformat(),
+                }
+                for session in sessions
+            ],
+            "active_session_ids": active_session_ids,
+            "session_count": len(sessions),
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def session_status(self, session_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.get_session(session_id)
+        events = self.store.list_session_store_events(session.id)
+        messages = self.store.list_session_messages(session.id)
+        children = self.store.list_child_sessions(session.id)
+        runtime = self._runtime_manager().status(session.id)
+        try:
+            cwd = session_cwd_payload(
+                self.project_root,
+                session.metadata,
+                load_config(self.project_root).context_excludes,
+            )
+        except Exception:
+            cwd = {"cwd": session.metadata.get("cwd", "."), "resolved_abs_path": None}
+        return {
+            "schema_version": "harness.session_status/v1",
+            "ok": True,
+            "session_id": session.id,
+            "status": session.status.value,
+            "title": session.title,
+            "active_run_id": session.active_run_id,
+            "active_task_id": session.active_task_id,
+            "objective_id": session.objective_id,
+            "summary": session.summary,
+            "token_input": session.token_input,
+            "token_output": session.token_output,
+            "token_reasoning": session.token_reasoning,
+            "token_cache_read": session.token_cache_read,
+            "token_cache_write": session.token_cache_write,
+            "estimated_cost_usd": str(session.estimated_cost_usd) if session.estimated_cost_usd is not None else None,
+            "message_count": len(messages),
+            "event_count": len(events),
+            "cwd": cwd,
+            "planning_mode": session_planning_mode_projection(session.metadata),
+            "operator": session_operator_status_projection(
+                self.store,
+                session.id,
+                project_root=self.project_root,
+                cwd=str(cwd.get("cwd") or "."),
+                active_tools=self._operator_active_tools(),
+            ),
+            "runtime": runtime.model_dump(mode="json"),
+            "child_session_ids": [child.id for child in children],
+            "latest_ui_activation": self.latest_session_ui_activation(session.id),
+            "terminal": session.status
+            in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED, SessionStatus.ARCHIVED},
+            "process_running": runtime.process_running,
+            "permission_granting": False,
+        }
+
+    def list_messages(self, session_id: str, *, limit: int | None = None) -> dict[str, Any]:
+        self._require_initialized()
+        self.store.get_session(session_id)
+        messages = self.store.list_session_messages(session_id)
+        if limit is not None:
+            messages = messages[-limit:] if limit else []
+        parts_by_message = {
+            message.id: self.store.list_session_parts(session_id, message.id)
+            for message in messages
+        }
+        return {
+            "schema_version": "harness.session_messages/v1",
+            "ok": True,
+            "session_id": session_id,
+            "limit": limit,
+            "messages": [message.model_dump(mode="json") for message in messages],
+            "parts": {
+                message_id: [part.model_dump(mode="json") for part in message_parts]
+                for message_id, message_parts in parts_by_message.items()
+            },
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def message_detail(self, session_id: str, message_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        self.store.get_session(session_id)
+        message = next(
+            (candidate for candidate in self.store.list_session_messages(session_id) if candidate.id == message_id),
+            None,
+        )
+        if message is None:
+            raise KeyError(f"Session message not found: {message_id}")
+        parts = self.store.list_session_parts(session_id, message_id)
+        return {
+            "schema_version": "harness.session_message/v1",
+            "ok": True,
+            "session_id": session_id,
+            "message_id": message_id,
+            "message": message.model_dump(mode="json"),
+            "parts": [part.model_dump(mode="json") for part in parts],
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def list_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        self._require_initialized()
+        self.store.get_session(session_id)
+        events = self.store.list_store_events(
+            EventStreamType.SESSION,
+            session_id,
+            after_seq=after_seq,
+            limit=limit,
+        )
+        return {
+            "schema_version": "harness.session_events/v1",
+            "ok": True,
+            "session_id": session_id,
+            "after_seq": after_seq,
+            "limit": limit,
+            "events": [event.model_dump(mode="json") for event in events],
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def runtime_status(self, session_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        runtime = self._runtime_manager().status(session_id)
+        return {
+            "schema_version": "harness.session_runtime_status/v1",
+            "ok": True,
+            "session_id": session_id,
+            "runtime": runtime.model_dump(mode="json"),
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def list_permissions(self, session_id: str | None = None) -> dict[str, Any]:
+        self._require_initialized()
+        if session_id is None:
+            permissions: list[Any] = []
+            for session in self.store.list_sessions():
+                permissions.extend(
+                    self.store.list_session_permissions(session.id, status=SessionPermissionStatus.PENDING)
+                )
+            return {
+                "schema_version": "harness.global_permissions/v1",
+                "ok": True,
+                "permissions": self._session_permission_payloads(permissions),
+                "approval_cards": self._approval_cards_for_permissions(permissions),
+                "pending_count": len(permissions),
+                "execution_started": False,
+                "permission_granting": False,
+            }
+        self.store.get_session(session_id)
+        permissions = self.store.list_session_permissions(session_id)
+        return {
+            "schema_version": "harness.session_permissions/v1",
+            "ok": True,
+            "session_id": session_id,
+            "permissions": self._session_permission_payloads(permissions),
+            "snapshot": self._session_permission_snapshot_payload(session_id, permissions),
+            "permission_granting": False,
+        }
+
+    def list_questions(self, session_id: str | None = None) -> dict[str, Any]:
+        self._require_initialized()
+        if session_id is None:
+            questions: list[Any] = []
+            for session in self.store.list_sessions():
+                questions.extend(
+                    part
+                    for part in self.store.list_session_parts(session.id)
+                    if part.kind == SessionPartKind.QUESTION
+                )
+            return {
+                "schema_version": "harness.global_questions/v1",
+                "ok": True,
+                "questions": [part.model_dump(mode="json") for part in questions],
+                "pending_count": len(questions),
+                "execution_started": False,
+                "permission_granting": False,
+            }
+        self.store.get_session(session_id)
+        questions = [
+            part
+            for part in self.store.list_session_parts(session_id)
+            if part.kind == SessionPartKind.QUESTION
+        ]
+        return {
+            "schema_version": "harness.session_questions/v1",
+            "ok": True,
+            "session_id": session_id,
+            "questions": [part.model_dump(mode="json") for part in questions],
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def settings_tui(self, session_id: str | None = None) -> dict[str, Any]:
+        preferences: dict[str, Any] | None = None
+        source = "defaults"
+        if session_id is not None and self.initialized:
+            try:
+                session = self.store.get_session(session_id)
+                preferences = session.ui_preferences
+                source = "active_session"
+            except KeyError:
+                preferences = None
+        catalog = build_tui_settings_catalog(preferences, source=source, session_id=session_id)
+        return {
+            **catalog,
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def subscribe_session_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int | None = None,
+    ) -> EventSubscription:
+        self._require_initialized()
+        self.store.get_session(session_id)
+        return subscribe_store_events(self.store, EventStreamType.SESSION, session_id, after_seq=after_seq)
+
+    def subscribe_global_events(self) -> EventSubscription:
+        return subscribe_global_events(self.project_root)
+
+    def latest_session_ui_activation(self, session_id: str) -> dict[str, Any] | None:
+        events = self.store.list_session_store_events(session_id)
+        event = next((item for item in reversed(events) if item.kind == "tui.ui_activation.applied"), None)
+        if event is None:
+            return None
+        payload = event.payload or {}
+        action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+        return {
+            "seq": event.seq,
+            "event_id": event.id,
+            "entry_id": payload.get("entry_id"),
+            "source": payload.get("source"),
+            "activation_kind": payload.get("activation_kind"),
+            "action_type": action.get("type"),
+            "evidence_status": payload.get("evidence_status") or "ui_only_persisted",
+            "policy_boundary": payload.get("policy_boundary")
+            or {
+                "kind": "safe_ui_activation",
+                "ui_state_only": True,
+                "command_execution_allowed": False,
+                "process_start_allowed": False,
+                "filesystem_mutation_allowed": False,
+                "permission_grant_allowed": False,
+                "authority_grant_allowed": False,
+            },
+            "blocked_reasons": payload.get("blocked_reasons") or [],
+            "ui_action_applied": bool(payload.get("ui_action_applied")),
+            "command_started": bool(payload.get("command_started")),
+            "process_started": bool(payload.get("process_started")),
+            "filesystem_modified": bool(payload.get("filesystem_modified")),
+            "permission_granting": bool(payload.get("permission_granting")),
+            "authority_granting": bool(payload.get("authority_granting")),
+        }
+
+    def _runtime_manager(self) -> SessionRuntimeManager:
+        if self.runtime is not None:
+            return self.runtime
+        self.runtime = SessionRuntimeManager.for_store(self.store, execution_enabled=self.execution_enabled)
+        return self.runtime
+
+    def _submit_prompt(self, session_id: str, body: dict[str, Any], *, mode: str) -> dict[str, Any]:
+        self._require_initialized()
+        session = self.store.get_session(session_id)
+        terminal_statuses = {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED, SessionStatus.ARCHIVED}
+        if session.status in terminal_statuses:
+            runtime = self._runtime_manager().status(session.id)
+            return {
+                "schema_version": f"harness.session_prompt_{mode}/v1",
+                "ok": False,
+                "accepted": False,
+                "session_id": session.id,
+                "session": session.model_dump(mode="json"),
+                "error_code": "session_terminal",
+                "error": f"Session is terminal: {session.status.value}.",
+                "guidance": "Fork this session or create a new session before submitting another prompt.",
+                "message": None,
+                "part": None,
+                "runtime": {
+                    "schema_version": "harness.session_prompt_accepted/v1",
+                    "ok": False,
+                    "accepted": False,
+                    "session_id": session.id,
+                    "prompt_id": None,
+                    "queued": False,
+                    "queue_policy": SessionPromptQueuePolicy.FOLLOW_UP.value,
+                    "phase": runtime.phase.value,
+                    "reason": f"Session is terminal: {session.status.value}.",
+                    "execution_started": False,
+                    "worker_started": False,
+                    "runtime": runtime.model_dump(mode="json"),
+                },
+                "prompt_id": None,
+                "async_accepted": False,
+                "waited_for_response": False,
+                "assistant_response_started": False,
+                "messages_mutated": False,
+                "parts_mutated": False,
+                "execution_started": False,
+                "process_started": False,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "permission_granting": False,
+                "authority_granting": False,
+                "no_hidden_fallback": True,
+            }
+        content = _message_content_from_body(body)
+        if not content:
+            raise ValueError("Missing required prompt content.")
+        agent_id = _optional_text(body, "agent_id") or _optional_text(body, "agent") or session.agent_id
+        model_ref = _body_model_ref(body) or session.raw_model_ref
+        message_payload = self.append_message(
+            session.id,
+            {
+                "content": content,
+                "role": SessionMessageRole.USER.value,
+                "agent_id": agent_id,
+                "source": _optional_text(body, "source") or f"app_service_prompt_{mode}",
+                "metadata": {
+                    "prompt_mode": mode,
+                    "model_ref": model_ref,
+                    **(dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}),
+                },
+            },
+        )
+        queue_policy = _queue_policy_from_body(body)
+        runtime_acceptance = self._runtime_manager().submit_prompt(
+            SessionPromptRequest(
+                session_id=session.id,
+                content=content,
+                mode=mode,  # type: ignore[arg-type]
+                queue_policy=queue_policy,
+                agent_id=agent_id,
+                model_ref=model_ref,
+                message_id=message_payload["message"]["id"],
+                part_id=message_payload["part"]["id"],
+                metadata={
+                    "source": _optional_text(body, "source") or f"app_service_prompt_{mode}",
+                    "tui_submit": bool(body.get("tui_submit")),
+                    **(dict(body.get("runtime_metadata") or {}) if isinstance(body.get("runtime_metadata"), dict) else {}),
+                },
+            )
+        )
+        return {
+            **message_payload,
+            "schema_version": f"harness.session_prompt_{mode}/v1",
+            "ok": runtime_acceptance.ok,
+            "accepted": runtime_acceptance.accepted,
+            "session_id": session.id,
+            "runtime": runtime_acceptance.model_dump(mode="json"),
+            "prompt_id": runtime_acceptance.prompt_id,
+            "async_accepted": mode == "async" and runtime_acceptance.accepted,
+            "waited_for_response": False,
+            "assistant_response_started": False,
+            "messages_mutated": True,
+            "parts_mutated": True,
+            "execution_started": runtime_acceptance.execution_started,
+            "process_started": runtime_acceptance.worker_started,
+            "provider_execution_started": runtime_acceptance.execution_started,
+            "model_execution_started": runtime_acceptance.execution_started,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def _require_initialized(self) -> None:
+        if not self.initialized:
+            raise FileNotFoundError(f"Harness project is not initialized: {self.project_root}")
+
+    def _uninitialized_payload(self, schema_version: str, **fields: Any) -> dict[str, Any]:
+        return {
+            "schema_version": schema_version,
+            "ok": False,
+            "project_root": str(self.project_root),
+            "error_code": "project_uninitialized",
+            "error": "Harness project is not initialized.",
+            "execution_started": False,
+            "permission_granting": False,
+            **fields,
+        }
+
+    def _session_permission_payloads(self, permissions: list[Any]) -> list[dict[str, Any]]:
+        payloads = []
+        for permission in permissions:
+            payload = permission.model_dump(mode="json")
+            try:
+                payload["approval_card"] = build_session_approval_card(self.store, permission.session_id, permission.id)
+            except Exception:
+                payload["approval_card"] = None
+            payloads.append(payload)
+        return payloads
+
+    def _approval_cards_for_permissions(self, permissions: list[Any]) -> list[dict[str, Any]]:
+        cards = []
+        for permission in permissions:
+            try:
+                cards.append(build_session_approval_card(self.store, permission.session_id, permission.id))
+            except Exception:
+                continue
+        return cards
+
+    def _session_permission_snapshot_payload(self, session_id: str, permissions: list[Any]) -> dict[str, Any]:
+        counts = {status.value: 0 for status in SessionPermissionStatus}
+        pending_ids: list[str] = []
+        approval_cards: list[dict[str, Any]] = []
+        for permission in permissions:
+            status = permission.status.value
+            counts[status] = counts.get(status, 0) + 1
+            if permission.status == SessionPermissionStatus.PENDING:
+                pending_ids.append(permission.id)
+                try:
+                    approval_cards.append(build_session_approval_card(self.store, session_id, permission.id))
+                except Exception:
+                    pass
+        return {
+            "session_id": session_id,
+            "counts": counts,
+            "pending_permission_ids": pending_ids,
+            "approval_cards": approval_cards,
+            "pending_approval_cards": approval_cards,
+            "pending_count": len(pending_ids),
+            "blocked_on_permission": bool(pending_ids),
+            "reply_route": "/sessions/{session_id}/permissions/{permission_id}/reply",
+            "approval_route": "/sessions/{session_id}/approval/{approval_id}",
+            "execution_started": False,
+        }
+
+    def _append_model_validation_event(
+        self,
+        session_id: str,
+        validation_payload: dict[str, Any],
+        *,
+        source: str,
+    ):
+        return self.store.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.model_validation",
+            {
+                **validation_payload,
+                "source": source,
+                "summary": "Model selection validated."
+                if validation_payload.get("executable")
+                else "Model selection blocked before execution.",
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "network_accessed": False,
+                "hidden_provider_fallback": False,
+                "hidden_model_fallback": False,
+                "no_hidden_fallback": True,
+                "permission_granting": False,
+                "authority_granting": False,
+            },
+            session_id=session_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+
+    def _operator_active_tools(self) -> list[str]:
+        from harness.session_tools import default_session_tool_descriptors
+
+        return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+
+
+def _optional_text(body: dict[str, Any], key: str) -> str | None:
+    value = body.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _message_content_from_body(body: dict[str, Any]) -> str | None:
+    direct = _optional_text(body, "content") or _optional_text(body, "text")
+    if direct:
+        return direct
+    prompt = body.get("prompt")
+    if isinstance(prompt, str):
+        text = prompt.strip()
+        return text or None
+    if isinstance(prompt, dict):
+        nested = _message_content_from_body(prompt)
+        if nested:
+            return nested
+    parts = body.get("parts")
+    if isinstance(parts, list):
+        lines: list[str] = []
+        for part in parts:
+            if isinstance(part, str):
+                text = part.strip()
+            elif isinstance(part, dict):
+                text = str(part.get("text") or part.get("content") or "").strip()
+            else:
+                text = ""
+            if text:
+                lines.append(text)
+        if lines:
+            return "\n".join(lines)
+    return None
+
+
+def _body_model_ref(body: dict[str, Any]) -> str | None:
+    raw_model_ref = _optional_text(body, "raw_model_ref") or _optional_text(body, "model")
+    if raw_model_ref:
+        return raw_model_ref
+    model_id = _optional_text(body, "model_id") or _optional_text(body, "modelID")
+    provider_id = _optional_text(body, "provider_id") or _optional_text(body, "providerID")
+    if model_id and provider_id:
+        return f"{provider_id}/{model_id}"
+    return model_id
+
+
+def _queue_policy_from_body(body: dict[str, Any]) -> SessionPromptQueuePolicy:
+    raw = _optional_text(body, "queue_policy") or _optional_text(body, "queuePolicy") or SessionPromptQueuePolicy.FOLLOW_UP.value
+    try:
+        return SessionPromptQueuePolicy(raw)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported prompt queue policy: {raw}") from exc
 
 
 class CoreEventSummary(BaseModel):
