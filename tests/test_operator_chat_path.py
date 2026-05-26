@@ -4,14 +4,64 @@ import json
 
 from typer.testing import CliRunner
 
+from harness.backends.codex_cli import CodexRunResult, NETWORK_NOT_ENFORCEABLE
 from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
 from harness.cli.main import app
 from harness.execution import execute_lease
 from harness.memory.sqlite_store import SQLiteStore
+from harness.models import BackendCapabilities, BackendStatus
 from harness.workflow_templates import template_for_intent
 
 
 runner = CliRunner()
+
+
+class FakeCodexBackend:
+    def __init__(self, config) -> None:
+        self.config = config
+        self.name = config.name
+
+    def preflight(self):
+        return BackendStatus(
+            available=True,
+            metadata=self.config.metadata,
+            capabilities=BackendCapabilities(
+                supports_exec=True,
+                supports_cd=True,
+                supports_read_only_sandbox=True,
+                supports_workspace_write_sandbox=True,
+                supports_json_events=True,
+                supports_output_last_message=True,
+            ),
+        )
+
+    def run_read_only(self, project_root, prompt, final_message_path):
+        if final_message_path:
+            final_message_path.write_text("implementation plan", encoding="utf-8")
+        return CodexRunResult(
+            ["codex", "exec", "--cd", str(project_root), "--sandbox", "read-only"],
+            "",
+            "",
+            0,
+            [],
+            "implementation plan",
+        )
+
+    def run_edit(self, isolated_workspace, prompt, final_message_path):
+        if final_message_path:
+            final_message_path.write_text("no changes needed", encoding="utf-8")
+        return (
+            CodexRunResult(
+                ["codex", "exec", "--cd", str(isolated_workspace), "--sandbox", "workspace-write"],
+                "",
+                "",
+                0,
+                [],
+                "no changes needed",
+            ),
+            self.preflight().capabilities,
+            NETWORK_NOT_ENFORCEABLE,
+        )
 
 
 def test_workflow_templates_describe_initial_operator_paths(tmp_path) -> None:
@@ -44,6 +94,7 @@ def test_natural_operator_intents_route_to_first_class_paths() -> None:
     assert route_chat_intent("summarize this repo")["intent"] == "repo_summary"
     assert route_chat_intent("plan how to improve the CLI")["intent"] == "repo_planning"
     assert route_chat_intent("fix the failing test with codex")["intent"] == "coding_fix"
+    assert route_chat_intent("create a python script for black scholes pricing")["intent"] == "coding_fix"
     assert route_chat_intent("show recent runs")["intent"] == "show_runs"
     assert route_chat_intent("review the last result")["intent"] == "show_last_result"
     assert route_chat_intent("continue")["intent"] == "continue_workflow"
@@ -76,13 +127,42 @@ def test_repo_planning_draft_uses_registered_adapter_contract(tmp_path) -> None:
     assert response["draft"]["required_approvals"] == ["hosted_provider_codex"]
 
 
-def test_coding_fix_template_creates_reviewed_task_graph_and_blocks_on_missing_approval(tmp_path, monkeypatch) -> None:
+def test_chat_self_managed_local_action_returns_policy_and_file_evidence(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
 
-    def fail_codex(*_args, **_kwargs):
-        raise AssertionError("missing approval must block before provider construction")
+    response = handle_chat_input("create scratch.md with hello world", tmp_path, ChatSessionState())
 
-    monkeypatch.setattr("harness.execution.CodexCliBackend", fail_codex)
+    assert response["kind"] == "self_managed_local_action"
+    assert response["ok"] is True
+    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == "hello world\n"
+    rendered = "\n".join(response["lines"])
+    assert "Created: scratch.md" in rendered
+    assert "Policy: auto_allowed; sandbox=safe; executor=write_file" in rendered
+    assert "no provider, shell, Docker, network, permission grant, or human approval prompt" in rendered
+    assert response["decision"]["status"] == "auto_allowed"
+    assert response["decision"]["sandbox_assessment"]["status"] == "safe"
+
+
+def test_chat_black_scholes_python_script_runs_as_self_managed_action(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    response = handle_chat_input("create a python script for the black scholes pricing", tmp_path, ChatSessionState())
+
+    script = tmp_path / "black_scholes_pricing.py"
+    assert response["kind"] == "self_managed_local_action"
+    assert response["ok"] is True
+    assert script.exists()
+    assert "def black_scholes_price(" in script.read_text(encoding="utf-8")
+    rendered = "\n".join(response["lines"])
+    assert "Created: black_scholes_pricing.py" in rendered
+    assert "Policy: auto_allowed; sandbox=safe; executor=create_file_with_content" in rendered
+    assert "human approval prompt" in rendered
+
+
+def test_coding_fix_template_creates_reviewed_task_graph_and_prepares_scoped_approval(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakeCodexBackend)
     state = ChatSessionState(codex_like_mode=True)
     draft = handle_chat_input("fix the failing test with codex", tmp_path, state)
     assert draft["kind"] == "orchestration_draft"
@@ -99,7 +179,7 @@ def test_coding_fix_template_creates_reviewed_task_graph_and_blocks_on_missing_a
 
     store = SQLiteStore(tmp_path)
     assert response["kind"] == "orchestration_result"
-    assert response["ok"] is False
+    assert response["ok"] is True
     assert state.latest_objective_id is not None
     tasks = store.list_tasks(objective_id=state.latest_objective_id)
     assert [task.metadata["execution_adapter"] for task in tasks] == [
@@ -118,8 +198,10 @@ def test_coding_fix_template_creates_reviewed_task_graph_and_blocks_on_missing_a
     assert tasks[4].metadata["blocks_apply_back"] is True
     assert set(tasks[5].depends_on) == {tasks[0].id, tasks[1].id, tasks[2].id, tasks[3].id, tasks[4].id}
     rendered = "\n".join(response["lines"])
-    assert "Hosted-boundary approval is required before Codex run creation." in rendered
-    assert "harness approvals add --backend codex_cli --data-boundary hosted_provider" in rendered
+    assert "Prepared scoped hosted-provider Codex approval" in rendered
+    assert f"objectives={state.latest_objective_id}" in rendered
+    approval = store.project_root / ".harness" / "approvals.yaml"
+    assert approval.exists()
 
 
 def test_codex_like_dry_run_creates_leases_dispatches_and_renders_evidence(tmp_path) -> None:

@@ -45,6 +45,8 @@ RUNTIME_COMPACTION_SCHEMA_VERSION = "harness.runtime_compaction/v1"
 MAX_TRANSIENT_RETRIES = 1
 MAX_CONTEXT_OVERFLOW_COMPACTIONS = 1
 DEFAULT_RETRY_DELAY_SECONDS = 0.05
+MAX_PROVIDER_CONTEXT_MESSAGES = 24
+MAX_PROVIDER_CONTEXT_MESSAGE_CHARS = 8_000
 
 
 class SessionRuntimePhase(str, Enum):
@@ -844,7 +846,7 @@ class SessionRuntimeManager:
     ) -> _ProviderStreamResult:
         if self.provider_adapter is None and self.protocol_adapter_registry is None:
             return _ProviderStreamResult(response_text="", failed=True)
-        messages = [ProviderMessage(role=SessionMessageRole.USER.value, content=prompt.content)]
+        messages = self._provider_messages_for_prompt(prompt)
         if compaction is not None:
             summary = str(compaction.get("summary") or "").strip()
             if summary:
@@ -907,6 +909,32 @@ class SessionRuntimeManager:
             policy_blocked=_provider_error_is_policy_block(error),
             provider_execution_started=provider_execution_started,
         )
+
+    def _provider_messages_for_prompt(self, prompt: QueuedPrompt) -> list[ProviderMessage]:
+        if not prompt.message_id:
+            return [ProviderMessage(role=SessionMessageRole.USER.value, content=prompt.content)]
+        messages: list[ProviderMessage] = []
+        try:
+            persisted_messages = self.store.list_session_messages(prompt.session_id)
+        except Exception:
+            return [ProviderMessage(role=SessionMessageRole.USER.value, content=prompt.content)]
+        for message in persisted_messages:
+            role = message.role.value
+            if role not in {
+                SessionMessageRole.SYSTEM.value,
+                SessionMessageRole.USER.value,
+                SessionMessageRole.ASSISTANT.value,
+            }:
+                continue
+            content = prompt.content if message.id == prompt.message_id else message.content_preview
+            content = _truncate_provider_message_content(content)
+            if content:
+                messages.append(ProviderMessage(role=role, content=content))
+            if message.id == prompt.message_id:
+                break
+        if not messages or messages[-1].content != prompt.content:
+            messages.append(ProviderMessage(role=SessionMessageRole.USER.value, content=prompt.content))
+        return messages[-MAX_PROVIDER_CONTEXT_MESSAGES:]
 
     def _provider_event_stream(self, prompt: QueuedPrompt, request: ProviderRequest) -> Iterator[ProviderEvent]:
         if self.provider_adapter is not None:
@@ -2543,3 +2571,10 @@ def _utc_now() -> datetime:
 def _preview(content: str, limit: int = 240) -> str:
     text = " ".join(str(sanitize_for_logging(content)).split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def _truncate_provider_message_content(content: str) -> str:
+    text = str(sanitize_for_logging(content or "")).strip()
+    if len(text) <= MAX_PROVIDER_CONTEXT_MESSAGE_CHARS:
+        return text
+    return text[: MAX_PROVIDER_CONTEXT_MESSAGE_CHARS - 3] + "..."

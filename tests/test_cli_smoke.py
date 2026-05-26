@@ -255,7 +255,7 @@ def test_cli_act_can_create_and_run_local_task_graph(tmp_path, monkeypatch) -> N
 def test_cli_root_launches_unified_app(tmp_path, monkeypatch) -> None:
     launched = {}
 
-    def fake_run(project_root):
+    def fake_run(project_root, **kwargs):
         launched["project_root"] = str(project_root)
 
     monkeypatch.setattr("harness.cli.main._run_unified_app", fake_run)
@@ -322,12 +322,17 @@ def test_cli_chat_json_reports_context_without_backend_preflight(tmp_path, monke
     )
 
     result = runner.invoke(app, ["--project", str(tmp_path), "--output", "json"])
+    verbose = runner.invoke(app, ["--project", str(tmp_path), "--output", "json", "--verbose"])
 
     assert result.exit_code == 0, result.output
+    assert verbose.exit_code == 0, verbose.output
+    assert len(result.output) < 60_000
+    assert len(verbose.output) > len(result.output)
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.chat/v1"
     assert payload["ok"] is True
     assert payload["initialized"] is False
+    assert payload["dashboard"]["detail"] == "compact"
     assert {adapter["id"] for adapter in payload["registered_adapters"]} >= {
         "dry_run",
         "read_only_summary",
@@ -456,6 +461,7 @@ def test_chat_read_only_intent_routing() -> None:
     assert route_chat_intent("plan how to improve the CLI")["intent"] == "repo_planning"
     assert route_chat_intent("fix the failing test with codex")["intent"] == "coding_fix"
     assert route_chat_intent("create an empty file in the repository")["intent"] == "coding_fix"
+    assert route_chat_intent("create a python script for black scholes pricing")["intent"] == "coding_fix"
     assert route_chat_intent("initialize this project")["intent"] == "init_project"
 
 
@@ -2133,6 +2139,11 @@ def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirma
                 "kind": "self_managed_local_action",
                 "ok": True,
                 "run_id": "run_managed123",
+                "created_paths": [str(tmp_path / "scratch.md")],
+                "decision": {
+                    "status": "auto_allowed",
+                    "sandbox_assessment": {"status": "safe"},
+                },
                 "report_path": str(tmp_path / ".harness" / "runs" / "run_managed123" / "final_report.md"),
             },
         },
@@ -2143,6 +2154,8 @@ def test_tui_right_panel_surfaces_latest_managed_action_without_pending_confirma
 
     assert model["active_section_id"] == "active_work"
     assert "Latest action: succeeded" in rendered
+    assert "Created: scratch.md" in rendered
+    assert "Policy: auto allowed / sandbox safe" in rendered
     assert "run_managed123" not in rendered
     assert "Report: final_report.md" in rendered
     assert "Confirm: yes or /confirm" not in rendered
@@ -2460,13 +2473,13 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             await pilot.pause()
             assert prompt.value == "/"
             assert "/help" in str(slash_status.content)
-            assert "Print the MVP agent command sequence" in str(slash_status.content)
+            assert "List the compact operator slash commands." in str(slash_status.content)
             assert "[bold blue]/help" in str(slash_status.content)
 
             await pilot.press("down")
             await pilot.pause()
             assert prompt.value == "/"
-            assert "[bold blue]/home" in str(slash_status.content)
+            assert "[bold blue]/status" in str(slash_status.content)
 
             await pilot.press("up")
             await pilot.pause()
@@ -2479,13 +2492,13 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             await pilot.pause()
             assert prompt.value == "/"
             assert "... 1 previous. Keep using arrows to navigate." in str(slash_status.content)
-            assert "[bold blue]/scaffold" in str(slash_status.content)
+            assert "[bold blue]/run" in str(slash_status.content)
 
             await pilot.press("e", "x", "e")
             await pilot.pause()
             assert prompt.value == "/exe"
             assert "/execute" in str(slash_status.content)
-            assert "/home" not in str(slash_status.content)
+            assert "/status" not in str(slash_status.content)
 
             await pilot.press("down")
             await pilot.pause()
@@ -2509,6 +2522,20 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             await pilot.pause()
             assert prompt.value == ""
             assert str(slash_status.content) == ""
+
+            local_help_count = len(app._messages)
+            await pilot.press("/", "h", "e", "l", "p")
+            await pilot.pause()
+            await pilot.press("enter")
+            await pilot.pause()
+            help_rendered = "\n".join(render_chat_message(message) for message in app._messages)
+            assert prompt.value == ""
+            assert len(app._messages) == local_help_count + 2
+            assert app._request_in_flight is False
+            assert app._latest_palette_activation["activation_kind"] == "slash_help"
+            assert app._latest_palette_activation["chat_submitted"] is False
+            assert "/models" in help_rendered
+            assert "/execute-read-only" not in help_rendered
 
             assert app._section_cursor_index == 1
             await pilot.press("tab")
@@ -2820,6 +2847,17 @@ def test_tui_composer_ctrl_j_inserts_newline(tmp_path, monkeypatch) -> None:
             assert app._request_in_flight is False
 
     asyncio.run(run_pilot())
+
+
+def test_tui_managed_file_request_uses_chat_control_plane_not_runtime(tmp_path) -> None:
+    pytest.importorskip("textual")
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    tui_app = create_harness_app(tmp_path)
+
+    assert tui_app._should_use_runtime_prompt("create a python script for the black scholes pricing") is False
+    assert tui_app._should_use_runtime_prompt("create scratch.md with hello world") is False
+    assert tui_app._should_use_runtime_prompt("an arbitrary prompt with no special routing") is True
 
 
 def test_tui_palette_enter_applies_safe_ui_control_actions(tmp_path) -> None:
@@ -3237,7 +3275,7 @@ def test_tui_safe_slash_commands_focus_dashboard_sections_without_chat(tmp_path)
             initial_messages = len(app._messages)
 
             for slash, section_index, entry_id in [
-                ("/home", 5, "orientation.home"),
+                ("/status", 5, "orientation.home"),
                 ("/sessions", 5, "sessions.list"),
                 ("/tasks", 0, "objectives_tasks.list_tasks"),
                 ("/runs", 4, "runtime_evidence.runs"),
@@ -3336,44 +3374,16 @@ def test_tui_safe_ui_control_slash_commands_mutate_only_local_state(tmp_path) ->
                 assert app._latest_palette_activation["authority_granting"] is False
                 assert app._latest_palette_activation["session_message_created"] is False
 
-            await pilot.press("/", "p", "a", "l", "e", "t", "t", "e")
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            assert app._focus_mode == "palette"
-            assert prompt.value == ""
-            assert len(app._messages) == initial_messages
-            assert app._request_in_flight is False
-            assert_safe_ui_control("/palette", "ui_controls.palette_focus", ["focus_mode"])
-
-            await pilot.press("/", "d", "a", "s", "h", "b", "o", "a", "r", "d")
+            await pilot.press("/", "s", "e", "t", "t", "i", "n", "g", "s")
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
             assert app._focus_mode == "dashboard"
+            assert app._active_section_id == "context"
             assert prompt.value == ""
             assert len(app._messages) == initial_messages
-            assert_safe_ui_control("/dashboard", "ui_controls.dashboard_focus", ["focus_mode"])
-
-            await pilot.press("/", "t", "o", "g", "g", "l", "e", "-", "s", "e", "c", "t", "i", "o", "n")
-            await pilot.pause()
-            app._active_section_id = "queue"
-            app._section_cursor_index = 4
-            await pilot.press("enter")
-            await pilot.pause()
-            assert app._collapsed_section_ids == {"orchestrations"}
-            assert prompt.value == ""
-            assert len(app._messages) == initial_messages
-            assert_safe_ui_control("/toggle-section", "ui_controls.toggle_section", ["active_section_id", "collapsed_section_ids"])
-
-            await pilot.press("/", "e", "x", "p", "a", "n", "d", "-", "a", "l", "l")
-            await pilot.pause()
-            await pilot.press("enter")
-            await pilot.pause()
-            assert app._collapsed_section_ids == set()
-            assert prompt.value == ""
-            assert len(app._messages) == initial_messages
-            assert_safe_ui_control("/expand-all", "ui_controls.expand_all", ["collapsed_section_ids"])
+            assert app._request_in_flight is False
+            assert_safe_ui_control("/settings", "ui_controls.settings", ["focus_mode", "active_section_id", "active_section_index"])
 
             await pilot.press("/", "c", "l", "e", "a", "r")
             await pilot.pause()
@@ -3472,11 +3482,30 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     slash_commands = build_slash_commands(palette)
 
     names = [command["name"] for command in slash_commands["commands"]]
-    assert slash_commands["schema_version"] == "harness.tui_slash_commands/v1"
-    assert len(names) == len(set(names))
-    assert {
-        "home",
+    expected_names = [
+        "help",
+        "status",
+        "init",
+        "sessions",
+        "tasks",
+        "runs",
+        "progress",
+        "execute",
+        "run",
+        "confirm",
+        "decline",
+        "stop",
+        "models",
+        "model",
+        "settings",
         "clear",
+        "quit",
+    ]
+    assert slash_commands["schema_version"] == "harness.tui_slash_commands/v1"
+    assert names == expected_names
+    assert len(names) == len(set(names))
+    assert not {
+        "home",
         "palette",
         "dashboard",
         "toggle-section",
@@ -3486,23 +3515,18 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
         "validate",
         "agents",
         "specs",
-        "tasks",
-        "settings",
         "theme",
         "dark-mode",
         "light-mode",
         "lease",
         "inspect-lease",
         "execute-read-only",
-        "execute",
         "plan-task",
-        "runs",
-        "models",
-        "model",
         "policy",
         "artifacts",
         "wheel",
-    } <= set(names)
+        "provider",
+    } & set(names)
     assert all(command["slash"].startswith("/") for command in slash_commands["commands"])
     assert all(
         set(command)
@@ -3520,45 +3544,51 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
         }
         for command in slash_commands["commands"]
     )
-    settings = next(command for command in slash_commands["commands"] if command["name"] == "settings")
-    theme = next(command for command in slash_commands["commands"] if command["name"] == "theme")
-    dark_mode = next(command for command in slash_commands["commands"] if command["name"] == "dark-mode")
-    light_mode = next(command for command in slash_commands["commands"] if command["name"] == "light-mode")
-    home = next(command for command in slash_commands["commands"] if command["name"] == "home")
+    help_command = next(command for command in slash_commands["commands"] if command["name"] == "help")
+    status = next(command for command in slash_commands["commands"] if command["name"] == "status")
+    init = next(command for command in slash_commands["commands"] if command["name"] == "init")
     sessions = next(command for command in slash_commands["commands"] if command["name"] == "sessions")
     tasks = next(command for command in slash_commands["commands"] if command["name"] == "tasks")
     runs = next(command for command in slash_commands["commands"] if command["name"] == "runs")
+    progress = next(command for command in slash_commands["commands"] if command["name"] == "progress")
+    execute = next(command for command in slash_commands["commands"] if command["name"] == "execute")
+    run = next(command for command in slash_commands["commands"] if command["name"] == "run")
+    confirm = next(command for command in slash_commands["commands"] if command["name"] == "confirm")
+    decline = next(command for command in slash_commands["commands"] if command["name"] == "decline")
+    stop = next(command for command in slash_commands["commands"] if command["name"] == "stop")
     models = next(command for command in slash_commands["commands"] if command["name"] == "models")
     model = next(command for command in slash_commands["commands"] if command["name"] == "model")
+    settings = next(command for command in slash_commands["commands"] if command["name"] == "settings")
     clear = next(command for command in slash_commands["commands"] if command["name"] == "clear")
-    palette_focus = next(command for command in slash_commands["commands"] if command["name"] == "palette")
-    dashboard_focus = next(command for command in slash_commands["commands"] if command["name"] == "dashboard")
-    toggle_section = next(command for command in slash_commands["commands"] if command["name"] == "toggle-section")
-    expand_all = next(command for command in slash_commands["commands"] if command["name"] == "expand-all")
+    quit_command = next(command for command in slash_commands["commands"] if command["name"] == "quit")
+    assert help_command["entry_id"] == "chat.help"
+    assert help_command["activation"]["kind"] == "chat_command"
+    assert status["entry_id"] == "orientation.home"
+    assert status["activation"]["kind"] == "ui_action"
+    assert init["entry_id"] == "chat.init"
+    assert init["activation"]["kind"] == "chat_command"
     assert settings["entry_id"] == "ui_controls.settings"
     assert settings["activation"]["kind"] == "ui_action"
-    assert theme["entry_id"] == "ui_controls.theme_cycle"
-    assert theme["activation"]["kind"] == "ui_action"
-    assert dark_mode["activation"]["kind"] == "ui_action"
-    assert light_mode["activation"]["kind"] == "ui_action"
-    assert home["activation"]["kind"] == "ui_action"
     assert sessions["activation"]["kind"] == "ui_action"
     assert tasks["activation"]["kind"] == "ui_action"
     assert runs["activation"]["kind"] == "ui_action"
+    assert progress["activation"]["kind"] == "chat_command"
+    assert execute["activation"]["kind"] == "chat_command"
+    assert run["activation"]["kind"] == "chat_command"
+    assert confirm["activation"]["kind"] == "chat_command"
+    assert decline["activation"]["kind"] == "chat_command"
+    assert stop["activation"]["kind"] == "chat_command"
     assert clear["activation"]["kind"] == "ui_action"
-    assert palette_focus["activation"]["kind"] == "ui_action"
-    assert dashboard_focus["activation"]["kind"] == "ui_action"
-    assert toggle_section["activation"]["kind"] == "ui_action"
-    assert expand_all["activation"]["kind"] == "ui_action"
+    assert quit_command["activation"]["kind"] == "chat_command"
     assert models["activation"]["kind"] == "model_list"
     assert model["activation"]["kind"] == "session_model_selection"
 
-    read_only = filter_slash_commands(slash_commands, "/execute-read-only")
+    execute_match = filter_slash_commands(slash_commands, "/execute")
     task_matches = filter_slash_commands(slash_commands, "task")
     missing = filter_slash_commands(slash_commands, "does-not-exist")
 
-    assert read_only["schema_version"] == "harness.tui_slash_command_filter/v1"
-    assert [command["name"] for command in read_only["commands"]] == ["execute-read-only"]
+    assert execute_match["schema_version"] == "harness.tui_slash_command_filter/v1"
+    assert [command["name"] for command in execute_match["commands"]] == ["execute"]
     assert any(command["name"] == "tasks" for command in task_matches["commands"])
     assert missing["commands"] == []
     serialized = json.dumps(slash_commands)
@@ -3587,21 +3617,25 @@ def test_tui_functionality_table_groups_commands_by_operator_workflow() -> None:
     assert any(row["title"] == "Switch model" and row["invoke"] == "ctrl+x m" for row in table["rows"])
     model_row = next(row for row in table["rows"] if row["id"] == "suggested.model")
     execute_row = next(row for row in table["rows"] if row["id"] == "adapters.execute")
+    status_row = next(row for row in table["rows"] if row["id"] == "suggested.status")
+    run_row = next(row for row in table["rows"] if row["id"] == "tasks.run")
     settings_row = next(row for row in table["rows"] if row["id"] == "system.settings")
-    theme_row = next(row for row in table["rows"] if row["id"] == "system.theme")
 
     assert model_row["authority"] == "session metadata"
     assert model_row["status"] == "state"
     assert model_row["does_not"] == "call provider, execute model, hidden fallback"
-    assert execute_row["authority"] == "registered dispatch"
-    assert execute_row["status"] == "dispatch"
+    assert execute_row["authority"] == "chat governance"
+    assert execute_row["status"] == "chat"
+    assert execute_row["does_not"] == "bypass governance, hidden fallback, blanket permission"
+    assert status_row["authority"] == "ui-only"
+    assert status_row["status"] == "ui"
+    assert run_row["authority"] == "chat governance"
+    assert run_row["status"] == "chat"
     assert settings_row["authority"] == "ui-only"
     assert settings_row["status"] == "ui"
-    assert theme_row["title"] == "Switch theme"
-    assert theme_row["invoke"] == "ctrl+x t"
-    assert theme_row["authority"] == "ui-only"
     assert any(theme["id"] == "light" and theme["textual_theme"] == "harness-light" for theme in build_tui_settings_catalog()["themes"])
     assert any(theme["id"] == "system" and theme["textual_theme"] == "textual-light" for theme in THEME_DIALOG_ENTRIES)
+    assert not any(row["id"] == "system.theme" for row in table["rows"])
     assert not any(row["id"] == "system.dark-mode" for row in table["rows"])
     assert not any(row["id"] == "system.light-mode" for row in table["rows"])
     assert "Switch to dark mode" not in rendered
@@ -3634,17 +3668,18 @@ def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
 
     assert "[bold blue]/help" in all_suggestions
     assert "[bold cyan]" not in all_suggestions
-    assert "[bold blue]/home" in selected_second
+    assert "[bold blue]/status" in selected_second
     assert "... 1 previous. Keep using arrows to navigate." in selected_after_first_page
-    assert "[bold blue]/scaffold" in selected_after_first_page
-    assert "Print the MVP agent command sequence without running it." in all_suggestions
-    assert "/execute-read-only" in execute_suggestions
+    assert "[bold blue]/run" in selected_after_first_page
+    assert "List the compact operator slash commands." in all_suggestions
+    assert "/execute" in execute_suggestions
+    assert "/execute-read-only" not in execute_suggestions
     assert "/settings" in settings_suggestions
     assert "/models" in model_suggestions
     assert "/model" in model_suggestions
     assert "Select the active session model" in model_suggestions
     assert "Focus the read-only TUI settings catalog." in settings_suggestions
-    assert "/home" not in execute_suggestions
+    assert "/status" not in execute_suggestions
     assert plain_text == ""
     assert "No slash commands match /does-not-exist" in missing
 
@@ -3654,7 +3689,7 @@ def test_tui_chat_slash_command_responses_are_templates_only() -> None:
     welcome = build_chat_welcome_message("/tmp/project")
 
     help_response = handle_slash_command("/help", slash_commands)
-    command_response = handle_slash_command("/execute-read-only", slash_commands)
+    command_response = handle_slash_command("/execute", slash_commands)
     plain_response = handle_slash_command("run something", slash_commands)
     unknown_response = handle_slash_command("/does-not-exist", slash_commands)
 
@@ -3663,16 +3698,18 @@ def test_tui_chat_slash_command_responses_are_templates_only() -> None:
     assert "o  o" not in render_chat_message(welcome)
     assert help_response["ok"] is True
     assert help_response["kind"] == "help"
-    assert any("/execute-read-only" in line for line in help_response["messages"][0]["lines"])
+    assert any("/execute" in line for line in help_response["messages"][0]["lines"])
+    assert not any("/execute-read-only" in line for line in help_response["messages"][0]["lines"])
     assert any("/models" in line for line in help_response["messages"][0]["lines"])
     assert any("/model" in line for line in help_response["messages"][0]["lines"])
     assert command_response["ok"] is True
     assert command_response["kind"] == "command_template"
-    assert command_response["command"]["name"] == "execute-read-only"
+    assert command_response["command"]["name"] == "execute"
     rendered = render_chat_message(command_response["messages"][0])
-    assert "harness daemon execute-read-only task_lease_abc123 --project . --output json" in rendered
+    assert "/execute [lease_id]" in rendered
     assert "Mutates when run manually: True" in rendered
-    assert "Compatibility command for the bounded read-only adapter when manually run." in rendered
+    assert "Routes through chat governance and fails closed without a valid registered lease." in rendered
+    assert "harness daemon execute-read-only" not in rendered
     assert plain_response["kind"] == "plain_text_unsupported"
     assert unknown_response["kind"] == "unknown"
 
@@ -3891,6 +3928,25 @@ def test_cli_runs_and_show_support_json_output(tmp_path) -> None:
         "final_report",
         "manifest",
     }
+
+
+def test_cli_runs_prune_removes_old_unreferenced_runs(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    old = store.create_run(goal="old", task_type="phase_1a_test")
+    keep = store.create_run(goal="keep", task_type="phase_1a_test")
+
+    pruned = runner.invoke(app, ["runs", "prune", "--keep", "1", "--project", str(tmp_path), "--output", "json"])
+    bad_keep = runner.invoke(app, ["runs", "prune", "--keep", "-1", "--project", str(tmp_path), "--output", "json"])
+
+    assert pruned.exit_code == 0, pruned.output
+    payload = json.loads(pruned.output)
+    assert payload["schema_version"] == "harness.runs_prune/v1"
+    assert payload["removed_run_ids"] == [old.id]
+    assert store.get_run(keep.id).id == keep.id
+    assert not (tmp_path / ".harness" / "runs" / old.id).exists()
+    assert bad_keep.exit_code == 1
+    assert "--keep" in json.loads(bad_keep.output)["errors"][0]
 
 
 def test_cli_artifacts_list_and_inspect_report_evidence_without_contents(tmp_path, monkeypatch) -> None:
@@ -6276,6 +6332,7 @@ def test_cli_tasks_support_objective_dependencies_approvals_and_graph(tmp_path) 
     graph_payload = json.loads(graph.output)
     assert graph_payload["schema_version"] == "harness.task_graph/v1"
     assert graph_payload["ok"] is True
+    assert graph_payload["graph"]["tasks"] == graph_payload["tasks"]
     assert [objective["id"] for objective in graph_payload["objectives"]] == [objective_id]
     assert graph_payload["dependencies"][0]["upstream_task_id"] == upstream_id
     assert graph_payload["dependencies"][0]["downstream_task_id"] == downstream["id"]
@@ -6284,6 +6341,52 @@ def test_cli_tasks_support_objective_dependencies_approvals_and_graph(tmp_path) 
         "task_id": upstream_id,
         "status": "ready",
     }
+    missing_graph = runner.invoke(
+        app,
+        ["tasks", "graph", "--objective", "obj_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert missing_graph.exit_code == 1
+    assert json.loads(missing_graph.output)["ok"] is False
+
+
+def test_cli_tasks_status_is_read_only_and_set_status_mutates(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    created = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Status task", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert created.exit_code == 0, created.output
+    task_id = json.loads(created.output)["task"]["id"]
+
+    overview = runner.invoke(app, ["tasks", "status", "--project", str(tmp_path), "--output", "json"])
+    inspected = runner.invoke(app, ["tasks", "status", task_id, "--project", str(tmp_path), "--output", "json"])
+    changed = runner.invoke(
+        app,
+        ["tasks", "set-status", task_id, "succeeded", "--project", str(tmp_path), "--output", "json"],
+    )
+    legacy_task = runner.invoke(
+        app,
+        ["tasks", "add", "--title", "Legacy status task", "--project", str(tmp_path), "--output", "json"],
+    )
+    assert legacy_task.exit_code == 0, legacy_task.output
+    legacy_task_id = json.loads(legacy_task.output)["task"]["id"]
+    legacy_changed = runner.invoke(
+        app,
+        ["tasks", "status", legacy_task_id, "succeeded", "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert overview.exit_code == 0, overview.output
+    overview_payload = json.loads(overview.output)
+    assert overview_payload["schema_version"] == "harness.task_status/v1"
+    assert overview_payload["status_counts"]["ready"] == 1
+    assert "tasks set-status" in overview_payload["mutation_command"]
+    assert inspected.exit_code == 0, inspected.output
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["status"] == "ready"
+    assert changed.exit_code == 0, changed.output
+    assert json.loads(changed.output)["task"]["status"] == "succeeded"
+    assert legacy_changed.exit_code == 0, legacy_changed.output
+    assert json.loads(legacy_changed.output)["task"]["status"] == "succeeded"
 
 
 def test_cli_tasks_reject_invalid_objective_and_dependency_refs(tmp_path) -> None:
@@ -7334,28 +7437,65 @@ def test_chat_codex_like_dry_run_confirmation_runs_foreground(tmp_path) -> None:
     assert len(store.list_runs()) == 1
 
 
-def test_chat_codex_like_read_only_missing_approval_prompts_in_app_recovery(tmp_path) -> None:
+def test_chat_codex_like_read_only_confirmation_prepares_scoped_approval(tmp_path, monkeypatch) -> None:
+    from harness.backends.codex_cli import CodexRunResult
+    from harness.models import BackendCapabilities, BackendStatus
+
+    class FakeCodexBackend:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=BackendCapabilities(
+                    supports_exec=True,
+                    supports_cd=True,
+                    supports_read_only_sandbox=True,
+                    supports_json_events=True,
+                    supports_output_last_message=True,
+                ),
+            )
+
+        def run_read_only(self, project_root, prompt, final_message_path):
+            if final_message_path:
+                final_message_path.write_text("repository summary", encoding="utf-8")
+            return CodexRunResult(
+                ["codex", "exec", "--cd", str(project_root), "--sandbox", "read-only"],
+                "",
+                "",
+                0,
+                [],
+                "repository summary",
+            )
+
+    monkeypatch.setattr("harness.daemon_adapters.CodexCliBackend", FakeCodexBackend)
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     state = ChatSessionState(codex_like_mode=True)
 
     draft = handle_chat_input("summarize this repo", tmp_path, state)
-    rejected = handle_chat_input("yes", tmp_path, state)
-    pending_approval = state.pending_hosted_approval
-    approval = handle_chat_input("yes", tmp_path, state)
+    executed = handle_chat_input("yes", tmp_path, state)
 
-    rendered = "\n".join(rejected["lines"])
+    rendered = "\n".join(executed["lines"])
     assert draft["kind"] == "task_draft"
     assert draft["draft"]["execution_adapter"] == "read_only_summary"
-    assert rejected["kind"] == "codex_like_task_result"
-    assert rejected["ok"] is False
-    assert rejected["execution"]["decision"] == "execution_adapter_rejected"
-    assert rejected["execution"]["run"] is None
-    assert pending_approval is True
-    assert "Hosted-boundary approval is required before Codex run creation." in rendered
-    assert approval["kind"] == "hosted_approval_created"
-    assert ApprovalStore(tmp_path).find_valid("codex_cli", "hosted_provider", "read_only_repo_summary") is not None
-    assert ApprovalStore(tmp_path).find_valid("codex_cli", "hosted_provider", "codex_code_edit") is not None
-    assert SQLiteStore(tmp_path).list_runs() == []
+    assert executed["kind"] == "codex_like_task_result"
+    assert executed["ok"] is True
+    assert executed["execution"]["decision"] == "read_only_summary_completed"
+    assert executed["execution"]["run"] is not None
+    assert state.pending_hosted_approval is False
+    assert "Prepared scoped hosted-provider Codex approval" in rendered
+    task = SQLiteStore(tmp_path).list_tasks()[0]
+    approvals = ApprovalStore(tmp_path).list()
+    assert len(approvals) == 1
+    assert approvals[0].task_types == ["read_only_repo_summary"]
+    assert approvals[0].allowed_adapters == ["read_only_summary"]
+    assert approvals[0].allowed_workbenches == [task.workbench_id]
+    assert approvals[0].max_runs == 1
+    assert all("codex_code_edit" not in approval.task_types for approval in approvals)
+    assert SQLiteStore(tmp_path).list_runs()
 
 
 def test_chat_unknown_adapter_fail_closed_without_run(tmp_path) -> None:
@@ -7392,15 +7532,66 @@ def test_chat_duplicate_execute_is_rejected(tmp_path) -> None:
     assert len(SQLiteStore(tmp_path).list_runs()) == 1
 
 
-def test_chat_codex_missing_hosted_approval_rejects_before_run(tmp_path, monkeypatch) -> None:
+def test_chat_codex_confirm_prepares_scoped_hosted_approval_before_run(tmp_path, monkeypatch) -> None:
+    from harness.backends.codex_cli import CodexRunResult, NETWORK_NOT_ENFORCEABLE
+    from harness.models import BackendCapabilities, BackendStatus
+
+    class FakeCodexBackend:
+        def __init__(self, config) -> None:
+            self.config = config
+            self.name = config.name
+
+        def preflight(self):
+            return BackendStatus(
+                available=True,
+                metadata=self.config.metadata,
+                capabilities=BackendCapabilities(
+                    supports_exec=True,
+                    supports_cd=True,
+                    supports_read_only_sandbox=True,
+                    supports_workspace_write_sandbox=True,
+                    supports_json_events=True,
+                    supports_output_last_message=True,
+                ),
+            )
+
+        def run_read_only(self, project_root, prompt, final_message_path):
+            if final_message_path:
+                final_message_path.write_text("implementation plan", encoding="utf-8")
+            return CodexRunResult(
+                ["codex", "exec", "--cd", str(project_root), "--sandbox", "read-only"],
+                "",
+                "",
+                0,
+                [],
+                "implementation plan",
+            )
+
+        def run_edit(self, isolated_workspace, prompt, final_message_path):
+            if final_message_path:
+                final_message_path.write_text("no changes needed", encoding="utf-8")
+            return (
+                CodexRunResult(
+                    ["codex", "exec", "--cd", str(isolated_workspace), "--sandbox", "workspace-write"],
+                    "",
+                    "",
+                    0,
+                    [],
+                    "no changes needed",
+                ),
+                self.preflight().capabilities,
+                NETWORK_NOT_ENFORCEABLE,
+            )
+
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakeCodexBackend)
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     state = ChatSessionState()
 
     draft = handle_chat_input("fix this bug with Codex", tmp_path, state)
-    rejected = handle_chat_input("yes", tmp_path, state)
+    response = handle_chat_input("yes", tmp_path, state)
 
-    rendered = "\n".join(rejected["lines"])
+    rendered = "\n".join(response["lines"])
     assert draft["kind"] == "orchestration_draft"
     assert draft["draft"]["orchestrator_id"] == "coding_orchestrator"
     assert [task["execution_adapter"] for task in draft["draft"]["tasks"]] == [
@@ -7413,18 +7604,16 @@ def test_chat_codex_missing_hosted_approval_rejects_before_run(tmp_path, monkeyp
     ]
     assert draft["draft"]["tasks"][3]["agent_id"] == "implementation_reviewer"
     assert draft["draft"]["tasks"][4]["agent_id"] == "security_reviewer"
-    assert rejected["ok"] is False
-    assert rejected["kind"] == "orchestration_result"
-    assert rejected["orchestration"]["results"][0]["decision"] == "execution_adapter_rejected"
-    assert rejected["orchestration"]["results"][0]["security_decision"]["decision"] == "approval_required"
-    assert rejected["orchestration"]["results"][0]["security_decision"]["missing_approvals"] == [
-        "hosted_provider_codex"
-    ]
-    assert rejected["orchestration"]["results"][0]["run"] is None
-    assert state.pending_hosted_approval is True
-    assert "Hosted-boundary approval is not apply-back approval." in rendered
-    assert "sk-test-secret" not in json.dumps(rejected)
-    assert SQLiteStore(tmp_path).list_runs() == []
+    assert response["ok"] is True
+    assert response["kind"] == "orchestration_result"
+    assert response["orchestration"]["results"][0]["decision"] == "repo_planning_completed"
+    assert response["orchestration"]["results"][0]["security_decision"]["decision"] == "allow"
+    assert response["orchestration"]["results"][0]["security_decision"]["missing_approvals"] == []
+    assert state.pending_hosted_approval is False
+    assert "Prepared scoped hosted-provider Codex approval" in rendered
+    assert "apply-back" in rendered
+    assert "sk-test-secret" not in json.dumps(response)
+    assert SQLiteStore(tmp_path).list_runs()
 
 
 def test_chat_orchestrator_slash_commands_are_session_local(tmp_path) -> None:
@@ -8321,6 +8510,11 @@ def test_cli_policy_explain_supports_runtime_subjects_without_preflight_or_setti
         "harness.cli.main.LocalOpenAICompatibleBackend",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("policy explain must not preflight local backend")),
     )
+    help_result = runner.invoke(app, ["policy", "explain", "--project", str(tmp_path), "--output", "json"])
+    assert help_result.exit_code == 0, help_result.output
+    help_payload = json.loads(help_result.output)
+    assert help_payload["schema_version"] == "harness.policy_explain_help/v1"
+    assert "task" in help_payload["subject_kinds"]
 
     for kind, subject_id in [
         ("run", run.id),
@@ -8393,9 +8587,12 @@ def test_cli_policy_explain_unknown_subject_returns_stable_json_error(tmp_path) 
 
 def test_cli_specs_registry_supports_json_output_without_runtime_leaks(tmp_path) -> None:
     result = runner.invoke(app, ["specs", "--output", "json"])
+    explicit_list = runner.invoke(app, ["specs", "list", "--output", "json"])
 
     assert result.exit_code == 0
+    assert explicit_list.exit_code == 0
     payload = json.loads(result.output)
+    assert json.loads(explicit_list.output)["schema_version"] == "harness.spec_registry/v1"
     assert payload["schema_version"] == "harness.spec_registry/v1"
     assert {"local_reasoning", "codex_supervised"} <= set(payload["model_profiles"])
     assert {"commodities_researcher.default", "risk_reviewer.default", "job_researcher.default"} <= set(
@@ -9003,8 +9200,11 @@ def test_cli_approvals_add_list_revoke(tmp_path) -> None:
     assert add.exit_code == 0
     approval_id = add.output.split("Created approval ", 1)[1].strip()
     listed = runner.invoke(app, ["approvals", "--project", str(tmp_path)])
+    listed_command = runner.invoke(app, ["approvals", "list", "--project", str(tmp_path), "--output", "json"])
     assert listed.exit_code == 0
+    assert listed_command.exit_code == 0
     assert approval_id in listed.output
+    assert json.loads(listed_command.output)["approvals"][0]["id"] == approval_id
     revoked = runner.invoke(app, ["approvals", "revoke", approval_id, "--project", str(tmp_path)])
     assert revoked.exit_code == 0
     listed_after = runner.invoke(app, ["approvals", "--project", str(tmp_path)])

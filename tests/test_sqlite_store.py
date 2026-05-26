@@ -7,7 +7,7 @@ import pytest
 from harness.agent_authoring import load_agent_bundle
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
-from harness.models import BreakerStatus, KillSwitchTargetKind, ObjectiveStatus, TaskLeaseStatus, TaskStatus
+from harness.models import BreakerStatus, DaemonStatus, KillSwitchTargetKind, ObjectiveStatus, TaskLeaseStatus, TaskStatus
 from harness.security import SecretBlockedError
 
 
@@ -409,6 +409,33 @@ def test_store_daemon_records_events_status_and_stop(tmp_path) -> None:
     assert [item.id for item in stopped] == [daemon.id]
     assert stopped[0].status.value == "stopped"
     assert store.daemon_status().active_daemons == []
+
+
+def test_store_daemon_status_marks_stale_and_expires_owned_leases(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(title="Stale lease")
+    tick = store.daemon_run_once("local_daemon:test:stale", pid=123)
+    assert tick.lease is not None
+    assert tick.daemon_id is not None
+
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE daemon_records SET heartbeat_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00+00:00", tick.daemon_id),
+        )
+        conn.execute(
+            "UPDATE task_leases SET expires_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00+00:00", tick.lease.id),
+        )
+
+    status = store.daemon_status(stale_after_seconds=1)
+
+    assert status.active_daemons[0].status == DaemonStatus.STALE
+    assert store.get_task_lease(tick.lease.id).status == TaskLeaseStatus.EXPIRED
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id)[0].failure_code == "daemon_stale"
+    assert any(event.event_type == "stale_lease" for event in store.list_daemon_events(tick.daemon_id))
 
 
 def test_store_daemon_run_once_leases_without_creating_runs_or_artifacts(tmp_path) -> None:
@@ -998,6 +1025,29 @@ def test_store_artifact_evidence_verifies_mismatch_and_missing(tmp_path) -> None
     assert store.verify_artifact(artifact.id).evidence_status == "missing"
 
 
+def test_store_mutable_run_artifacts_refresh_after_final_writes(tmp_path) -> None:
+    from harness.events import append_jsonl
+
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    run = store.create_run(goal="mutable artifact run", task_type="phase_1a_test")
+    paths = store.initialize_run_artifacts(run.id)
+    for kind, path in paths.items():
+        store.register_artifact(run.id, kind, path)
+
+    store.append_event(run.id, "info", "event", "event written", {})
+    append_jsonl(paths["transcript"], {"role": "user", "content": "hello"})
+    store.generate_final_report(run.id)
+
+    statuses = {artifact.kind: artifact.evidence_status for artifact in store.verify_artifacts(run.id)}
+    assert statuses == {
+        "events": "verified",
+        "transcript": "verified",
+        "final_report": "verified",
+        "manifest": "verified",
+    }
+
+
 def test_store_artifact_registration_marks_clean_evidence_not_required(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -1120,6 +1170,26 @@ def test_store_run_baselines_round_trip_replace_and_compare(tmp_path) -> None:
     replaced = store.set_run_baseline("local-green", second.id)
     assert replaced.run_id == second.id
     assert store.get_run_baseline("local-green").run_id == second.id
+
+
+def test_store_prune_runs_deletes_only_unreferenced_old_runs(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    referenced = store.create_run(goal="referenced", task_type="phase_1a_test")
+    old = store.create_run(goal="old", task_type="phase_1a_test")
+    newest = store.create_run(goal="newest", task_type="phase_1a_test")
+    task = store.create_task(title="References run")
+    with store.connect() as conn:
+        conn.execute("UPDATE tasks SET run_id = ? WHERE id = ?", (referenced.id, task.id))
+
+    removed = store.prune_runs(keep=1)
+
+    assert removed == [old.id]
+    assert store.get_run(referenced.id).id == referenced.id
+    assert store.get_run(newest.id).id == newest.id
+    assert not (tmp_path / ".harness" / "runs" / old.id).exists()
+    with pytest.raises(ValueError, match="--keep"):
+        store.prune_runs(keep=-1)
 
 
 def test_store_compare_reports_artifact_evidence_drift_without_contents(tmp_path) -> None:

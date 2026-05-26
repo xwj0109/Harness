@@ -378,6 +378,15 @@ def _active_work_rows(
     if latest_response.get("kind") == "self_managed_local_action":
         report = latest_response.get("report_path") or (latest_response.get("extra") or {}).get("report_path")
         rows.append("Latest action: succeeded" if latest_response.get("ok") else "Latest action: failed")
+        rows.extend(_managed_action_target_rows(dashboard, latest_response))
+        decision = latest_response.get("decision") or {}
+        sandbox = decision.get("sandbox_assessment") or {}
+        if decision or sandbox:
+            rows.append(
+                "Policy: "
+                f"{_humanize(decision.get('status') or 'unknown')} / "
+                f"sandbox {_humanize(sandbox.get('status') or 'not recorded')}"
+            )
         if report:
             rows.append(f"Report: {Path(str(report)).name}")
     next_action = next((row.removeprefix("Next: ") for row in rows if row.startswith("Next: ")), None)
@@ -493,6 +502,39 @@ def _context_rows(dashboard: dict[str, Any], state: dict[str, Any], focus_mode: 
     if focus_mode == "palette" and query.strip():
         rows.append("Palette: command previews only")
     return rows
+
+
+def _managed_action_target_rows(dashboard: dict[str, Any], latest_response: dict[str, Any]) -> list[str]:
+    rows = []
+    project_root = Path(str(dashboard.get("project_root") or ".")).resolve()
+    created = _response_path_list(latest_response.get("created_paths"), project_root)
+    changed = _response_path_list(latest_response.get("changed_paths"), project_root)
+    if created:
+        rows.append("Created: " + ", ".join(created))
+    if changed:
+        rows.append("Changed: " + ", ".join(changed))
+    return rows
+
+
+def _response_path_list(value: object, project_root: Path) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value[:3]:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        path = Path(text)
+        if path.is_absolute():
+            try:
+                result.append(path.resolve().relative_to(project_root).as_posix())
+            except ValueError:
+                result.append(path.name)
+        else:
+            result.append(path.as_posix())
+    if len(value) > 3:
+        result.append(f"+{len(value) - 3} more")
+    return result
 
 
 def _context_window_label(active_session: dict[str, Any], active_model: dict[str, Any]) -> str:

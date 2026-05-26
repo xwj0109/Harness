@@ -282,6 +282,30 @@ def test_narrow_terminal_compact_mode(tmp_path) -> None:
     assert "GRAPH" in rows
 
 
+def test_graph_mode_renders_lane_flowchart(tmp_path) -> None:
+    store = _store(tmp_path)
+    objective = store.create_objective("Flowchart")
+    planner = store.create_task("Plan fix", objective_id=objective.id, agent_id="Planner")
+    store.create_task("Apply patch", objective_id=objective.id, agent_id="Coder", depends_on=[planner.id])
+
+    rendered = render_right_panel(
+        build_right_panel_model(
+            build_tui_dashboard(tmp_path),
+            {"palette": build_command_palette(), "right_pane_mode": "graph"},
+            "",
+            "dashboard",
+        )
+    )
+
+    assert "PLANNER" in rendered
+    assert "CODER" in rendered
+    assert "Plan fix" in rendered
+    assert "Apply patch" in rendered
+    assert "Flow:" in rendered
+    assert "Plan fix" in rendered and "->" in rendered and "Apply patch" in rendered
+    assert "depends_on" in rendered
+
+
 def test_graph_layout_stable_after_event_update(tmp_path) -> None:
     store = _store(tmp_path)
     objective = store.create_objective("Stable layout")

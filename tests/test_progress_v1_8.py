@@ -145,6 +145,11 @@ def test_progress_cli_json_and_unknown_objective_error(tmp_path) -> None:
     assert payload["ok"] is True
     assert payload["objective_id"] == objective.id
     assert payload["mode"] == "ready"
+    text = runner.invoke(app, ["progress", "--objective", objective.id, "--project", str(tmp_path)])
+    assert text.exit_code == 0, text.output
+    assert "task_id\tstatus\ttitle\tadapter" in text.output
+    assert "Inspect" in text.output
+    assert '"schema_version"' not in text.output
 
     missing = runner.invoke(app, ["progress", "--objective", "obj_missing", "--project", str(tmp_path), "--output", "json"])
     assert missing.exit_code != 0

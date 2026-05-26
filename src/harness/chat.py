@@ -95,6 +95,12 @@ CODEX_ORCHESTRATION_TASK_TYPE = "codex_code_edit"
 DEFAULT_ORCHESTRATOR_ID = "coding_orchestrator"
 ORCHESTRATION_OWNER = "chat_orchestrator"
 MAX_CHAT_TOOL_CALLS = 3
+HOSTED_CODEX_ADAPTER_TASK_TYPES = {
+    "read_only_summary": "read_only_repo_summary",
+    "repo_planning": "repo_planning",
+    "codex_isolated_edit": "codex_code_edit",
+}
+HOSTED_CODEX_APPROVAL_RUNTIME_SECONDS = 2 * 60 * 60
 
 
 def run_autonomous_read_loop(
@@ -449,7 +455,7 @@ class ChatSessionState:
         self.operator_runtime.abort()
 
 
-def chat_context(project_root: Path) -> dict[str, Any]:
+def chat_context(project_root: Path, *, detail: str = "full") -> dict[str, Any]:
     project_root = resolve_project_root(project_root)
     context = build_operator_context(project_root)
     try:
@@ -458,7 +464,7 @@ def chat_context(project_root: Path) -> dict[str, Any]:
         cfg = default_config()
     summary = dict(context["summary"])
     summary.setdefault("runs_total", summary.get("recent_runs", 0))
-    return {
+    payload = {
         "schema_version": CHAT_SCHEMA_VERSION,
         "ok": True,
         "project_root": str(project_root),
@@ -486,6 +492,28 @@ def chat_context(project_root: Path) -> dict[str, Any]:
             "no_persistent_history",
         ],
     }
+    if detail == "full":
+        payload["dashboard"] = context
+    else:
+        payload["detail"] = "compact"
+        payload["dashboard"] = {
+            "schema_version": context["schema_version"],
+            "ok": context.get("ok", True),
+            "project_root": context["project_root"],
+            "initialized": context["initialized"],
+            "version": context.get("version"),
+            "branch": context.get("branch"),
+            "summary": summary,
+            "task_status_counts": context.get("task_status_counts", {}),
+            "tasks": context.get("tasks", [])[:10],
+            "memory": context.get("memory", {}),
+            "recent_runs": context.get("recent_runs", [])[:5],
+            "recent_sessions": context.get("recent_sessions", [])[:5],
+            "command_suggestions": context.get("command_suggestions", [])[:8],
+            "detail": "compact",
+            "next_detail_command": f"harness home --project {project_root} --output json",
+        }
+    return payload
 
 
 def handle_chat_input(
@@ -581,13 +609,18 @@ def run_chat_loop(
     project_root = resolve_project_root(project_root)
     state = ChatSessionState(codex_like_mode=codex_like, autonomy_profile_id=autonomy_profile_id)
     state.selected_orchestrator_id = _default_orchestrator_id()
-    context = chat_context(project_root)
+    try:
+        cfg = load_config(project_root)
+    except FileNotFoundError:
+        cfg = default_config()
+    initialized = (project_root / HARNESS_DIR / "harness.sqlite").exists()
     stdout.write("Harness chat\n")
-    stdout.write(f"Project: {context['project_root']}\n")
+    stdout.write(f"Project: {project_root}\n")
     stdout.write(f"Orchestrator: {state.selected_orchestrator_id or 'none'}\n")
     stdout.write(f"Mode: {'codex-like' if state.codex_like_mode else 'normal'}\n")
     stdout.write(f"Autonomy: {state.autonomy_profile_id}\n")
-    stdout.write(f"Initialized: {context['initialized']}\n")
+    stdout.write(f"Initialized: {initialized}\n")
+    stdout.write(f"Chat model profile: {cfg.chat.default_model_profile}\n")
     stdout.write("Type /help for commands. Type /quit to exit.\n")
     while True:
         prompt = "harness"
@@ -723,48 +756,82 @@ def _handle_slash(
     _emit_progress(progress_callback, "procedure", "Ran slash command routing")
     _emit_progress(progress_callback, "procedure", f"- command: /{command}")
     if command == "help":
+        if tail not in {"all", "full"}:
+            return _response(
+                "help",
+                "Commands",
+                [
+                    "Essentials",
+                    "/status                 show project state",
+                    "/init                   initialize local Harness records",
+                    "/tasks                  list latest tasks",
+                    "/runs                   list latest runs",
+                    "/progress [id]          show objective progress",
+                    "",
+                    "Work",
+                    "/execute [lease_id]     prepare registered adapter dispatch",
+                    "/run                    run pending work or continue a lease",
+                    "/confirm                confirm a pending governed action",
+                    "/decline [feedback]     decline a pending governed action",
+                    "/stop                   stop foreground orchestration at a boundary",
+                    "",
+                    "Session",
+                    "/quit                   exit",
+                    "",
+                    "Advanced: /help all",
+                ],
+            )
         return _response(
             "help",
             "Commands",
             [
-                "/home, /status - show project state",
-                "/init - initialize this project for Harness records",
-                "/tools - list model-visible session tools",
-                "/pwd - show active project root and session cwd",
-                "/cd <path> - change durable session cwd inside the active project",
-                "/project <path>, /workspace <path> - switch active root explicitly",
-                "/mode [normal|codex-like] - show or change chat action mode",
-                "/dashboard - show passive dashboard context",
-                "/orchestrators - list built-in orchestrators",
-                "/use <orchestrator_id> - select an orchestrator for this chat session",
-                "/agents - list built-in agents for the active workbench",
-                "/tasks - list latest tasks",
-                "/runs - list latest runs",
-                "/leases - list active leases",
-                "/capabilities - list Harness capability catalog entries",
-                "/adapters - list registered adapters including repo_planning",
-                "/memory - list explicit local memory records",
-                "/remember <text> - save a project-scoped operator memory note",
-                "/forget <memory_id> - forget a memory record",
-                "/progress [objective_id] - show read-only orchestration progress",
-                "/task <id> - show task details",
-                "/run <id> - show run manifest summary",
-                "/artifact <id> - show artifact metadata",
-                "/lease [id] - inspect a lease",
-                "/execute [lease_id] - prepare registered adapter dispatch",
-                "/plan [request] - ask the assistant for a plan or show pending/latest orchestration plan",
-                "/act <request> - let the assistant inspect and propose Harness-backed action contracts",
-                "/diff - show latest isolated diff artifact or git diff",
-                "/test [command] - propose a sandboxed test run through an action contract",
-                "/apply [approve|deny|keep] - review/apply inspected isolated changes",
-                "/revert - prepare a Harness revert action contract for pending isolated state",
-                "/run - run pending orchestration or prepare latest lease dispatch",
-                "/stop - stop the foreground orchestration loop",
-                "/apply-back [deny|approve|keep] - review inspected Codex diff artifacts",
-                "/confirm - confirm pending draft or execution",
-                "/decline [feedback] - deny pending approval or execution",
-                "/reset - clear in-memory chat references",
-                "/quit - exit",
+                "Navigation & Information",
+                "/home, /status          show project state and dashboard",
+                "/dashboard              show passive dashboard context",
+                "/pwd                    show active project root and session cwd",
+                "/tasks                  list latest tasks",
+                "/runs                   list latest runs",
+                "/leases                 list active leases",
+                "/capabilities           list Harness capability catalog entries",
+                "/adapters               list registered adapters",
+                "/memory                 list explicit local memory records",
+                "/progress [id]          show read-only orchestration progress",
+                "/task <id>              show task details",
+                "/run <id>               show run manifest summary",
+                "/artifact <id>          show artifact metadata",
+                "/lease [id]             inspect a lease",
+                "",
+                "Orchestration & Planning",
+                "/orchestrators          list built-in orchestrators",
+                "/use <id>               select an orchestrator for this chat",
+                "/agents                 list built-in agents for the active workbench",
+                "/plan [request]         ask the assistant for a plan",
+                "/act <request>          propose Harness-backed action contracts",
+                "/execute [lease_id]     prepare registered adapter dispatch",
+                "/run                    run pending orchestration or dispatch lease",
+                "/stop                   stop the foreground orchestration loop",
+                "",
+                "Session & Project",
+                "/init                   initialize this project for Harness records",
+                "/cd <path>              change session cwd inside the active project",
+                "/project <path>         switch active root explicitly",
+                "/mode [normal|codex]    show or change chat action mode",
+                "/tools                  list model-visible session tools",
+                "/remember <text>        save a project-scoped memory note",
+                "/forget <id>            forget a memory record",
+                "",
+                "Codex Edit & Review",
+                "/diff                   show latest isolated diff or git diff",
+                "/apply [approve|deny]   review/apply inspected isolated changes",
+                "/apply-back [deny|approve]  review Codex diff artifacts",
+                "/revert                 prepare a revert action contract",
+                "/test [command]         propose a sandboxed test run",
+                "",
+                "Action Commands",
+                "/confirm                confirm pending draft or execution",
+                "/decline [feedback]     deny pending approval or execution",
+                "/reset                  clear in-memory chat references",
+                "/quit                   exit",
             ],
         )
     if command in {"decline", "deny"}:
@@ -965,7 +1032,7 @@ def _handle_intent_routed(
     if natural_language_response is not None:
         return natural_language_response
     isolated_edit_request = _isolated_edit_request_for_user_intent(raw)
-    if isolated_edit_request is not None:
+    if isolated_edit_request is not None and state.codex_like_mode:
         return _action_contract_response(project_root, state, isolated_edit_request)
     managed_action_response = _maybe_run_managed_action(raw, project_root, state)
     if managed_action_response is not None:
@@ -1341,12 +1408,25 @@ def _maybe_run_managed_action(
         )
     state.latest_run_id = result.run_id
     state.progress.append(f"managed action: {route.intent} run={result.run_id}")
-    return _managed_action_response(result)
+    return _managed_action_response(result, project_root=project_root, route=route, decision=decision)
 
 
-def _managed_action_response(result: ManagedActionResult) -> dict[str, Any]:
+def _managed_action_response(
+    result: ManagedActionResult,
+    *,
+    project_root: Path,
+    route: Any,
+    decision: Any,
+) -> dict[str, Any]:
     manifest_path = result.manifest_path or (result.report_path.parent / "manifest.json" if result.report_path else None)
     lines = [result.message]
+    if result.created_paths:
+        lines.append("Created: " + ", ".join(_project_relative_display_path(path, project_root) for path in result.created_paths))
+    if result.changed_paths:
+        lines.append("Changed: " + ", ".join(_project_relative_display_path(path, project_root) for path in result.changed_paths))
+    sandbox = decision.sandbox_assessment.status.value if decision.sandbox_assessment else "not_recorded"
+    lines.append(f"Policy: {decision.status.value}; sandbox={sandbox}; executor={route.executor}")
+    lines.append("Boundary: no provider, shell, Docker, network, permission grant, or human approval prompt.")
     if result.run_id:
         lines.append(f"Run: {result.run_id}")
     if result.report_path:
@@ -1358,8 +1438,19 @@ def _managed_action_response(result: ManagedActionResult) -> dict[str, Any]:
         "Done",
         lines,
         ok=result.ok,
-        extra=result.model_dump(mode="json"),
+        extra={
+            **result.model_dump(mode="json"),
+            "route": route.model_dump(mode="json"),
+            "decision": decision.model_dump(mode="json"),
+        },
     )
+
+
+def _project_relative_display_path(path: Path, project_root: Path) -> str:
+    try:
+        return path.resolve().relative_to(resolve_project_root(project_root)).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _model_chat_response(
@@ -1877,7 +1968,9 @@ def _fallback_action_request_for_user_intent(raw: str) -> ChatToolRequest | None
 
 def _isolated_edit_request_for_user_intent(raw: str) -> ChatToolRequest | None:
     normalized = _normalize(raw)
-    if normalized and _looks_like_repo_mutation_request(normalized):
+    if normalized and _looks_like_repo_mutation_request(normalized) and (
+        "isolated edit" in normalized or "action contract" in normalized
+    ):
         return ChatToolRequest(type="harness.tool_request/v1", tool="edit_isolated", arguments={"goal": raw})
     return None
 
@@ -2001,6 +2094,9 @@ def _looks_like_repo_mutation_request(normalized: str) -> bool:
             " feature",
             " docs",
             " readme",
+            " script",
+            " program",
+            " python",
         )
     )
 
@@ -2584,6 +2680,7 @@ def _ensure_contract_required_approvals(
     elif contract.tool == "dispatch_registered_adapter":
         adapter_id = contract.normalized_arguments.get("adapter_id") or contract.normalized_arguments.get("execution_adapter")
         allowed_adapters = [str(adapter_id)] if adapter_id else None
+    max_runs = 2 if contract.tool == "edit_isolated" else max(1, len(task_types))
     approvals.add(
         backend="codex_cli",
         data_boundary="hosted_provider",
@@ -2595,6 +2692,8 @@ def _ensure_contract_required_approvals(
             else f"Created from confirmed Harness action contract {contract.id}."
         ),
         allowed_adapters=allowed_adapters,
+        max_runs=max_runs,
+        max_total_runtime_seconds=HOSTED_CODEX_APPROVAL_RUNTIME_SECONDS,
         autonomy_scope=autonomy_scope,
     )
     if autonomy_scope:
@@ -2608,16 +2707,101 @@ def _ensure_contract_required_approvals(
     ]
 
 
+def _ensure_scoped_hosted_codex_approval_for_tasks(
+    project_root: Path,
+    tasks: list[TaskRecord],
+    *,
+    reason: str,
+    autonomy_scope: str | None = None,
+) -> list[str]:
+    hosted_tasks = [
+        task
+        for task in tasks
+        if _task_uses_hosted_codex_adapter(task)
+    ]
+    if not hosted_tasks:
+        return []
+    approvals = ApprovalStore(project_root)
+    missing_tasks = [
+        task
+        for task in hosted_tasks
+        if approvals.find_valid(
+            "codex_cli",
+            "hosted_provider",
+            str(task.metadata.get("task_type") or ""),
+            adapter_id=str(task.metadata.get("execution_adapter") or ""),
+            workbench_id=task.workbench_id,
+            objective_id=task.objective_id,
+            autonomy_scope=autonomy_scope,
+            strict_scope=autonomy_scope is not None,
+        )
+        is None
+    ]
+    if not missing_tasks:
+        return []
+
+    allowed_adapters = sorted({str(task.metadata.get("execution_adapter") or "") for task in hosted_tasks})
+    allowed_workbenches = sorted({str(task.workbench_id) for task in hosted_tasks if task.workbench_id})
+    allowed_objective_ids = sorted({str(task.objective_id) for task in hosted_tasks if task.objective_id})
+    task_types = sorted({str(task.metadata.get("task_type") or "") for task in hosted_tasks})
+    approvals.add(
+        backend="codex_cli",
+        data_boundary="hosted_provider",
+        task_types=task_types,
+        duration_days=1,
+        reason=reason,
+        allowed_adapters=allowed_adapters,
+        allowed_workbenches=allowed_workbenches,
+        allowed_objective_ids=allowed_objective_ids,
+        max_runs=len(hosted_tasks),
+        max_total_runtime_seconds=HOSTED_CODEX_APPROVAL_RUNTIME_SECONDS,
+        autonomy_scope=autonomy_scope,
+    )
+    scope_parts = [
+        f"adapters={','.join(allowed_adapters)}",
+        f"task_types={','.join(task_types)}",
+        f"max_runs={len(hosted_tasks)}",
+    ]
+    if allowed_workbenches:
+        scope_parts.append(f"workbenches={','.join(allowed_workbenches)}")
+    if allowed_objective_ids:
+        scope_parts.append(f"objectives={','.join(allowed_objective_ids)}")
+    return [
+        "Prepared scoped hosted-provider Codex approval for this confirmed workflow.",
+        f"Scope: {' '.join(scope_parts)}.",
+        "This does not permit apply-back, active repo writes, shell, Docker, or arbitrary network.",
+    ]
+
+
+def _task_uses_hosted_codex_adapter(task: TaskRecord) -> bool:
+    adapter_id = str(task.metadata.get("execution_adapter") or "")
+    task_type = str(task.metadata.get("task_type") or "")
+    return HOSTED_CODEX_ADAPTER_TASK_TYPES.get(adapter_id) == task_type
+
+
 def _hosted_codex_task_types_for_contract(contract: ActionContract) -> list[str]:
-    task_types = {"codex_code_edit", "repo_planning"}
+    if contract.tool == "edit_isolated":
+        return ["codex_code_edit", "repo_planning"]
+    task_types: set[str] = set()
     if contract.tool == "dispatch_registered_adapter":
         task_type = contract.normalized_arguments.get("task_type")
         if isinstance(task_type, str) and task_type:
             task_types.add(task_type)
+    if contract.tool == "create_task":
+        adapter_id = contract.normalized_arguments.get("execution_adapter")
+        task_type = contract.normalized_arguments.get("task_type")
+        if isinstance(adapter_id, str) and isinstance(task_type, str):
+            if HOSTED_CODEX_ADAPTER_TASK_TYPES.get(adapter_id) == task_type:
+                task_types.add(task_type)
     if contract.tool == "create_task_graph":
         for task in contract.normalized_arguments.get("tasks") or []:
-            if isinstance(task, dict) and isinstance(task.get("task_type"), str):
-                task_types.add(task["task_type"])
+            if not isinstance(task, dict):
+                continue
+            adapter_id = task.get("execution_adapter")
+            task_type = task.get("task_type")
+            if isinstance(adapter_id, str) and isinstance(task_type, str):
+                if HOSTED_CODEX_ADAPTER_TASK_TYPES.get(adapter_id) == task_type:
+                    task_types.add(task_type)
     return sorted(task_types)
 
 
@@ -3394,17 +3578,24 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
     if state.pending_hosted_approval:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
-        ApprovalStore(project_root).add(
-            backend="codex_cli",
-            data_boundary="hosted_provider",
-            task_types=["codex_code_edit", "read_only_repo_summary", "repo_planning"],
-            duration_days=1,
-            reason="Created from explicit harness chat confirmation.",
+        scoped_tasks: list[TaskRecord] = []
+        store = _require_store(project_root)
+        if state.latest_lease_id:
+            try:
+                lease = store.get_task_lease(state.latest_lease_id)
+                scoped_tasks.append(store.get_task(lease.task_id))
+            except KeyError:
+                scoped_tasks = []
+        if not scoped_tasks and state.latest_objective_id:
+            scoped_tasks = store.list_tasks(objective_id=state.latest_objective_id)
+        approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
+            project_root,
+            scoped_tasks,
+            reason="Created from explicit harness chat confirmation for the latest blocked hosted Codex task.",
         )
         state.pending_hosted_approval = False
         lines = [
-            "Created a one-day Codex hosted-boundary approval profile.",
-            "It permits scoped Codex execution for read-only summaries, repo planning, and isolated edits.",
+            *(approval_lines or ["No scoped hosted Codex task is available for approval."]),
             "It is not apply-back approval.",
         ]
         if state.latest_lease_id:
@@ -3417,8 +3608,10 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
         state.pending_draft = None
         task = _create_task_from_draft(project_root, state, draft)
         if state.codex_like_mode:
-            return _run_single_task_response(project_root, state, task)
-        return _task_created_response(task, draft)
+            response = _run_single_task_response(project_root, state, task)
+        else:
+            response = _task_created_response(task, draft)
+        return response
     if state.pending_orchestration is not None:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
@@ -3428,7 +3621,24 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
     if state.pending_execute_lease_id is not None:
         lease_id = state.pending_execute_lease_id
         state.pending_execute_lease_id = None
-        return _execute_response(project_root, lease_id, state)
+        approval_lines = []
+        if _is_initialized(project_root):
+            store = _require_store(project_root)
+            try:
+                lease = store.get_task_lease(lease_id)
+                task = store.get_task(lease.task_id)
+                approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
+                    project_root,
+                    [task],
+                    reason=f"Created from confirmed registered adapter dispatch for lease {lease_id}.",
+                )
+            except KeyError:
+                approval_lines = []
+        response = _execute_response(project_root, lease_id, state)
+        if approval_lines:
+            response["lines"] = [*approval_lines, *response.get("lines", [])]
+            response["auto_approvals"] = approval_lines
+        return response
     return _response("nothing_to_confirm", "Nothing Pending", ["There is no pending chat action to confirm."], ok=False)
 
 
@@ -3496,9 +3706,15 @@ def _run_single_task_response(project_root: Path, state: ChatSessionState, task:
         state.latest_task_id = tick.selected_task.id
     state.progress.append(f"lease acquired: {tick.lease.id}")
     lines.extend([f"Lease acquired: {tick.lease.id}", "Dispatching registered adapter."])
+    approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
+        project_root,
+        [tick.selected_task or task],
+        reason=f"Created from confirmed foreground chat task {task.id} after lease {tick.lease.id}.",
+    )
+    lines.extend(approval_lines)
     result_response = _execute_response(project_root, tick.lease.id, state)
     result_lines = result_response.get("lines", [])
-    return _response(
+    response = _response(
         "codex_like_task_result",
         "Foreground Task Result",
         [*lines, *result_lines],
@@ -3509,6 +3725,9 @@ def _run_single_task_response(project_root: Path, state: ChatSessionState, task:
             "execution": result_response.get("result"),
         },
     )
+    if approval_lines:
+        response["auto_approvals"] = approval_lines
+    return response
 
 
 def _draft_response(project_root: Path, state: ChatSessionState, draft: ChatDraftTask) -> dict[str, Any]:
@@ -3567,6 +3786,14 @@ def _orchestration_draft_response(
             f"Required approvals: {draft.required_approvals}",
             "Safety boundary:",
             *[f"- {note}" for note in draft.safety_notes],
+            *(
+                [
+                    "On confirmation, Harness creates a scoped hosted-provider approval for this workflow only.",
+                    "The approval is constrained by adapter, task type, workbench/objective, run count, and expiry.",
+                ]
+                if "hosted_provider_codex" in draft.required_approvals
+                else []
+            ),
             "Equivalent commands:",
             *draft.equivalent_commands,
             draft.confirm_prompt,
@@ -4455,6 +4682,12 @@ def _create_and_run_orchestration(
     draft: OrchestratedRunDraft,
 ) -> dict[str, Any]:
     store = _require_store(project_root)
+    # Cancel stale open objectives from the same workbench to prevent task pileup
+    for existing in store.list_objectives():
+        if existing.workbench_id == draft.workbench_id and existing.status == "active" and existing.id != state.latest_objective_id:
+            for task in store.list_tasks(objective_id=existing.id):
+                if task.status.value in {"ready", "leased", "blocked", "waiting_approval", "created"}:
+                    store.cancel_task(task.id)
     objective = store.create_objective(
         title=draft.objective_title,
         description=draft.objective_description,
@@ -4495,8 +4728,17 @@ def _create_and_run_orchestration(
         "objective": objective.model_dump(mode="json"),
         "tasks": [task.model_dump(mode="json") for task in created_tasks],
     }
+    approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
+        project_root,
+        created_tasks,
+        reason=f"Created from confirmed chat orchestration for objective {objective.id}.",
+    )
     state.progress.append(f"orchestration objective created: {objective.id}")
-    return _run_orchestration_loop(project_root, state, objective.id)
+    response = _run_orchestration_loop(project_root, state, objective.id)
+    if approval_lines:
+        response["lines"] = [*approval_lines, *response.get("lines", [])]
+        response["auto_approvals"] = approval_lines
+    return response
 
 
 def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objective_id: str) -> dict[str, Any]:
@@ -4513,7 +4755,7 @@ def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objecti
         if objective_tasks and all(task.status.value in {"succeeded", "failed", "cancelled", "skipped"} for task in objective_tasks):
             lines.append("All objective tasks are terminal.")
             break
-        tick = store.daemon_run_once(owner=ORCHESTRATION_OWNER, pid=None)
+        tick = store.daemon_run_once(owner=ORCHESTRATION_OWNER, pid=None, objective_id=objective_id)
         if tick.lease is None:
             lines.append(f"Lease decision: {tick.decision}")
             if tick.pause_reasons:

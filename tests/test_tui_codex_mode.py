@@ -14,6 +14,7 @@ from harness.tui import (
     _merge_codex_stream_and_final_lines,
     _model_selection_dialog_entries,
     _runtime_elapsed_seconds,
+    _transcript_event_messages,
     _update_markup_static,
     _render_composer_status,
     _model_catalog_pane_rows,
@@ -971,6 +972,47 @@ def test_codex_like_finish_keeps_live_steps_before_final_answer() -> None:
     assert "[dim]•[/dim] [bold]Explored[/bold]" in rendered
     assert "[dim]────────────────" in rendered
     assert "\nFinal answer line one.\n" in rendered
+
+
+def test_codex_like_self_managed_action_keeps_progress_before_done_title() -> None:
+    final = _chat_response_to_tui_message(
+        {
+            "kind": "self_managed_local_action",
+            "title": "Done",
+            "lines": ["Created `simple_script.py`.", "Run: run_123"],
+        }
+    )
+    merged = _merge_codex_stream_and_final_lines(["Turn started"], final["lines"])
+    rendered = render_codex_like_transcript(
+        [{"role": "assistant", "title": final["title"], "lines": merged}],
+        separator_width=24,
+    )
+
+    assert final["title"] == "Assistant"
+    assert rendered.index("Turn started") < rendered.index("Done")
+    assert rendered.index("Done") < rendered.index("Created")
+
+
+def test_transcript_events_without_seq_use_timestamp_order() -> None:
+    messages = _transcript_event_messages(
+        [
+            {
+                "id": "event_z",
+                "kind": "model.message_delta",
+                "occurred_at": "2026-05-26T12:00:02+00:00",
+                "payload": {"prompt_id": "prompt_1", "delta": "Second."},
+            },
+            {
+                "id": "event_a",
+                "kind": "model.message_delta",
+                "occurred_at": "2026-05-26T12:00:01+00:00",
+                "payload": {"prompt_id": "prompt_1", "delta": "First."},
+            },
+        ],
+        [],
+    )
+
+    assert messages[0]["lines"] == ["First.", "Second."]
 
 
 def test_codex_like_transcript_uses_connectors_only_for_procedure_children() -> None:

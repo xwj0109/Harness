@@ -49,12 +49,32 @@ def compact_graph_rows(graph: LiveOrchestrationGraph, *, limit: int = 7) -> list
 
 def expanded_graph_rows(graph: LiveOrchestrationGraph, *, limit: int = 12) -> list[str]:
     lanes = graph.lanes or [AgentLane(id="work", title="Work", row=0)]
-    header = "  ".join(f"[{lane.title[:12]}]" for lane in lanes[:5])
-    rows = [header]
+    visible_lanes = lanes[:4]
+    lane_width = 18
+    header = "  ".join(_fit(lane.title.upper(), lane_width) for lane in visible_lanes)
+    divider = "  ".join("-" * lane_width for _ in visible_lanes)
+    rows = [header, divider]
+    lane_index = {lane.id: index for index, lane in enumerate(visible_lanes)}
     lane_order = {lane.id: lane.row for lane in lanes}
     nodes = sorted(graph.nodes, key=lambda node: (lane_order.get(node.lane_id or "", 999), (node.row or 0), node.id))
-    for node in nodes[:limit]:
-        rows.append(f"{node.symbol or _symbol_for_state(node.state)} {node.title}  ({node.kind})")
+    visible_nodes = nodes[:limit]
+    row_count = max((node.row or 0 for node in visible_nodes), default=-1) + 1
+    for row_index in range(row_count):
+        cells = [" " * lane_width for _ in visible_lanes]
+        for node in visible_nodes:
+            if (node.row or 0) != row_index:
+                continue
+            lane = node.lane_id or visible_lanes[-1].id
+            column = lane_index.get(lane)
+            if column is None:
+                continue
+            cells[column] = _node_cell(node, lane_width, selected=node.id == graph.selected_node_id)
+        if any(cell.strip() for cell in cells):
+            rows.append("  ".join(cells))
+    edge_rows = _edge_rows(graph, visible_nodes, limit=max(3, limit // 2))
+    if edge_rows:
+        rows.append("Flow:")
+        rows.extend(edge_rows)
     if len(nodes) > limit:
         rows.append(f"... {len(nodes) - limit} more nodes")
     return rows
@@ -92,3 +112,44 @@ def _symbol_for_state(state: str) -> str:
         "blocked": "■",
         "failed": "!",
     }.get(state, "○")
+
+
+def _node_cell(node: GraphNode, width: int, *, selected: bool) -> str:
+    selected_marker = ">" if selected else " "
+    attention = "!" if node.attention else " "
+    symbol = node.symbol or _symbol_for_state(node.state)
+    title = _fit(node.title, width - 6)
+    return _fit(f"{selected_marker}{symbol}{attention} {title}", width)
+
+
+def _edge_rows(graph: LiveOrchestrationGraph, nodes: list[GraphNode], *, limit: int) -> list[str]:
+    visible_ids = {node.id for node in nodes}
+    title_by_id = {node.id: node.title for node in graph.nodes}
+    rows: list[str] = []
+    priority = {
+        "requires_approval": 0,
+        "blocked_by": 1,
+        "depends_on": 2,
+        "dispatches": 3,
+        "produces": 4,
+        "consumes": 5,
+        "verifies": 6,
+        "contains": 7,
+    }
+    edges = sorted(graph.edges, key=lambda edge: (priority.get(edge.kind, 99), edge.id))
+    for edge in edges:
+        if edge.source_node_id not in visible_ids or edge.target_node_id not in visible_ids:
+            continue
+        source = _fit(title_by_id.get(edge.source_node_id, edge.source_node_id), 16)
+        target = _fit(title_by_id.get(edge.target_node_id, edge.target_node_id), 16)
+        rows.append(f"  {source} -> {target}  {edge.kind}")
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _fit(value: str, width: int) -> str:
+    text = " ".join(str(value).split())
+    if len(text) > width:
+        return text[: max(0, width - 1)] + "…"
+    return text.ljust(width)

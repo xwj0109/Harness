@@ -170,7 +170,9 @@ harness tasks add --title "Plan repo change" \
 harness tasks list --project .
 harness tasks inspect task_abc123 --project .
 harness tasks graph --project . --output json
-harness tasks status task_abc123 succeeded --project . --output json
+harness tasks status --project .
+harness tasks status task_abc123 --project .
+harness tasks set-status task_abc123 succeeded --project . --output json
 harness tasks cancel task_abc123 --project . --output json
 harness tasks retry task_abc123 --project . --output json
 harness tasks run-next --project . --output json
@@ -217,7 +219,7 @@ Runtime controls are local kill switches and adapter breakers. They only narrow 
 ```bash
 harness capabilities list --project . --output json
 harness capabilities inspect dry_run --project . --output json
-harness memory save-note --scope project --summary "Local operator note" --project . --output json
+harness memory save-note "Local operator note" --scope project --project . --output json
 harness memory save-derived \
   --scope objective \
   --scope-id obj_abc123 \
@@ -266,9 +268,11 @@ Registered adapters do not authorize Docker-from-queue, generic shell access, ho
 
 ```bash
 harness runs --project .
+harness runs prune --keep 20 --project .
 harness show run_abc123 --project . --output json
 harness artifacts list run_abc123 --project .
 harness artifacts inspect artifact_abc123 --project .
+harness policy explain --project .
 harness policy explain --subject-kind task --subject-id task_abc123 --project . --output json
 harness tools list --project . --output json
 harness tools inspect repo_read --project . --output json

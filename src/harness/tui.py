@@ -538,49 +538,149 @@ RIGHT_PANEL_SECTION_ALIASES = {
 }
 
 SLASH_COMMAND_ALIASES = {
-    "help": "orientation.quickstart_agent",
-    "home": "orientation.home",
-    "clear": "ui_controls.clear_search",
-    "palette": "ui_controls.palette_focus",
-    "dashboard": "ui_controls.dashboard_focus",
-    "toggle-section": "ui_controls.toggle_section",
-    "expand-all": "ui_controls.expand_all",
-    "quickstart": "orientation.quickstart_agent",
-    "scaffold": "agent_authoring.scaffold",
-    "validate": "agent_authoring.validate",
-    "preview": "agent_authoring.preview",
-    "import-agent": "project_agents.import",
-    "agents": "project_agents.list",
-    "agent": "project_agents.inspect",
-    "specs": "built_in_specs.list",
-    "spec": "built_in_specs.preview_agent",
-    "task": "objectives_tasks.add_task",
-    "plan-task": "objectives_tasks.add_repo_planning_task",
-    "tasks": "objectives_tasks.list_tasks",
-    "graph": "objectives_tasks.graph",
-    "lease": "daemon_control.run_once",
-    "inspect-lease": "daemon_control.inspect_lease",
-    "execute-read-only": "registered_adapters.execute_read_only",
-    "execute": "registered_adapters.execute",
-    "runs": "runtime_evidence.runs",
+    "status": "orientation.home",
     "sessions": "sessions.list",
-    "session": "sessions.list",
+    "tasks": "objectives_tasks.list_tasks",
+    "runs": "runtime_evidence.runs",
     "settings": "ui_controls.settings",
-    "theme": "ui_controls.theme_cycle",
-    "light-mode": "ui_controls.theme_light",
-    "dark-mode": "ui_controls.theme_dark",
-    "continue-session": "sessions.continue_last",
-    "tail-session": "sessions.tail",
-    "transcript-session": "sessions.transcript",
-    "session-tools": "sessions.tools",
-    "build": "native_agents.build",
-    "plan": "native_agents.plan",
-    "general": "native_agents.general",
-    "explore": "native_agents.explore",
-    "policy": "runtime_evidence.policy",
-    "artifacts": "runtime_evidence.artifacts",
-    "wheel": "packaging_smoke.wheel",
+    "clear": "ui_controls.clear_search",
 }
+
+ESSENTIAL_CHAT_SLASH_COMMANDS = [
+    {
+        "name": "help",
+        "title": "Show essential commands",
+        "description": "List the compact operator slash commands.",
+        "command": "/help",
+        "mutates_when_run": False,
+        "safety_note": "Local help text only; no provider, process, or filesystem mutation.",
+    },
+    {
+        "name": "init",
+        "title": "Initialize project records",
+        "description": "Create local Harness records for this project if they are missing.",
+        "command": "/init",
+        "mutates_when_run": True,
+        "safety_note": "Creates Harness-managed local project metadata through chat governance.",
+    },
+    {
+        "name": "progress",
+        "title": "Show progress",
+        "description": "Show read-only orchestration progress for the current or selected objective.",
+        "command": "/progress [objective_id]",
+        "mutates_when_run": False,
+        "safety_note": "Read-only orchestration state projection.",
+    },
+    {
+        "name": "execute",
+        "title": "Prepare dispatch",
+        "description": "Prepare governed registered-adapter dispatch for an active lease.",
+        "command": "/execute [lease_id]",
+        "mutates_when_run": True,
+        "safety_note": "Routes through chat governance and fails closed without a valid registered lease.",
+    },
+    {
+        "name": "run",
+        "title": "Run pending work",
+        "description": "Run pending orchestration work or continue the latest active lease.",
+        "command": "/run [run_id]",
+        "mutates_when_run": True,
+        "safety_note": "Routes through chat governance, policy checks, and recorded evidence.",
+    },
+    {
+        "name": "confirm",
+        "title": "Confirm pending action",
+        "description": "Confirm the current governed action contract or pending dispatch.",
+        "command": "/confirm",
+        "mutates_when_run": True,
+        "safety_note": "Only confirms an existing Harness-managed pending action; does not grant blanket permission.",
+    },
+    {
+        "name": "decline",
+        "title": "Decline pending action",
+        "description": "Decline the current pending action and optionally record feedback.",
+        "command": "/decline [feedback]",
+        "mutates_when_run": True,
+        "safety_note": "Records a bounded denial and returns the operator runtime to idle.",
+    },
+    {
+        "name": "stop",
+        "title": "Stop foreground loop",
+        "description": "Request the foreground orchestration loop to stop at the next boundary.",
+        "command": "/stop",
+        "mutates_when_run": True,
+        "safety_note": "Sets a session-local stop flag; no process kill or permission grant.",
+    },
+    {
+        "name": "quit",
+        "title": "Quit TUI",
+        "description": "Exit the current Harness TUI session.",
+        "command": "/quit",
+        "mutates_when_run": False,
+        "safety_note": "Exits the local interface only.",
+    },
+]
+
+ESSENTIAL_MODEL_SLASH_COMMANDS = [
+    {
+        "name": "models",
+        "slash": "/models",
+        "entry_id": "model_selection.list",
+        "group_id": "model_selection",
+        "title": "List selectable models",
+        "description": "Show configured model refs with selection numbers.",
+        "command": "/models",
+        "mutates_when_run": False,
+        "safety_note": "Read-only model catalog projection; no provider call.",
+        "activation": {
+            "kind": "model_list",
+            "supported": True,
+            "process_started": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+        },
+        "custom_command": False,
+    },
+    {
+        "name": "model",
+        "slash": "/model",
+        "entry_id": "model_selection.select",
+        "group_id": "model_selection",
+        "title": "Select session model",
+        "description": "Select the active session model by number, search, or provider/model ref.",
+        "command": "/model <number|search|provider/model>",
+        "mutates_when_run": True,
+        "safety_note": "Persists active session model metadata and validation evidence only; no provider call or fallback.",
+        "activation": {
+            "kind": "session_model_selection",
+            "supported": True,
+            "process_started": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+        },
+        "custom_command": False,
+    },
+]
+
+SLASH_COMMAND_ORDER = [
+    "help",
+    "status",
+    "init",
+    "sessions",
+    "tasks",
+    "runs",
+    "progress",
+    "execute",
+    "run",
+    "confirm",
+    "decline",
+    "stop",
+    "models",
+    "model",
+    "settings",
+    "clear",
+    "quit",
+]
 
 
 FUNCTIONALITY_TABLE_GROUPS = [
@@ -595,14 +695,12 @@ FUNCTIONALITY_TABLE_GROUPS = [
 ]
 
 FUNCTIONALITY_TABLE_LAYOUT = [
-    ("suggested", ["model", "continue-session", "runs"]),
-    ("session", ["sessions", "continue-session", "tail-session", "transcript-session", "session-tools"]),
-    ("agent", ["model", "build", "plan", "general", "explore", "scaffold", "validate", "preview", "agents", "agent", "import-agent"]),
-    ("tasks", ["task", "plan-task", "tasks", "graph", "lease", "inspect-lease"]),
-    ("adapters", ["execute-read-only", "execute"]),
-    ("evidence", ["runs", "policy", "artifacts"]),
+    ("suggested", ["status", "tasks", "runs", "model"]),
+    ("session", ["sessions"]),
+    ("tasks", ["init", "progress", "run", "confirm", "decline", "stop"]),
+    ("adapters", ["execute"]),
     ("provider", ["models", "model"]),
-    ("system", ["home", "settings", "theme", "palette", "dashboard", "clear", "toggle-section", "expand-all", "help", "quickstart", "specs", "spec", "wheel"]),
+    ("system", ["settings", "clear", "help", "quit"]),
 ]
 
 FUNCTIONALITY_INVOKES = {
@@ -620,13 +718,21 @@ FUNCTIONALITY_INVOKES = {
 FUNCTIONALITY_TITLES = {
     "model": "Switch model",
     "models": "Model catalog",
+    "status": "Project status",
+    "init": "Initialize project",
     "sessions": "Switch session",
-    "continue-session": "Continue session",
     "tasks": "Task queue",
     "runs": "Runs",
-    "theme": "Switch theme",
-    "dark-mode": "Switch to dark mode",
-    "light-mode": "Switch to light mode",
+    "progress": "Progress",
+    "execute": "Prepare dispatch",
+    "run": "Run pending work",
+    "confirm": "Confirm action",
+    "decline": "Decline action",
+    "stop": "Stop loop",
+    "settings": "Settings",
+    "clear": "Clear composer",
+    "help": "Help",
+    "quit": "Quit",
 }
 
 THEME_DIALOG_ENTRIES = [
@@ -651,17 +757,29 @@ THEME_DIALOG_ENTRIES = [
 ]
 
 FUNCTIONALITY_EVIDENCE = {
+    "status": "none",
+    "init": ".harness records",
     "model": "session.model_selected",
     "models": "none",
+    "sessions": "none",
     "task": "task id",
     "plan-task": "task id",
     "lease": "lease id",
-    "execute": "run id/artifacts",
+    "progress": "objective state",
+    "execute": "lease/action evidence",
+    "run": "run id/artifacts",
+    "confirm": "decision/run evidence",
+    "decline": "denial event",
+    "stop": "operator stop flag",
     "execute-read-only": "run id/artifacts",
     "continue-session": "session event/run id",
     "tail-session": "event stream",
     "transcript-session": "transcript",
     "wheel": "wheelhouse path",
+    "settings": "none",
+    "clear": "none",
+    "help": "none",
+    "quit": "none",
 }
 
 
@@ -2855,6 +2973,8 @@ def _functionality_authority(command: dict) -> str:
     activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
     if activation_kind == "ui_action":
         return "ui-only"
+    if activation_kind == "chat_command":
+        return "chat governance"
     if activation_kind == "model_list":
         return "read-only"
     if activation_kind == "session_model_selection":
@@ -2870,6 +2990,8 @@ def _functionality_surface(command: dict) -> str:
     activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
     if activation_kind == "ui_action":
         return "dashboard"
+    if activation_kind == "chat_command":
+        return "composer"
     if activation_kind in {"model_list", "session_model_selection"}:
         return "dialog"
     if command.get("group_id") == "registered_adapters":
@@ -2883,6 +3005,8 @@ def _functionality_status(command: dict) -> str:
     activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
     if activation_kind == "ui_action":
         return "ui"
+    if activation_kind == "chat_command":
+        return "chat"
     if activation_kind == "model_list":
         return "read"
     if activation_kind == "session_model_selection":
@@ -2904,6 +3028,8 @@ def _functionality_does_not(command: dict) -> str:
     activation_kind = str((command.get("activation") or {}).get("kind") or "manual_command")
     if activation_kind == "ui_action":
         return "start process, mutate files, grant permission"
+    if activation_kind == "chat_command":
+        return "bypass governance, hidden fallback, blanket permission"
     if activation_kind == "model_list":
         return "call provider, execute model, mutate state"
     if activation_kind == "session_model_selection":
@@ -2919,6 +3045,8 @@ def _functionality_next(command: dict, invoke: str) -> str:
         return "/model <number|search|provider/model>"
     if activation_kind == "model_list":
         return "/models"
+    if activation_kind == "chat_command":
+        return str(command.get("slash") or invoke)
     if activation_kind == "ui_action":
         return invoke
     return str(command.get("command") or command.get("slash") or invoke)
@@ -3364,86 +3492,56 @@ def _format_token_usage(usage: dict) -> str:
 def build_slash_commands(palette: dict | None = None, custom_commands: list[dict] | None = None) -> dict:
     palette = palette or build_command_palette()
     entries_by_id = {entry["id"]: entry for entry in palette["entries"]}
+    chat_commands_by_name = {command["name"]: command for command in ESSENTIAL_CHAT_SLASH_COMMANDS}
+    model_commands_by_name = {command["name"]: command for command in ESSENTIAL_MODEL_SLASH_COMMANDS}
     commands = []
-    for name, entry_id in SLASH_COMMAND_ALIASES.items():
-        entry = entries_by_id[entry_id]
-        commands.append(
-            {
-                "name": name,
-                "slash": f"/{name}",
-                "entry_id": entry_id,
-                "group_id": entry["group_id"],
-                "title": entry["title"],
-                "description": entry["description"],
-                "command": entry["command"],
-                "mutates_when_run": entry["mutates_when_run"],
-                "safety_note": entry["safety_note"],
-                "activation": dict(entry.get("activation") or {}),
-                "custom_command": False,
-            }
-        )
-    commands.extend(
-        [
-            {
-                "name": "models",
-                "slash": "/models",
-                "entry_id": "model_selection.list",
-                "group_id": "model_selection",
-                "title": "List selectable models",
-                "description": "Show configured model refs with selection numbers.",
-                "command": "/models",
-                "mutates_when_run": False,
-                "safety_note": "Read-only model catalog projection; no provider call.",
-                "activation": {
-                    "kind": "model_list",
-                    "supported": True,
-                    "process_started": False,
-                    "filesystem_modified": False,
-                    "permission_granting": False,
-                },
-                "custom_command": False,
-            },
-            {
-                "name": "model",
-                "slash": "/model",
-                "entry_id": "model_selection.select",
-                "group_id": "model_selection",
-                "title": "Select session model",
-                "description": "Select the active session model by number, search, or provider/model ref.",
-                "command": "/model <number|search|provider/model>",
-                "mutates_when_run": True,
-                "safety_note": "Persists active session model metadata and validation evidence only; no provider call or fallback.",
-                "activation": {
-                    "kind": "session_model_selection",
-                    "supported": True,
-                    "process_started": False,
-                    "filesystem_modified": False,
-                    "permission_granting": False,
-                },
-                "custom_command": False,
-            },
-            {
-                "name": "provider",
-                "slash": "/provider",
-                "entry_id": "provider.connect",
-                "group_id": "provider",
-                "title": "Connect provider from models",
-                "description": "Open the model picker and use the selected provider row to connect credentials.",
-                "command": "/models",
-                "mutates_when_run": True,
-                "safety_note": "Provider connection is launched from /models; account persistence remains explicit and redacted with no provider/model call.",
-                "activation": {
-                    "kind": "provider_connect",
-                    "supported": True,
-                    "process_started": False,
-                    "provider_execution_started": False,
-                    "model_execution_started": False,
-                    "permission_granting": False,
-                },
-                "custom_command": False,
-            },
-        ]
-    )
+    for name in SLASH_COMMAND_ORDER:
+        if name in chat_commands_by_name:
+            command = chat_commands_by_name[name]
+            commands.append(
+                {
+                    "name": name,
+                    "slash": f"/{name}",
+                    "entry_id": f"chat.{name}",
+                    "group_id": "chat_commands",
+                    "title": command["title"],
+                    "description": command["description"],
+                    "command": command["command"],
+                    "mutates_when_run": command["mutates_when_run"],
+                    "safety_note": command["safety_note"],
+                    "activation": {
+                        "kind": "chat_command",
+                        "supported": True,
+                        "governed_by": "harness.chat.handle_chat_input",
+                        "process_started": False,
+                        "filesystem_modified": False,
+                        "permission_granting": False,
+                    },
+                    "custom_command": False,
+                }
+            )
+            continue
+        if name in SLASH_COMMAND_ALIASES:
+            entry_id = SLASH_COMMAND_ALIASES[name]
+            entry = entries_by_id[entry_id]
+            commands.append(
+                {
+                    "name": name,
+                    "slash": f"/{name}",
+                    "entry_id": entry_id,
+                    "group_id": entry["group_id"],
+                    "title": entry["title"],
+                    "description": entry["description"],
+                    "command": entry["command"],
+                    "mutates_when_run": entry["mutates_when_run"],
+                    "safety_note": entry["safety_note"],
+                    "activation": dict(entry.get("activation") or {}),
+                    "custom_command": False,
+                }
+            )
+            continue
+        if name in model_commands_by_name:
+            commands.append(dict(model_commands_by_name[name]))
     for command in custom_commands or []:
         commands.append(
             {
@@ -4201,7 +4299,7 @@ def _lines_from_transcript_events(events: list[dict], *, persisted_assistant_tex
         explored_children = []
         explored_seen = set()
 
-    for event in sorted(events, key=lambda item: (int(item.get("seq") or 0), str(item.get("id") or ""))):
+    for event in sorted(events, key=lambda item: _transcript_sort_key(item, bucket=1)):
         kind = str(event.get("kind") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
         line = ""
@@ -4911,6 +5009,7 @@ def create_harness_app(
     from textual.css.query import NoMatches
     from textual.theme import Theme
     from textual.widgets import Header, Label, ListItem, ListView, Static, TextArea
+    from harness.action_router import route_managed_action
     from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
     from harness.core_service import HarnessAppService
 
@@ -5354,7 +5453,7 @@ def create_harness_app(
                 _render_composer_status(dashboard, self._selected_agent_id, self._chat_state.session_id),
                 id="composer-status",
             )
-            yield HarnessPromptInput(placeholder="Ask Harness or type /help", id="prompt")
+            yield HarnessPromptInput(placeholder="Ask Harness, /help, or ? shortcuts", id="prompt")
             yield Static(COMPOSER_FOOTER_HINTS, id="composer-footer")
 
         def on_mount(self) -> None:
@@ -5541,6 +5640,8 @@ def create_harness_app(
                 self._show_theme_dialog()
                 self._render_palette_activation_status("Select a theme with arrows, then enter.", ok=True)
                 return
+            if self._activate_help_slash_command(prompt.value):
+                return
             if self._activate_safe_slash_command(prompt.value):
                 return
             request = self._request_from_prompt_submission(prompt.value)
@@ -5689,6 +5790,11 @@ def create_harness_app(
             if getattr(self._chat_state.operator_runtime.phase, "value", "idle") != "idle":
                 return False
             try:
+                if route_managed_action(request).intent != "unsupported":
+                    return False
+            except Exception:
+                pass
+            try:
                 return route_chat_intent(request).get("intent") == "unsupported"
             except Exception:
                 return False
@@ -5804,7 +5910,7 @@ def create_harness_app(
             if self._chat_state.pending_action_contract is not None:
                 prompt.placeholder = "Type yes to confirm, no to cancel, or ask a follow-up"
             else:
-                prompt.placeholder = "Ask Harness or type /help"
+                prompt.placeholder = "Ask Harness, /help, or ? shortcuts"
             self._render_slash_suggestions(prompt.value)
             self._request_started_at = None
             if response.get("kind") == "runtime_prompt_submitted":
@@ -8786,6 +8892,42 @@ def create_harness_app(
                 self._render_current_view()
                 return True
 
+        def _activate_help_slash_command(self, value: str) -> bool:
+            request = value.strip()
+            if not request.startswith("/"):
+                return False
+            command_name = request[1:].split(maxsplit=1)[0]
+            if command_name not in {"help", "commands"}:
+                return False
+            prompt = self.query_one("#prompt", TextArea)
+            response = handle_slash_command(request, slash_commands)
+            self._append_local_message({"role": "user", "title": request, "lines": []})
+            for message in response.get("messages", []):
+                self._append_local_message(message)
+            prompt.value = ""
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": bool(response.get("ok")),
+                "entry_id": f"slash.{command_name}",
+                "activation_kind": "slash_help",
+                "ui_action_applied": True,
+                "source": "slash",
+                "slash": f"/{command_name}",
+                "slash_consumed": True,
+                "chat_submitted": False,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "evidence_status": "slash_help_rendered",
+                "policy_boundary": _safe_palette_policy_boundary(),
+                "blocked_reasons": [] if response.get("ok") else ["slash_help_failed"],
+                **_palette_no_side_effect_flags(),
+            }
+            self._render_slash_suggestions("")
+            self._render_chat()
+            self._render_palette_activation_status("Listed essential slash commands.", ok=bool(response.get("ok")))
+            self._render_current_view()
+            return True
+
         def action_activate_safe_slash_command(self) -> bool:
             prompt = self.query_one("#prompt", TextArea)
             return self._activate_safe_slash_command(prompt.value)
@@ -9409,10 +9551,11 @@ def run_read_only_tui(project_root: Path) -> None:
 def _chat_response_to_tui_message(response: dict, *, debug: bool = False) -> dict:
     lines = list(response.get("lines", []))
     if response.get("kind") == "self_managed_local_action":
+        title = str(response.get("title") or "Done").strip()
         return {
             "role": "assistant",
-            "title": response.get("title") or "Done",
-            "lines": lines,
+            "title": "Assistant",
+            "lines": [title, *lines] if title else lines,
         }
     if response.get("tool_results"):
         lines.append("Tool calls:")

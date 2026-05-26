@@ -74,6 +74,30 @@ def test_memory_save_list_inspect_and_forget_project_note(tmp_path) -> None:
     assert [item["id"] for item in json.loads(included.output)["memory"]] == [record["id"]]
 
 
+def test_memory_save_note_accepts_positional_note_text(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    positional = runner.invoke(
+        app,
+        [
+            "memory",
+            "save-note",
+            "Remember this positional note.",
+            "--scope",
+            "project",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert positional.exit_code == 0, positional.output
+    payload = json.loads(positional.output)
+    assert payload["schema_version"] == "harness.memory_record/v1"
+    assert payload["memory"]["summary"] == "Remember this positional note."
+
+
 def test_memory_notes_redact_secret_looking_text_without_persisting_raw_values(tmp_path) -> None:
     SQLiteStore(tmp_path).initialize()
     store = SQLiteStore(tmp_path)

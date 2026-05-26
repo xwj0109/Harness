@@ -1628,6 +1628,41 @@ def test_session_runtime_persists_generic_provider_adapter_events(tmp_path) -> N
     assert provider_delta.payload["model_ref"] == "static/model"
 
 
+def test_session_runtime_provider_request_includes_prior_messages_for_follow_up(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    session = store.create_session(title="Runtime follow-up")
+    first_user = store.append_session_message(session.id, SessionMessageRole.USER, "Where is the Python code located?")
+    store.append_session_message(
+        session.id,
+        SessionMessageRole.ASSISTANT,
+        '{"type":"harness.tool_request/v1","tool":"read","reason":"Find Python source files."}',
+        parent_message_id=first_user.id,
+    )
+    follow_up = store.append_session_message(session.id, SessionMessageRole.USER, "yes")
+    adapter = StaticProviderAdapter()
+    manager = SessionRuntimeManager.for_store(store, provider_adapter=adapter)
+
+    accepted = manager.submit_prompt(
+        SessionPromptRequest(
+            session_id=session.id,
+            content="yes",
+            message_id=follow_up.id,
+            queue_policy=SessionPromptQueuePolicy.FOLLOW_UP,
+        )
+    )
+    final = manager.wait(session.id, timeout=1.0)
+
+    assert accepted.execution_started is True
+    assert final.phase == SessionRuntimePhase.IDLE
+    assert [message.role for message in adapter.requests[0].messages] == ["user", "assistant", "user"]
+    assert [message.content for message in adapter.requests[0].messages] == [
+        "Where is the Python code located?",
+        '{"type":"harness.tool_request/v1","tool":"read","reason":"Find Python source files."}',
+        "yes",
+    ]
+
+
 def test_session_runtime_propagates_abort_checker_to_provider_stream(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

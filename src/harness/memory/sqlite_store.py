@@ -94,6 +94,8 @@ from harness.security import SecretBlockedError, is_secret_path, redact_secret_t
 logger = logging.getLogger(__name__)
 from harness.security_explanations import explanations_from_eligibility, explanations_from_security_decision
 
+MUTABLE_RUN_ARTIFACT_KINDS = {"events", "transcript", "procedure", "final_report", "token_usage", "manifest"}
+
 LEGACY_TASK_STATUS_VALUES = {
     "queued": TaskStatus.READY,
     "completed": TaskStatus.SUCCEEDED,
@@ -2837,6 +2839,44 @@ class SQLiteStore:
             rows = conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
         return [self._row_to_run(row) for row in rows]
 
+    def prune_runs(self, keep: int = 20) -> list[str]:
+        """Delete all unreferenced runs except the N most recent. Returns removed run ids."""
+        if keep < 0:
+            raise ValueError("--keep must be greater than or equal to 0.")
+        runs = self.list_runs()
+        if len(runs) <= keep:
+            return []
+        prune_ids = [run.id for run in runs[keep:]]
+        removable_ids: list[str] = []
+        with self.connect() as conn:
+            for run_id in prune_ids:
+                if self._run_has_external_references(conn, run_id):
+                    continue
+                removable_ids.append(run_id)
+                conn.execute("DELETE FROM events WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM artifacts WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM backend_snapshots WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM runs WHERE id = ?", (run_id,))
+        for run_id in removable_ids:
+            run_dir = self.runs_dir / run_id
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+        return removable_ids
+
+    def _run_has_external_references(self, conn: sqlite3.Connection, run_id: str) -> bool:
+        reference_queries = (
+            "SELECT 1 FROM tasks WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM task_attempts WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM sessions WHERE active_run_id = ? LIMIT 1",
+            "SELECT 1 FROM session_messages WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM session_parts WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM session_permissions WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM session_run_links WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM event_store WHERE run_id = ? LIMIT 1",
+            "SELECT 1 FROM run_baselines WHERE run_id = ? LIMIT 1",
+        )
+        return any(conn.execute(query, (run_id,)).fetchone() is not None for query in reference_queries)
+
     def get_run(self, run_id: str) -> RunRecord:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -3785,20 +3825,31 @@ class SQLiteStore:
         self,
         owner: str,
         lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+        objective_id: str | None = None,
     ) -> tuple[dict[str, TaskAttempt | TaskLease | TaskRecord] | None, list[dict[str, Any]]]:
         timestamp = now_iso()
         expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
         pause_reasons: list[dict[str, Any]] = []
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            rows = conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE status IN (?, ?, ?)
-                ORDER BY priority DESC, created_at ASC
-                """,
-                (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value),
-            ).fetchall()
+            if objective_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE status IN (?, ?, ?) AND objective_id = ?
+                    ORDER BY priority DESC, created_at ASC
+                    """,
+                    (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value, objective_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE status IN (?, ?, ?)
+                    ORDER BY priority DESC, created_at ASC
+                    """,
+                    (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value),
+                ).fetchall()
             for row in rows:
                 task = self._row_to_task(row)
                 eligibility = self.daemon_task_eligibility(task, conn=conn)
@@ -4049,10 +4100,10 @@ class SQLiteStore:
             ),
         }
 
-    def daemon_run_once(self, owner: str, pid: int | None = None) -> DaemonTickResult:
+    def daemon_run_once(self, owner: str, pid: int | None = None, objective_id: str | None = None) -> DaemonTickResult:
         daemon = self.ensure_daemon(owner=owner, pid=pid)
         tick_id = f"daemon_tick_{uuid.uuid4().hex[:12]}"
-        renewed_leases = self.renew_daemon_leases(owner=owner)
+        renewed_leases = self.renew_daemon_leases(owner=owner, objective_id=objective_id)
         if renewed_leases:
             self.record_daemon_event(
                 daemon.id,
@@ -4075,7 +4126,7 @@ class SQLiteStore:
                 lease=renewed_leases[0],
                 pause_reasons=[],
             )
-        selection, pause_reasons = self.select_next_daemon_task_for_lease(owner=owner)
+        selection, pause_reasons = self.select_next_daemon_task_for_lease(owner=owner, objective_id=objective_id)
         decision = "leased_task" if selection is not None else "paused" if pause_reasons else "no_eligible_task"
         metadata = {
             "tick_id": tick_id,
@@ -4770,19 +4821,31 @@ class SQLiteStore:
         self,
         owner: str,
         lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+        objective_id: str | None = None,
     ) -> list[TaskLease]:
         timestamp = now_iso()
         expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
         renewed_ids: list[str] = []
         with self.connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT * FROM task_leases
-                WHERE owner = ? AND status = ? AND expires_at > ?
-                ORDER BY acquired_at ASC, id ASC
-                """,
-                (owner, TaskLeaseStatus.ACTIVE.value, timestamp),
-            ).fetchall()
+            if objective_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT tl.* FROM task_leases tl
+                    JOIN tasks t ON t.id = tl.task_id
+                    WHERE tl.owner = ? AND tl.status = ? AND tl.expires_at > ? AND t.objective_id = ?
+                    ORDER BY tl.acquired_at ASC, tl.id ASC
+                    """,
+                    (owner, TaskLeaseStatus.ACTIVE.value, timestamp, objective_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM task_leases
+                    WHERE owner = ? AND status = ? AND expires_at > ?
+                    ORDER BY acquired_at ASC, id ASC
+                    """,
+                    (owner, TaskLeaseStatus.ACTIVE.value, timestamp),
+                ).fetchall()
             for row in rows:
                 conn.execute(
                     "UPDATE task_leases SET heartbeat_at = ?, expires_at = ? WHERE id = ?",
@@ -5228,23 +5291,37 @@ class SQLiteStore:
         with self.connect() as conn:
             if owner is None:
                 rows = conn.execute(
-                    "SELECT * FROM daemon_records WHERE status = ? ORDER BY heartbeat_at DESC",
-                    (DaemonStatus.RUNNING.value,),
+                    """
+                    SELECT * FROM daemon_records
+                    WHERE status IN (?, ?)
+                    ORDER BY heartbeat_at DESC
+                    """,
+                    (DaemonStatus.RUNNING.value, DaemonStatus.STALE.value),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """
                     SELECT * FROM daemon_records
-                    WHERE status = ? AND owner = ?
+                    WHERE status IN (?, ?) AND owner = ?
                     ORDER BY heartbeat_at DESC
                     """,
-                    (DaemonStatus.RUNNING.value, owner),
+                    (DaemonStatus.RUNNING.value, DaemonStatus.STALE.value, owner),
                 ).fetchall()
             for row in rows:
                 stopped_ids.append(row["id"])
+                daemon_owner = row["owner"]
                 conn.execute(
                     "UPDATE daemon_records SET status = ?, stopped_at = ?, heartbeat_at = ? WHERE id = ?",
                     (DaemonStatus.STOPPED.value, timestamp, timestamp, row["id"]),
+                )
+                self._expire_active_daemon_leases(
+                    conn,
+                    daemon_id=row["id"],
+                    owner=daemon_owner,
+                    timestamp=timestamp,
+                    event_type="stop_lease",
+                    message="Stopped daemon lease and returned task to queue.",
+                    transition_reason="daemon_stopped",
                 )
                 self._record_daemon_event(
                     conn,
@@ -5262,12 +5339,8 @@ class SQLiteStore:
         stale_after_seconds: int = DEFAULT_DAEMON_STALE_AFTER_SECONDS,
     ) -> DaemonStatusResult:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)
-        active_daemons = [
-            daemon.model_copy(update={"status": DaemonStatus.STALE})
-            if daemon.heartbeat_at < cutoff
-            else daemon
-            for daemon in self.list_daemons(include_stopped=False)
-        ]
+        self._mark_stale_daemons(cutoff)
+        active_daemons = self.list_daemons(include_stopped=False)
         return DaemonStatusResult(
             project_root=self.project_root,
             active_daemons=active_daemons,
@@ -5275,6 +5348,130 @@ class SQLiteStore:
             paused_tasks=self.daemon_paused_tasks(),
             stale_after_seconds=stale_after_seconds,
         )
+
+    def _mark_stale_daemons(self, cutoff: datetime) -> list[str]:
+        timestamp = now_iso()
+        stale_ids: list[str] = []
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM daemon_records
+                WHERE status = ? AND heartbeat_at < ?
+                ORDER BY heartbeat_at ASC, id ASC
+                """,
+                (DaemonStatus.RUNNING.value, cutoff.isoformat()),
+            ).fetchall()
+            for row in rows:
+                stale_ids.append(row["id"])
+                conn.execute(
+                    "UPDATE daemon_records SET status = ? WHERE id = ?",
+                    (DaemonStatus.STALE.value, row["id"]),
+                )
+                self._expire_active_daemon_leases(
+                    conn,
+                    daemon_id=row["id"],
+                    owner=row["owner"],
+                    timestamp=timestamp,
+                    event_type="stale_lease",
+                    message="Stale daemon lease expired and task returned to queue.",
+                    transition_reason="daemon_stale",
+                )
+                self._record_daemon_event(
+                    conn,
+                    daemon_id=row["id"],
+                    event_type="stale",
+                    message="Daemon heartbeat exceeded stale timeout.",
+                    metadata={"stale_after": cutoff.isoformat()},
+                    created_at=timestamp,
+                )
+        return stale_ids
+
+    def _expire_active_daemon_leases(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        owner: str,
+        timestamp: str,
+        event_type: str,
+        message: str,
+        transition_reason: str,
+    ) -> list[str]:
+        rows = conn.execute(
+            """
+            SELECT * FROM task_leases
+            WHERE owner = ? AND status = ?
+            ORDER BY acquired_at ASC, id ASC
+            """,
+            (owner, TaskLeaseStatus.ACTIVE.value),
+        ).fetchall()
+        expired_ids: list[str] = []
+        for row in rows:
+            lease = self._row_to_task_lease(row)
+            task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+            if task_row is None:
+                conn.execute(
+                    """
+                    UPDATE task_leases
+                    SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?)
+                    WHERE id = ?
+                    """,
+                    (TaskLeaseStatus.EXPIRED.value, timestamp, timestamp, lease.id),
+                )
+                expired_ids.append(lease.id)
+                continue
+            task = self._row_to_task(task_row)
+            next_status = self._task_requeue_status(task) if task.status in {TaskStatus.LEASED, TaskStatus.RUNNING} else task.status
+            if task.status != next_status:
+                validate_task_transition(task.status, next_status)
+            conn.execute(
+                """
+                UPDATE task_leases
+                SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?)
+                WHERE id = ?
+                """,
+                (TaskLeaseStatus.EXPIRED.value, timestamp, timestamp, lease.id),
+            )
+            if lease.attempt_id is not None:
+                conn.execute(
+                    """
+                    UPDATE task_attempts
+                    SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
+                    WHERE id = ? AND run_id IS NULL
+                    """,
+                    (
+                        TaskStatus.FAILED.value,
+                        timestamp,
+                        transition_reason,
+                        message,
+                        lease.attempt_id,
+                    ),
+                )
+            if task.status != next_status:
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (next_status.value, timestamp, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=task.status,
+                    to_status=next_status,
+                    reason=transition_reason,
+                    actor=owner,
+                    metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id, "daemon_id": daemon_id},
+                    created_at=timestamp,
+                )
+            self._record_daemon_event(
+                conn,
+                daemon_id=daemon_id,
+                event_type=event_type,
+                message=message,
+                metadata={"lease_id": lease.id, "task_id": task.id, "attempt_id": lease.attempt_id},
+                created_at=timestamp,
+            )
+            expired_ids.append(lease.id)
+        return expired_ids
 
     def get_daemon(self, daemon_id: str) -> DaemonRecord:
         with self.connect() as conn:
@@ -5293,10 +5490,10 @@ class SQLiteStore:
                 rows = conn.execute(
                     """
                     SELECT * FROM daemon_records
-                    WHERE status = ?
+                    WHERE status IN (?, ?)
                     ORDER BY heartbeat_at DESC, id ASC
                     """,
-                    (DaemonStatus.RUNNING.value,),
+                    (DaemonStatus.RUNNING.value, DaemonStatus.STALE.value),
                 ).fetchall()
         return [self._row_to_daemon(row) for row in rows]
 
@@ -5501,6 +5698,8 @@ class SQLiteStore:
         return [self._row_to_task_dependency(row) for row in rows]
 
     def build_task_graph(self, objective_id: str | None = None) -> dict[str, Any]:
+        if objective_id is not None:
+            self.get_objective(objective_id)
         tasks = self.list_tasks(objective_id=objective_id)
         task_ids = {task.id for task in tasks}
         objectives = self.list_objectives()
@@ -6023,6 +6222,8 @@ class SQLiteStore:
         artifact_id = f"art_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         sha256, size_bytes = self._artifact_file_evidence(path)
+        if kind in MUTABLE_RUN_ARTIFACT_KINDS and "mutable_run_artifact" not in metadata:
+            metadata["mutable_run_artifact"] = True
         metadata = with_artifact_provenance_metadata(
             artifact_id=artifact_id,
             run_id=run_id,
@@ -6107,6 +6308,65 @@ class SQLiteStore:
             )
         self.write_run_manifest(run_id)
         return record
+
+    def refresh_artifact_evidence(self, artifact_id: str) -> ArtifactRecord:
+        from harness.integrity import artifact_provenance_from_metadata, with_artifact_provenance_metadata
+
+        artifact = self.get_artifact(artifact_id)
+        metadata = dict(artifact.metadata)
+        if not artifact.path.exists():
+            with self.connect() as conn:
+                conn.execute(
+                    "UPDATE artifacts SET evidence_status = ? WHERE id = ?",
+                    ("missing", artifact.id),
+                )
+            return self.get_artifact(artifact.id)
+        sha256, size_bytes = self._artifact_file_evidence(artifact.path)
+        metadata.pop("provenance", None)
+        metadata = with_artifact_provenance_metadata(
+            artifact_id=artifact.id,
+            run_id=artifact.run_id,
+            kind=artifact.kind,
+            producer=artifact.producer,
+            sha256=sha256,
+            redaction_state=artifact.redaction_state,
+            metadata=metadata,
+            created_at=artifact.created_at,
+        )
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE artifacts
+                SET sha256 = ?, size_bytes = ?, evidence_status = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (sha256, size_bytes, "verified", json.dumps(metadata, sort_keys=True, default=str), artifact.id),
+            )
+        refreshed = self.get_artifact(artifact.id)
+        return refreshed.model_copy(
+            update={
+                "provenance": artifact_provenance_from_metadata(
+                    artifact_id=refreshed.id,
+                    run_id=refreshed.run_id,
+                    kind=refreshed.kind,
+                    producer=refreshed.producer,
+                    sha256=refreshed.sha256,
+                    redaction_state=refreshed.redaction_state,
+                    metadata=refreshed.metadata,
+                    created_at=refreshed.created_at,
+                )
+            }
+        )
+
+    def refresh_run_artifact_evidence(self, run_id: str, *, include_manifest: bool = True) -> list[ArtifactRecord]:
+        refreshed: list[ArtifactRecord] = []
+        for artifact in self.list_artifacts(run_id):
+            if artifact.kind == "manifest" and not include_manifest:
+                continue
+            if artifact.kind not in MUTABLE_RUN_ARTIFACT_KINDS and not artifact.metadata.get("mutable_run_artifact"):
+                continue
+            refreshed.append(self.refresh_artifact_evidence(artifact.id))
+        return refreshed
 
     def _prepare_artifact_registration(
         self,
@@ -6236,10 +6496,12 @@ class SQLiteStore:
             lines.append("- none")
         lines.extend(["", "## Events", "", f"- Event count: {len(events)}", ""])
         report_path.write_text("\n".join(lines), encoding="utf-8")
+        self.refresh_run_artifact_evidence(run_id, include_manifest=False)
         self.write_run_manifest(run_id)
         return report_path
 
     def write_run_manifest(self, run_id: str) -> Path:
+        self.refresh_run_artifact_evidence(run_id, include_manifest=False)
         manifest = self.build_run_manifest(run_id)
         path = self.runs_dir / run_id / "manifest.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -6247,6 +6509,10 @@ class SQLiteStore:
             json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        for artifact in self.list_artifacts(run_id):
+            if artifact.kind == "manifest" and artifact.path == path:
+                self.refresh_artifact_evidence(artifact.id)
+                break
         return path
 
     def build_context_provenance(

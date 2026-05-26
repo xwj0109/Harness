@@ -388,9 +388,9 @@ OutputOption = Annotated[OutputFormat, typer.Option("--output", help="Output for
 SpecSourceOption = Annotated[str, typer.Option("--source", help="Spec source: builtin or explicit bundle path.")]
 PolicySubjectKindOption = Annotated[
     str,
-    typer.Option("--subject-kind", help="Policy subject kind: run, task, agent, workbench, or backend."),
+    typer.Option("--subject-kind", help="Policy subject kind. Choices: run, task, agent, workbench, backend."),
 ]
-PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy subject id.")]
+PolicySubjectIdOption = Annotated[str, typer.Option("--subject-id", help="Policy subject id (run_id, task_id, agent_id, workbench_id, backend_name).")]
 TraceFormatOption = Annotated[str, typer.Option("--format", help="Trace format. Only otel-json is supported.")]
 TranscriptFormatOption = Annotated[str, typer.Option("--format", help="Transcript format: markdown or jsonl.")]
 
@@ -421,6 +421,7 @@ def main(
         typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
     ] = False,
     autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "supervised-codex",
+    verbose: Annotated[bool, typer.Option("--verbose", help="Include the full dashboard payload with --output json.")] = False,
     server_url: Annotated[str | None, typer.Option("--server-url", help="Attach the TUI to an existing Harness local server.")] = None,
     token: Annotated[str | None, typer.Option("--token", help="Bearer token for --server-url.")] = None,
 ) -> None:
@@ -430,7 +431,7 @@ def main(
         return
     project_root = resolve_project_root(project)
     if output == OutputFormat.JSON:
-        _emit_json(chat_context(project_root))
+        _emit_json(chat_context(project_root, detail="full" if verbose else "compact"))
         raise typer.Exit()
     autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
     if plain:
@@ -553,6 +554,7 @@ def tui(
         typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
     ] = False,
     autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "supervised-codex",
+    verbose: Annotated[bool, typer.Option("--verbose", help="Include the full dashboard payload with --output json.")] = False,
     server_url: Annotated[str | None, typer.Option("--server-url", help="Attach the TUI to an existing Harness local server.")] = None,
     token: Annotated[str | None, typer.Option("--token", help="Bearer token for --server-url.")] = None,
 ) -> None:
@@ -585,6 +587,7 @@ def chat(
         typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
     ] = False,
     autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "supervised-codex",
+    verbose: Annotated[bool, typer.Option("--verbose", help="Include the full dashboard payload with --output json.")] = False,
     server_url: Annotated[str | None, typer.Option("--server-url", help="Attach the TUI to an existing Harness local server.")] = None,
     token: Annotated[str | None, typer.Option("--token", help="Bearer token for --server-url.")] = None,
 ) -> None:
@@ -592,7 +595,7 @@ def chat(
 
     project_root = resolve_project_root(project)
     if output == OutputFormat.JSON:
-        _emit_json(chat_context(project_root))
+        _emit_json(chat_context(project_root, detail="full" if verbose else "compact"))
         return
     autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
     if (project_root / HARNESS_DIR / "harness.sqlite").exists():
@@ -913,6 +916,48 @@ def runs(
                 record.backend_name or "none",
             ]
         )
+
+
+@runs_app.command("prune")
+def runs_prune(
+    keep: Annotated[int, typer.Option("--keep", "-k", help="Number of recent runs to keep.")] = 20,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Delete all runs except the N most recent ones."""
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        removed = store.prune_runs(keep=keep)
+    except ValueError as exc:
+        if output == OutputFormat.JSON:
+            _emit_json(
+                {
+                    "schema_version": "harness.runs_prune/v1",
+                    "ok": False,
+                    "project_root": str(project_root),
+                    "errors": [str(exc)],
+                }
+            )
+        else:
+            typer.echo(f"Error: {exc}")
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json({
+            "schema_version": "harness.runs_prune/v1",
+            "ok": True,
+            "project_root": str(project_root),
+            "removed_run_ids": removed,
+            "kept_count": keep,
+        })
+        return
+    if not removed:
+        typer.echo(f"No runs to prune. Total runs ({len(store.list_runs())}) <= keep ({keep}).")
+        return
+    typer.echo(f"Pruned {len(removed)} runs (kept {keep} most recent).")
+    for run_id in removed:
+        typer.echo(f"  Removed: {run_id}")
 
 
 @runs_app.command("tail")
@@ -1452,7 +1497,7 @@ def tasks_graph(
     except KeyError as exc:
         _emit_task_error("harness.task_graph/v1", str(exc).strip("'"), output)
         raise typer.Exit(code=1) from exc
-    payload = {"schema_version": "harness.task_graph/v1", "ok": True, **graph}
+    payload = {"schema_version": "harness.task_graph/v1", "ok": True, **graph, "graph": graph}
     if output == OutputFormat.JSON:
         _emit_json(payload)
         return
@@ -1549,6 +1594,76 @@ def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: Outp
 
 @tasks_app.command("status")
 def tasks_status(
+    task_id: Annotated[str | None, typer.Argument(help="Optional task id to inspect or mutate.")] = None,
+    status: Annotated[TaskStatus | None, typer.Argument(help="Optional new task status. Prefer `tasks set-status`.")] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    if task_id is not None and status is not None:
+        _set_task_status(task_id, status, project, output)
+        return
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    if task_id is not None:
+        try:
+            task = store.get_task(task_id)
+        except KeyError as exc:
+            _emit_task_error("harness.task_status/v1", str(exc).strip("'"), output)
+            raise typer.Exit(code=1) from exc
+        if output == OutputFormat.JSON:
+            _emit_json(
+                {
+                    "schema_version": "harness.task_status/v1",
+                    "ok": True,
+                    "task_id": task.id,
+                    "status": task.status.value,
+                    "task": task.model_dump(mode="json"),
+                    "mutation_command": f"harness tasks set-status {task.id} <status> --project {project_root}",
+                }
+            )
+            return
+        typer.echo(f"Task {task.id}: {task.status.value}")
+        typer.echo(f"To change status: harness tasks set-status {task.id} <status> --project {project_root}")
+        return
+    tasks = store.list_tasks()
+    counts = {item.value: 0 for item in TaskStatus}
+    for task in tasks:
+        counts[task.status.value] = counts.get(task.status.value, 0) + 1
+    payload = {
+        "schema_version": "harness.task_status/v1",
+        "ok": True,
+        "project_root": str(project_root),
+        "status_counts": counts,
+        "available_statuses": [item.value for item in TaskStatus],
+        "task_count": len(tasks),
+        "mutation_command": f"harness tasks set-status <task_id> <status> --project {project_root}",
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_section("Task Status")
+    _print_kv("Tasks", len(tasks))
+    _print_tsv(["status", "count"])
+    for status_value, count in counts.items():
+        _print_tsv_row([status_value, count])
+    _print_section("Commands")
+    typer.echo(f"Inspect task: harness tasks status <task_id> --project {project_root}")
+    typer.echo(f"Change status: harness tasks set-status <task_id> <status> --project {project_root}")
+
+
+@tasks_app.command("set-status", hidden=False)
+def tasks_set_status(
+    task_id: str,
+    status: TaskStatusArg,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    """Set a task's status. Alias for `tasks status` with clearer mutation semantics."""
+    _set_task_status(task_id, status, project, output)
+
+
+def _set_task_status(
     task_id: str,
     status: TaskStatusArg,
     project: ProjectOption = Path("."),
@@ -1664,6 +1779,26 @@ def tasks_run(
 def specs_callback(ctx: typer.Context, output: OutputOption = OutputFormat.TEXT) -> None:
     if ctx.invoked_subcommand is not None:
         return
+    registry = builtin_spec_registry()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.spec_registry/v1",
+                "model_profiles": _dump_spec_mapping(registry.model_profiles),
+                "tool_policies": _dump_spec_mapping(registry.tool_policies),
+                "memory_scopes": _dump_spec_mapping(registry.memory_scopes),
+                "agents": _dump_spec_mapping(registry.agents),
+                "agent_profiles": _dump_spec_mapping(registry.agent_profiles),
+                "workbenches": _dump_spec_mapping(registry.workbenches),
+            }
+        )
+        return
+    _print_spec_registry(registry)
+
+
+@specs_app.command("list")
+def specs_list(output: OutputOption = OutputFormat.TEXT) -> None:
+    """List all available spec entities (agents, workbenches, model profiles, etc.)."""
     registry = builtin_spec_registry()
     if output == OutputFormat.JSON:
         _emit_json(
@@ -2155,13 +2290,49 @@ def agents_remove(
 
 @policy_app.command("explain")
 def policy_explain(
-    subject_kind: PolicySubjectKindOption,
-    subject_id: PolicySubjectIdOption,
+    subject_kind: Annotated[
+        str | None,
+        typer.Option("--subject-kind", help="Policy subject kind. Choices: run, task, agent, workbench, backend."),
+    ] = None,
+    subject_id: Annotated[
+        str | None,
+        typer.Option("--subject-id", help="Policy subject id (run_id, task_id, agent_id, workbench_id, backend_name)."),
+    ] = None,
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
+    if subject_kind is None and subject_id is None:
+        payload = {
+            "schema_version": "harness.policy_explain_help/v1",
+            "ok": True,
+            "project_root": str(project_root),
+            "subject_kinds": ["run", "task", "agent", "workbench", "backend"],
+            "examples": [
+                f"harness policy explain --subject-kind task --subject-id task_abc123 --project {project_root}",
+                f"harness policy explain --subject-kind run --subject-id run_abc123 --project {project_root}",
+                f"harness policy explain --subject-kind backend --subject-id codex_cli --project {project_root}",
+            ],
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            return
+        _print_section("Policy Explain")
+        typer.echo("Choose a subject kind and id.")
+        _print_tsv(["subject_kind", "subject_id"])
+        _print_tsv_row(["run", "run_id"])
+        _print_tsv_row(["task", "task_id"])
+        _print_tsv_row(["agent", "agent_id"])
+        _print_tsv_row(["workbench", "workbench_id"])
+        _print_tsv_row(["backend", "backend_name"])
+        _print_section("Examples")
+        for example in payload["examples"]:
+            typer.echo(example)
+        return
+    if subject_kind is None or subject_id is None:
+        _emit_policy_error("--subject-kind and --subject-id must be provided together.", output)
+        raise typer.Exit(code=1)
     try:
         policy, extra = _resolve_policy_explain(project_root, subject_kind, subject_id)
     except (KeyError, ValueError) as exc:
@@ -3585,6 +3756,7 @@ def sessions_apply_hunk(
 
 @sessions_app.command("tools")
 def sessions_tools(
+    session_id: Annotated[str | None, typer.Argument(help="Ignored. Use `sessions tool <session_id> <tool_id>` to run a tool.")] = None,
     tool_id: Annotated[str | None, typer.Option("--tool", help="Inspect one session tool descriptor.")] = None,
     plan_only: Annotated[bool, typer.Option("--plan-only", help="Show only tools allowed for the plan agent.")] = False,
     project: ProjectOption = Path("."),
@@ -3592,6 +3764,9 @@ def sessions_tools(
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
+    if session_id is not None:
+        _emit_session_error("To run a tool on a session, use: harness sessions tool <session_id> <tool_id>", output)
+        raise typer.Exit(code=1)
     try:
         descriptors = [get_session_tool_descriptor(tool_id)] if tool_id else default_session_tool_descriptors()
     except KeyError as exc:
@@ -4733,19 +4908,21 @@ def _emit_controls_error(message: str, project_root: Path, output: OutputFormat)
 
 @memory_app.command("save-note")
 def memory_save_note(
-    scope: Annotated[MemoryScopeType, typer.Option("--scope", help="Memory scope type.")],
-    summary: Annotated[str, typer.Option("--summary", help="Operator note summary.")],
+    note: Annotated[str | None, typer.Argument(help="Note text content.")] = None,
+    scope: Annotated[MemoryScopeType, typer.Option("--scope", help="Memory scope type.")] = MemoryScopeType.PROJECT,
+    summary: Annotated[str | None, typer.Option("--summary", help="Note text content (use positional argument instead).")] = None,
     scope_id: Annotated[str | None, typer.Option("--scope-id", help="Scope id for workbench, agent, or objective.")] = None,
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
+    text = note or summary or ""
     store = SQLiteStore(project_root)
     try:
         store.initialize()
         resolved_scope_id = _resolve_memory_scope_id(store, project_root, scope, scope_id)
-        record = store.save_memory_note(scope, resolved_scope_id, summary)
+        record = store.save_memory_note(scope, resolved_scope_id, text)
     except (KeyError, ValueError) as exc:
         _emit_memory_error(str(exc).strip("'"), output)
         raise typer.Exit(code=1) from exc
@@ -4917,19 +5094,24 @@ def progress(
     if not payload.tasks:
         typer.echo("No tasks for this objective.")
         return
-    _print_tsv(["task_id", "status", "adapter", "task_type", "lease", "run", "next"])
+    _print_tsv(["task_id", "status", "title", "adapter", "lease", "run", "blocked", "next"])
     for task in payload.tasks:
         _print_tsv_row(
             [
                 task.task_id,
                 task.status.value,
+                task.title,
                 task.execution_adapter or "",
-                task.task_type or "",
                 task.lease_id or "",
                 task.run_id or "",
+                "; ".join(task.blocked_reasons),
                 task.next_action or "",
             ]
         )
+    if payload.equivalent_commands:
+        _print_section("Inspect")
+        for command in payload.equivalent_commands:
+            typer.echo(command)
 
 
 @sandbox_app.command("profiles")
@@ -7721,6 +7903,32 @@ def approvals_revoke(approval_id: str, project: ProjectOption = Path(".")) -> No
     if not ApprovalStore(project_root).revoke(approval_id):
         raise typer.BadParameter(f"Approval not found: {approval_id}")
     typer.echo(f"Revoked approval {approval_id}")
+
+
+@approvals_app.command("list")
+def approvals_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    """List all approval profiles."""
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = ApprovalStore(project_root)
+    approvals = store.list()
+    if output == OutputFormat.JSON:
+        _emit_json(
+            {
+                "schema_version": "harness.approvals/v1",
+                "approvals": [approval.model_dump(mode="json") for approval in approvals],
+            }
+        )
+        return
+    if not approvals:
+        typer.echo("No approvals found.")
+        return
+    for approval in approvals:
+        typer.echo(
+            f"{approval.id}\t{approval.backend}\t{approval.data_boundary}\t"
+            f"{','.join(approval.task_types)}\t{approval.expires_at.isoformat()}\t"
+            f"revoked={approval.revoked}"
+        )
 
 
 @tests_app.command(

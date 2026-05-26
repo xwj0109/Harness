@@ -395,12 +395,15 @@ def test_session_tools_cli_lists_descriptor_metadata_without_grants(tmp_path) ->
     inspect_one = runner.invoke(app, ["session", "tools", "--project", str(tmp_path), "--tool", "artifact-read"])
     shell = runner.invoke(app, ["session", "tools", "--project", str(tmp_path), "--tool", "shell", "--output", "json"])
     missing = runner.invoke(app, ["session", "tools", "--project", str(tmp_path), "--tool", "not-a-tool", "--output", "json"])
+    confused = runner.invoke(app, ["sessions", "tools", "sess_demo", "--project", str(tmp_path), "--output", "json"])
 
     assert result.exit_code == 0, result.output
     assert plan_only.exit_code == 0, plan_only.output
     assert inspect_one.exit_code == 0, inspect_one.output
     assert shell.exit_code == 0, shell.output
     assert missing.exit_code == 1
+    assert confused.exit_code == 1
+    assert "sessions tool <session_id> <tool_id>" in json.loads(confused.output)["error"]
 
     payload = json.loads(result.output)
     plan_payload = json.loads(plan_only.output)
