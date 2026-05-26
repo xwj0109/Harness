@@ -235,7 +235,9 @@ def test_dirty_repo_refuses_by_default_and_continues_with_explicit_approval(tmp_
 
     workspace = IsolationManager().create(project, allow_dirty=True)
     try:
-        assert "may not include uncommitted changes" in " ".join(workspace.warnings)
+        assert workspace.strategy == "isolated_copy"
+        assert "includes current workspace state" in " ".join(workspace.warnings)
+        assert (workspace.path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
     finally:
         workspace.cleanup()
 

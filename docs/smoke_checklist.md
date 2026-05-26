@@ -536,6 +536,197 @@ harness daemon execute "$LEASE_ID" --project . --output json
 
 The queued smoke also requires hosted-boundary approval, but hosted-boundary approval is not apply-back approval. Apply-back remains denied by default unless an explicit apply-back approval provider is wired into the operator path.
 
+## Model Registry Smoke
+
+Active implementation plan: `docs/plans/model_provider_completion_execution_plan.md`. This smoke section covers the completed model/provider path: metadata projections, selection/default resolution, discovery cache, provider-account lifecycle, credential redaction, protocol-adapter conformance, usage/cost evidence, retry/abort evidence, TUI picker behavior, and runtime fail-closed gates. Catalog reads still do not prove runtime readiness; execution must revalidate the selected provider/model, approvals, credentials, and protocol adapter before a provider client is constructed.
+
+Run the model catalog metadata commands:
+
+```bash
+harness providers list --project . --output json
+harness providers status --project . --output json
+harness models list --project . --output json
+harness models providers --project . --output json
+harness models inspect codex/gpt-5.5 --project . --output json
+harness models validate codex/gpt-5.5 --project . --output json
+harness models validate missing_provider/not-a-real-model --project . --output json || true
+harness models validate openai/gpt-5.3-codex --project . --output json || true
+harness models protocols --project . --output json
+harness models preferences --project . --output json
+harness models default codex_cli/gpt-5.5 --project . --output json
+harness models favorite codex_cli/gpt-5.5 --project . --output json
+harness models unfavorite codex_cli/gpt-5.5 --project . --output json
+harness models config validate --project . --output json
+harness models refresh local_openai_compatible --project . --output json
+harness models refresh local_openai_compatible --clear-cache --project . --output json
+```
+
+Run the exact model/provider operator path against a throwaway project:
+
+```bash
+tmp_provider_path="${TMPDIR:-/tmp}/harness-model-provider-path-smoke"
+rm -rf "$tmp_provider_path"
+harness init --project "$tmp_provider_path"
+harness providers list --project "$tmp_provider_path" --output json
+harness models list --project "$tmp_provider_path" --output json
+harness models validate codex/gpt-5.5 --project "$tmp_provider_path" --output json
+harness models validate missing_provider/not-a-real-model --project "$tmp_provider_path" --output json || true
+OPENAI_API_KEY=sk-redacted \
+  harness providers login paid_openai_compatible \
+    --credential-kind env \
+    --env-var OPENAI_API_KEY \
+    --project "$tmp_provider_path" \
+    --output json
+harness providers accounts paid_openai_compatible --project "$tmp_provider_path" --output json
+session_id="$(
+  python - "$tmp_provider_path" <<'PY'
+from pathlib import Path
+import sys
+from harness.memory.sqlite_store import SQLiteStore
+
+store = SQLiteStore.open_initialized(Path(sys.argv[1]))
+print(store.create_session(title="Model provider smoke").id)
+PY
+)"
+harness session model "$session_id" local/qwen3-coder --project "$tmp_provider_path" --output json
+harness session inspect "$session_id" --project "$tmp_provider_path" --output json
+harness models refresh local_openai_compatible --project "$tmp_provider_path" --output json
+```
+
+Run the session/runtime and TUI picker smoke coverage:
+
+```bash
+pytest -q \
+  tests/test_session_runtime.py::test_session_runtime_uses_session_selected_model_with_resolution_event \
+  tests/test_session_runtime.py::test_runtime_blocks_missing_env_credential_before_network
+pytest -q \
+  tests/test_tui_codex_mode.py::test_model_picker_renders_protocol_alias_boundary_and_blocked_state \
+  tests/test_tui_codex_mode.py::test_model_picker_sections_current_favorites_recent_connected_local_hosted_blocked \
+  tests/test_tui_codex_mode.py::test_model_picker_shows_provider_connect_action_for_missing_credentials
+pytest -q \
+  tests/test_session_timeline.py::test_session_timeline_renders_usage_and_cost_evidence \
+  tests/test_tui_backend_wiring.py::test_cli_tui_server_catalogs_share_active_registry_status
+```
+
+Manual TUI picker inspection:
+
+```bash
+harness --project "$tmp_provider_path"
+```
+
+In the TUI, open `ctrl+x m` or type `/models`, then inspect `/model` search and `/model <number>` selection. Verify the selected row detail panel shows canonical ref, protocol, source, context, output limit, reasoning, variants, modalities, tools, boundary, credentials, cost, blocked reasons, and provider action hints. Verify the picker groups current, favorites, recents, connected, local, hosted, and blocked rows in that order and that selecting a row persists session metadata only.
+
+In the TUI, open `/models`, `/model`, or `ctrl+x m` and verify provider connect is part of the model picker rather than a separate provider browser. Select a credential-blocked model/provider row and press `Ctrl+A`; verify the account/auth-method dialog shows supported methods such as API key, environment variable, OAuth/manual code, AWS methods, static local, or Codex login as applicable. Also type `/provider` and verify it opens the same model picker flow instead of a separate `Connect a provider` list. For API-key connect, enter a test key and verify the dialog masks input, the transcript/status/dialog do not contain the raw key, evidence reports `credential_value_included=false`, `credentials_included=false`, `provider_execution_started=false`, `model_execution_started=false`, and `network_accessed=false`, and the UI returns to the model picker filtered to that provider. For env connect, verify only the env var name is stored and the env value is not read or rendered. For local-only methods such as `static_local`, `codex_login`, `aws_env`, or `aws_profile`, verify the account row is created without a secret prompt and without provider/model execution.
+
+Run a custom local provider/config smoke in a throwaway project:
+
+```bash
+tmp_models_project="${TMPDIR:-/tmp}/harness-model-config-smoke"
+rm -rf "$tmp_models_project"
+harness init --project "$tmp_models_project"
+mkdir -p "$tmp_models_project/.harness"
+cat > "$tmp_models_project/.harness/models.yaml" <<'EOF'
+providers:
+  smoke_local:
+    display_name: Smoke Local
+    enabled: true
+    data_boundary: local_only
+    base_url: http://localhost:11434/v1
+    protocol: openai_chat
+    credential:
+      kind: static_local
+    models:
+      smoke-model:
+        display_name: Smoke Model
+        api_id: smoke-model
+        context_window: 8192
+        max_output_tokens: 1024
+        input_modalities: [text]
+        output_modalities: [text]
+        tool_support: true
+        reasoning_support: native
+        cost:
+          input_per_1m: 1.0
+          output_per_1m: 2.0
+        status: active
+EOF
+harness models config validate --project "$tmp_models_project" --output json
+harness models inspect smoke_local/smoke-model --project "$tmp_models_project" --output json
+harness models validate smoke_local/smoke-model --project "$tmp_models_project" --output json
+```
+
+Run the explicit provider account lifecycle against a throwaway project:
+
+```bash
+tmp_project="${TMPDIR:-/tmp}/harness-provider-smoke"
+rm -rf "$tmp_project"
+harness init --project "$tmp_project"
+OPENAI_API_KEY=sk-redacted \
+  harness providers login paid_openai_compatible --project "$tmp_project" --output json
+harness providers accounts paid_openai_compatible --project "$tmp_project" --output json
+harness providers status --project "$tmp_project" --output json
+harness providers activate-account paid_openai_compatible <account_id> --project "$tmp_project" --output json
+harness providers logout paid_openai_compatible --project "$tmp_project" --output json
+```
+
+Expected safety properties:
+
+- List, providers, inspect, validate, and protocols do not call providers, preflight endpoints, read credentials, start adapters, or grant hidden fallback.
+- `harness providers list`, `harness models list`, known-model validation, unknown-model validation, env-provider connect, session model selection, selected-session runtime tests, missing-credential runtime tests, local refresh, and TUI picker inspection are all covered by the smoke sequence above.
+- `harness models protocols --output json` includes `anthropic_messages`, `bedrock_converse`, `codex_cli`, `google_generative`, `openai_chat`, `openai_responses`, and `openai_codex_responses`.
+- Alias inspection records both `raw_model_ref` and `canonical_model_ref`.
+- Disabled hosted aliases, such as `openai/gpt-5.3-codex`, fail validation with `provider_disabled`.
+- Model validation blocks unsupported context, output, reasoning, modality, and tool requests before provider execution.
+- `harness models preferences`, `favorite`, `unfavorite`, and `default` mutate only local preference records and preserve `provider_execution_started=false`, `model_execution_started=false`, `network_accessed=false`, and `no_hidden_fallback=true`.
+- Runtime default model resolution emits `session.model_resolution` before validation, records the source of the selected candidate, and never tries later defaults as fallback when the selected candidate is blocked.
+- Missing defaults fail with `model_ref_missing`; invalid or disabled operator/workspace/session/workbench defaults fail closed with validation blocked reasons and keep `hidden_provider_fallback=false`, `hidden_model_fallback=false`, and `no_hidden_fallback=true`.
+- `harness models refresh local_openai_compatible --project . --output json` may call only the validated local `/models` endpoint.
+- `harness models refresh paid_openai_compatible --project . --output json` fails closed before network access unless `--approve-hosted` is explicitly provided for that refresh.
+- Discovery `--approve-hosted` is not a runtime execution approval; sessions using hosted, paid, or external-router/data-boundary providers must still block before credentials/network unless the matching runtime approval exists.
+- `harness models refresh <provider_id> --with-credentials` resolves credentials only for explicit discovery, keeps credential values redacted, and fails before network when required credentials are missing.
+- Successful explicit refresh persists discovered rows as `source=discovered`; later catalog reads include them without another provider call, and `--clear-cache` removes only those discovered rows without touching built-ins, custom config, aliases, accounts, credentials, favorites, defaults, or approvals.
+- `.harness/models.yaml`, when present, is reloaded by catalog listing and validation; local custom providers must use loopback or explicitly approved LAN URLs, hosted custom providers require explicit approval before they can be enabled, and credential/header fields must not contain raw values.
+- `harness providers login` records redacted account metadata only; it does not print or persist raw credential values, call providers, start execution, or grant hidden fallback.
+- `harness providers accounts`, `harness providers activate-account`, and `harness providers logout` expose explicit account lifecycle state with `credentials_included=false` and `network_accessed=false`.
+- CLI and local-server account/status JSON may show env var names as credential references, but TUI model/provider projections must redact those names as `env:<redacted>` and must not contain `OPENAI_API_KEY` or raw env/header values.
+- Provider connect/disconnect through CLI or local-server auth routes mutates only local account/secret-store state: it does not select a model, refresh discovery, validate credentials with a provider call, grant hosted/data-boundary approval, or start provider/model execution.
+- TUI provider connect is launched from `/models` and uses the same account/secret-store actions as CLI/server connect, masks API-key entry, clears typed secret buffers after submission, persists redacted evidence, and returns to the model picker only after account state has been written. `/provider` is only a compatibility alias into that model-picker flow.
+- API-key and OAuth token writes store secret material only in `.harness/provider_secrets.json` under local `0600` file permissions; command output and provider account events report account id, status, credential kind, write/removal state, and `credential_value_included=false` without printing stored, env, header, OAuth, or removed values.
+- Protocol adapter conformance and handoff tests run offline with `pytest tests/test_protocol_adapters.py tests/test_cross_provider_handoff.py -q`; failures must identify the adapter and unsupported canonical part.
+- Session/runtime usage evidence should include `normalized_usage` and, when model cost metadata is present, `estimated_cost`; provider-reported cost should remain under `provider_reported_cost`.
+- Session timeline rendering should show token usage and cost evidence when available, including explicit estimated-cost source/estimated marker and provider-reported cost as a separate field.
+- In the TUI, `/models` and `/model` show selected-model details, protocol, source, canonical ref for aliases, context limit, max output, reasoning support, modalities, tool support, provider boundary, credentials, cost, and blocked reasons without starting model execution.
+- In the TUI, `/models` shows provider connect/auth-method choices without starting provider/model execution; API-key/env/OAuth/local-account actions are explicit account actions, not model validation or credential tests.
+- TUI model picker ordering is current session model, favorites, recents, connected providers, local providers, hosted providers, then disabled or blocked providers; selecting an executable row persists session metadata and validation evidence only, while blocked selections leave the session model unchanged and record blocked reasons.
+- TUI model picker action keys for favorite/default/inspect/provider refresh/provider connect/provider disconnect route through explicit model preference or provider-management actions; opening, filtering, navigating, and selection keep `provider_execution_started=false`, `model_execution_started=false`, `network_accessed=false`, `permission_granting=false`, and `no_hidden_fallback=true`.
+
+Release gate:
+
+```bash
+harness doctor --release --project . --output json
+```
+
+Expected model-provider release gate properties:
+
+- `model_provider_release_gates` reports `catalog_secret_values_included=false`, `picker_provider_calls_allowed=false`, `provider_execution_started=false`, `model_execution_started=false`, `network_accessed=false`, `credentials_included=false`, `hidden_provider_fallback=false`, `hidden_model_fallback=false`, and `no_hidden_fallback=true`.
+- `model_provider_release_gates.registered_protocols` includes all seven built-in protocols and `unregistered_protocol_blocks_before_execution=true`.
+
+Model/provider release-readiness checklist:
+
+- [ ] CLI, local server, TUI, and session runtime all project the same provider/model catalog state for built-in, custom-config, static-catalog, and discovered rows.
+- [ ] Local provider flow is documented and smoke-tested: configure `.harness/models.yaml`, validate config, list/inspect/validate the model, refresh local discovery, select the model, and run with the selected model.
+- [ ] Hosted provider flow is documented and smoke-tested: connect an env or API-key account, verify redacted account state, approve the hosted and paid/data-boundary runtime gates where required, select the model, and block before network when approval or credentials are missing.
+- [ ] Credential redaction is verified across CLI JSON, local-server JSON, TUI projections, session events, provider events, discovery cache metadata, account events, and release-gate output.
+- [ ] Provider connect/disconnect actions mutate only account and secret-store state; they do not refresh discovery, select models, call providers, grant approval, or start execution.
+- [ ] Model picker behavior is verified for ordering, search, details panel fields, blocked rows, favorite/default/inspect actions, provider connect/refresh/disconnect hints, and no provider/model execution while navigating.
+- [ ] Default model resolution emits `session.model_resolution`, records the selected source, validates the selected candidate, and fails closed instead of trying later defaults as fallback.
+- [ ] Discovery is explicit, cache-backed, source-labeled, clearable per provider, local-endpoint validated, hosted-approval gated, and credential-backed only when `--with-credentials` is requested.
+- [ ] Runtime policy gates block before credential resolution and provider client construction for missing hosted approval, paid-provider approval, data-boundary approval, missing credentials, unknown providers/models, disabled providers/models, unsupported capabilities, and missing protocol adapters.
+- [ ] Retry evidence preserves the same provider, model, alias/canonical ref, variant, protocol, reasoning/options, and request metadata across attempts; retry scheduling records attempt, delay, category, retryable, and no hidden fallback.
+- [ ] Protocol adapter coverage includes offline payload, streaming, usage/cost, tool-call, provider-error, abort, partial-response, and cross-provider handoff tests for every registered protocol.
+- [ ] Release docs are current: `docs/operator_guide.md`, `docs/command_catalog.md`, `docs/smoke_checklist.md`, and `docs/plans/model_provider_completion_execution_plan.md` describe only implemented behavior and no advertised dead controls.
+- [ ] Required checks pass: `pytest -q tests/test_docs_phase_3d.py`, the focused model/provider smoke tests listed above, `pytest -q tests/test_protocol_adapters.py tests/test_cross_provider_handoff.py`, `pytest -q`, and `harness doctor --release --project . --output json`.
+
 Verify the active file after denial or apply-back:
 
 ```bash

@@ -25,7 +25,14 @@ def _live_run(store: SQLiteStore) -> str:
     store.append_run_event(run.id, RunEventType.TEST_FINISHED, {"status": "passed"}, message="Tests passed.")
     store.append_token_usage_event(
         run.id,
-        TokenUsageSnapshot(input_tokens=100, output_tokens=50, reasoning_tokens=20, total_tokens=170),
+        TokenUsageSnapshot(
+            input_tokens=100,
+            output_tokens=50,
+            reasoning_tokens=20,
+            cache_read_tokens=12,
+            cache_write_tokens=3,
+            total_tokens=170,
+        ),
     )
     store.append_run_event(run.id, RunEventType.RUN_FINISHED, {"status": "completed"}, message="Run finished.")
     return run.id
@@ -54,7 +61,14 @@ def test_live_run_artifacts_are_written_registered_and_manifested(tmp_path) -> N
     assert "● Tests finished: passed" in procedure
 
     usage = json.loads(paths["token_usage"].read_text(encoding="utf-8"))
-    assert usage == {"input_tokens": 100, "output_tokens": 50, "reasoning_tokens": 20, "total_tokens": 170}
+    assert usage == {
+        "cache_read_tokens": 12,
+        "cache_write_tokens": 3,
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "reasoning_tokens": 20,
+        "total_tokens": 170,
+    }
 
     report = paths["final_report"].read_text(encoding="utf-8")
     assert "# Run Summary" in report

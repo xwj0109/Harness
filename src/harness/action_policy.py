@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from harness.action_router import (
     ManagedActionDecision,
     ManagedActionDecisionStatus,
     ManagedActionRisk,
     ManagedActionRoute,
+    ManagedActionSandboxAssessment,
+    ManagedActionSandboxStatus,
 )
 from harness.governance.protected_paths import protected_apply_path_match
 from harness.security import is_secret_path
@@ -48,12 +51,22 @@ def decide_managed_action(route: ManagedActionRoute, project_root: Path) -> Mana
             route=route,
             reasons=[f"Risk requires approval: {route.risk.value}", *route.required_approvals],
             requires_human=True,
+            sandbox_assessment=_not_run_sandbox_assessment(route, "approval_required_actions_are_not_preflighted"),
         )
     if route.risk in AUTO_ALLOWED_RISKS:
+        sandbox_assessment = assess_managed_action_in_sandbox(route, project_root)
+        if sandbox_assessment.dangerous:
+            return ManagedActionDecision(
+                status=ManagedActionDecisionStatus.DENIED,
+                route=route,
+                reasons=["Sandbox preflight classified the action as dangerous.", *sandbox_assessment.reasons],
+                sandbox_assessment=sandbox_assessment,
+            )
         return ManagedActionDecision(
             status=ManagedActionDecisionStatus.AUTO_ALLOWED,
             route=route,
             reasons=[f"Risk is auto-allowed by local policy: {route.risk.value}"],
+            sandbox_assessment=sandbox_assessment,
         )
     return ManagedActionDecision(
         status=ManagedActionDecisionStatus.DENIED,
@@ -90,3 +103,112 @@ def _path_policy_reasons(route: ManagedActionRoute, project_root: Path) -> list[
         if Path(filename).suffix not in {str(item) for item in allowed_extensions}:
             reasons.append(f"File extension is not allowed for this action: {Path(filename).suffix}")
     return reasons
+
+
+def assess_managed_action_in_sandbox(route: ManagedActionRoute, project_root: Path) -> ManagedActionSandboxAssessment:
+    """Classify the real executor target using an isolated filesystem preflight."""
+    reasons: list[str] = []
+    expected_paths: list[str] = []
+    with TemporaryDirectory(prefix="harness-managed-action-") as sandbox_dir:
+        sandbox_root = Path(sandbox_dir)
+        try:
+            expected_paths = _simulate_managed_action(route, project_root.resolve(), sandbox_root)
+        except ValueError as exc:
+            reasons.append(str(exc))
+    if reasons:
+        return ManagedActionSandboxAssessment(
+            status=ManagedActionSandboxStatus.DANGEROUS,
+            executor=route.executor,
+            dangerous=True,
+            reasons=reasons,
+            expected_paths=expected_paths,
+        )
+    return ManagedActionSandboxAssessment(
+        status=ManagedActionSandboxStatus.SAFE,
+        executor=route.executor,
+        dangerous=False,
+        reasons=["Sandbox preflight completed without dangerous effects."],
+        expected_paths=expected_paths,
+    )
+
+
+def _not_run_sandbox_assessment(route: ManagedActionRoute, reason: str) -> ManagedActionSandboxAssessment:
+    return ManagedActionSandboxAssessment(
+        status=ManagedActionSandboxStatus.NOT_RUN,
+        executor=route.executor,
+        dangerous=False,
+        reasons=[reason],
+    )
+
+
+def _simulate_managed_action(route: ManagedActionRoute, project_root: Path, sandbox_root: Path) -> list[str]:
+    if route.executor == "create_empty_file":
+        requested = str(
+            route.normalized_arguments.get("filename")
+            or route.normalized_arguments.get("default_filename")
+            or "scratch.txt"
+        )
+        target = _sandbox_target(project_root, sandbox_root, requested)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _mirror_existing_regular_file(project_root / requested, target)
+        candidate = _next_available_path(target)
+        candidate.write_text("", encoding="utf-8")
+        return [str(_project_relative_from_sandbox(sandbox_root, candidate))]
+    if route.executor == "create_directory":
+        dirname = str(route.normalized_arguments.get("dirname") or "new-folder")
+        target = _sandbox_target(project_root, sandbox_root, dirname)
+        _mirror_existing_regular_file(project_root / dirname, target)
+        if target.exists() and not target.is_dir():
+            raise ValueError(f"Sandbox preflight found existing non-directory target: {dirname}")
+        target.mkdir(parents=False, exist_ok=True)
+        return [str(_project_relative_from_sandbox(sandbox_root, target))]
+    if route.executor in {"write_file", "write_note_file"}:
+        filename = str(route.normalized_arguments.get("filename") or ("notes.md" if route.executor == "write_note_file" else "scratch.md"))
+        target = _sandbox_target(project_root, sandbox_root, filename)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _mirror_existing_regular_file(project_root / filename, target)
+        existing = target.read_text(encoding="utf-8") if target.exists() else ""
+        text = str(route.normalized_arguments.get("text") or "")
+        separator = "" if not existing or existing.endswith("\n") else "\n"
+        target.write_text(f"{existing}{separator}{text}\n", encoding="utf-8")
+        return [str(_project_relative_from_sandbox(sandbox_root, target))]
+    raise ValueError(f"Sandbox preflight does not support executor: {route.executor}")
+
+
+def _sandbox_target(project_root: Path, sandbox_root: Path, relative_path: str) -> Path:
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or any(part == ".." for part in candidate.parts):
+        raise ValueError(f"Sandbox preflight refused unsafe relative path: {relative_path}")
+    real_target = (project_root / candidate).resolve()
+    try:
+        real_target.relative_to(project_root)
+    except ValueError as exc:
+        raise ValueError(f"Sandbox preflight target resolves outside the project: {relative_path}") from exc
+    return sandbox_root / candidate
+
+
+def _mirror_existing_regular_file(real_path: Path, sandbox_path: Path) -> None:
+    if not real_path.exists():
+        return
+    if real_path.is_dir():
+        sandbox_path.mkdir(parents=True, exist_ok=True)
+        return
+    if not real_path.is_file():
+        raise ValueError(f"Sandbox preflight found unsupported filesystem target: {real_path.name}")
+    sandbox_path.parent.mkdir(parents=True, exist_ok=True)
+    sandbox_path.write_bytes(real_path.read_bytes())
+
+
+def _next_available_path(path: Path) -> Path:
+    candidate = path
+    base = path.stem or "scratch"
+    suffix = path.suffix
+    index = 2
+    while candidate.exists():
+        candidate = path.parent / f"{base}-{index}{suffix}"
+        index += 1
+    return candidate
+
+
+def _project_relative_from_sandbox(sandbox_root: Path, path: Path) -> Path:
+    return path.resolve().relative_to(sandbox_root.resolve())

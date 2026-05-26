@@ -80,13 +80,32 @@ def test_managed_action_policy_allows_low_risk_and_denies_forbidden_paths(tmp_pa
     denied_secret = allowed.model_copy(update={"normalized_arguments": {**allowed.normalized_arguments, "filename": "token"}})
     denied_extension = allowed.model_copy(update={"normalized_arguments": {**allowed.normalized_arguments, "filename": "scratch.py"}})
 
-    assert decide_managed_action(allowed, tmp_path).status == ManagedActionDecisionStatus.AUTO_ALLOWED
+    allowed_decision = decide_managed_action(allowed, tmp_path)
+    assert allowed_decision.status == ManagedActionDecisionStatus.AUTO_ALLOWED
+    assert allowed_decision.sandbox_assessment is not None
+    assert allowed_decision.sandbox_assessment.status == "safe"
+    assert allowed_decision.sandbox_assessment.dangerous is False
+    assert allowed_decision.sandbox_assessment.expected_paths == ["scratch.md"]
     assert decide_managed_action(denied_git, tmp_path).status == ManagedActionDecisionStatus.DENIED
     assert decide_managed_action(denied_harness, tmp_path).status == ManagedActionDecisionStatus.DENIED
     assert decide_managed_action(denied_parent, tmp_path).status == ManagedActionDecisionStatus.DENIED
     assert decide_managed_action(denied_absolute, tmp_path).status == ManagedActionDecisionStatus.DENIED
     assert decide_managed_action(denied_secret, tmp_path).status == ManagedActionDecisionStatus.DENIED
     assert decide_managed_action(denied_extension, tmp_path).status == ManagedActionDecisionStatus.DENIED
+
+
+def test_managed_action_policy_denies_when_sandbox_preflight_finds_dangerous_executor(tmp_path) -> None:
+    route = route_managed_action("create an empty .md file").model_copy(update={"executor": "unknown"})
+
+    decision = decide_managed_action(route, tmp_path)
+
+    assert decision.status == ManagedActionDecisionStatus.DENIED
+    assert decision.sandbox_assessment is not None
+    assert decision.sandbox_assessment.status == "dangerous"
+    assert decision.sandbox_assessment.dangerous is True
+    assert "Sandbox preflight classified the action as dangerous." in decision.reasons
+    assert "does not support executor" in " ".join(decision.sandbox_assessment.reasons)
+    assert not (tmp_path / "scratch.md").exists()
 
 
 def test_managed_action_policy_never_auto_allows_destructive_routes(tmp_path) -> None:
@@ -221,6 +240,7 @@ def test_managed_action_report_contains_release_ready_sections(tmp_path) -> None
         assert heading in content
     assert "- Intent: create_empty_markdown_file" in content
     assert "- Decision: auto_allowed" in content
+    assert "- Sandbox preflight: safe" in content
 
 
 def test_cli_actions_route_is_read_only(tmp_path) -> None:

@@ -1126,6 +1126,70 @@ def test_write_tool_supports_plan_mode_and_permissioned_apply(tmp_path) -> None:
     assert metadata_payload["active_repo_modified"] is True
 
 
+def test_fs_write_file_alias_denies_external_paths_without_permission_prompt(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="External write")
+    external = tmp_path.parent / "outside-downloads-style.txt"
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "fs.write_file",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"path": str(external), "content": ""}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert payload["permission_id"]
+    assert "Path escapes project root" in payload["preview"]
+    assert not external.exists()
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+
+
+def test_fs_write_file_alias_records_plan_without_active_repo_prompt(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Planned write alias")
+    target = tmp_path / "notes.md"
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "fs.write_file",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"path": "notes.md", "content": "hello\n"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is True
+    assert payload["error_type"] is None
+    assert payload["permission_id"] is None
+    assert "write planned." in payload["preview"]
+    assert not target.exists()
+
+
 def test_plan_enter_exit_tools_update_session_metadata_and_events(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)

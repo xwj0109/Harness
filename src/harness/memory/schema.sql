@@ -255,6 +255,35 @@ CREATE TABLE IF NOT EXISTS provider_model_catalog_cache (
   refreshed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS provider_accounts (
+  account_id TEXT PRIMARY KEY,
+  provider_id TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT 'default',
+  credential_kind TEXT NOT NULL,
+  status TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1,
+  expires_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS model_preferences (
+  raw_model_ref TEXT PRIMARY KEY,
+  provider_id TEXT,
+  model_id TEXT,
+  model_variant TEXT,
+  favorite INTEGER NOT NULL DEFAULT 0,
+  is_default INTEGER NOT NULL DEFAULT 0,
+  selection_count INTEGER NOT NULL DEFAULT 0,
+  last_selected_at TEXT,
+  last_reasoning_effort TEXT,
+  source TEXT NOT NULL DEFAULT 'unknown',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
 CREATE TABLE IF NOT EXISTS task_dependencies (
   id TEXT PRIMARY KEY,
   upstream_task_id TEXT NOT NULL,
@@ -471,6 +500,15 @@ CREATE INDEX IF NOT EXISTS idx_provider_model_catalog_kind_provider
 
 CREATE INDEX IF NOT EXISTS idx_provider_model_catalog_raw_ref
   ON provider_model_catalog_cache(raw_model_ref);
+
+CREATE INDEX IF NOT EXISTS idx_provider_accounts_provider_active
+  ON provider_accounts(provider_id, active);
+
+CREATE INDEX IF NOT EXISTS idx_model_preferences_favorite
+  ON model_preferences(favorite, last_selected_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_model_preferences_default
+  ON model_preferences(is_default, updated_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_project_agents_workbench
   ON project_agents(workbench_id, imported_at ASC);

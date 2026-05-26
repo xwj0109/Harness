@@ -15,9 +15,17 @@ from harness.provider_events import (
     ProviderEventKind,
     ProviderMessage,
     ProviderRequest,
+    ProviderStreamAbortError,
+    ProviderStreamTimeoutError,
+    normalize_token_usage_payload,
+    provider_error_category_for,
+    provider_error_retryable_for,
+    provider_retry_after_seconds_for,
     provider_error_event,
     provider_event,
 )
+from harness.provider_auth import ProviderCredentialResolutionError
+from harness.provider_content import UnsupportedCanonicalPartError, canonical_messages_from_provider_request
 from harness.security import sanitize_for_logging
 
 
@@ -53,7 +61,7 @@ class ChatModelProviderAdapter:
         sequence += 1
         try:
             response = self.chat_model.complete(
-                [_chat_message(message) for message in normalized_request.messages],
+                [_chat_message(message) for message in canonical_messages_from_provider_request(normalized_request)],
                 _chat_context(normalized_request),
             )
         except Exception as exc:
@@ -169,6 +177,18 @@ def provider_event_from_backend_stream_event(
             tool_call_id=tool_call_id or None,
             tool_name=tool_name or None,
         )
+    if event.type == "tool_call_delta":
+        tool_call_id = str(payload.get("id") or payload.get("tool_call_id") or "")
+        tool_name = str(payload.get("name") or payload.get("tool") or payload.get("tool_name") or "")
+        return provider_event(
+            ProviderEventKind.TOOL_CALL_DELTA,
+            sequence=sequence,
+            request=request,
+            text=event.text,
+            payload=payload,
+            tool_call_id=tool_call_id or None,
+            tool_name=tool_name or None,
+        )
     if event.type == "tool_result":
         tool_call_id = str(payload.get("id") or payload.get("tool_call_id") or "")
         tool_name = str(payload.get("name") or payload.get("tool") or payload.get("tool_name") or "")
@@ -182,13 +202,24 @@ def provider_event_from_backend_stream_event(
             tool_name=tool_name or None,
         )
     if event.type == "token_usage":
-        return provider_event(ProviderEventKind.TOKEN_USAGE_UPDATED, sequence=sequence, request=request, payload=payload)
+        return provider_event(
+            ProviderEventKind.TOKEN_USAGE_UPDATED,
+            sequence=sequence,
+            request=request,
+            payload=normalize_token_usage_payload(payload),
+        )
+    if event.type == "finish_reason":
+        return provider_event(ProviderEventKind.MODEL_COMPLETED, sequence=sequence, request=request, payload=payload)
     if event.type == "error":
+        error_type = str(payload.get("error_type") or "BackendStreamError")
+        message = event.text or str(payload.get("message") or "Provider stream error.")
+        category = ProviderErrorCategory.CONFIGURATION if error_type == "BackendConfigError" else provider_error_category_for(error_type, message, payload)
         error = ProviderError(
-            category=ProviderErrorCategory.UNKNOWN,
-            error_type=str(payload.get("error_type") or "BackendStreamError"),
-            message=event.text or str(payload.get("message") or "Provider stream error."),
-            retryable=False,
+            category=category,
+            error_type=error_type,
+            message=message,
+            retryable=provider_error_retryable_for(category, error_type, message, payload),
+            retry_after_seconds=provider_retry_after_seconds_for(payload),
         )
         return provider_error_event(error, sequence=sequence, request=request)
     return provider_event(
@@ -202,13 +233,19 @@ def provider_event_from_backend_stream_event(
 
 def classify_provider_exception(exc: Exception) -> ProviderError:
     message = str(sanitize_for_logging(str(exc)))
-    if _looks_like_context_overflow(message):
+    if isinstance(exc, ProviderStreamAbortError):
+        category = ProviderErrorCategory.ABORTED
+        retryable = False
+    elif isinstance(exc, ProviderStreamTimeoutError):
+        category = ProviderErrorCategory.UNAVAILABLE
+        retryable = True
+    elif _looks_like_context_overflow(message):
         category = ProviderErrorCategory.CONTEXT_OVERFLOW
         retryable = True
     elif isinstance(exc, LocalEndpointUnavailable):
         category = ProviderErrorCategory.UNAVAILABLE
         retryable = True
-    elif isinstance(exc, BackendConfigError):
+    elif isinstance(exc, (BackendConfigError, ProviderCredentialResolutionError)):
         category = ProviderErrorCategory.CONFIGURATION
         retryable = False
     elif isinstance(exc, TimeoutError):
@@ -218,8 +255,8 @@ def classify_provider_exception(exc: Exception) -> ProviderError:
         category = ProviderErrorCategory.INVALID_RESPONSE
         retryable = False
     else:
-        category = ProviderErrorCategory.UNKNOWN
-        retryable = False
+        category = provider_error_category_for(type(exc).__name__, message)
+        retryable = provider_error_retryable_for(category, type(exc).__name__, message)
     return ProviderError(
         category=category,
         error_type=type(exc).__name__,
@@ -256,8 +293,17 @@ def _request_with_defaults(request: ProviderRequest, *, provider_id: str, model_
     )
 
 
-def _chat_message(message: ProviderMessage) -> ChatMessage:
-    return ChatMessage(role=message.role, content=message.content)
+def _chat_message(message) -> ChatMessage:
+    content_parts: list[str] = []
+    for part in message.parts:
+        if part.kind == "provider_metadata":
+            continue
+        if part.kind != "text":
+            raise UnsupportedCanonicalPartError(part.kind, "chat_model", role=message.role)
+        if part.text:
+            content_parts.append(part.text)
+    content = "\n".join(content_parts)
+    return ChatMessage(role=message.role, content=content)
 
 
 def _chat_context(request: ProviderRequest) -> ChatContext:

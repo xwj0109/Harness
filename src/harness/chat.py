@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shlex
 import sqlite3
 import subprocess
@@ -659,6 +660,8 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "repo_summary"
     elif normalized.startswith("plan ") or " repo planning" in normalized or "implementation plan" in normalized:
         intent = "repo_planning"
+    elif _looks_like_repo_mutation_request(normalized):
+        intent = "coding_fix"
     elif (
         "fix" in normalized
         or "bug" in normalized
@@ -949,6 +952,9 @@ def _handle_intent_routed(
     chat_model: ChatModel | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    external_write_block = _external_filesystem_write_block_response(raw, project_root)
+    if external_write_block is not None:
+        return external_write_block
     natural_language_response = _natural_language_route_response(
         raw,
         project_root,
@@ -958,6 +964,9 @@ def _handle_intent_routed(
     )
     if natural_language_response is not None:
         return natural_language_response
+    isolated_edit_request = _isolated_edit_request_for_user_intent(raw)
+    if isolated_edit_request is not None:
+        return _action_contract_response(project_root, state, isolated_edit_request)
     managed_action_response = _maybe_run_managed_action(raw, project_root, state)
     if managed_action_response is not None:
         return managed_action_response
@@ -1759,8 +1768,8 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
                 "You are the Harness terminal coding and research assistant. "
                 "The user speaks in intentions. Answer naturally and use the provided Harness context. "
                 "You are not limited to read-only conversation. Read-only tools run automatically inside the chat "
-                "loop. Side-effecting tools are also available, but Harness converts them into validated action "
-                "contracts and asks the user for confirmation before execution. Do not claim to mutate files, run "
+                "loop. Side-effecting tools are also available, and Harness validates them through deterministic "
+                "policy before either executing them with evidence or failing closed. Do not claim to mutate files, run "
                 "tests, apply patches, or create records directly; request the appropriate Harness tool instead. "
                 "When a tool is needed, respond with exactly one JSON object of type harness.tool_request/v1 using "
                 "one of the listed tools. After Harness returns a read-only tool result, answer the user normally. "
@@ -1799,7 +1808,9 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
                 "harness.tool_request/v1 envelope and route through the session-tool registry. "
                 "For web-search, always include arguments.query with the concrete search query inferred "
                 "from the user's request; do not emit an empty arguments object. "
-                "Permission-required tools pause until the operator approves the exact permission id:\n"
+                "Permission-required tools are controlled boundaries. For file or folder write requests, prefer "
+                "edit_isolated so Harness can use an isolated workspace and apply-back gates; raw write/edit tools "
+                "are active-repo boundaries and must fail closed without exact authority:\n"
                 + json.dumps(_model_tool_specs_payload(), sort_keys=True, default=str)
             ),
         )
@@ -1864,6 +1875,93 @@ def _fallback_action_request_for_user_intent(raw: str) -> ChatToolRequest | None
     return None
 
 
+def _isolated_edit_request_for_user_intent(raw: str) -> ChatToolRequest | None:
+    normalized = _normalize(raw)
+    if normalized and _looks_like_repo_mutation_request(normalized):
+        return ChatToolRequest(type="harness.tool_request/v1", tool="edit_isolated", arguments={"goal": raw})
+    return None
+
+
+def _external_filesystem_write_block_response(raw: str, project_root: Path) -> dict[str, Any] | None:
+    target_hint = _external_filesystem_write_target_hint(raw, project_root)
+    if target_hint is None:
+        return None
+    project_root = resolve_project_root(project_root)
+    return _response(
+        "external_filesystem_write_blocked",
+        "Write Blocked",
+        [
+            f"Requested target: {target_hint}",
+            "Decision: blocked before orchestration.",
+            "Reason: external filesystem writes are outside the project and isolated apply-back boundary.",
+            "No file was created, no repo task was started, and no human approval prompt is needed.",
+            f"Project boundary: {project_root}",
+            "Supported autonomous path: request a project-relative path, then Harness can use isolated edit evidence and keep apply-back separate.",
+        ],
+        ok=False,
+        extra={
+            "policy_boundary": {
+                "kind": "external_filesystem_write",
+                "target": target_hint,
+                "project_root": str(project_root),
+                "filesystem_modified": False,
+                "orchestration_started": False,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+        },
+    )
+
+
+def _external_filesystem_write_target_hint(raw: str, project_root: Path) -> str | None:
+    normalized = _normalize(raw)
+    if not normalized or not _looks_like_repo_mutation_request(normalized):
+        return None
+    explicit_path = _external_absolute_path_hint(raw, project_root)
+    if explicit_path is not None:
+        return explicit_path
+    if re.search(r"\b(?:outside|external)\s+(?:the\s+)?(?:repo|repository|project|workspace)\b", normalized):
+        return "outside project"
+    home_markers = (
+        (
+            "Downloads",
+            r"\b(?:in|into|inside|under|within|to|at)\s+(?:the\s+)?downloads?\b|\bdownloads?\s+(?:folder|directory)\b",
+        ),
+        (
+            "Desktop",
+            r"\b(?:in|into|inside|under|within|to|at)\s+(?:the\s+)?desktop\b|\bdesktop\s+(?:folder|directory)\b",
+        ),
+        (
+            "home directory",
+            r"\b(?:in|into|inside|under|within|to|at)\s+(?:the\s+)?home\s+(?:folder|directory)\b|\buser\s+home\b",
+        ),
+    )
+    for label, pattern in home_markers:
+        if re.search(pattern, normalized):
+            return label
+    return None
+
+
+def _external_absolute_path_hint(raw: str, project_root: Path) -> str | None:
+    root = resolve_project_root(project_root)
+    pattern = re.compile(r"(?<!\S)(~[/\\][^\s]+|\$HOME[/\\][^\s]+|/[^\s]+|[A-Za-z]:\\[^\s]+)")
+    for match in pattern.finditer(raw):
+        token = match.group(1).strip().strip("'\"`").rstrip(".,;:)]}")
+        if not token:
+            continue
+        candidate_text = token
+        if token.startswith("$HOME"):
+            candidate_text = str(Path.home()) + token[len("$HOME") :]
+        candidate = Path(candidate_text).expanduser()
+        if not candidate.is_absolute():
+            continue
+        try:
+            candidate.resolve(strict=False).relative_to(root.resolve())
+        except ValueError:
+            return token
+    return None
+
+
 def _looks_like_repo_mutation_request(normalized: str) -> bool:
     mutation_verbs = {
         "add",
@@ -1885,10 +1983,14 @@ def _looks_like_repo_mutation_request(normalized: str) -> bool:
     words = set(normalized.split())
     if not words.intersection(mutation_verbs):
         return False
+    if re.search(r"\b[a-z0-9_./-]+\.[a-z0-9]{1,12}\b", normalized):
+        return True
     return any(
         marker in normalized
         for marker in (
             " file",
+            " folder",
+            " directory",
             " repo",
             " repository",
             " code",
@@ -2337,7 +2439,13 @@ def _action_contract_response(project_root: Path, state: ChatSessionState, tool_
             if not _is_initialized(project_root):
                 return _uninitialized_response(project_root)
             approval = _record_autonomous_approval(project_root, contract, autonomy_decision)
-            response = _execute_action_contract(project_root, state, contract, prepare_required_approvals=False)
+            response = _execute_action_contract(
+                project_root,
+                state,
+                contract,
+                prepare_required_approvals=True,
+                autonomy_scope=state.autonomy_profile_id,
+            )
             response["autonomy_decision"] = autonomy_decision.model_dump(mode="json")
             if decision_evidence is not None:
                 response["autonomy_decision_evidence"] = decision_evidence
@@ -2401,8 +2509,13 @@ def _execute_action_contract(
     contract: ActionContract,
     *,
     prepare_required_approvals: bool = True,
+    autonomy_scope: str | None = None,
 ) -> dict[str, Any]:
-    approval_lines = _ensure_contract_required_approvals(project_root, contract) if prepare_required_approvals else []
+    approval_lines = (
+        _ensure_contract_required_approvals(project_root, contract, autonomy_scope=autonomy_scope)
+        if prepare_required_approvals
+        else []
+    )
     if contract.tool == "create_objective":
         response = _confirm_create_objective_contract(project_root, state, contract)
     elif contract.tool == "create_task":
@@ -2440,7 +2553,12 @@ def _execute_action_contract(
     return response
 
 
-def _ensure_contract_required_approvals(project_root: Path, contract: ActionContract) -> list[str]:
+def _ensure_contract_required_approvals(
+    project_root: Path,
+    contract: ActionContract,
+    *,
+    autonomy_scope: str | None = None,
+) -> list[str]:
     if "hosted_provider_codex" not in contract.required_approvals:
         return []
     task_types = _hosted_codex_task_types_for_contract(contract)
@@ -2448,17 +2566,42 @@ def _ensure_contract_required_approvals(project_root: Path, contract: ActionCont
     missing = [
         task_type
         for task_type in task_types
-        if approvals.find_valid("codex_cli", "hosted_provider", task_type) is None
+        if approvals.find_valid(
+            "codex_cli",
+            "hosted_provider",
+            task_type,
+            adapter_id=_hosted_codex_adapter_for_contract_task(contract, task_type),
+            autonomy_scope=autonomy_scope,
+            strict_scope=autonomy_scope is not None,
+        )
+        is None
     ]
     if not missing:
         return []
+    allowed_adapters = None
+    if contract.tool == "edit_isolated":
+        allowed_adapters = ["repo_planning", "codex_isolated_edit"]
+    elif contract.tool == "dispatch_registered_adapter":
+        adapter_id = contract.normalized_arguments.get("adapter_id") or contract.normalized_arguments.get("execution_adapter")
+        allowed_adapters = [str(adapter_id)] if adapter_id else None
     approvals.add(
         backend="codex_cli",
         data_boundary="hosted_provider",
         task_types=task_types,
         duration_days=1,
-        reason=f"Created from confirmed Harness action contract {contract.id}.",
+        reason=(
+            f"Created by Harness autonomy profile {autonomy_scope} for action contract {contract.id}."
+            if autonomy_scope
+            else f"Created from confirmed Harness action contract {contract.id}."
+        ),
+        allowed_adapters=allowed_adapters,
+        autonomy_scope=autonomy_scope,
     )
+    if autonomy_scope:
+        return [
+            f"Prepared autonomous hosted-provider Codex authority for profile {autonomy_scope}.",
+            "This permits scoped Codex planning/edit execution only; active repo apply-back remains separate.",
+        ]
     return [
         "Prepared required hosted-provider Codex approval for this confirmed action contract.",
         "This permits scoped Codex planning/edit execution only; apply-back still requires a separate approval.",
@@ -2476,6 +2619,18 @@ def _hosted_codex_task_types_for_contract(contract: ActionContract) -> list[str]
             if isinstance(task, dict) and isinstance(task.get("task_type"), str):
                 task_types.add(task["task_type"])
     return sorted(task_types)
+
+
+def _hosted_codex_adapter_for_contract_task(contract: ActionContract, task_type: str) -> str | None:
+    if contract.tool == "edit_isolated":
+        if task_type == "repo_planning":
+            return "repo_planning"
+        if task_type == "codex_code_edit":
+            return "codex_isolated_edit"
+    if contract.tool == "dispatch_registered_adapter":
+        adapter_id = contract.normalized_arguments.get("adapter_id") or contract.normalized_arguments.get("execution_adapter")
+        return str(adapter_id) if adapter_id else None
+    return None
 
 
 def _evaluate_action_contract_autonomy(
@@ -2556,6 +2711,20 @@ def _apply_adapter_autonomy_metadata(
         and descriptor.required_approvals
         and not request.has_scoped_approval
     ):
+        if (
+            _policy_allows_hosted_provider_autonomy(policy_id)
+            and request.tool_name == "edit_isolated"
+            and request.boundary == "hosted_provider_codex"
+            and request.adapter_id == "codex_isolated_edit"
+        ):
+            return decision.model_copy(
+                update={
+                    "reasons": [
+                        *decision.reasons,
+                        f"adapter hosted boundary is auto-authorized for isolated edit by autonomy profile: {descriptor.id}",
+                    ]
+                }
+            )
         return decision.model_copy(
             update={
                 "status": AutonomyDecisionStatus.APPROVAL_REQUIRED,
@@ -2575,6 +2744,13 @@ def _apply_adapter_autonomy_metadata(
             ]
         }
     )
+
+
+def _policy_allows_hosted_provider_autonomy(policy_id: str) -> bool:
+    try:
+        return bool(get_builtin_autonomy_policy(policy_id).allow_hosted_provider_autonomy)
+    except KeyError:
+        return False
 
 
 def _autonomy_input_from_contract(
@@ -4383,6 +4559,8 @@ def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objecti
         lines.extend(_evidence_next_lines(project_root, result))
         if result.rejection_reasons:
             lines.append(f"Rejection reasons: {result.rejection_reasons}")
+        if result.errors:
+            lines.append(f"Errors: {result.errors}")
         lines.extend(_recovery_lines_for_execution(result))
         lines.extend(_summary_lines_from_result(project_root, result.adapter_result))
         if _needs_hosted_approval(result.rejection_reasons + result.errors):

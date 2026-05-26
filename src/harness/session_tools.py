@@ -2041,6 +2041,15 @@ def validate_session_tool_arguments(descriptor: SessionToolDescriptor, arguments
 
 def _normalize_tool_identity(tool_id: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     normalized_args = dict(arguments)
+    if tool_id in {"fs.write_file", "write_file"}:
+        path = normalized_args.get("path") or normalized_args.get("filePath") or normalized_args.get("file") or ""
+        content = normalized_args.get("content")
+        if content is None:
+            content = normalized_args.get("text")
+        if content is None:
+            content = ""
+        create_dirs = bool(normalized_args.get("create_dirs") or normalized_args.get("createDirs") or False)
+        return "write", {"path": path, "content": content, "create_dirs": create_dirs, "mode": "plan"}
     if tool_id == "shell":
         cd_path = _simple_shell_cd_path(str(normalized_args.get("command") or ""))
         if cd_path is not None:

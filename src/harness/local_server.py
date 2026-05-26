@@ -27,7 +27,14 @@ from harness.memory.sqlite_store import (
     SQLiteStore,
     is_missing_session_schema_error,
 )
-from harness.model_catalog import catalog_projection_evidence, list_model_catalog, list_provider_catalog, validate_model_selection
+from harness.model_discovery import list_cached_discovered_models
+from harness.model_catalog import (
+    build_model_provider_suggestions,
+    catalog_projection_evidence,
+    list_model_catalog,
+    list_provider_catalog,
+    validate_model_selection,
+)
 from harness.models import (
     EventStreamType,
     RedactionState,
@@ -37,9 +44,12 @@ from harness.models import (
     SessionPermissionStatus,
     SessionStatus,
 )
+from harness.operator_context import build_session_pane_projection, build_tui_dashboard
 from harness.operator_loop import session_operator_status_projection
 from harness.paths import is_excluded_relative, relative_to_project, resolve_project_root, resolve_under_project
+from harness.plugin_provider_hooks import read_plugin_provider_hooks_from_manifest
 from harness.process_supervisor import reset_process_supervisor
+from harness.provider_auth import provider_auth_methods_projection
 from harness.security import assert_not_secret_path, is_secret_path, redact_secret_text, sanitize_for_logging
 from harness.session_cwd import CwdResolutionError, cwd_recovery_message, session_cwd_payload
 from harness.session_replay import build_session_replay_projection
@@ -138,7 +148,220 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                         "status": {"type": "integer"},
                         "permission_granting": {"const": False},
                     },
-                }
+                },
+                "ProviderSuggestion": {
+                    "type": "object",
+                    "required": ["schema_version", "provider_id", "suggestion_only"],
+                    "properties": {
+                        "schema_version": {"const": "harness.provider_suggestion/v1"},
+                        "provider_id": {"type": "string"},
+                        "display_name": {"type": ["string", "null"]},
+                        "enabled": {"type": "boolean"},
+                        "connected": {"type": "boolean"},
+                        "credential_status": {"type": "string"},
+                        "suggestion_only": {"const": True},
+                        "selected_provider": {"const": False},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ModelSuggestion": {
+                    "type": "object",
+                    "required": ["schema_version", "raw_model_ref", "suggestion_only"],
+                    "properties": {
+                        "schema_version": {"const": "harness.model_suggestion/v1"},
+                        "raw_model_ref": {"type": "string"},
+                        "canonical_model_ref": {"type": ["string", "null"]},
+                        "provider_id": {"type": "string"},
+                        "model_id": {"type": "string"},
+                        "available_model": {"type": "boolean"},
+                        "executable_model": {"type": "boolean"},
+                        "blocked_reasons": {"type": "array", "items": {"type": "string"}},
+                        "suggestion_only": {"const": True},
+                        "selected_model": {"const": False},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ProviderCatalogResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "providers", "all", "connected", "blocked", "distinctions"],
+                    "properties": {
+                        "schema_version": {"const": "harness.providers/v1"},
+                        "ok": {"type": "boolean"},
+                        "providers": {"type": "array", "items": {"type": "object"}},
+                        "provider": {"type": ["object", "null"]},
+                        "all": {"type": "array", "items": {"type": "object"}},
+                        "connected": {"type": "array", "items": {"type": "object"}},
+                        "default": {"type": ["object", "null"]},
+                        "blocked": {"type": "array", "items": {"type": "object"}},
+                        "all_providers": {"type": "array", "items": {"type": "object"}},
+                        "connected_providers": {"type": "array", "items": {"type": "object"}},
+                        "default_provider": {"type": ["object", "null"]},
+                        "blocked_providers": {"type": "array", "items": {"type": "object"}},
+                        "auth_methods": {"type": "array", "items": {"type": "string"}},
+                        "methods_by_provider": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+                        "oauth_supported_providers": {"type": "array", "items": {"type": "string"}},
+                        "oauth_support": {"type": "object", "additionalProperties": {"type": "boolean"}},
+                        "suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderSuggestion"}},
+                        "provider_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderSuggestion"}},
+                        "model_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ModelCatalogResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "models", "all", "connected", "blocked", "distinctions"],
+                    "properties": {
+                        "schema_version": {"const": "harness.models/v1"},
+                        "ok": {"type": "boolean"},
+                        "models": {"type": "array", "items": {"type": "object"}},
+                        "all": {"type": "array", "items": {"type": "object"}},
+                        "connected": {"type": "array", "items": {"type": "object"}},
+                        "default": {"type": ["object", "null"]},
+                        "blocked": {"type": "array", "items": {"type": "object"}},
+                        "all_models": {"type": "array", "items": {"type": "object"}},
+                        "connected_models": {"type": "array", "items": {"type": "object"}},
+                        "default_model": {"type": ["object", "null"]},
+                        "blocked_models": {"type": "array", "items": {"type": "object"}},
+                        "auth_methods": {"type": "array", "items": {"type": "string"}},
+                        "methods_by_provider": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+                        "oauth_supported_providers": {"type": "array", "items": {"type": "string"}},
+                        "oauth_support": {"type": "object", "additionalProperties": {"type": "boolean"}},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ModelDetailResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "raw_model_ref", "model", "validation"],
+                    "properties": {
+                        "schema_version": {"const": "harness.model_detail/v1"},
+                        "ok": {"type": "boolean"},
+                        "provider_id": {"type": "string"},
+                        "model_id": {"type": "string"},
+                        "raw_model_ref": {"type": "string"},
+                        "model": {"type": ["object", "null"]},
+                        "validation": {"type": "object"},
+                        "suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "model_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "provider_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderSuggestion"}},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ModelValidationResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "validation"],
+                    "properties": {
+                        "schema_version": {"const": "harness.model_selection_validation_result/v1"},
+                        "ok": {"type": "boolean"},
+                        "validation": {"type": "object"},
+                        "suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "model_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "provider_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderSuggestion"}},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ProviderAuthMethodsResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "providers", "auth_methods", "oauth_support"],
+                    "properties": {
+                        "schema_version": {"const": "harness.provider_auth_methods/v1"},
+                        "ok": {"type": "boolean"},
+                        "providers": {"type": "array", "items": {"type": "object"}},
+                        "auth_methods": {"type": "array", "items": {"type": "string"}},
+                        "methods_by_provider": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+                        "oauth_supported_providers": {"type": "array", "items": {"type": "string"}},
+                        "oauth_support": {"type": "object", "additionalProperties": {"type": "boolean"}},
+                        "credentials_included": {"const": False},
+                        "credential_value_included": {"const": False},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ModelPreferencesResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "preferences", "favorite_preferences", "default_preference"],
+                    "properties": {
+                        "schema_version": {"const": "harness.model_preferences/v1"},
+                        "ok": {"type": "boolean"},
+                        "preferences": {"type": "array", "items": {"type": "object"}},
+                        "favorite_preferences": {"type": "array", "items": {"type": "object"}},
+                        "default_preference": {"type": ["object", "null"]},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "ModelPreferenceUpdateResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "preference"],
+                    "properties": {
+                        "schema_version": {"const": "harness.model_preference_update/v1"},
+                        "ok": {"type": "boolean"},
+                        "preference": {"type": "object"},
+                        "validation": {"type": "object"},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "credentials_included": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
+                "SessionModelSelectionResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "session_model_selected", "model_validation"],
+                    "properties": {
+                        "schema_version": {"const": "harness.session_update/v1"},
+                        "ok": {"type": "boolean"},
+                        "session_model_selected": {"type": "boolean"},
+                        "model_validation": {"type": "object"},
+                        "suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "model_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ModelSuggestion"}},
+                        "provider_suggestions": {"type": "array", "items": {"$ref": "#/components/schemas/ProviderSuggestion"}},
+                        "provider_execution_started": {"const": False},
+                        "model_execution_started": {"const": False},
+                        "network_accessed": {"const": False},
+                        "hidden_provider_fallback": {"const": False},
+                        "hidden_model_fallback": {"const": False},
+                        "permission_granting": {"const": False},
+                    },
+                    "additionalProperties": True,
+                },
             },
         },
         "paths": {
@@ -164,25 +387,146 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             "/server/lifecycle": {"get": {"summary": "Inspect local server lifecycle capabilities without mutating process state", "security": bearer, "responses": _json_response()}},
             "/server/mdns": {"get": {"summary": "Inspect mDNS advertisement status without broadcasting on the LAN", "security": bearer, "responses": _json_response()}},
             "/server/dispose": {"post": {"summary": "Fail-closed placeholder for local server dispose", "security": bearer, "responses": _json_response(status="501")}},
-            "/providers": {"get": {"summary": "List provider metadata", "security": bearer, "responses": _json_response()}},
-            "/models": {"get": {"summary": "List model metadata", "security": bearer, "responses": _json_response()}},
-            "/models/validate": {"get": {"summary": "Validate a model ref without provider execution", "security": bearer, "responses": _json_response()}},
-            "/provider": {"get": {"summary": "OpenCode-compatible provider metadata list", "security": bearer, "responses": _json_response()}},
-            "/provider/auth": {"get": {"summary": "OpenCode-compatible provider auth method projection without secrets", "security": bearer, "responses": _json_response()}},
-            "/provider/{provider_id}/oauth/authorize": {
-                "post": {
-                    "summary": "Fail-closed placeholder for provider OAuth authorization",
+            "/providers": {
+                "get": {
+                    "summary": "List provider metadata with all/connected/default/blocked distinctions and auth flags",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/providers/{provider_id}": {
+                "get": {
+                    "summary": "Get one provider or advisory provider/model suggestions when unknown",
                     "security": bearer,
                     "parameters": [_path_param("provider_id")],
-                    "responses": _json_response(status="501"),
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/models": {
+                "get": {
+                    "summary": "List model metadata with all/connected/default/blocked distinctions and provider auth flags",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/models/{provider_id}/{model_id}": {
+                "get": {
+                    "summary": "Get one model or advisory model/provider suggestions when unknown",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id"), _path_param("model_id")],
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelDetailResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/models/validate": {
+                "get": {
+                    "summary": "Validate a model ref without provider execution and return advisory suggestions when blocked",
+                    "security": bearer,
+                    "parameters": [_query_param("model"), _query_param("raw_model_ref", required=False)],
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelValidationResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/models/preferences": {
+                "get": {
+                    "summary": "List model preferences, favorites, and default without provider execution",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelPreferencesResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/models/preferences/favorite": {
+                "post": {
+                    "summary": "Persist or clear a model favorite after validation without provider execution",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelPreferenceUpdateResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/models/preferences/default": {
+                "post": {
+                    "summary": "Persist the default model preference after validation without provider execution",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelPreferenceUpdateResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/provider": {
+                "get": {
+                    "summary": "Provider metadata list alias",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/providers",
+            },
+            "/provider/auth": {
+                "get": {
+                    "summary": "Provider auth method and OAuth support projection without secrets",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderAuthMethodsResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                }
+            },
+            "/provider/{provider_id}/auth/api-key": {
+                "post": {
+                    "summary": "Create or replace a provider API-key account without provider execution",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/provider/{provider_id}/auth/env": {
+                "post": {
+                    "summary": "Create or replace a provider environment-variable account without provider execution",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/provider/{provider_id}/auth/local": {
+                "post": {
+                    "summary": "Create a provider local account such as static_local, codex_login, aws_env, or aws_profile without provider execution",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/provider/{provider_id}/auth/activate": {
+                "post": {
+                    "summary": "Activate an existing provider account without provider execution",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/provider/{provider_id}/auth": {
+                "delete": {
+                    "summary": "Remove provider accounts and local secret payloads without provider execution",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/provider/{provider_id}/oauth/authorize": {
+                "post": {
+                    "summary": "Start a provider OAuth manual-code flow without opening a browser or storing credentials",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id")],
+                    "responses": _json_response(),
+                    "x-harness-safety": _metadata_only_safety(),
                 }
             },
             "/provider/{provider_id}/oauth/callback": {
                 "post": {
-                    "summary": "Fail-closed placeholder for provider OAuth callback",
+                    "summary": "Store provider OAuth callback tokens in the local secret store without returning token values",
                     "security": bearer,
                     "parameters": [_path_param("provider_id")],
-                    "responses": _json_response(status="501"),
+                    "responses": _json_response(),
+                    "x-harness-safety": _metadata_only_safety(metadata_only=False, credential_written=True),
                 }
             },
             "/auth/{provider_id}": {
@@ -200,18 +544,72 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                 },
             },
             "/log": {"post": {"summary": "Fail-closed placeholder for client log ingestion", "security": bearer, "responses": _json_response(status="501")}},
-            "/api/provider": {"get": {"summary": "OpenCode v2-compatible provider metadata list", "security": bearer, "responses": _json_response()}},
+            "/api/provider": {
+                "get": {
+                    "summary": "OpenCode v2-compatible provider metadata list",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/providers",
+            },
             "/api/provider/{provider_id}": {
                 "get": {
                     "summary": "OpenCode v2-compatible provider metadata lookup",
                     "security": bearer,
                     "parameters": [_path_param("provider_id")],
-                    "responses": _json_response(),
-                }
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/providers/{provider_id}",
             },
-            "/api/model": {"get": {"summary": "OpenCode v2-compatible model metadata list", "security": bearer, "responses": _json_response()}},
-            "/api/model/validate": {"get": {"summary": "OpenCode v2-compatible model selection validation", "security": bearer, "responses": _json_response()}},
-            "/config/providers": {"get": {"summary": "OpenCode-compatible configured provider projection", "security": bearer, "responses": _json_response()}},
+            "/api/catalog/model": {
+                "get": {
+                    "summary": "OpenCode v2-compatible flattened model catalog",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/models",
+            },
+            "/api/catalog/model/{provider_id}/{model_id}": {
+                "get": {
+                    "summary": "OpenCode v2-compatible model catalog lookup",
+                    "security": bearer,
+                    "parameters": [_path_param("provider_id"), _path_param("model_id")],
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelDetailResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/models/{provider_id}/{model_id}",
+            },
+            "/api/model": {
+                "get": {
+                    "summary": "Model metadata list alias",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/models",
+            },
+            "/api/model/validate": {
+                "get": {
+                    "summary": "Model selection validation alias",
+                    "security": bearer,
+                    "parameters": [_query_param("model"), _query_param("raw_model_ref", required=False)],
+                    "responses": _json_response(schema_ref="#/components/schemas/ModelValidationResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/models/validate",
+            },
+            "/config/providers": {
+                "get": {
+                    "summary": "Configured provider projection alias",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/ProviderCatalogResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
+                },
+                "x-harness-alias-for": "/providers",
+            },
             "/config": {
                 "get": {"summary": "Read sanitized project config metadata", "security": bearer, "responses": _json_response()},
                 "patch": {"summary": "Fail-closed placeholder for config updates", "security": bearer, "responses": _json_response(status="501")},
@@ -323,6 +721,8 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             "/desktop/launch": {"post": {"summary": "Fail-closed placeholder for desktop launch", "security": bearer, "responses": _json_response(status="501")}},
             "/version/check": {"get": {"summary": "Return offline version-check contract without calling the network", "security": bearer, "responses": _json_response()}},
             "/settings/tui": {"get": {"summary": "List supported TUI themes, keybindings, and settings without mutating preferences", "security": bearer, "responses": _json_response()}},
+            "/tui/dashboard": {"get": {"summary": "Read the TUI dashboard projection for attached clients", "security": bearer, "responses": _json_response()}},
+            "/tui/session-pane": {"get": {"summary": "Read the TUI session pane projection for attached clients", "security": bearer, "responses": _json_response()}},
             "/tui/append-prompt": {"post": {"summary": "Record fail-closed TUI append-prompt intent", "security": bearer, "responses": _json_response(status="202")}},
             "/tui/open-help": {"post": {"summary": "Record fail-closed TUI open-help intent", "security": bearer, "responses": _json_response(status="202")}},
             "/tui/open-sessions": {"post": {"summary": "Record fail-closed TUI open-sessions intent", "security": bearer, "responses": _json_response(status="202")}},
@@ -490,6 +890,15 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                     "security": bearer,
                     "parameters": [_path_param("session_id")],
                     "responses": _json_response(status="200"),
+                }
+            },
+            "/sessions/{session_id}/model": {
+                "post": {
+                    "summary": "Validate and persist explicit session model selection without provider execution",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(schema_ref="#/components/schemas/SessionModelSelectionResponse"),
+                    "x-harness-safety": _metadata_only_safety(),
                 }
             },
             "/sessions/{session_id}/abort": {
@@ -1069,7 +1478,7 @@ def create_local_http_server(
                 return
             parsed = urlparse(self.path)
             try:
-                payload = _route_delete(parsed.path, store=store)
+                payload = _route_delete(parsed.path, store=store, project_root=project_root, cfg=cfg)
             except KeyError as exc:
                 self._write_error(HTTPStatus.NOT_FOUND, "not_found", str(exc).strip("'"))
                 return
@@ -1094,6 +1503,12 @@ def create_local_http_server(
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             return
+
+        def handle(self) -> None:
+            try:
+                super().handle()
+            except ConnectionResetError:
+                return
 
         def _read_json_body(self) -> dict[str, Any]:
             try:
@@ -1233,7 +1648,7 @@ def _route_get(
     if path in {"/event", "/global/event"}:
         return _global_event_projection(store, project_root)
     if path == "/global/config":
-        return _global_config_projection(project_root, cfg)
+        return _global_config_projection(project_root, _hot_reload_project_config(project_root, cfg))
     if path == "/tui/control/next":
         return {
             "schema_version": "harness.tui_control_next/v1",
@@ -1252,29 +1667,54 @@ def _route_get(
     if path == "/openapi.json":
         return build_openapi_spec(server_url=f"http://{host}:{port}")
     if path in {"/providers", "/provider", "/api/provider", "/config/providers"}:
-        return _provider_catalog_projection(store, cfg)
+        return _provider_catalog_projection(store, _hot_reload_project_config(project_root, cfg))
+    if path.startswith("/providers/"):
+        provider_id = path.removeprefix("/providers/").strip("/")
+        if provider_id:
+            return _provider_catalog_projection(store, _hot_reload_project_config(project_root, cfg), provider_id=provider_id)
     if path.startswith("/api/provider/"):
         provider_id = path.removeprefix("/api/provider/").strip("/")
-        return _provider_catalog_projection(store, cfg, provider_id=provider_id)
+        return _provider_catalog_projection(store, _hot_reload_project_config(project_root, cfg), provider_id=provider_id)
     if path == "/provider/auth":
-        return _provider_auth_projection(cfg)
+        return _provider_auth_projection(_hot_reload_project_config(project_root, cfg), store)
     if path in {"/models/validate", "/api/model/validate"}:
         raw_model_ref = _single_query_value(query, "model") or _single_query_value(query, "raw_model_ref")
         if not raw_model_ref:
             raise ValueError("Missing required query parameter: model")
-        return _model_selection_validation_projection(cfg, raw_model_ref)
-    if path in {"/models", "/api/model"}:
-        return _model_catalog_projection(store, cfg)
+        return _model_selection_validation_projection(store, _hot_reload_project_config(project_root, cfg), raw_model_ref)
+    if path in {"/models", "/api/model", "/api/catalog/model"}:
+        return _model_catalog_projection(store, _hot_reload_project_config(project_root, cfg))
+    if path == "/models/preferences":
+        return _model_preferences_projection(store)
+    if path.startswith("/models/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 3:
+            return _model_detail_projection(
+                store,
+                _hot_reload_project_config(project_root, cfg),
+                provider_id=parts[1],
+                model_id="/".join(parts[2:]),
+            )
+    if path.startswith("/api/catalog/model/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) >= 5:
+            return _model_detail_projection(
+                store,
+                _hot_reload_project_config(project_root, cfg),
+                provider_id=parts[3],
+                model_id="/".join(parts[4:]),
+            )
     if path == "/config":
+        current_cfg = _hot_reload_project_config(project_root, cfg)
         return {
             "schema_version": "harness.config_projection/v1",
             "ok": True,
             "config": {
-                "project_name": cfg.project_name,
-                "chat": cfg.chat.model_dump(mode="json"),
-                "backends": [backend.to_descriptor().model_dump(mode="json") for backend in cfg.backends.values()],
-                "context_excludes": cfg.context_excludes,
-                "isolation_copy_excludes": cfg.isolation_copy_excludes,
+                "project_name": current_cfg.project_name,
+                "chat": current_cfg.chat.model_dump(mode="json"),
+                "backends": [backend.to_descriptor().model_dump(mode="json") for backend in current_cfg.backends.values()],
+                "context_excludes": current_cfg.context_excludes,
+                "isolation_copy_excludes": current_cfg.isolation_copy_excludes,
             },
             "permission_granting": False,
         }
@@ -1403,6 +1843,18 @@ def _route_get(
         return _version_check_projection()
     if path == "/settings/tui":
         return build_tui_settings_catalog()
+    if path == "/tui/dashboard":
+        return build_tui_dashboard(
+            project_root,
+            selected_session_id=_single_query_value(query, "selected_session_id"),
+        )
+    if path == "/tui/session-pane":
+        return build_session_pane_projection(
+            project_root,
+            selected_session_id=_single_query_value(query, "selected_session_id"),
+            status_filter=_single_query_value(query, "status_filter") or "open",
+            query=_single_query_value(query, "query") or "",
+        )
     if path in {"/commands", "/command"}:
         return build_command_catalog(project_root)
     if path == "/tools":
@@ -1448,12 +1900,23 @@ def _route_get(
                 "permission_granting": False,
             }
         if len(parts) == 3 and parts[2] == "events":
-            events = store.list_store_events(EventStreamType.SESSION, parts[1])
+            after_seq = _optional_query_int(query, "after_seq")
+            limit = _optional_query_int(query, "limit")
+            events = store.list_store_events(
+                EventStreamType.SESSION,
+                parts[1],
+                after_seq=after_seq,
+                limit=limit,
+            )
             return {
                 "schema_version": "harness.session_events/v1",
                 "ok": True,
                 "session_id": parts[1],
+                "after_seq": after_seq,
+                "limit": limit,
                 "events": [event.model_dump(mode="json") for event in events],
+                "execution_started": False,
+                "permission_granting": False,
             }
         if len(parts) == 3 and parts[2] == "status":
             return _session_status_projection(store, parts[1])
@@ -1569,6 +2032,13 @@ def _route_get(
     return None
 
 
+def _hot_reload_project_config(project_root: Path, fallback_cfg):
+    try:
+        return load_config(project_root)
+    except FileNotFoundError:
+        return fallback_cfg
+
+
 def _route_post(
     path: str,
     *,
@@ -1626,15 +2096,72 @@ def _route_post(
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[2] == "reply":
             existing = store.get_session_permission(parts[1])
-            return _reply_to_session_permission(store, existing.session_id, existing.id, body)
+            from harness.core_service import HarnessAppService
+
+            return HarnessAppService(project_root, store=store).reply_permission(existing.session_id, existing.id, body)
     if path.startswith("/question/"):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[2] in {"reply", "reject"}:
             return _reply_to_session_question(store, parts[1], body, rejected=parts[2] == "reject")
     if path.startswith("/provider/"):
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 4 and parts[2] == "auth":
+            from harness.core_service import HarnessAppService
+
+            service = HarnessAppService(project_root, store=store)
+            if parts[3] == "api-key":
+                return service.connect_provider_api_key(
+                    parts[1],
+                    _optional_body_text(body, "api_key") or _optional_body_text(body, "key") or "",
+                    description=_optional_body_text(body, "description") or "local_server",
+                    active=_optional_body_bool(body, "active") if "active" in body else True,
+                )
+            if parts[3] == "env":
+                return service.connect_provider_env(
+                    parts[1],
+                    _optional_body_text(body, "env_var") or _optional_body_text(body, "env") or "",
+                    description=_optional_body_text(body, "description") or "local_server",
+                    active=_optional_body_bool(body, "active") if "active" in body else True,
+                )
+            if parts[3] == "local":
+                return service.connect_provider_local_account(
+                    parts[1],
+                    _optional_body_text(body, "credential_kind") or _optional_body_text(body, "kind") or "",
+                    description=_optional_body_text(body, "description") or "local_server",
+                    active=_optional_body_bool(body, "active") if "active" in body else True,
+                    env_var=_optional_body_text(body, "env_var") or _optional_body_text(body, "env"),
+                )
+            if parts[3] == "activate":
+                return service.activate_provider_account(
+                    parts[1],
+                    _optional_body_text(body, "account_id") or _optional_body_text(body, "account") or "",
+                )
         if len(parts) == 4 and parts[2] == "oauth" and parts[3] in {"authorize", "callback"}:
-            return _provider_oauth_unsupported(parts[1], parts[3], body)
+            from harness.core_service import HarnessAppService
+
+            service = HarnessAppService(project_root, store=store)
+            if parts[3] == "authorize":
+                return service.provider_oauth_authorize(parts[1], body)
+            return service.provider_oauth_callback(parts[1], body)
+    if path.startswith("/models/"):
+        from harness.core_service import HarnessAppService
+
+        service = HarnessAppService(project_root, store=store)
+        if path in {"/models/favorite", "/models/preferences/favorite"}:
+            return service.set_model_favorite(
+                _optional_body_text(body, "raw_model_ref") or _optional_body_text(body, "model") or "",
+                _optional_body_bool(body, "favorite") if "favorite" in body else True,
+            )
+        if path in {"/models/default", "/models/preferences/default"}:
+            return service.set_default_model_preference(_optional_body_text(body, "raw_model_ref") or _optional_body_text(body, "model") or "")
+        if path == "/models/inspect":
+            return service.inspect_model(_optional_body_text(body, "raw_model_ref") or _optional_body_text(body, "model") or "")
+        if path == "/models/refresh":
+            return service.refresh_provider_models(
+                _optional_body_text(body, "provider_id") or _optional_body_text(body, "provider") or "",
+                approve_hosted=_optional_body_bool(body, "approve_hosted") if "approve_hosted" in body else False,
+                with_credentials=_optional_body_bool(body, "with_credentials") if "with_credentials" in body else False,
+            )
     if path.startswith("/auth/"):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 2:
@@ -1685,6 +2212,14 @@ def _route_post(
             return _api_session_wait_projection(store, parts[2], body)
     if path.startswith("/sessions/"):
         parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[2] == "model":
+            from harness.core_service import HarnessAppService
+
+            return HarnessAppService(project_root, store=store).update_session_model_selection(
+                parts[1],
+                _body_model_ref(body) or "",
+                source=_optional_body_text(body, "source") or "local_server_session_model_route",
+            )
         if len(parts) == 3 and parts[2] == "abort":
             session_id = parts[1]
             reason = _optional_body_text(body, "reason")
@@ -1697,6 +2232,33 @@ def _route_post(
                 "run_cancelled": False,
                 "task_cancelled": False,
                 "permission_granting": False,
+            }
+        if len(parts) == 3 and parts[2] == "restore":
+            session = store.restore_session(parts[1])
+            return {
+                "schema_version": "harness.session_restore/v1",
+                "ok": True,
+                "session": session.model_dump(mode="json"),
+                "restored": True,
+                "execution_started": False,
+                "process_started": False,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+        if len(parts) == 3 and parts[2] == "hard-delete":
+            counts = store.hard_delete_session(parts[1])
+            return {
+                "schema_version": "harness.session_hard_delete/v1",
+                "ok": True,
+                "session_id": parts[1],
+                "counts": counts,
+                "deletion_counts": counts,
+                "hard_deleted": True,
+                "active_repo_modified": False,
+                "process_started": False,
+                "filesystem_modified": True,
+                "permission_granting": False,
+                "authority_granting": False,
             }
         if len(parts) == 3 and parts[2] == "fork":
             session_id = parts[1]
@@ -1948,7 +2510,9 @@ def _route_post(
         ) or (len(parts) == 4 and parts[2] == "permissions"):
             session_id = parts[1]
             permission_id = parts[3]
-            return _reply_to_session_permission(store, session_id, permission_id, body)
+            from harness.core_service import HarnessAppService
+
+            return HarnessAppService(project_root, store=store).reply_permission(session_id, permission_id, body)
         if len(parts) in {4, 5} and parts[2] == "approval":
             session_id = parts[1]
             permission_id = parts[3]
@@ -2179,9 +2743,26 @@ def _route_patch(path: str, *, body: dict[str, Any], store: SQLiteStore, cfg: An
             store.get_session(session_id)
             title_updated = False
             model_updated = False
+            agent_updated = False
             if "title" in body:
                 store.update_session_title(session_id, _optional_body_text(body, "title"))
                 title_updated = True
+            if "agent_id" in body or "agent" in body:
+                store.update_session(session_id, agent_id=_optional_body_text(body, "agent_id") or _optional_body_text(body, "agent"))
+                store.append_store_event(
+                    EventStreamType.SESSION,
+                    session_id,
+                    "agent.selected",
+                    {
+                        "agent_id": _optional_body_text(body, "agent_id") or _optional_body_text(body, "agent"),
+                        "source": _optional_body_text(body, "source") or "local_server_session_update",
+                        "process_started": False,
+                        "permission_granting": False,
+                    },
+                    session_id=session_id,
+                    redaction_state=RedactionState.NOT_REQUIRED,
+                )
+                agent_updated = True
             raw_model_ref = _body_model_ref(body)
             model_validation: dict[str, Any] | None = None
             if raw_model_ref:
@@ -2199,9 +2780,21 @@ def _route_patch(path: str, *, body: dict[str, Any], store: SQLiteStore, cfg: An
                         session_id,
                         raw_model_ref,
                         source="local_server_session_update",
-                    )
+                )
+                    if model_validation.get("executable"):
+                        store.record_model_selection(
+                            raw_model_ref=raw_model_ref,
+                            provider_id=model_validation.get("provider_id"),
+                            model_id=model_validation.get("model_id"),
+                            model_variant=model_validation.get("variant"),
+                            last_reasoning_effort=(model_validation.get("resolved_model_selection") or {}).get(
+                                "resolved_reasoning_effort"
+                            ),
+                            source="local_server_session_update",
+                            metadata={"session_id": session_id},
+                        )
                 model_updated = True
-            if not title_updated and not model_updated:
+            if not title_updated and not model_updated and not agent_updated:
                 raise ValueError("No supported mutable session fields provided.")
             return {
                 "schema_version": "harness.session_update/v1",
@@ -2210,6 +2803,7 @@ def _route_patch(path: str, *, body: dict[str, Any], store: SQLiteStore, cfg: An
                 "model_validation": model_validation,
                 "title_updated": title_updated,
                 "model_updated": model_updated,
+                "agent_updated": agent_updated,
                 "messages_mutated": False,
                 "parts_mutated": False,
                 "execution_started": False,
@@ -2219,10 +2813,23 @@ def _route_patch(path: str, *, body: dict[str, Any], store: SQLiteStore, cfg: An
     return None
 
 
-def _route_delete(path: str, *, store: SQLiteStore) -> dict[str, Any] | None:
+def _route_delete(
+    path: str,
+    *,
+    store: SQLiteStore,
+    project_root: Path | None = None,
+    cfg=None,
+) -> dict[str, Any] | None:
     path = _normalize_opencode_session_path(path)
     if _uses_session_schema(path):
         _ensure_session_schema_ready(store)
+    if path.startswith("/provider/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[2] == "auth":
+            from harness.core_service import HarnessAppService
+
+            service = HarnessAppService(project_root or store.project_root, store=store)
+            return service.disconnect_provider(parts[1])
     if path.startswith("/auth/"):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 2:
@@ -2329,7 +2936,11 @@ def _session_prompt_operator_response(
     from harness.chat import ChatSessionState, handle_chat_input
 
     before_event_ids = {event.id for event in store.list_session_store_events(session_id)}
-    state = ChatSessionState(session_id=session_id, active_project_root=str(project_root))
+    state = ChatSessionState(
+        session_id=session_id,
+        active_project_root=str(project_root),
+        autonomy_profile_id="supervised-codex",
+    )
     try:
         chat_response = handle_chat_input(prompt, project_root, state)
     except Exception as exc:  # pragma: no cover - debug payload is asserted through direct helper tests.
@@ -2783,44 +3394,382 @@ def _file_status_projection(project_root: Path, excludes: list[str]) -> dict[str
     }
 
 
+def _provider_payload_connected(provider: dict[str, Any]) -> bool:
+    credential_status = str(provider.get("credential_status") or "unknown")
+    return bool(provider.get("connected")) or credential_status in {"configured", "not_required"}
+
+
+def _provider_payload_blocked(provider: dict[str, Any]) -> bool:
+    credential_status = str(provider.get("credential_status") or "unknown")
+    if not bool(provider.get("enabled", True)):
+        return True
+    if _provider_payload_connected(provider):
+        return False
+    return credential_status in {
+        "missing",
+        "expired",
+        "refresh_required",
+        "credential_missing",
+        "credential_expired",
+        "credential_refresh_required",
+        "unknown",
+    }
+
+
+def _model_payload_blocked(model: dict[str, Any]) -> bool:
+    availability = str(model.get("availability") or "").lower()
+    executable = bool(model.get("executable_model", model.get("executable", False)))
+    return bool(model.get("blocked_reasons")) or availability == "blocked" or not executable
+
+
+def _model_distinction_ref(model: dict[str, Any]) -> str:
+    return str(model.get("raw_model_ref") or f"{model.get('provider_id')}/{model.get('model_id')}")
+
+
+def _catalog_distinction_refs(items: list[dict[str, Any]], ref_key: str) -> list[str]:
+    return [str(item.get(ref_key) or "") for item in items if item.get(ref_key)]
+
+
+def _provider_auth_summary(auth_entry: dict[str, Any] | None) -> dict[str, Any]:
+    if auth_entry is None:
+        return {
+            "auth_methods": [],
+            "auth_method_details": [],
+            "oauth_supported": False,
+            "credential_write_supported": False,
+            "active_account_id": None,
+            "active_credential_kind": None,
+            "account_count": 0,
+        }
+    return {
+        "auth_methods": [_catalog_safe_auth_value(method) for method in list(auth_entry.get("auth_methods") or [])],
+        "auth_method_details": _catalog_safe_auth_value(list(auth_entry.get("methods") or [])),
+        "oauth_supported": bool(auth_entry.get("oauth_supported")),
+        "credential_write_supported": bool(auth_entry.get("credential_write_supported")),
+        "active_account_id": auth_entry.get("active_account_id"),
+        "active_credential_kind": _catalog_safe_auth_value(auth_entry.get("active_credential_kind")),
+        "account_count": int(auth_entry.get("account_count") or 0),
+    }
+
+
+def _provider_auth_catalog_summary(auth_projection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "auth_methods": [_catalog_safe_auth_value(method) for method in list(auth_projection.get("auth_methods") or [])],
+        "methods_by_provider": _catalog_safe_auth_value(dict(auth_projection.get("methods_by_provider") or {})),
+        "oauth_supported_providers": list(auth_projection.get("oauth_supported_providers") or []),
+        "oauth_unsupported_providers": list(auth_projection.get("oauth_unsupported_providers") or []),
+        "oauth_support": dict(auth_projection.get("oauth_support") or {}),
+        "credential_write_supported_providers": list(
+            auth_projection.get("credential_write_supported_providers") or []
+        ),
+        "credential_write_support": dict(auth_projection.get("credential_write_support") or {}),
+    }
+
+
+def _catalog_safe_auth_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return "secret_token" if value == "api_key" else value
+    if isinstance(value, list):
+        return [_catalog_safe_auth_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            str(key): _catalog_safe_auth_value(item)
+            for key, item in value.items()
+            if str(key) not in {"secret_value_required"}
+        }
+    return value
+
+
+def _unknown_provider_projection(
+    store: SQLiteStore,
+    cfg,
+    *,
+    provider_id: str,
+    cache: dict[str, Any],
+    auth_projection: dict[str, Any],
+) -> dict[str, Any]:
+    suggestions = build_model_provider_suggestions(
+        cfg,
+        provider_id,
+        provider_accounts=store.list_provider_accounts(),
+        model_overlays=list_cached_discovered_models(cfg, store),
+    )
+    return {
+        "schema_version": "harness.providers/v1",
+        "ok": False,
+        "error_code": "provider_unknown",
+        "error": f"Provider not found: {provider_id}",
+        "requested_provider_id": provider_id,
+        "cache": cache,
+        "providers": [],
+        "provider": None,
+        "suggestions": suggestions["provider_suggestions"],
+        "provider_suggestions": suggestions["provider_suggestions"],
+        "model_suggestions": suggestions["model_suggestions"],
+        "suggestion_only": True,
+        **_provider_auth_catalog_summary(auth_projection),
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "no_hidden_fallback": True,
+        "permission_granting": False,
+        "authority_granting": False,
+    }
+
+
 def _provider_catalog_projection(store: SQLiteStore, cfg, *, provider_id: str | None = None) -> dict[str, Any]:
-    providers = list_provider_catalog(cfg)
-    models = list_model_catalog(cfg)
+    provider_accounts = store.list_provider_accounts()
+    providers = list_provider_catalog(cfg, provider_accounts=provider_accounts)
+    models = list_model_catalog(cfg, provider_accounts=provider_accounts)
     cache = store.replace_provider_model_catalog_cache(providers, models)
-    provider_payloads = [provider.model_dump(mode="json") for provider in providers]
+    default_preference = store.get_default_model_preference()
+    default_provider_id = str(default_preference.get("provider_id") or "") if default_preference is not None else None
+    auth_projection = provider_auth_methods_projection(cfg, store)
+    auth_entries = {
+        str(entry.get("provider_id")): entry for entry in auth_projection.get("providers", []) if entry.get("provider_id")
+    }
+    provider_payloads = []
+    for provider in providers:
+        payload = provider.model_dump(mode="json")
+        auth_summary = _provider_auth_summary(auth_entries.get(str(payload.get("provider_id"))))
+        payload["is_connected"] = _provider_payload_connected(payload)
+        payload["is_default"] = bool(default_provider_id and payload.get("provider_id") == default_provider_id)
+        payload["is_blocked"] = _provider_payload_blocked(payload)
+        payload["auth_methods"] = auth_summary["auth_methods"]
+        payload["auth_method_details"] = auth_summary["auth_method_details"]
+        payload["oauth_supported"] = auth_summary["oauth_supported"]
+        payload["credential_write_supported"] = auth_summary["credential_write_supported"]
+        payload["active_account_id"] = auth_summary["active_account_id"]
+        payload["active_credential_kind"] = auth_summary["active_credential_kind"]
+        payload["account_count"] = auth_summary["account_count"]
+        provider_payloads.append(payload)
+    all_provider_payloads = list(provider_payloads)
+    connected_provider_payloads = [provider for provider in all_provider_payloads if provider["is_connected"]]
+    blocked_provider_payloads = [provider for provider in all_provider_payloads if provider["is_blocked"]]
+    default_provider = next((provider for provider in all_provider_payloads if provider["is_default"]), None)
     if provider_id is not None:
         provider_payloads = [provider for provider in provider_payloads if provider["provider_id"] == provider_id]
         if not provider_payloads:
-            raise KeyError(f"Provider not found: {provider_id}")
+            return _unknown_provider_projection(
+                store,
+                cfg,
+                provider_id=provider_id,
+                cache=cache,
+                auth_projection=auth_projection,
+            )
     return {
         "schema_version": "harness.providers/v1",
         "ok": True,
         "cache": cache,
         "providers": provider_payloads,
         "provider": provider_payloads[0] if provider_id is not None else None,
+        "all": all_provider_payloads,
+        "connected": connected_provider_payloads,
+        "default": default_provider,
+        "blocked": blocked_provider_payloads,
+        "all_providers": all_provider_payloads,
+        "connected_providers": connected_provider_payloads,
+        "default_provider": default_provider,
+        "blocked_providers": blocked_provider_payloads,
+        "default_preference": default_preference,
+        "distinctions": {
+            "all": _catalog_distinction_refs(all_provider_payloads, "provider_id"),
+            "connected": _catalog_distinction_refs(connected_provider_payloads, "provider_id"),
+            "default": default_provider.get("provider_id") if default_provider is not None else None,
+            "blocked": _catalog_distinction_refs(blocked_provider_payloads, "provider_id"),
+        },
+        **_provider_auth_catalog_summary(auth_projection),
         **catalog_projection_evidence("providers_catalog_projection"),
     }
 
 
 def _model_catalog_projection(store: SQLiteStore, cfg) -> dict[str, Any]:
-    providers = list_provider_catalog(cfg)
-    models = list_model_catalog(cfg)
-    cache = store.replace_provider_model_catalog_cache(providers, models)
+    provider_accounts = store.list_provider_accounts()
+    providers = list_provider_catalog(cfg, provider_accounts=provider_accounts)
+    base_models = list_model_catalog(cfg, provider_accounts=provider_accounts)
+    models = [*base_models, *list_cached_discovered_models(cfg, store)]
+    cache = store.replace_provider_model_catalog_cache(providers, base_models)
+    preferences = store.list_model_preferences()
+    preferences_by_ref = {str(preference.get("raw_model_ref")): preference for preference in preferences}
+    default_preference = store.get_default_model_preference()
+    default_ref = str(default_preference.get("raw_model_ref") or "") if default_preference is not None else None
+    auth_projection = provider_auth_methods_projection(cfg, store)
+    auth_entries = {
+        str(entry.get("provider_id")): entry for entry in auth_projection.get("providers", []) if entry.get("provider_id")
+    }
+    model_payloads = []
+    for model in models:
+        payload = model.model_dump(mode="json")
+        preference = preferences_by_ref.get(_model_distinction_ref(payload))
+        auth_summary = _provider_auth_summary(auth_entries.get(str(payload.get("provider_id"))))
+        payload["favorite"] = bool(preference.get("favorite")) if preference is not None else False
+        payload["is_default"] = bool(default_ref and _model_distinction_ref(payload) == default_ref)
+        payload["is_connected"] = bool(payload.get("provider_connected"))
+        payload["is_blocked"] = _model_payload_blocked(payload)
+        payload["provider_auth_methods"] = auth_summary["auth_methods"]
+        payload["provider_auth_method_details"] = auth_summary["auth_method_details"]
+        payload["provider_oauth_supported"] = auth_summary["oauth_supported"]
+        payload["provider_credential_write_supported"] = auth_summary["credential_write_supported"]
+        payload["provider_active_account_id"] = auth_summary["active_account_id"]
+        payload["provider_active_credential_kind"] = auth_summary["active_credential_kind"]
+        payload["selection_count"] = int(preference.get("selection_count") or 0) if preference is not None else 0
+        payload["last_selected_at"] = preference.get("last_selected_at") if preference is not None else None
+        payload["last_reasoning_effort"] = preference.get("last_reasoning_effort") if preference is not None else None
+        payload["preference_source"] = preference.get("source") if preference is not None else None
+        model_payloads.append(payload)
+    all_model_payloads = list(model_payloads)
+    connected_model_payloads = [model for model in all_model_payloads if model["is_connected"]]
+    blocked_model_payloads = [model for model in all_model_payloads if model["is_blocked"]]
+    default_model = next((model for model in all_model_payloads if model["is_default"]), None)
     return {
         "schema_version": "harness.models/v1",
         "ok": True,
         "cache": cache,
-        "models": [model.model_dump(mode="json") for model in models],
+        "models": model_payloads,
+        "all": all_model_payloads,
+        "connected": connected_model_payloads,
+        "default": default_model,
+        "blocked": blocked_model_payloads,
+        "all_models": all_model_payloads,
+        "connected_models": connected_model_payloads,
+        "default_model": default_model,
+        "blocked_models": blocked_model_payloads,
+        "preferences": preferences,
+        "default_preference": default_preference,
+        "distinctions": {
+            "all": [_model_distinction_ref(model) for model in all_model_payloads],
+            "connected": [_model_distinction_ref(model) for model in connected_model_payloads],
+            "default": _model_distinction_ref(default_model) if default_model is not None else default_ref or None,
+            "blocked": [_model_distinction_ref(model) for model in blocked_model_payloads],
+        },
+        **_provider_auth_catalog_summary(auth_projection),
         **catalog_projection_evidence("models_catalog_projection"),
     }
 
 
-def _model_selection_validation_projection(cfg, raw_model_ref: str) -> dict[str, Any]:
-    validation = validate_model_selection(cfg, raw_model_ref)
+def _model_detail_projection(store: SQLiteStore, cfg, *, provider_id: str, model_id: str) -> dict[str, Any]:
+    catalog = _model_catalog_projection(store, cfg)
+    raw_ref = f"{provider_id}/{model_id}"
+    validation = _model_selection_validation_projection(store, cfg, raw_ref)
+    models = [
+        model
+        for model in catalog["models"]
+        if model.get("raw_model_ref") == raw_ref
+        or (model.get("provider_id") == provider_id and model.get("model_id") == model_id)
+    ]
+    if not models:
+        suggestions = build_model_provider_suggestions(
+            cfg,
+            raw_ref,
+            provider_accounts=store.list_provider_accounts(),
+            model_overlays=list_cached_discovered_models(cfg, store),
+        )
+        return {
+            "schema_version": "harness.model_detail/v1",
+            "ok": False,
+            "error_code": "model_unknown",
+            "error": f"Model not found: {raw_ref}",
+            "provider_id": provider_id,
+            "model_id": model_id,
+            "raw_model_ref": raw_ref,
+            "model": None,
+            "validation": validation["validation"],
+            "suggestions": suggestions["model_suggestions"],
+            "model_suggestions": suggestions["model_suggestions"],
+            "provider_suggestions": suggestions["provider_suggestions"],
+            "suggestion_only": True,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+            **catalog_projection_evidence("model_detail_projection"),
+        }
+    return {
+        "schema_version": "harness.model_detail/v1",
+        "ok": True,
+        "provider_id": provider_id,
+        "model_id": model_id,
+        "raw_model_ref": raw_ref,
+        "model": models[0],
+        "validation": validation["validation"],
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "no_hidden_fallback": True,
+        "permission_granting": False,
+        "authority_granting": False,
+        **catalog_projection_evidence("model_detail_projection"),
+    }
+
+
+def _model_preferences_projection(store: SQLiteStore) -> dict[str, Any]:
+    preferences = store.list_model_preferences()
+    default = store.get_default_model_preference()
+    favorites = [preference for preference in preferences if preference.get("favorite")]
+    return {
+        "schema_version": "harness.model_preferences/v1",
+        "ok": True,
+        "preferences": preferences,
+        "favorite_preferences": favorites,
+        "default_preference": default,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "credential_written": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "no_hidden_fallback": True,
+        "permission_granting": False,
+        "authority_granting": False,
+        "metadata_only": True,
+    }
+
+
+def _model_selection_validation_projection(store: SQLiteStore, cfg, raw_model_ref: str) -> dict[str, Any]:
+    validation = validate_model_selection(
+        cfg,
+        raw_model_ref,
+        model_overlays=list_cached_discovered_models(cfg, store),
+        provider_accounts=store.list_provider_accounts(),
+    )
+    suggestions = (
+        build_model_provider_suggestions(
+            cfg,
+            raw_model_ref,
+            provider_accounts=store.list_provider_accounts(),
+            model_overlays=list_cached_discovered_models(cfg, store),
+        )
+        if any(
+            reason in {"provider_unknown", "provider_not_specified", "model_unknown", "variant_unknown"}
+            for reason in validation.blocked_reasons
+        )
+        else None
+    )
+    validation_payload = validation.model_dump(mode="json")
+    if suggestions is not None:
+        validation_payload["suggestions"] = suggestions["model_suggestions"]
+        validation_payload["model_suggestions"] = suggestions["model_suggestions"]
+        validation_payload["provider_suggestions"] = suggestions["provider_suggestions"]
     return {
         "schema_version": "harness.model_selection_validation_result/v1",
         "ok": validation.executable,
-        "validation": validation.model_dump(mode="json"),
+        "validation": validation_payload,
+        "suggestions": suggestions["model_suggestions"] if suggestions is not None else [],
+        "model_suggestions": suggestions["model_suggestions"] if suggestions is not None else [],
+        "provider_suggestions": suggestions["provider_suggestions"] if suggestions is not None else [],
+        "suggestion_only": suggestions is not None,
         "provider_execution_started": False,
         "model_execution_started": False,
         "network_accessed": False,
@@ -2854,7 +3803,12 @@ def _append_session_model_validation_event(
 ) -> dict[str, Any] | None:
     if not raw_model_ref:
         return None
-    validation = validate_model_selection(cfg, raw_model_ref)
+    validation = validate_model_selection(
+        cfg,
+        raw_model_ref,
+        model_overlays=list_cached_discovered_models(cfg, store),
+        provider_accounts=store.list_provider_accounts(),
+    )
     payload = validation.model_dump(mode="json")
     store.append_store_event(
         EventStreamType.SESSION,
@@ -2878,26 +3832,8 @@ def _append_session_model_validation_event(
     return payload
 
 
-def _provider_auth_projection(cfg) -> dict[str, Any]:
-    providers = list_provider_catalog(cfg)
-    return {
-        "schema_version": "harness.provider_auth_methods/v1",
-        "ok": True,
-        "providers": [
-            {
-                "provider_id": provider.provider_id,
-                "credential_status": provider.credential_status.value,
-                "configured": provider.credential_status.value in {"configured", "not_required"},
-                "enabled": provider.enabled,
-                "auth_methods": ["environment", "config_reference"],
-                "oauth_supported": False,
-                "credentials_included": False,
-            }
-            for provider in providers
-        ],
-        "credentials_included": False,
-        "permission_granting": False,
-    }
+def _provider_auth_projection(cfg, store: SQLiteStore | None = None) -> dict[str, Any]:
+    return provider_auth_methods_projection(cfg, store)
 
 
 def _provider_oauth_unsupported(provider_id: str, action: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -5495,6 +6431,7 @@ def _mcp_action_unsupported(action: str, name: str | None, body: dict[str, Any])
 
 def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
     plugins: list[dict[str, Any]] = []
+    provider_hooks: list[dict[str, Any]] = []
     for name, plugin in sorted(cfg.plugins.project.items()):
         normalized_spec = plugin.spec or plugin.path or plugin.url or name
         payload: dict[str, Any] = {
@@ -5513,6 +6450,8 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
             "origin_review_required": True,
             "runtime_load_supported": False,
             "tool_execution_supported": False,
+            "provider_hook_supported": True,
+            "provider_registered": False,
             "install_supported": False,
             "update_supported": False,
             "remove_supported": False,
@@ -5522,6 +6461,8 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
                 "runtime_load_allowed": False,
                 "tool_registration_allowed": False,
                 "tool_execution_allowed": False,
+                "provider_registration_allowed": False,
+                "provider_execution_allowed": False,
                 "filesystem_mutation_allowed": False,
                 "network_fetch_allowed": False,
                 "origin_review_required": True,
@@ -5529,6 +6470,8 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
             "blocked_reasons": ["plugin_origin_review_required", "plugin_runtime_load_disabled", "plugin_tool_execution_disabled"],
             "runtime_loaded": False,
             "tools_registered": False,
+            "provider_hooks": [],
+            "provider_hook_count": 0,
             "filesystem_modified": False,
             "network_called": False,
             "permission_granting": False,
@@ -5536,13 +6479,24 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
         if plugin.path:
             path = resolve_under_project(project_root, plugin.path)
             manifest = _plugin_manifest_path(path)
+            manifest_ref = relative_to_project(project_root, manifest) if manifest else None
+            hook_payload = read_plugin_provider_hooks_from_manifest(
+                plugin_name=name,
+                scope="project",
+                manifest_path=manifest,
+                manifest_ref=manifest_ref,
+            )
+            provider_hooks.extend(hook_payload["provider_hooks"])
             payload.update(
                 {
                     "path": relative_to_project(project_root, path),
                     "exists": path.exists(),
                     "directory": path.is_dir(),
-                    "manifest_path": relative_to_project(project_root, manifest) if manifest else None,
+                    "manifest_path": manifest_ref,
                     "manifest_exists": bool(manifest and manifest.exists()),
+                    "provider_hook_interface": hook_payload,
+                    "provider_hooks": hook_payload["provider_hooks"],
+                    "provider_hook_count": hook_payload["provider_hook_count"],
                 }
             )
         plugins.append(payload)
@@ -5552,6 +6506,14 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
         for child in sorted(path.iterdir()):
             if not child.is_dir():
                 continue
+            manifest = _plugin_manifest_path(child)
+            hook_payload = read_plugin_provider_hooks_from_manifest(
+                plugin_name=child.name,
+                scope="global",
+                manifest_path=manifest,
+                manifest_ref=str(manifest) if manifest else None,
+            )
+            provider_hooks.extend(hook_payload["provider_hooks"])
             plugins.append(
                 {
                     "name": child.name,
@@ -5574,6 +6536,8 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
                     "origin_review_required": True,
                     "runtime_load_supported": False,
                     "tool_execution_supported": False,
+                    "provider_hook_supported": True,
+                    "provider_registered": False,
                     "install_supported": False,
                     "update_supported": False,
                     "remove_supported": False,
@@ -5583,6 +6547,8 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
                         "runtime_load_allowed": False,
                         "tool_registration_allowed": False,
                         "tool_execution_allowed": False,
+                        "provider_registration_allowed": False,
+                        "provider_execution_allowed": False,
                         "filesystem_mutation_allowed": False,
                         "network_fetch_allowed": False,
                         "origin_review_required": True,
@@ -5594,6 +6560,10 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
                     ],
                     "runtime_loaded": False,
                     "tools_registered": False,
+                    "provider_hook_interface": hook_payload,
+                    "provider_hooks": hook_payload["provider_hooks"],
+                    "provider_hook_count": hook_payload["provider_hook_count"],
+                    "provider_registered": False,
                     "filesystem_modified": False,
                     "network_called": False,
                     "permission_granting": False,
@@ -5610,6 +6580,10 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
         "runtime_loaded": False,
         "tools_registered": False,
         "tool_execution_supported": False,
+        "provider_hook_supported": True,
+        "provider_hooks": provider_hooks,
+        "provider_hook_count": len(provider_hooks),
+        "provider_registered": False,
         "origin_review_required": True,
         "install_supported": False,
         "update_supported": False,
@@ -5619,6 +6593,8 @@ def _plugin_catalog(project_root: Path, cfg) -> dict[str, Any]:
             "runtime_load_allowed": False,
             "tool_registration_allowed": False,
             "tool_execution_allowed": False,
+            "provider_registration_allowed": False,
+            "provider_execution_allowed": False,
             "filesystem_mutation_allowed": False,
             "network_fetch_allowed": False,
             "origin_review_required": True,
@@ -6781,8 +7757,14 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _json_response(*, status: str = "200") -> dict[str, Any]:
-    return {status: {"description": "JSON response", "content": {"application/json": {"schema": {"type": "object"}}}}}
+def _json_response(
+    *,
+    status: str = "200",
+    schema_ref: str | None = None,
+    schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response_schema = schema or ({"$ref": schema_ref} if schema_ref else {"type": "object"})
+    return {status: {"description": "JSON response", "content": {"application/json": {"schema": response_schema}}}}
 
 
 def _sse_response() -> dict[str, Any]:
@@ -6796,3 +7778,24 @@ def _sse_response() -> dict[str, Any]:
 
 def _path_param(name: str) -> dict[str, Any]:
     return {"name": name, "in": "path", "required": True, "schema": {"type": "string"}}
+
+
+def _query_param(name: str, *, required: bool = True) -> dict[str, Any]:
+    return {"name": name, "in": "query", "required": required, "schema": {"type": "string"}}
+
+
+def _metadata_only_safety(*, metadata_only: bool = True, credential_written: bool = False) -> dict[str, Any]:
+    return {
+        "metadata_only": metadata_only,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "credential_value_included": False,
+        "credential_written": credential_written,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "no_hidden_fallback": True,
+        "permission_granting": False,
+        "authority_granting": False,
+    }

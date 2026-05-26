@@ -15,6 +15,8 @@ from harness.memory.sqlite_store import (
     is_missing_session_schema_error,
 )
 from harness.model_catalog import list_model_catalog, list_provider_catalog, validate_model_selection
+from harness.model_registry import resolve_model_for_session
+from harness.model_discovery import list_cached_discovered_models
 from harness.models import EventStreamType, SessionPartKind, SessionPermissionStatus, SessionStatus, TaskStatus
 from harness.operator_loop import session_operator_status_projection
 from harness.paths import resolve_project_root
@@ -81,6 +83,8 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             provider_catalog,
             model_catalog,
             sessions=[],
+            preferences=[],
+            provider_accounts=[],
             source=catalog_source,
             config_error=catalog_error,
         ),
@@ -180,6 +184,8 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
 
     try:
         store = SQLiteStore.open_initialized(project_root)
+        provider_accounts = store.list_provider_accounts()
+        provider_catalog = list_provider_catalog(catalog_config, provider_accounts=provider_accounts)
         agents = store.list_project_agents()
         objectives = store.list_objectives()
         tasks = store.list_tasks()
@@ -199,13 +205,16 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
                 selected_session = None
         memory_records = store.list_memory_records()[:5]
         cfg = catalog_config
-        catalog_cache = store.replace_provider_model_catalog_cache(provider_catalog, model_catalog)
+        base_model_catalog = list_model_catalog(cfg, provider_accounts=provider_accounts)
+        model_catalog = [*base_model_catalog, *list_cached_discovered_models(cfg, store)]
+        catalog_cache = store.replace_provider_model_catalog_cache(provider_catalog, base_model_catalog)
         daemon_status = store.daemon_status()
         controls = store.list_execution_controls()
         breakers = store.list_adapter_breaker_states(
             [descriptor.id for descriptor in list_execution_adapter_descriptors()]
         )
         terminal_tabs = _terminal_tabs_summary(store)
+        model_preferences = store.list_model_preferences()
     except sqlite3.Error as exc:
         dashboard["initialized"] = False
         dashboard["live_activity"] = _empty_live_activity("blocked")
@@ -321,7 +330,10 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
         cfg,
         provider_catalog,
         model_catalog,
+        store=store,
         sessions=model_sessions,
+        preferences=model_preferences,
+        provider_accounts=provider_accounts,
         cache=catalog_cache,
         source=catalog_source,
         config_error=catalog_error,
@@ -769,6 +781,11 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         "model_variant": sanitize_for_logging(session.model_variant),
         "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
         "active_run_id": session.active_run_id,
+        "token_input": session.token_input,
+        "token_output": session.token_output,
+        "token_reasoning": session.token_reasoning,
+        "token_cache_read": session.token_cache_read,
+        "token_cache_write": session.token_cache_write,
         "cwd": cwd,
         "operator": operator,
         "ui_preferences": sanitize_for_logging(session.ui_preferences),
@@ -829,7 +846,17 @@ def _operator_active_tools() -> list[str]:
 
 def _session_composer_context(store: SQLiteStore, session_id: str, project_root: Path) -> dict:
     attachments: list[dict] = []
+    transcript_bytes = 0
+    transcript_part_count = 0
     for part in store.list_session_parts(session_id):
+        if part.kind in {
+            SessionPartKind.TEXT,
+            SessionPartKind.TOOL_RESULT,
+            SessionPartKind.REASONING_SUMMARY,
+            SessionPartKind.SUMMARY,
+        }:
+            transcript_part_count += 1
+            transcript_bytes += len(str(part.text or "").encode("utf-8"))
         if part.kind != SessionPartKind.ARTIFACT_REF:
             continue
         metadata = part.metadata or {}
@@ -852,13 +879,19 @@ def _session_composer_context(store: SQLiteStore, session_id: str, project_root:
                 "contents_included": False,
             }
         )
-    total_bytes = sum(int(item["size_bytes"]) for item in attachments)
+    attachment_bytes = sum(int(item["size_bytes"]) for item in attachments)
+    attachment_tokens = _estimate_tokens_for_bytes(attachment_bytes)
+    transcript_tokens = _estimate_tokens_for_bytes(transcript_bytes)
     return {
         "schema_version": "harness.tui_composer_context/v1",
         "attachment_count": len(attachments),
         "attachments": attachments,
-        "total_attachment_bytes": total_bytes,
-        "total_estimated_tokens": _estimate_tokens_for_bytes(total_bytes),
+        "text_part_count": transcript_part_count,
+        "transcript_bytes": transcript_bytes,
+        "transcript_estimated_tokens": transcript_tokens,
+        "total_attachment_bytes": attachment_bytes,
+        "attachment_estimated_tokens": attachment_tokens,
+        "total_estimated_tokens": transcript_tokens + attachment_tokens,
         "contents_included": False,
         "process_started": False,
         "filesystem_modified": False,
@@ -915,39 +948,129 @@ def _model_catalog_projection(
     provider_catalog: list,
     model_catalog: list,
     *,
+    store: SQLiteStore | None = None,
     sessions: list,
+    preferences: list | None = None,
+    provider_accounts: list[dict] | None = None,
     cache: dict | None = None,
     source: str = "project_config",
     config_error: dict | None = None,
 ) -> dict:
+    providers_by_id = {provider.provider_id: provider for provider in provider_catalog}
+    preferences = preferences or []
+    preferences_by_ref = {preference.get("raw_model_ref"): preference for preference in preferences}
+    active_model = _active_model_summary(cfg, sessions, model_catalog, provider_accounts=provider_accounts, store=store)
+    active_ref = active_model.get("raw_model_ref") if active_model else None
+
+    def _model_row(model) -> dict:
+        provider = providers_by_id.get(model.provider_id)
+        preference = preferences_by_ref.get(model.raw_model_ref) or preferences_by_ref.get(model.canonical_model_ref)
+        if model.alias_of is not None or provider is None:
+            validation = validate_model_selection(
+                cfg,
+                model.raw_model_ref,
+                model_overlays=[item for item in model_catalog if item.source == "discovered"],
+                provider_accounts=provider_accounts,
+            )
+            provider_enabled = validation.provider_enabled
+            executable = validation.executable
+            blocked_reasons = validation.blocked_reasons
+            no_hidden_fallback = validation.no_hidden_fallback
+        else:
+            provider_enabled = provider.enabled
+            blocked_reasons = list(getattr(model, "blocked_reasons", []) or ([] if provider.enabled else ["provider_disabled"]))
+            executable = bool(getattr(model, "executable_model", False))
+            no_hidden_fallback = True
+        return {
+            "provider_id": model.provider_id,
+            "model_id": sanitize_for_logging(model.model_id),
+            "raw_model_ref": sanitize_for_logging(model.raw_model_ref),
+            "canonical_model_ref": sanitize_for_logging(model.canonical_model_ref),
+            "alias_of": sanitize_for_logging(model.alias_of),
+            "protocol": sanitize_for_logging(model.protocol),
+            "status": sanitize_for_logging(model.status),
+            "variant": sanitize_for_logging(model.variant),
+            "variant_list": sanitize_for_logging(list(getattr(model, "variant_list", []) or [])),
+            "model_profile_id": sanitize_for_logging(model.model_profile_id),
+            "source": model.source,
+            "context_limit": model.context_limit,
+            "max_output_tokens": model.max_output_tokens,
+            "cost": sanitize_for_logging(model.cost),
+            "tool_support": model.tool_support,
+            "reasoning_support": model.reasoning_support,
+            "modalities": model.modalities,
+            "last_refresh_at": sanitize_for_logging(getattr(model, "last_refresh_at", None)),
+            "cache_status": sanitize_for_logging(getattr(model, "cache_status", None)),
+            "refresh_supported": bool(getattr(model, "refresh_supported", False)),
+            "data_boundary": provider.metadata.data_boundary.value if provider is not None else "unknown",
+            "endpoint": sanitize_for_logging((provider.settings_preview or {}).get("base_url")) if provider is not None else None,
+            "provider_enabled": provider_enabled,
+            "provider_connected": bool(getattr(model, "provider_connected", False)),
+            "known_catalog_model": bool(getattr(model, "known_catalog_model", True)),
+            "available_model": bool(getattr(model, "available_model", False)),
+            "executable_model": bool(getattr(model, "executable_model", executable)),
+            "selected_model": bool(active_ref and model.raw_model_ref == active_ref),
+            "availability": sanitize_for_logging(getattr(model, "availability", "available" if executable else "blocked")),
+            "executable": executable,
+            "blocked_reasons": blocked_reasons,
+            "no_hidden_fallback": no_hidden_fallback,
+            "favorite": bool(preference.get("favorite")) if preference else False,
+            "is_default": bool(preference.get("is_default")) if preference else False,
+            "selection_count": int(preference.get("selection_count") or 0) if preference else 0,
+            "last_selected_at": sanitize_for_logging(preference.get("last_selected_at")) if preference else None,
+            "last_reasoning_effort": sanitize_for_logging(preference.get("last_reasoning_effort")) if preference else None,
+            "preference_source": sanitize_for_logging(preference.get("source")) if preference else None,
+        }
+
+    def _model_sort_key(model: dict) -> tuple:
+        if model.get("raw_model_ref") == active_ref:
+            group = 0
+        elif model.get("favorite"):
+            group = 1
+        elif model.get("last_selected_at"):
+            group = 2
+        elif model.get("executable"):
+            group = 3
+        else:
+            group = 4
+        recency = str(model.get("last_selected_at") or "")
+        return (
+            group,
+            "" if group in {0, 3, 4} else _invert_sort_text(recency),
+            str(model.get("provider_id") or ""),
+            str(model.get("model_id") or ""),
+            str(model.get("raw_model_ref") or ""),
+        )
+
+    model_rows = sorted([_model_row(model) for model in model_catalog], key=_model_sort_key)
+
     projection = {
         "schema_version": "harness.operator_model_catalog/v1",
         "providers": [
             {
                 "provider_id": provider.provider_id,
+                "display_name": provider.display_name,
                 "enabled": provider.enabled,
+                "connected": bool(getattr(provider, "connected", False)),
                 "kind": provider.kind.value,
                 "credential_status": provider.credential_status.value,
+                "credential_source": _redacted_credential_source(getattr(provider, "credential_source", "unknown")),
+                "active_account_id": sanitize_for_logging(getattr(provider, "active_account_id", None)),
+                "auth_methods": [_redacted_credential_source(item) for item in list(getattr(provider, "auth_methods", []) or [])],
+                "model_count": getattr(provider, "model_count", 0),
+                "available_model_count": getattr(provider, "available_model_count", 0),
+                "refresh_supported": bool(getattr(provider, "refresh_supported", False))
+                or any(model.get("provider_id") == provider.provider_id and model.get("refresh_supported") for model in model_rows),
+                "refresh_status": _provider_refresh_status(provider.provider_id, model_rows),
                 "data_boundary": provider.metadata.data_boundary.value,
+                "endpoint": sanitize_for_logging((provider.settings_preview or {}).get("base_url")),
                 "constraints": provider.constraints,
             }
             for provider in provider_catalog
         ],
-        "models": [
-            {
-                "provider_id": model.provider_id,
-                "model_id": sanitize_for_logging(model.model_id),
-                "raw_model_ref": sanitize_for_logging(model.raw_model_ref),
-                "model_profile_id": sanitize_for_logging(model.model_profile_id),
-                "source": model.source,
-                "context_limit": model.context_limit,
-                "tool_support": model.tool_support,
-                "reasoning_support": model.reasoning_support,
-                "modalities": model.modalities,
-            }
-            for model in model_catalog
-        ],
-        "active_model": _active_model_summary(cfg, sessions, model_catalog),
+        "models": model_rows,
+        "preferences": [sanitize_for_logging(preference) for preference in preferences],
+        "active_model": active_model,
         "source": source,
         "permission_granting": False,
         "no_hidden_fallback": True,
@@ -957,6 +1080,27 @@ def _model_catalog_projection(
     if config_error is not None:
         projection["config_error"] = config_error
     return projection
+
+
+def _invert_sort_text(value: str) -> str:
+    return "".join(chr(0x10FFFF - ord(char)) for char in value)
+
+
+def _provider_refresh_status(provider_id: str, model_rows: list[dict]) -> str:
+    provider_models = [model for model in model_rows if model.get("provider_id") == provider_id]
+    statuses = sorted({str(model.get("cache_status")) for model in provider_models if model.get("cache_status")})
+    if statuses:
+        return statuses[0] if len(statuses) == 1 else "mixed"
+    if any(model.get("refresh_supported") for model in provider_models):
+        return "not_refreshed"
+    return "unsupported"
+
+
+def _redacted_credential_source(value) -> str:
+    text = str(value or "unknown")
+    if text.startswith("env:"):
+        return "env:<redacted>"
+    return str(sanitize_for_logging(text))
 
 
 def _terminal_tabs_summary(store: SQLiteStore) -> dict:
@@ -1067,24 +1211,37 @@ def _terminal_tab_from_events(store: SQLiteStore, pty_id: str) -> dict:
     }
 
 
-def _active_model_summary(cfg, sessions: list, model_catalog: list) -> dict | None:
+def _active_model_summary(
+    cfg,
+    sessions: list,
+    model_catalog: list,
+    *,
+    provider_accounts: list[dict] | None = None,
+    store: SQLiteStore | None = None,
+) -> dict | None:
     if not sessions:
         return None
     latest = sessions[0]
-    raw_ref = latest.raw_model_ref
-    validation = validate_model_selection(cfg, raw_ref) if raw_ref else None
+    resolution = resolve_model_for_session(cfg, store, latest.id) if store is not None else None
+    raw_ref = resolution.raw_model_ref if resolution is not None else latest.raw_model_ref
+    validation = validate_model_selection(cfg, raw_ref, provider_accounts=provider_accounts) if raw_ref else None
     matched = validation.matched_model if validation else None
     return {
         "session_id": latest.id,
         "raw_model_ref": sanitize_for_logging(raw_ref),
+        "selection_source": resolution.source.value if resolution is not None and resolution.source is not None else ("session_override" if latest.raw_model_ref else None),
+        "model_resolution": sanitize_for_logging(resolution.model_dump(mode="json")) if resolution is not None else None,
         "provider_id": sanitize_for_logging(latest.provider_id or (matched.provider_id if matched else None)),
         "model_id": sanitize_for_logging(latest.model_id or (matched.model_id if matched else None)),
         "model_variant": sanitize_for_logging(latest.model_variant),
+        "canonical_model_ref": sanitize_for_logging(validation.canonical_model_ref if validation else None),
+        "protocol": sanitize_for_logging(validation.protocol if validation else None),
+        "alias_used": sanitize_for_logging(validation.alias_used if validation else None),
         "known_catalog_entry": matched is not None,
         "executable": validation.executable if validation else None,
         "provider_known": validation.provider_known if validation else None,
         "provider_enabled": validation.provider_enabled if validation else None,
-        "blocked_reasons": validation.blocked_reasons if validation else [],
+        "blocked_reasons": validation.blocked_reasons if validation else (resolution.blocked_reasons if resolution else []),
         "validation": validation.model_dump(mode="json") if validation else None,
         "model_profile_id": sanitize_for_logging(matched.model_profile_id if matched else None),
         "tool_support": matched.tool_support if matched else None,

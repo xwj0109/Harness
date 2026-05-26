@@ -64,6 +64,7 @@ def test_token_usage_event_persists_reasoning_tokens_as_count_only(tmp_path) -> 
         output_tokens=25,
         reasoning_tokens=9,
         cached_input_tokens=10,
+        cache_write_tokens=4,
         total_tokens=134,
         estimated_cost_usd=Decimal("0.0123"),
     )
@@ -74,6 +75,7 @@ def test_token_usage_event_persists_reasoning_tokens_as_count_only(tmp_path) -> 
     assert event.visibility == EventVisibility.USER_VISIBLE
     assert event.payload == {
         "cached_input_tokens": 10,
+        "cache_write_tokens": 4,
         "estimated_cost_usd": "0.0123",
         "input_tokens": 100,
         "output_tokens": 25,

@@ -33,6 +33,7 @@ from harness.models import EventStreamType, SessionPermissionBoundaryKind, Sessi
 from harness.operator_loop import create_turn_state_from_session, persist_turn_finished, persist_turn_started
 from harness.operator_models import HarnessAgentPhase
 from harness.process_supervisor import get_process_supervisor
+from harness.provider_auth import read_provider_account_secret, read_provider_oauth_tokens
 
 
 runner = CliRunner()
@@ -72,7 +73,13 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "/server/mdns",
         "/server/dispose",
         "/providers",
+        "/providers/{provider_id}",
         "/models",
+        "/models/{provider_id}/{model_id}",
+        "/models/validate",
+        "/models/preferences",
+        "/models/preferences/favorite",
+        "/models/preferences/default",
         "/provider",
         "/provider/auth",
         "/provider/{provider_id}/oauth/authorize",
@@ -81,6 +88,8 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "/log",
         "/api/provider",
         "/api/provider/{provider_id}",
+        "/api/catalog/model",
+        "/api/catalog/model/{provider_id}/{model_id}",
         "/api/model",
         "/config/providers",
         "/config",
@@ -203,6 +212,7 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "/sessions/{session_id}/fork",
         "/sessions/{session_id}/summary",
         "/sessions/{session_id}/summarize",
+        "/sessions/{session_id}/model",
         "/sessions/{session_id}/abort",
         "/sessions/{session_id}/replay",
         "/sessions/{session_id}/messages",
@@ -265,6 +275,73 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
     assert "delete" in spec["paths"]["/sessions/{session_id}"]
     assert "post" in spec["paths"]["/sessions/{session_id}/messages"]
     assert spec["paths"]["/session/{session_id}/message"]["x-harness-alias-for"] == "/sessions/{session_id}/message"
+    assert spec["paths"]["/api/provider"]["x-harness-alias-for"] == "/providers"
+    assert spec["paths"]["/api/provider/{provider_id}"]["x-harness-alias-for"] == "/providers/{provider_id}"
+    assert spec["paths"]["/api/catalog/model"]["x-harness-alias-for"] == "/models"
+    assert spec["paths"]["/api/catalog/model/{provider_id}/{model_id}"]["x-harness-alias-for"] == "/models/{provider_id}/{model_id}"
+    schemas = spec["components"]["schemas"]
+    for schema_name in (
+        "ProviderCatalogResponse",
+        "ModelCatalogResponse",
+        "ModelDetailResponse",
+        "ModelValidationResponse",
+        "ProviderAuthMethodsResponse",
+        "ModelPreferencesResponse",
+        "ModelPreferenceUpdateResponse",
+        "SessionModelSelectionResponse",
+        "ModelSuggestion",
+        "ProviderSuggestion",
+    ):
+        assert schema_name in schemas
+    assert schemas["ProviderCatalogResponse"]["properties"]["all"]
+    assert schemas["ProviderCatalogResponse"]["properties"]["connected"]
+    assert schemas["ProviderCatalogResponse"]["properties"]["default"]
+    assert schemas["ProviderCatalogResponse"]["properties"]["blocked"]
+    assert "oauth_support" in schemas["ProviderCatalogResponse"]["properties"]
+    assert "provider_suggestions" in schemas["ProviderCatalogResponse"]["properties"]
+    assert schemas["ModelCatalogResponse"]["properties"]["all"]
+    assert schemas["ModelCatalogResponse"]["properties"]["connected"]
+    assert schemas["ModelCatalogResponse"]["properties"]["default"]
+    assert schemas["ModelCatalogResponse"]["properties"]["blocked"]
+    assert "oauth_support" in schemas["ModelCatalogResponse"]["properties"]
+    assert "model_suggestions" in schemas["ModelDetailResponse"]["properties"]
+    assert "provider_suggestions" in schemas["ModelValidationResponse"]["properties"]
+    assert "oauth_supported_providers" in schemas["ProviderAuthMethodsResponse"]["properties"]
+    assert (
+        spec["paths"]["/providers"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ProviderCatalogResponse"
+    )
+    assert (
+        spec["paths"]["/providers/{provider_id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ProviderCatalogResponse"
+    )
+    assert (
+        spec["paths"]["/models"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ModelCatalogResponse"
+    )
+    assert (
+        spec["paths"]["/models/{provider_id}/{model_id}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ModelDetailResponse"
+    )
+    assert (
+        spec["paths"]["/models/validate"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ModelValidationResponse"
+    )
+    assert (
+        spec["paths"]["/provider/auth"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/ProviderAuthMethodsResponse"
+    )
+    assert (
+        spec["paths"]["/sessions/{session_id}/model"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/SessionModelSelectionResponse"
+    )
+    assert spec["paths"]["/provider/{provider_id}/oauth/authorize"]["post"]["responses"].keys() == {"200"}
+    assert spec["paths"]["/provider/{provider_id}/oauth/callback"]["post"]["responses"].keys() == {"200"}
+    assert spec["paths"]["/provider/{provider_id}/oauth/callback"]["post"]["x-harness-safety"]["credential_written"] is True
+    assert spec["paths"]["/provider/{provider_id}/oauth/callback"]["post"]["x-harness-safety"]["credentials_included"] is False
+    assert spec["paths"]["/models"]["get"]["x-harness-safety"]["provider_execution_started"] is False
+    assert spec["paths"]["/models/{provider_id}/{model_id}"]["get"]["x-harness-safety"]["hidden_model_fallback"] is False
+    assert "/api/auth" not in spec["paths"]
     assert spec["paths"]["/sessions/{session_id}/events"]["get"]["security"] == [{"bearerAuth": []}]
     assert spec["paths"]["/event"]["get"]["responses"]["200"]["content"] == {"text/event-stream": {"schema": {"type": "string"}}}
     assert spec["paths"]["/global/event"]["get"]["responses"]["200"]["content"] == {"text/event-stream": {"schema": {"type": "string"}}}
@@ -272,6 +349,326 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         spec["paths"]["/sessions/{session_id}/events/stream"]["get"]["responses"]["200"]["content"]
         == {"text/event-stream": {"schema": {"type": "string"}}}
     )
+
+
+def test_local_server_model_catalog_reads_hot_reload_custom_models_config(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    custom_path = tmp_path / ".harness" / "models.yaml"
+
+    custom_path.write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "hot_router": {
+                        "display_name": "Hot Router",
+                        "enabled": True,
+                        "data_boundary": "local_only",
+                        "base_url": "http://localhost:11434/v1",
+                        "protocol": "openai_chat",
+                        "credential": {"kind": "static_local"},
+                        "models": {"alpha": {"context_window": 4096}},
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    providers = _route_get("/providers", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    models = _route_get("/models", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    validation = _route_get(
+        "/models/validate",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+        query={"model": ["hot_router/alpha"]},
+    )
+
+    assert any(provider["provider_id"] == "hot_router" for provider in providers["providers"])
+    assert "hot_router/alpha" in {model["raw_model_ref"] for model in models["models"]}
+    assert validation["validation"]["known_catalog_entry"] is True
+    assert validation["validation"]["executable"] is True
+
+    custom_path.write_text(
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "hot_router": {
+                        "display_name": "Hot Router",
+                        "enabled": True,
+                        "data_boundary": "local_only",
+                        "base_url": "http://localhost:11434/v1",
+                        "protocol": "openai_chat",
+                        "credential": {"kind": "static_local"},
+                        "models": {"beta": {"context_window": 8192}},
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    reloaded = _route_get("/models", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    reloaded_refs = {model["raw_model_ref"] for model in reloaded["models"]}
+    reloaded_validation = _route_get(
+        "/models/validate",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+        query={"model": ["hot_router/beta"]},
+    )
+
+    assert "hot_router/beta" in reloaded_refs
+    assert "hot_router/alpha" not in reloaded_refs
+    assert reloaded_validation["validation"]["known_catalog_entry"] is True
+    assert reloaded_validation["validation"]["executable"] is True
+    assert reloaded["metadata_only"] is True
+    assert reloaded["network_accessed"] is False
+    assert reloaded["credentials_included"] is False
+
+
+def test_model_provider_stable_api_routes_expose_settings_surface_without_execution(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Stable model API")
+
+    providers = _route_get("/providers", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    provider_id = "codex_cli"
+    provider = _route_get(f"/providers/{provider_id}", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    auth = _route_get("/provider/auth", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    models = _route_get("/models", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    opencode_models = _route_get("/api/catalog/model", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    model = _route_get(
+        "/models/codex_cli/gpt-5.5",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    opencode_model = _route_get(
+        "/api/catalog/model/codex_cli/gpt-5.5",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    validation = _route_get(
+        "/models/validate",
+        query={"model": ["codex_cli/gpt-5.5"]},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    selected = _route_post(
+        f"/sessions/{session.id}/model",
+        body={"raw_model_ref": "codex_cli/gpt-5.5"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    favorite = _route_post(
+        "/models/preferences/favorite",
+        body={"raw_model_ref": "codex_cli/gpt-5.5", "favorite": True},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    default = _route_post(
+        "/models/preferences/default",
+        body={"raw_model_ref": "codex_cli/gpt-5.5"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    preferences = _route_get(
+        "/models/preferences",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    providers_after_default = _route_get(
+        "/providers",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    models_after_default = _route_get(
+        "/models",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert any(item["provider_id"] == provider_id for item in providers["providers"])
+    assert provider["provider"]["provider_id"] == provider_id
+    assert any(item["provider_id"] == provider_id for item in auth["providers"])
+    assert "codex_cli/gpt-5.5" in {item["raw_model_ref"] for item in models["models"]}
+    assert opencode_models["models"] == models["models"]
+    assert model["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert opencode_model["model"] == model["model"]
+    assert opencode_model["validation"] == model["validation"]
+    assert model["provider_execution_started"] is False
+    assert opencode_model["provider_execution_started"] is False
+    assert model["model_execution_started"] is False
+    assert opencode_model["model_execution_started"] is False
+    assert validation["validation"]["executable"] is True
+    assert selected["session_model_selected"] is True
+    assert selected["provider_execution_started"] is False
+    assert selected["model_execution_started"] is False
+    assert favorite["preference"]["favorite"] is True
+    assert default["preference"]["is_default"] is True
+    assert preferences["default_preference"]["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert preferences["favorite_preferences"][0]["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert preferences["provider_execution_started"] is False
+    assert preferences["model_execution_started"] is False
+    assert preferences["credential_written"] is False
+    assert providers_after_default["all"] == providers_after_default["all_providers"]
+    assert providers_after_default["connected"] == providers_after_default["connected_providers"]
+    assert providers_after_default["default"]["provider_id"] == "codex_cli"
+    assert providers_after_default["default_provider"]["provider_id"] == "codex_cli"
+    assert providers_after_default["distinctions"]["default"] == "codex_cli"
+    assert "codex_cli" in providers_after_default["distinctions"]["connected"]
+    assert all(item["is_connected"] for item in providers_after_default["connected"])
+    assert all(item["is_blocked"] for item in providers_after_default["blocked"])
+    provider_by_id = {item["provider_id"]: item for item in providers_after_default["all"]}
+    assert provider_by_id["paid_openai_compatible"]["oauth_supported"] is True
+    assert "oauth" in provider_by_id["paid_openai_compatible"]["auth_methods"]
+    assert provider_by_id["codex_cli"]["oauth_supported"] is False
+    assert "codex_login" in provider_by_id["codex_cli"]["auth_methods"]
+    assert "paid_openai_compatible" in providers_after_default["oauth_supported_providers"]
+    assert providers_after_default["oauth_support"]["paid_openai_compatible"] is True
+    assert models_after_default["all"] == models_after_default["all_models"]
+    assert models_after_default["connected"] == models_after_default["connected_models"]
+    assert models_after_default["default"]["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert models_after_default["default_model"]["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert models_after_default["distinctions"]["default"] == "codex_cli/gpt-5.5"
+    assert "codex_cli/gpt-5.5" in models_after_default["distinctions"]["connected"]
+    assert all(item["is_connected"] for item in models_after_default["connected"])
+    assert all(item["is_blocked"] for item in models_after_default["blocked"])
+    assert {item["raw_model_ref"] for item in models_after_default["models"]} == set(models_after_default["distinctions"]["all"])
+    assert models_after_default["default"]["favorite"] is True
+    assert models_after_default["default"]["is_default"] is True
+    default_model = models_after_default["default"]
+    assert default_model["provider_oauth_supported"] is False
+    assert "codex_login" in default_model["provider_auth_methods"]
+    assert "paid_openai_compatible" in models_after_default["oauth_supported_providers"]
+    assert models_after_default["oauth_support"]["paid_openai_compatible"] is True
+    assert store.get_session(session.id).raw_model_ref == "codex_cli/gpt-5.5"
+
+
+def test_models_get_returns_one_model_or_suggestions(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Suggestion API")
+
+    known = _route_get(
+        "/models/codex_cli/gpt-5.5",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    unknown_model = _route_get(
+        "/models/codex_cli/not-a-real-model",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    unknown_provider_model = _route_get(
+        "/models/missing/gpt-5.5",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    unknown_provider = _route_get(
+        "/providers/missing",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    validation = _route_get(
+        "/models/validate",
+        query={"model": ["codex_cli/not-a-real-model"]},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    selected = _route_post(
+        f"/sessions/{session.id}/model",
+        body={"raw_model_ref": "codex_cli/not-a-real-model"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert known["ok"] is True
+    assert known["model"]["raw_model_ref"] == "codex_cli/gpt-5.5"
+    assert unknown_model["ok"] is False
+    assert unknown_model["error_code"] == "model_unknown"
+    assert unknown_model["model"] is None
+    assert unknown_model["validation"]["blocked_reasons"] == ["model_unknown"]
+    assert unknown_model["suggestion_only"] is True
+    assert unknown_model["suggestions"]
+    assert all(item["suggestion_only"] is True for item in unknown_model["suggestions"])
+    assert all(item["selected_model"] is False for item in unknown_model["suggestions"])
+    assert all(item["provider_execution_started"] is False for item in unknown_model["suggestions"])
+    assert "codex_cli/gpt-5.5" in {item["raw_model_ref"] for item in unknown_model["suggestions"]}
+    assert unknown_provider_model["ok"] is False
+    assert unknown_provider_model["validation"]["blocked_reasons"] == ["provider_unknown", "model_unknown"]
+    assert unknown_provider_model["provider_suggestions"]
+    assert all(item["suggestion_only"] is True for item in unknown_provider_model["provider_suggestions"])
+    assert unknown_provider["ok"] is False
+    assert unknown_provider["error_code"] == "provider_unknown"
+    assert unknown_provider["provider"] is None
+    assert unknown_provider["provider_suggestions"]
+    assert validation["ok"] is False
+    assert validation["suggestions"]
+    assert validation["validation"]["suggestions"] == validation["suggestions"]
+    assert selected["ok"] is False
+    assert selected["session_model_selected"] is False
+    assert selected["suggestions"]
+    assert selected["model_validation"]["suggestions"] == selected["suggestions"]
+    assert store.get_session(session.id).raw_model_ref is None
+    assert selected["provider_execution_started"] is False
+    assert selected["model_execution_started"] is False
+    assert selected["hidden_model_fallback"] is False
 
 
 def test_harness_serve_openapi_cli_outputs_checked_contract(tmp_path) -> None:
@@ -703,7 +1100,8 @@ def test_local_server_routes_require_token_and_return_store_projections(tmp_path
     assert provider_auth["schema_version"] == "harness.provider_auth_methods/v1"
     assert provider_auth["credentials_included"] is False
     assert provider_auth["permission_granting"] is False
-    assert all(method["oauth_supported"] is False for method in provider_auth["providers"])
+    assert provider_auth["credentials_included"] is False
+    assert any(method["oauth_supported"] is True for method in provider_auth["providers"])
     assert api_providers["providers"] == providers["providers"]
     assert api_provider["provider"]["provider_id"] == first_provider_id
     assert api_provider["credentials_included"] is False
@@ -799,7 +1197,8 @@ def test_local_server_routes_require_token_and_return_store_projections(tmp_path
     assert "\x1b[" not in sse
     assert "\x1b[" not in global_sse
     serialized = json.dumps([config, global_config, path_info, projects, current_project, vcs, vcs_status, vcs_diff, lifecycle, mdns, agents, artifacts, files, file_content, file_status, references, instructions, symbols, diagnostics, formatters, mcp_status, mcp_resources, plugins, skills, web_tools, extensions, web_client, worktrees, dev_loop, workspaces, workspace_adapters, workspace_status, workspace_clients, pty_sessions, pty_shells, distribution, packaging_smoke, desktop, version_check, tui_settings, command_alias, commands, providers, provider_auth, models, sessions, sessions_status, inspected, events, global_events, session_status, session_children, replay, messages, permissions, permission_snapshot, diffs, share])
-    assert "api_key" not in serialized
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in serialized
+    assert '"api_key":' not in serialized
     assert "ollama" not in serialized
     assert "server artifact body" not in serialized
 
@@ -1465,6 +1864,134 @@ def test_local_server_real_http_errors_are_shaped_and_bounded(tmp_path) -> None:
         not_found = _http_error_json(not_found_error.value)
         assert not_found["status"] == 404
         assert not_found["error_code"] == "not_found"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_provider_auth_routes_require_local_server_auth(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    session = SQLiteStore(tmp_path).create_session(title="Protected model routes")
+    server = create_local_http_server(tmp_path, host="127.0.0.1", port=0, token="model-token")
+    host, port = server.server_address
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://{host}:{port}"
+
+    protected_routes: list[tuple[str, str, dict[str, object] | None]] = [
+        ("GET", "/providers", None),
+        ("GET", "/providers/codex_cli", None),
+        ("GET", "/provider/auth", None),
+        ("GET", "/models", None),
+        ("GET", "/models/codex_cli/gpt-5.5", None),
+        ("GET", "/models/validate?model=codex_cli/gpt-5.5", None),
+        ("GET", "/models/preferences", None),
+        (
+            "POST",
+            "/provider/paid_openai_compatible/auth/api-key",
+            {"api_key": "sk-unauthorized-secret", "description": "should not persist"},
+        ),
+        (
+            "POST",
+            "/provider/paid_openai_compatible/oauth/authorize",
+            {"scopes": "models.read", "code_verifier": "unauthorized-verifier"},
+        ),
+        (
+            "POST",
+            f"/sessions/{session.id}/model",
+            {"raw_model_ref": "codex_cli/gpt-5.5"},
+        ),
+        (
+            "POST",
+            "/models/preferences/favorite",
+            {"raw_model_ref": "codex_cli/gpt-5.5", "favorite": True},
+        ),
+        (
+            "POST",
+            "/models/preferences/default",
+            {"raw_model_ref": "codex_cli/gpt-5.5"},
+        ),
+        ("DELETE", "/provider/paid_openai_compatible/auth", None),
+    ]
+
+    def _assert_unauthorized(method: str, path: str, body: dict[str, object] | None, *, token: str | None) -> None:
+        with pytest.raises(HTTPError) as error:
+            _http_json(f"{base_url}{path}", method=method, token=token, body=body)
+        payload = _http_error_json(error.value)
+        assert error.value.code == 401
+        assert payload["schema_version"] == "harness.local_server_error/v1"
+        assert payload["status"] == 401
+        assert payload["error_code"] == "unauthorized"
+        assert payload["permission_granting"] is False
+        assert "sk-unauthorized-secret" not in json.dumps(payload, sort_keys=True)
+
+    try:
+        for method, path, body in protected_routes:
+            _assert_unauthorized(method, path, body, token=None)
+            _assert_unauthorized(method, path, body, token="wrong-token")
+
+        store_after_denials = SQLiteStore(tmp_path)
+        assert store_after_denials.active_provider_account("paid_openai_compatible") is None
+        assert store_after_denials.get_session(session.id).raw_model_ref is None
+        assert store_after_denials.list_model_preferences() == []
+
+        providers = _http_json(f"{base_url}/providers", token="model-token")
+        provider = _http_json(f"{base_url}/providers/codex_cli", token="model-token")
+        auth = _http_json(f"{base_url}/provider/auth", token="model-token")
+        model = _http_json(f"{base_url}/models/codex_cli/gpt-5.5", token="model-token")
+        unknown = _http_json(f"{base_url}/models/codex_cli/not-a-real-model", token="model-token")
+        favorite = _http_json(
+            f"{base_url}/models/preferences/favorite",
+            method="POST",
+            token="model-token",
+            body={"raw_model_ref": "codex_cli/gpt-5.5", "favorite": True},
+        )
+        default = _http_json(
+            f"{base_url}/models/preferences/default",
+            method="POST",
+            token="model-token",
+            body={"raw_model_ref": "codex_cli/gpt-5.5"},
+        )
+        selected = _http_json(
+            f"{base_url}/sessions/{session.id}/model",
+            method="POST",
+            token="model-token",
+            body={"raw_model_ref": "codex_cli/gpt-5.5"},
+        )
+        connected = _http_json(
+            f"{base_url}/provider/paid_openai_compatible/auth/api-key",
+            method="POST",
+            token="model-token",
+            body={"api_key": "sk-authorized-secret", "description": "authorized test"},
+        )
+        deleted = _http_json(
+            f"{base_url}/provider/paid_openai_compatible/auth",
+            method="DELETE",
+            token="model-token",
+        )
+
+        assert providers["schema_version"] == "harness.providers/v1"
+        assert providers["credentials_included"] is False
+        assert provider["provider"]["provider_id"] == "codex_cli"
+        assert auth["schema_version"] == "harness.provider_auth_methods/v1"
+        assert auth["credentials_included"] is False
+        assert model["ok"] is True
+        assert model["model"]["raw_model_ref"] == "codex_cli/gpt-5.5"
+        assert unknown["ok"] is False
+        assert unknown["suggestions"]
+        assert favorite["preference"]["favorite"] is True
+        assert default["preference"]["is_default"] is True
+        assert selected["session_model_selected"] is True
+        assert connected["account_created"] is True
+        assert connected["credentials_included"] is False
+        assert connected["credential_value_included"] is False
+        assert "sk-authorized-secret" not in json.dumps(connected, sort_keys=True)
+        assert deleted["account_deleted"] is True
+        assert deleted["credential_removed"] is True
+        store_after_success = SQLiteStore(tmp_path)
+        assert store_after_success.get_session(session.id).raw_model_ref == "codex_cli/gpt-5.5"
+        assert store_after_success.active_provider_account("paid_openai_compatible") is None
     finally:
         server.shutdown()
         server.server_close()
@@ -2718,8 +3245,7 @@ def test_local_server_provider_oauth_routes_fail_closed(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     cfg = load_config(tmp_path)
 
-    providers = _route_get("/provider", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
-    provider_id = providers["providers"][0]["provider_id"]
+    provider_id = "codex_cli"
     authorized = _route_post(
         f"/provider/{provider_id}/oauth/authorize",
         body={"redirect": "http://127.0.0.1/callback"},
@@ -2752,6 +3278,145 @@ def test_local_server_provider_oauth_routes_fail_closed(tmp_path) -> None:
     assert callback["action"] == "callback"
     assert callback["network_called"] is False
     assert callback["credentials_stored"] is False
+
+
+def test_provider_auth_methods_projection_lists_supported_methods(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+
+    projection = _route_get("/provider/auth", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    assert projection["schema_version"] == "harness.provider_auth_methods/v1"
+    assert projection["credentials_included"] is False
+    assert projection["provider_execution_started"] is False
+    assert "oauth" in projection["auth_methods"]
+    assert "paid_openai_compatible" in projection["oauth_supported_providers"]
+    assert projection["oauth_support"]["paid_openai_compatible"] is True
+    assert projection["credential_write_support"]["paid_openai_compatible"] is True
+    providers = {provider["provider_id"]: provider for provider in projection["providers"]}
+    openai_methods = {method["method"]: method for method in providers["paid_openai_compatible"]["methods"]}
+    bedrock_methods = {method["method"]: method for method in providers["bedrock"]["methods"]}
+    codex_methods = {method["method"]: method for method in providers["codex_cli"]["methods"]}
+    assert openai_methods["api_key"]["supported"] is True
+    assert openai_methods["api_key"]["secret_value_required"] is True
+    assert openai_methods["env"]["supported"] is True
+    assert openai_methods["env"]["default_env_var"] == "OPENAI_API_KEY"
+    assert openai_methods["oauth"]["supported"] is True
+    assert openai_methods["oauth"]["oauth_supported"] is True
+    assert bedrock_methods["aws_profile"]["supported"] is True
+    assert bedrock_methods["aws_env"]["supported"] is True
+    assert codex_methods["codex_login"]["supported"] is True
+    assert all(method["credential_value_included"] is False for provider in providers.values() for method in provider["methods"])
+
+
+def test_server_provider_api_key_connect_redacts_secret(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+
+    result = _route_post(
+        "/provider/paid_openai_compatible/auth/api-key",
+        body={"api_key": "sk-test-secret", "description": "server test"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert result["schema_version"] == "harness.provider_auth_action/v1"
+    assert result["ok"] is True
+    assert result["provider_id"] == "paid_openai_compatible"
+    assert result["action"] == "api_key"
+    assert result["account_created"] is True
+    assert result["account_activated"] is True
+    assert result["credential_written"] is True
+    assert result["credential_value_included"] is False
+    assert result["credentials_included"] is False
+    assert result["provider_execution_started"] is False
+    assert result["model_execution_started"] is False
+    assert result["network_accessed"] is False
+    assert result["active_model_changed"] is False
+    assert "sk-test-secret" not in json.dumps(result, sort_keys=True)
+    account = store.active_provider_account("paid_openai_compatible")
+    assert account is not None
+    assert account["account_id"] == result["account_id"]
+    assert "sk-test-secret" not in json.dumps(account, sort_keys=True)
+    assert read_provider_account_secret(tmp_path, account) == "sk-test-secret"
+
+
+def test_oauth_authorize_returns_browser_or_code_method_without_secret_leakage(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+
+    result = _route_post(
+        "/provider/paid_openai_compatible/oauth/authorize",
+        body={"scopes": "models.read completions.write", "code_verifier": "secret-verifier"},
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert result["schema_version"] == "harness.provider_oauth_action/v1"
+    assert result["ok"] is True
+    assert result["provider_id"] == "paid_openai_compatible"
+    assert result["oauth_supported"] is True
+    assert result["method"] == "manual_code"
+    assert result["manual_code_required"] is True
+    assert result["browser_opened"] is False
+    assert result["network_called"] is False
+    assert result["credentials_stored"] is False
+    assert result["credential_value_included"] is False
+    assert result["credentials_included"] is False
+    assert result["pkce"]["code_challenge_method"] == "S256"
+    assert result["pkce"]["code_verifier_included"] is False
+    assert "secret-verifier" not in json.dumps(result, sort_keys=True)
+
+
+def test_oauth_callback_stores_redacted_account(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+
+    result = _route_post(
+        "/provider/paid_openai_compatible/oauth/callback",
+        body={
+            "access_token": "oauth-access-secret",
+            "refresh_token": "oauth-refresh-secret",
+            "expires_in": 3600,
+            "scopes": ["models.read"],
+        },
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    serialized = json.dumps(result, sort_keys=True)
+    assert result["schema_version"] == "harness.provider_auth_action/v1"
+    assert result["ok"] is True
+    assert result["action"] == "oauth_callback"
+    assert result["account_created"] is True
+    assert result["credential_source"] == "provider_account_oauth_secret_store"
+    assert result["credential_value_included"] is False
+    assert result["credentials_included"] is False
+    assert result["provider_execution_started"] is False
+    assert result["model_execution_started"] is False
+    assert "oauth-access-secret" not in serialized
+    assert "oauth-refresh-secret" not in serialized
+    account = store.active_provider_account("paid_openai_compatible")
+    assert account is not None
+    assert account["credential_kind"] == "oauth"
+    assert account["expires_at"]
+    assert read_provider_oauth_tokens(tmp_path, account) == {
+        "access_token": "oauth-access-secret",
+        "refresh_token": "oauth-refresh-secret",
+    }
 
 
 def test_local_server_control_config_project_and_session_shell_routes_fail_closed(tmp_path) -> None:
@@ -4380,6 +5045,243 @@ def test_local_server_projects_plugin_config_without_loading_plugins(tmp_path) -
     assert reviewer["filesystem_modified"] is False
     assert reviewer["network_called"] is False
     assert reviewer["permission_granting"] is False
+
+
+def test_plugin_provider_hook_cannot_run_network_during_catalog_projection(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    plugin_dir = tmp_path / "plugins" / "model-router"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "model-router",
+                "harness": {
+                    "provider_hooks": [
+                        {
+                            "hook_id": "router_hook",
+                            "provider_id": "plugin_router",
+                            "display_name": "Plugin Router",
+                            "protocol": "openai_chat",
+                            "data_boundary": "external_router",
+                            "endpoint": "https://router.example.invalid/v1",
+                            "credential": {"kind": "env", "env_var": "PLUGIN_ROUTER_KEY"},
+                            "models": {"router-model": {"api_id": "remote/router-model"}},
+                            "safe_metadata_only": False,
+                            "safety_notes": ["Manifest metadata only; runtime loader remains disabled."],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["plugins"] = {
+        "enabled": True,
+        "project": {
+            "model_router": {
+                "enabled": True,
+                "path": "plugins/model-router",
+                "spec": "./plugins/model-router",
+                "entrypoint": "plugin.json",
+                "description": "Model router hook fixture",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+
+    plugins = _route_get("/plugins", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    models = _route_get("/models", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    project_plugin = next(plugin for plugin in plugins["plugins"] if plugin["name"] == "model_router")
+    hook = project_plugin["provider_hooks"][0]
+
+    assert plugins["provider_hook_supported"] is True
+    assert plugins["provider_hook_count"] >= 1
+    assert plugins["provider_registered"] is False
+    assert plugins["runtime_loaded"] is False
+    assert plugins["network_called"] is False
+    assert project_plugin["provider_hook_count"] == 1
+    assert project_plugin["provider_registered"] is False
+    assert project_plugin["runtime_loaded"] is False
+    assert project_plugin["network_called"] is False
+    assert project_plugin["provider_hook_interface"]["metadata_only"] is True
+    assert project_plugin["provider_hook_interface"]["runtime_loaded"] is False
+    assert project_plugin["provider_hook_interface"]["provider_registered"] is False
+    assert project_plugin["provider_hook_interface"]["model_discovery_started"] is False
+    assert project_plugin["provider_hook_interface"]["network_called"] is False
+    assert hook["schema_version"] == "harness.plugin_provider_hook/v1"
+    assert hook["provider_id"] == "plugin_router"
+    assert hook["protocol"] == "openai_chat"
+    assert hook["data_boundary"] == "external_router"
+    assert hook["endpoint_configured"] is True
+    assert hook["credential_kind"] == "env"
+    assert hook["model_count"] == 1
+    assert hook["runtime_loaded"] is False
+    assert hook["provider_registered"] is False
+    assert hook["provider_execution_started"] is False
+    assert hook["model_discovery_started"] is False
+    assert hook["network_called"] is False
+    assert hook["credentials_included"] is False
+    assert "plugin_origin_review_required" in hook["blocked_reasons"]
+    assert "plugin_runtime_load_disabled" in hook["blocked_reasons"]
+    assert "plugin_router/router-model" not in {model["raw_model_ref"] for model in models["models"]}
+    assert models["metadata_only"] is True
+    assert models["network_accessed"] is False
+    assert models["credentials_included"] is False
+    serialized = json.dumps(plugins)
+    assert "https://router.example.invalid/v1" not in serialized
+    assert "PLUGIN_ROUTER_KEY" not in serialized
+
+
+def test_plugin_provider_hook_requires_declared_runtime_contract(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    plugin_dir = tmp_path / "plugins" / "incomplete-router"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "incomplete-router",
+                "harness": {
+                    "provider_hooks": [
+                        {
+                            "provider_id": "incomplete_router",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["plugins"] = {
+        "enabled": True,
+        "project": {
+            "incomplete_router": {
+                "enabled": True,
+                "path": "plugins/incomplete-router",
+                "spec": "./plugins/incomplete-router",
+                "entrypoint": "plugin.json",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+
+    plugins = _route_get("/plugins", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    project_plugin = next(plugin for plugin in plugins["plugins"] if plugin["name"] == "incomplete_router")
+    interface = project_plugin["provider_hook_interface"]
+    hook = project_plugin["provider_hooks"][0]
+
+    assert interface["provider_hook_count"] == 1
+    assert interface["metadata_only"] is True
+    assert interface["runtime_loaded"] is False
+    assert interface["provider_registered"] is False
+    assert interface["network_called"] is False
+    assert "plugin_provider_hook_invalid" in interface["blocked_reasons"]
+    assert {
+        "provider_hook_protocol_missing:incomplete_router:incomplete_router",
+        "provider_hook_data_boundary_missing:incomplete_router:incomplete_router",
+        "provider_hook_endpoint_missing:incomplete_router:incomplete_router",
+        "provider_hook_credential_missing:incomplete_router:incomplete_router",
+        "provider_hook_models_missing:incomplete_router:incomplete_router",
+        "provider_hook_safety_notes_missing:incomplete_router:incomplete_router",
+    }.issubset(set(interface["validation_errors"]))
+    assert hook["provider_id"] == "incomplete_router"
+    assert hook["protocol"] is None
+    assert hook["data_boundary"] is None
+    assert hook["endpoint_configured"] is False
+    assert hook["credential_kind"] == "none"
+    assert hook["model_count"] == 0
+    assert hook["safety_notes"] == []
+    assert "plugin_provider_hook_invalid" in hook["blocked_reasons"]
+    assert hook["runtime_loaded"] is False
+    assert hook["provider_registered"] is False
+    assert hook["network_called"] is False
+    assert plugins["provider_registered"] is False
+    assert plugins["network_called"] is False
+
+
+def test_plugin_provider_hook_rejects_raw_secret_values_without_leakage(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    plugin_dir = tmp_path / "plugins" / "secret-router"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": "secret-router",
+                "harness": {
+                    "provider_hooks": [
+                        {
+                            "provider_id": "secret_router",
+                            "protocol": "openai_chat",
+                            "data_boundary": "external_router",
+                            "endpoint": "https://router.example.invalid/v1",
+                            "credential": {"kind": "api_key", "value": "sk-plugin-raw-secret"},
+                            "headers": {
+                                "Authorization": {"kind": "literal", "value": "Bearer raw-header-secret"},
+                                "X-Trace": {"kind": "env", "env_var": "PLUGIN_TRACE_HEADER"},
+                            },
+                            "models": {"router-model": {"api_id": "remote/router-model"}},
+                            "safe_metadata_only": True,
+                            "safety_notes": ["Manifest metadata only; runtime loader remains disabled."],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["plugins"] = {
+        "enabled": True,
+        "project": {
+            "secret_router": {
+                "enabled": True,
+                "path": "plugins/secret-router",
+                "spec": "./plugins/secret-router",
+                "entrypoint": "plugin.json",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+
+    plugins = _route_get("/plugins", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    models = _route_get("/models", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    project_plugin = next(plugin for plugin in plugins["plugins"] if plugin["name"] == "secret_router")
+    interface = project_plugin["provider_hook_interface"]
+    hook = project_plugin["provider_hooks"][0]
+    serialized = json.dumps({"plugins": plugins, "models": models})
+
+    assert {
+        "provider_hook_credential_value_not_allowed:secret_router:secret_router:value",
+        "provider_hook_header_must_use_env_ref:secret_router:secret_router:Authorization",
+    }.issubset(set(interface["validation_errors"]))
+    assert "plugin_provider_hook_invalid" in interface["blocked_reasons"]
+    assert "plugin_provider_hook_invalid" in hook["blocked_reasons"]
+    assert hook["credential_kind"] == "api_key"
+    assert hook["runtime_loaded"] is False
+    assert hook["provider_registered"] is False
+    assert hook["provider_execution_started"] is False
+    assert hook["model_discovery_started"] is False
+    assert hook["network_called"] is False
+    assert plugins["provider_registered"] is False
+    assert plugins["network_called"] is False
+    assert models["network_accessed"] is False
+    assert "secret_router/router-model" not in {model["raw_model_ref"] for model in models["models"]}
+    assert "sk-plugin-raw-secret" not in serialized
+    assert "raw-header-secret" not in serialized
+    assert "PLUGIN_TRACE_HEADER" not in serialized
 
 
 def test_local_server_projects_skill_config_without_loading_skills(tmp_path) -> None:

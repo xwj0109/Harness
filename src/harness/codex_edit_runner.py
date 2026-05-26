@@ -83,6 +83,7 @@ class CodexCodeEditRunner:
         task_type: str,
         approval: ApprovalProfile | None,
         keep_isolation: bool = False,
+        allow_dirty_isolation: bool = False,
     ) -> dict[str, Any]:
         if approval is None:
             raise HostedBoundaryApprovalRequired(
@@ -106,6 +107,7 @@ class CodexCodeEditRunner:
             task_type=task_type,
             approval=approval,
             keep_isolation=keep_isolation,
+            allow_dirty_isolation=allow_dirty_isolation,
         )
 
     def run_existing(
@@ -115,6 +117,7 @@ class CodexCodeEditRunner:
         task_type: str,
         approval: ApprovalProfile,
         keep_isolation: bool = False,
+        allow_dirty_isolation: bool = False,
     ) -> dict[str, Any]:
         self.store.get_run(run_id)
         paths = self.store.initialize_run_artifacts(run_id)
@@ -128,6 +131,7 @@ class CodexCodeEditRunner:
                 "approval_id": approval.id,
                 "active_repo_write": "forbidden_until_apply_back_approval",
                 "isolated_workspace": "required",
+                "dirty_isolation_allowed": allow_dirty_isolation,
             },
             message="Resolved Codex edit policy.",
             redaction_state=RedactionState.NOT_REQUIRED,
@@ -153,7 +157,7 @@ class CodexCodeEditRunner:
         unified_diff_path = run_dir / "isolated_unified_diff.patch"
         diff_stat_path = run_dir / "isolated_diff_stat.txt"
         try:
-            workspace = self.isolation_manager.create(self.project_root)
+            workspace = self.isolation_manager.create(self.project_root, allow_dirty=allow_dirty_isolation)
             workspace.baseline_manifest.write_json(manifest_path)
             for kind, path in {
                 "baseline_manifest": manifest_path,
@@ -174,6 +178,7 @@ class CodexCodeEditRunner:
                     "agents_md_exists": workspace.agents_md_exists,
                     "warnings": workspace.warnings,
                     "active_pre_isolation_git_status": workspace.active_pre_isolation_git_status,
+                    "dirty_isolation_allowed": allow_dirty_isolation,
                 },
             )
             self.store.append_run_event(
@@ -183,6 +188,8 @@ class CodexCodeEditRunner:
                     "isolated_workspace": str(workspace.path),
                     "strategy": workspace.strategy,
                     "active_repo_write": "forbidden_until_apply_back_approval",
+                    "dirty_isolation_allowed": allow_dirty_isolation,
+                    "warnings": workspace.warnings,
                 },
                 message="Prepared isolated workspace.",
             )
@@ -358,6 +365,7 @@ class CodexCodeEditRunner:
             "isolation_strategy": workspace.strategy,
             "isolated_workspace": str(workspace.path),
             "isolation_cleanup_status": cleanup_status,
+            "isolation_warnings": workspace.warnings,
             "changed_files": diff_result.changed_files,
             "policy_violations": [violation.to_dict() for violation in diff_result.violations],
             "ignored_generated_artifacts": diff_result.ignored_generated_artifacts,
@@ -594,6 +602,7 @@ class CodexCodeEditRunner:
             f"- Isolation strategy: {workspace.strategy}",
             f"- Isolated workspace: {workspace.path}",
             f"- Isolation cleanup status: {cleanup_status}",
+            f"- Isolation warnings: {workspace.warnings}",
             f"- AGENTS.md exists: {workspace.agents_md_exists}",
             f"- Active pre-isolation git status: {workspace.active_pre_isolation_git_status!r}",
             f"- Codex exit status: {result.exit_status}",

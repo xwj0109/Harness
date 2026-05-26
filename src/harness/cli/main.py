@@ -49,13 +49,21 @@ from harness.backends.local_openai import LocalEndpointUnavailable, LocalOpenAIC
 from harness.capabilities import build_capability_catalog, get_capability
 from harness.chat import chat_context, run_autonomous_read_loop, run_chat_loop
 from harness.command_catalog import build_command_catalog, command_action_unsupported
-from harness.config import HARNESS_DIR, default_config, load_config, write_default_config
+from harness.config import (
+    HARNESS_DIR,
+    CustomModelsConfigError,
+    custom_models_config_path,
+    default_config,
+    load_config,
+    validate_custom_models_config,
+    write_default_config,
+)
 from harness.context_chunks import (
     rebuild_artifact_metadata_context_chunks,
     rebuild_memory_context_chunks,
     rebuild_repo_file_context_chunks,
 )
-from harness.core_service import HarnessCoreService
+from harness.core_service import HarnessCoreService, HarnessHTTPAppService, HarnessHTTPServiceError
 from harness.core_projection import (
     build_core_evidence_bundle,
     build_core_blocked_state_projection,
@@ -148,6 +156,9 @@ from harness.memory.sqlite_store import (
     is_missing_session_schema_error,
 )
 from harness.model_catalog import catalog_projection_evidence, list_model_catalog, list_provider_catalog, validate_model_selection
+from harness.model_discovery import ModelDiscoveryError, list_cached_discovered_models, refresh_model_discovery
+from harness.provider_auth import provider_oauth_callback, write_provider_account_secret
+from harness.protocol_adapters import build_default_protocol_adapter_registry, protocol_adapter_missing_error
 from harness.models import (
     EventStreamType,
     KillSwitchTargetKind,
@@ -240,6 +251,7 @@ dev_app = typer.Typer(help="Phase 1A development diagnostics.")
 backends_app = typer.Typer(help="Configured backend metadata and preflight checks.", invoke_without_command=True)
 providers_app = typer.Typer(help="Provider catalog metadata without credential disclosure.")
 models_app = typer.Typer(help="Model catalog metadata without provider fallback.")
+models_config_app = typer.Typer(help="Project-local model/provider config validation.")
 mcp_app = typer.Typer(help="MCP configuration diagnostics without connecting to servers.")
 plugins_app = typer.Typer(help="Plugin discovery diagnostics without loading plugins.")
 skills_app = typer.Typer(help="Skill discovery diagnostics without loading skill bodies.")
@@ -298,6 +310,7 @@ app.add_typer(dev_app, name="dev")
 app.add_typer(backends_app, name="backends")
 app.add_typer(providers_app, name="providers")
 app.add_typer(models_app, name="models")
+models_app.add_typer(models_config_app, name="config")
 app.add_typer(mcp_app, name="mcp")
 app.add_typer(plugins_app, name="plugins")
 app.add_typer(skills_app, name="skills")
@@ -407,7 +420,9 @@ def main(
         bool,
         typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
     ] = False,
-    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "manual",
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "supervised-codex",
+    server_url: Annotated[str | None, typer.Option("--server-url", help="Attach the TUI to an existing Harness local server.")] = None,
+    token: Annotated[str | None, typer.Option("--token", help="Bearer token for --server-url.")] = None,
 ) -> None:
     """Launch the unified Harness app when no subcommand is provided."""
 
@@ -428,10 +443,16 @@ def main(
                 autonomy_profile_id=autonomy_profile,
             )
         )
+    if not server_url:
+        if codex_like:
+            _run_unified_app(project_root, codex_like=True, autonomy_profile_id=autonomy_profile)
+        else:
+            _run_unified_app(project_root, autonomy_profile_id=autonomy_profile)
+        raise typer.Exit()
     if codex_like:
-        _run_unified_app(project_root, codex_like=True)
+        _run_unified_app(project_root, codex_like=True, server_url=server_url, token=token, autonomy_profile_id=autonomy_profile)
     else:
-        _run_unified_app(project_root)
+        _run_unified_app(project_root, server_url=server_url, token=token, autonomy_profile_id=autonomy_profile)
     raise typer.Exit()
 
 
@@ -524,8 +545,19 @@ def foreground_prompt(
 
 
 @app.command("tui", hidden=True)
-def tui(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+def tui(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    autonomous: Annotated[
+        bool,
+        typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
+    ] = False,
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "supervised-codex",
+    server_url: Annotated[str | None, typer.Option("--server-url", help="Attach the TUI to an existing Harness local server.")] = None,
+    token: Annotated[str | None, typer.Option("--token", help="Bearer token for --server-url.")] = None,
+) -> None:
     project_root = resolve_project_root(project)
+    autonomy_profile = _resolve_autonomy_profile_option(autonomous, autonomy)
     if output == OutputFormat.JSON:
         payload = chat_context(project_root)
         payload["schema_version"] = TUI_SCHEMA_VERSION
@@ -533,7 +565,10 @@ def tui(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.
         payload["launched"] = False
         _emit_json(payload)
         return
-    _run_unified_app(project_root)
+    if not server_url:
+        _run_unified_app(project_root, autonomy_profile_id=autonomy_profile)
+        return
+    _run_unified_app(project_root, server_url=server_url, token=token, autonomy_profile_id=autonomy_profile)
 
 
 @app.command("chat", hidden=True)
@@ -549,7 +584,9 @@ def chat(
         bool,
         typer.Option("--autonomous", help="Use the safe-local autonomy profile for eligible action contracts."),
     ] = False,
-    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "manual",
+    autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id for chat action contracts.")] = "supervised-codex",
+    server_url: Annotated[str | None, typer.Option("--server-url", help="Attach the TUI to an existing Harness local server.")] = None,
+    token: Annotated[str | None, typer.Option("--token", help="Bearer token for --server-url.")] = None,
 ) -> None:
     """Compatibility alias for the unified Harness app."""
 
@@ -569,10 +606,16 @@ def chat(
             payload={"entrypoint": "harness chat"},
         )
     if not plain:
+        if not server_url:
+            if codex_like:
+                _run_unified_app(project_root, codex_like=True, autonomy_profile_id=autonomy_profile)
+            else:
+                _run_unified_app(project_root, autonomy_profile_id=autonomy_profile)
+            return
         if codex_like:
-            _run_unified_app(project_root, codex_like=True)
+            _run_unified_app(project_root, codex_like=True, server_url=server_url, token=token, autonomy_profile_id=autonomy_profile)
         else:
-            _run_unified_app(project_root)
+            _run_unified_app(project_root, server_url=server_url, token=token, autonomy_profile_id=autonomy_profile)
         return
     try:
         raise typer.Exit(
@@ -2786,7 +2829,7 @@ def sessions_model(
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     store = SQLiteStore(project_root)
     try:
         store.get_session(session_id)
@@ -2803,6 +2846,18 @@ def sessions_model(
     )
     validation = validate_model_selection(cfg, raw_model_ref)
     validation_payload = validation.model_dump(mode="json")
+    if validation.executable:
+        store.record_model_selection(
+            raw_model_ref=raw_model_ref,
+            provider_id=validation.provider_id,
+            model_id=validation.model_id,
+            model_variant=validation.variant,
+            last_reasoning_effort=validation.resolved_model_selection.resolved_reasoning_effort
+            if validation.resolved_model_selection is not None
+            else None,
+            source="session_model_command",
+            metadata={"session_id": session.id},
+        )
     store.append_store_event(
         EventStreamType.SESSION,
         session.id,
@@ -3363,7 +3418,7 @@ def sessions_changed_files(
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     try:
         payload = _session_changed_files_projection(store, session_id, project_root, cfg.context_excludes)
     except KeyError as exc:
@@ -3399,7 +3454,7 @@ def sessions_snapshots(
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     try:
         payload = _session_snapshots_projection(
             store,
@@ -3443,7 +3498,7 @@ def sessions_revert_readiness(
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     store = SQLiteStore(project_root)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     try:
         payload = _session_revert_readiness_projection(
             store,
@@ -5386,7 +5441,7 @@ def backends_callback(
     if ctx.invoked_subcommand is not None:
         return
     project_root = resolve_project_root(project)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     if output == OutputFormat.JSON:
         _emit_json(
             {
@@ -5401,7 +5456,7 @@ def backends_callback(
 @backends_app.command("preflight")
 def backends_preflight(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     results = []
     for name, backend in cfg.backends.items():
         if name == "codex_cli":
@@ -5443,10 +5498,18 @@ def backends_preflight(project: ProjectOption = Path("."), output: OutputOption 
 def providers_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    cfg = load_config(project_root)
-    providers = list_provider_catalog(cfg)
-    models = list_model_catalog(cfg)
-    cache = SQLiteStore(project_root).replace_provider_model_catalog_cache(providers, models)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    if output == OutputFormat.JSON:
+        from harness.local_server import _provider_catalog_projection
+
+        _emit_json(_provider_catalog_projection(store, cfg))
+        return
+    provider_accounts = store.list_provider_accounts()
+    providers = list_provider_catalog(cfg, provider_accounts=provider_accounts)
+    base_models = list_model_catalog(cfg, provider_accounts=provider_accounts)
+    models = [*base_models, *list_cached_discovered_models(cfg, store)]
+    cache = store.replace_provider_model_catalog_cache(providers, base_models)
     payload = {
         "schema_version": "harness.providers/v1",
         "ok": True,
@@ -5476,10 +5539,13 @@ def providers_list(project: ProjectOption = Path("."), output: OutputOption = Ou
 def providers_status(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    cfg = load_config(project_root)
-    providers = list_provider_catalog(cfg)
-    models = list_model_catalog(cfg)
-    cache = SQLiteStore(project_root).replace_provider_model_catalog_cache(providers, models)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    provider_accounts = store.list_provider_accounts()
+    providers = list_provider_catalog(cfg, provider_accounts=provider_accounts)
+    base_models = list_model_catalog(cfg, provider_accounts=provider_accounts)
+    models = [*base_models, *list_cached_discovered_models(cfg, store)]
+    cache = store.replace_provider_model_catalog_cache(providers, base_models)
     payload = {
         "schema_version": "harness.providers_status/v1",
         "ok": True,
@@ -5502,29 +5568,83 @@ def providers_status(project: ProjectOption = Path("."), output: OutputOption = 
 @providers_app.command("login")
 def providers_login(
     provider_id: str,
+    credential_kind: Annotated[
+        str | None,
+        typer.Option("--credential-kind", help="Credential kind to record: env, static_local, api_key, codex_login, oauth, aws_env, or aws_profile."),
+    ] = None,
+    env_var: Annotated[str | None, typer.Option("--env-var", help="Environment variable used for env credentials.")] = None,
+    api_key: Annotated[str | None, typer.Option("--api-key", help="API key to store in the local 0600 provider secret store.")] = None,
+    access_token: Annotated[str | None, typer.Option("--access-token", help="OAuth access token for manual-code callback storage.")] = None,
+    refresh_token: Annotated[str | None, typer.Option("--refresh-token", help="OAuth refresh token for manual-code callback storage.")] = None,
+    expires_at: Annotated[str | None, typer.Option("--expires-at", help="OAuth access token expiry timestamp.")] = None,
+    scopes: Annotated[str | None, typer.Option("--scopes", help="OAuth scopes as a comma- or space-separated list.")] = None,
+    description: Annotated[str, typer.Option("--description", help="Redacted account description.")] = "default",
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     if provider_id not in cfg.backends:
         _emit_session_error(f"Provider not found: {provider_id}", output)
         raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    try:
+        if (credential_kind or "").strip() == "oauth" and (access_token or refresh_token):
+            oauth_result = provider_oauth_callback(
+                project_root,
+                store,
+                cfg,
+                provider_id,
+                {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_at": expires_at,
+                    "scopes": scopes,
+                    "description": description,
+                },
+            )
+            account = oauth_result["account"]
+            secret_write = oauth_result.get("secret_write") or {}
+        else:
+            account, secret_write = _create_provider_login_account(
+                store,
+                project_root,
+                provider_id,
+                cfg.backends[provider_id].settings,
+                credential_kind=credential_kind,
+                env_var=env_var,
+                api_key=api_key,
+                description=description,
+                prompt_for_api_key=output != OutputFormat.JSON,
+            )
+    except ValueError as exc:
+        _emit_session_error(str(exc), output)
+        raise typer.Exit(code=1) from exc
     payload = {
         "schema_version": "harness.provider_auth/v1",
-        "ok": False,
+        "ok": True,
         "provider_id": provider_id,
         "action": "login",
-        "error": "Provider login is not implemented yet; refusing to write credentials or call providers implicitly.",
+        "account": account,
+        "credential_status": account["status"],
+        "account_record_written": True,
+        "secret_write": secret_write,
+        "credential_written": bool(secret_write.get("credential_written", False)),
+        "credentials_included": False,
+        "network_accessed": False,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
         "permission_granting": False,
+        "authority_granting": False,
         "no_hidden_fallback": True,
     }
     if output == OutputFormat.JSON:
         _emit_json(payload)
-        raise typer.Exit(code=1)
-    typer.echo(payload["error"])
-    raise typer.Exit(code=1)
+        return
+    typer.echo(f"Provider account recorded: {provider_id} status={account['status']}")
 
 
 @providers_app.command("logout")
@@ -5539,20 +5659,118 @@ def providers_logout(
     if provider_id not in cfg.backends:
         _emit_session_error(f"Provider not found: {provider_id}", output)
         raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    accounts = store.list_provider_accounts(provider_id)
+    removed = [store.remove_provider_account(account["account_id"]) for account in accounts]
     payload = {
         "schema_version": "harness.provider_auth/v1",
-        "ok": False,
+        "ok": True,
         "provider_id": provider_id,
         "action": "logout",
-        "error": "Provider logout is not implemented yet; refusing to remove credentials or call providers implicitly.",
+        "removed_accounts": removed,
+        "removed_account_count": len(removed),
+        "credential_removed": bool(removed),
+        "credential_written": False,
+        "credentials_included": False,
+        "network_accessed": False,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
         "permission_granting": False,
+        "authority_granting": False,
         "no_hidden_fallback": True,
     }
     if output == OutputFormat.JSON:
         _emit_json(payload)
+        return
+    typer.echo(f"Provider accounts removed: {len(removed)}")
+
+
+@providers_app.command("accounts")
+def providers_accounts(
+    provider_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    if provider_id not in cfg.backends:
+        _emit_session_error(f"Provider not found: {provider_id}", output)
         raise typer.Exit(code=1)
-    typer.echo(payload["error"])
-    raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    accounts = store.list_provider_accounts(provider_id)
+    payload = {
+        "schema_version": "harness.provider_accounts/v1",
+        "ok": True,
+        "provider_id": provider_id,
+        "accounts": accounts,
+        "account_count": len(accounts),
+        "credentials_included": False,
+        "credential_written": False,
+        "network_accessed": False,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "permission_granting": False,
+        "authority_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["account", "provider", "kind", "status", "active", "description"])
+    for account in accounts:
+        _print_tsv_row(
+            [
+                account["account_id"],
+                account["provider_id"],
+                account["credential_kind"],
+                account["status"],
+                str(account["active"]),
+                account["description"],
+            ]
+        )
+
+
+@providers_app.command("activate-account")
+def providers_activate_account(
+    provider_id: str,
+    account_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    if provider_id not in cfg.backends:
+        _emit_session_error(f"Provider not found: {provider_id}", output)
+        raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    try:
+        account = store.activate_provider_account(provider_id, account_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.provider_auth/v1",
+        "ok": True,
+        "provider_id": provider_id,
+        "action": "activate_account",
+        "account": account,
+        "credential_written": False,
+        "credentials_included": False,
+        "network_accessed": False,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "permission_granting": False,
+        "authority_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Activated provider account: {account_id}")
 
 
 @models_app.command("list")
@@ -5571,14 +5789,50 @@ def models_list(
     if refresh:
         _emit_session_error("Model refresh is not implemented yet; refusing to call providers implicitly.", output)
         raise typer.Exit(code=1)
-    cfg = load_config(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
     if provider is not None and provider not in cfg.backends:
         _emit_session_error(f"Provider not found: {provider}", output)
         raise typer.Exit(code=1)
-    providers = list_provider_catalog(cfg)
-    all_models = list_model_catalog(cfg)
-    cache = SQLiteStore(project_root).replace_provider_model_catalog_cache(providers, all_models)
-    models = list_model_catalog(cfg, provider_id=provider)
+    store = SQLiteStore(project_root)
+    if output == OutputFormat.JSON:
+        from harness.local_server import _model_catalog_projection, _model_distinction_ref
+
+        payload = _model_catalog_projection(store, cfg)
+        if provider is not None:
+            models = [model for model in payload["models"] if model["provider_id"] == provider]
+            connected = [model for model in payload["connected"] if model["provider_id"] == provider]
+            blocked = [model for model in payload["blocked"] if model["provider_id"] == provider]
+            payload = {
+                **payload,
+                "models": models,
+                "all": models,
+                "connected": connected,
+                "blocked": blocked,
+                "all_models": models,
+                "connected_models": connected,
+                "blocked_models": blocked,
+                "default": payload["default"] if payload["default"] and payload["default"].get("provider_id") == provider else None,
+                "default_model": payload["default_model"]
+                if payload["default_model"] and payload["default_model"].get("provider_id") == provider
+                else None,
+                "distinctions": {
+                    **payload["distinctions"],
+                    "all": [_model_distinction_ref(model) for model in models],
+                    "connected": [_model_distinction_ref(model) for model in connected],
+                    "blocked": [_model_distinction_ref(model) for model in blocked],
+                    "default": _model_distinction_ref(payload["default"])
+                    if payload["default"] is not None and payload["default"].get("provider_id") == provider
+                    else None,
+                },
+            }
+        _emit_json(payload)
+        return
+    provider_accounts = store.list_provider_accounts()
+    providers = list_provider_catalog(cfg, provider_accounts=provider_accounts)
+    base_models = list_model_catalog(cfg, provider_accounts=provider_accounts)
+    all_models = [*base_models, *list_cached_discovered_models(cfg, store)]
+    cache = store.replace_provider_model_catalog_cache(providers, base_models)
+    models = [model for model in all_models if provider is None or model.provider_id == provider]
     payload = {
         "schema_version": "harness.models/v1",
         "ok": True,
@@ -5613,6 +5867,337 @@ def models_list(
     typer.echo("Model refs are explicit metadata; unavailable selections must fail visibly rather than fall back.")
 
 
+@models_app.command("preferences")
+def models_preferences(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    preferences = store.list_model_preferences()
+    payload = {
+        "schema_version": "harness.model_preferences/v1",
+        "ok": True,
+        "preferences": preferences,
+        "default": store.get_default_model_preference(),
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "credential_written": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "permission_granting": False,
+        "authority_granting": False,
+        "no_hidden_fallback": True,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["model", "favorite", "default", "selected", "count", "reasoning"])
+    for preference in preferences:
+        _print_tsv_row(
+            [
+                preference["raw_model_ref"],
+                str(preference["favorite"]),
+                str(preference["is_default"]),
+                preference["last_selected_at"] or "",
+                str(preference["selection_count"]),
+                preference["last_reasoning_effort"] or "",
+            ]
+        )
+
+
+@models_app.command("favorite")
+def models_favorite(
+    raw_model_ref: Annotated[str, typer.Argument(help="Explicit provider/model ref to mark as favorite.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _set_model_favorite(raw_model_ref, True, project=project, output=output)
+
+
+@models_app.command("unfavorite")
+def models_unfavorite(
+    raw_model_ref: Annotated[str, typer.Argument(help="Explicit provider/model ref to remove from favorites.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _set_model_favorite(raw_model_ref, False, project=project, output=output)
+
+
+@models_app.command("default")
+def models_default(
+    raw_model_ref: Annotated[str, typer.Argument(help="Explicit provider/model ref to mark as the default preference.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    validation = validate_model_selection(
+        cfg,
+        raw_model_ref,
+        model_overlays=list_cached_discovered_models(cfg, store),
+        provider_accounts=store.list_provider_accounts(),
+    )
+    if validation.matched_model is None:
+        _emit_session_error(f"Model ref is not present in the local catalog: {raw_model_ref}", output)
+        raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    preference = store.set_default_model_preference(
+        raw_model_ref,
+        provider_id=validation.provider_id,
+        model_id=validation.model_id,
+        model_variant=validation.variant,
+        source="models_default_command",
+    )
+    payload = _model_preference_update_payload("default", preference, validation.model_dump(mode="json"))
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Default model: {preference['raw_model_ref']}")
+
+
+@models_app.command("providers")
+def models_providers(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    providers = list_provider_catalog(cfg, provider_accounts=store.list_provider_accounts())
+    payload = {
+        "schema_version": "harness.models_providers/v1",
+        "ok": True,
+        "providers": [provider.model_dump(mode="json") for provider in providers],
+    }
+    payload.update(catalog_projection_evidence("models_providers_projection"))
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["provider", "kind", "enabled", "boundary", "credentials"])
+    for provider in providers:
+        _print_tsv_row(
+            [
+                provider.provider_id,
+                provider.kind.value,
+                str(provider.enabled),
+                provider.metadata.data_boundary.value,
+                provider.credential_status.value,
+            ]
+        )
+
+
+@models_app.command("refresh")
+def models_refresh(
+    provider_id: Annotated[str, typer.Argument(help="Provider/backend id to refresh explicitly.")],
+    approve_hosted: Annotated[
+        bool,
+        typer.Option("--approve-hosted", help="Allow hosted provider discovery after explicit operator approval."),
+    ] = False,
+    metadata_only: Annotated[
+        bool,
+        typer.Option("--metadata-only/--no-metadata-only", help="Keep refresh metadata-only; disabling fails closed because refresh cannot execute models."),
+    ] = True,
+    with_credentials: Annotated[
+        bool,
+        typer.Option("--with-credentials", help="Include runtime credentials for providers whose model-list API requires them."),
+    ] = False,
+    clear_cache: Annotated[
+        bool,
+        typer.Option("--clear-cache", help="Clear cached discovered models for this provider without provider network access."),
+    ] = False,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    if clear_cache:
+        cache = store.clear_discovered_model_catalog_cache(provider_id)
+        payload = {
+            "schema_version": "harness.model_discovery_cache_clear_result/v1",
+            "ok": True,
+            "provider_id": provider_id,
+            "cache": cache,
+            "source": "discovered",
+            "network_accessed": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+            return
+        typer.echo(f"Cleared discovered models: {cache['removed_count']}")
+        return
+    try:
+        result = refresh_model_discovery(
+            cfg,
+            provider_id,
+            store=store,
+            approve_hosted=approve_hosted,
+            metadata_only=metadata_only,
+            with_credentials=with_credentials,
+        )
+    except ModelDiscoveryError as exc:
+        payload = {
+            "schema_version": "harness.model_discovery_result/v1",
+            "ok": False,
+            "provider_id": exc.provider_id,
+            "error": str(exc),
+            "blocked_reasons": exc.blocked_reasons,
+            "source": "discovered",
+            "network_accessed": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(payload["error"])
+        raise typer.Exit(code=1)
+    payload = result.model_dump(mode="json")
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Provider: {provider_id}")
+    typer.echo(f"Discovered models: {result.model_count}")
+    typer.echo(f"Endpoint: {result.endpoint or ''}")
+    typer.echo(f"Network accessed: {result.network_accessed}")
+    for model in result.models:
+        typer.echo(f"- {model.raw_model_ref}")
+
+
+@models_config_app.command("validate")
+def models_config_validate(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        payload = validate_custom_models_config(project_root)
+    except CustomModelsConfigError as exc:
+        payload = {
+            "schema_version": "harness.custom_models_config_validation/v1",
+            "ok": False,
+            "path": str(exc.path),
+            "exists": exc.path.exists(),
+            "errors": exc.errors,
+            "validation_issues": exc.issues,
+            "metadata_only": True,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(f"Invalid model config: {custom_models_config_path(project_root)}")
+            for issue in exc.issues:
+                typer.echo(f"- {issue['code']} at {issue['path']}: {issue['message']} Fix: {issue['fix']}")
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Model config valid: {payload['path']}")
+    typer.echo(f"Providers: {payload['provider_count']}")
+    typer.echo(f"Models: {payload['model_count']}")
+
+
+@models_app.command("inspect")
+def models_inspect(
+    raw_model_ref: Annotated[str, typer.Argument(help="Raw provider/model reference to inspect.")],
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    validation = validate_model_selection(
+        cfg,
+        raw_model_ref,
+        model_overlays=list_cached_discovered_models(cfg, store),
+        provider_accounts=store.list_provider_accounts(),
+    )
+    payload = {
+        "schema_version": "harness.model_inspection/v1",
+        "ok": True,
+        "raw_model_ref": raw_model_ref,
+        "validation": validation.model_dump(mode="json"),
+        "model": validation.matched_model.model_dump(mode="json") if validation.matched_model is not None else None,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "no_hidden_fallback": True,
+        "permission_granting": False,
+        "authority_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Model: {raw_model_ref}")
+    typer.echo(f"Canonical: {validation.canonical_model_ref or '-'}")
+    typer.echo(f"Protocol: {validation.protocol or '-'}")
+    typer.echo(f"Executable: {validation.executable}")
+    if validation.blocked_reasons:
+        typer.echo(f"Blocked: {', '.join(validation.blocked_reasons)}")
+    typer.echo("Inspection is metadata-only; no provider call or fallback is performed.")
+
+
+@models_app.command("protocols")
+def models_protocols(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    registry = build_default_protocol_adapter_registry()
+    protocols = [
+        {
+            "protocol": protocol,
+            "registered": True,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "permission_granting": False,
+            "no_hidden_fallback": True,
+        }
+        for protocol in registry.list_protocols()
+    ]
+    payload = {
+        "schema_version": "harness.model_protocols/v1",
+        "ok": True,
+        "protocols": protocols,
+    }
+    payload.update(catalog_projection_evidence("models_protocols_projection"))
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_tsv(["protocol", "registered"])
+    for item in protocols:
+        _print_tsv_row([item["protocol"], str(item["registered"])])
+
+
 @models_app.command("validate")
 def models_validate(
     raw_model_ref: Annotated[str, typer.Argument(help="Raw provider/model reference to validate.")],
@@ -5621,8 +6206,14 @@ def models_validate(
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    cfg = load_config(project_root)
-    result = validate_model_selection(cfg, raw_model_ref)
+    cfg = _load_config_or_emit_custom_models_error(project_root, output)
+    store = SQLiteStore(project_root)
+    result = validate_model_selection(
+        cfg,
+        raw_model_ref,
+        model_overlays=list_cached_discovered_models(cfg, store),
+        provider_accounts=store.list_provider_accounts(),
+    )
     payload = {
         "schema_version": "harness.model_selection_validation_result/v1",
         "ok": result.executable,
@@ -8732,7 +9323,7 @@ def _emit_policy_error(message: str, output: OutputFormat) -> None:
 
 
 def _resolve_autonomy_profile_option(autonomous: bool, autonomy: str) -> str:
-    profile = "safe-local" if autonomous and autonomy == "manual" else autonomy
+    profile = "safe-local" if autonomous and autonomy in {"manual", "supervised-codex"} else autonomy
     try:
         get_builtin_autonomy_policy(profile)
     except KeyError as exc:
@@ -9073,14 +9664,29 @@ def _has_textual() -> bool:
     return importlib.util.find_spec("textual") is not None
 
 
-def _run_unified_app(project_root: Path, *, codex_like: bool = False) -> None:
+def _run_unified_app(
+    project_root: Path,
+    *,
+    codex_like: bool = False,
+    server_url: str | None = None,
+    token: str | None = None,
+    autonomy_profile_id: str = "supervised-codex",
+) -> None:
     if not _has_textual():
         typer.echo("Textual is not installed.")
         typer.echo(TUI_INSTALL_HINT)
         raise typer.Exit(code=1)
     from harness.tui import run_harness_app
 
-    run_harness_app(project_root, codex_like=codex_like)
+    app_service = None
+    if server_url:
+        resolved_token = token or os.environ.get("HARNESS_SERVER_TOKEN")
+        try:
+            app_service = HarnessHTTPAppService.from_attach(server_url, resolved_token)
+        except (ValueError, HarnessHTTPServiceError) as exc:
+            typer.echo(f"TUI attach failed: {exc}")
+            raise typer.Exit(code=1) from exc
+    run_harness_app(project_root, codex_like=codex_like, app_service=app_service, autonomy_profile_id=autonomy_profile_id)
 
 
 def _home_result(project_root: Path) -> dict:
@@ -9351,6 +9957,7 @@ def _doctor_result(project_root: Path, *, release: bool = False, repair: bool = 
         if config is not None:
             _doctor_backend_descriptors(checks, config)
             _doctor_sandbox_safety(checks, config)
+            _doctor_release_model_provider_gates(checks, config)
         _doctor_release_cli_metadata(checks)
         _doctor_release_runtime_state(checks, project_root)
     elif config is not None:
@@ -10001,6 +10608,78 @@ def _doctor_release_cli_metadata(checks: list[dict]) -> None:
     )
 
 
+def _doctor_release_model_provider_gates(checks: list[dict], config) -> None:
+    providers = list_provider_catalog(config)
+    models = list_model_catalog(config)
+    protocol_registry = build_default_protocol_adapter_registry()
+    protocols = protocol_registry.list_protocols()
+    missing_error = protocol_adapter_missing_error("not_registered")
+    expected_protocols = {
+        "anthropic_messages",
+        "bedrock_converse",
+        "codex_cli",
+        "google_generative",
+        "openai_chat",
+        "openai_codex_responses",
+        "openai_responses",
+    }
+    flags_ok = all(
+        provider.metadata_only
+        and not provider.provider_execution_started
+        and not provider.model_execution_started
+        and not provider.network_accessed
+        and not provider.credentials_included
+        and not provider.hidden_provider_fallback
+        and not provider.hidden_model_fallback
+        and provider.no_hidden_fallback
+        for provider in providers
+    ) and all(
+        model.metadata_only
+        and not model.provider_execution_started
+        and not model.model_execution_started
+        and not model.network_accessed
+        and not model.credentials_included
+        and not model.hidden_provider_fallback
+        and not model.hidden_model_fallback
+        and model.no_hidden_fallback
+        for model in models
+    )
+    protocol_coverage_ok = expected_protocols.issubset(set(protocols))
+    missing_protocol_blocks = (
+        missing_error.category.value == "configuration"
+        and missing_error.error_type == "ProtocolAdapterNotFound"
+        and missing_error.retryable is False
+        and missing_error.hidden_provider_fallback is False
+        and missing_error.no_hidden_fallback is True
+    )
+    checks_ok = flags_ok and protocol_coverage_ok and missing_protocol_blocks
+    _add_check(
+        checks,
+        "model_provider_release_gates",
+        "pass" if checks_ok else "fail",
+        "Model provider release gates passed." if checks_ok else "One or more model provider release gates failed.",
+        {
+            "provider_count": len(providers),
+            "model_count": len(models),
+            "registered_protocols": protocols,
+            "expected_protocols": sorted(expected_protocols),
+            "catalog_metadata_only": flags_ok,
+            "catalog_secret_values_included": False,
+            "picker_provider_calls_allowed": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": flags_ok,
+            "adapter_conformance_test_target": "tests/test_protocol_adapters.py tests/test_cross_provider_handoff.py",
+            "protocol_coverage_ok": protocol_coverage_ok,
+            "unregistered_protocol_blocks_before_execution": missing_protocol_blocks,
+        },
+    )
+
+
 def _doctor_release_runtime_state(checks: list[dict], project_root: Path) -> None:
     if not (project_root / HARNESS_DIR / "harness.sqlite").exists():
         _add_check(
@@ -10430,6 +11109,169 @@ def _parse_model_ref(raw_model_ref: str | None) -> dict[str, str | None]:
     elif ":" in model_id:
         model_id, variant = model_id.rsplit(":", 1)
     return {"provider_id": provider_id or None, "model_id": model_id or None, "model_variant": variant or None}
+
+
+def _set_model_favorite(raw_model_ref: str, favorite: bool, *, project: Path, output: OutputFormat) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    cfg = load_config(project_root)
+    validation = validate_model_selection(cfg, raw_model_ref)
+    if validation.matched_model is None:
+        _emit_session_error(f"Model ref is not present in the local catalog: {raw_model_ref}", output)
+        raise typer.Exit(code=1)
+    store = SQLiteStore(project_root)
+    preference = store.set_model_favorite(
+        raw_model_ref,
+        favorite,
+        provider_id=validation.provider_id,
+        model_id=validation.model_id,
+        model_variant=validation.variant,
+        source="models_favorite_command" if favorite else "models_unfavorite_command",
+    )
+    payload = _model_preference_update_payload(
+        "favorite" if favorite else "unfavorite",
+        preference,
+        validation.model_dump(mode="json"),
+    )
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    state = "Favorited" if favorite else "Unfavorited"
+    typer.echo(f"{state}: {preference['raw_model_ref']}")
+
+
+def _model_preference_update_payload(action: str, preference: dict, validation: dict) -> dict:
+    return {
+        "schema_version": "harness.model_preference_update/v1",
+        "ok": True,
+        "action": action,
+        "preference": preference,
+        "validation": validation,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_accessed": False,
+        "credentials_included": False,
+        "credential_written": False,
+        "hidden_provider_fallback": False,
+        "hidden_model_fallback": False,
+        "no_hidden_fallback": True,
+        "permission_granting": False,
+        "authority_granting": False,
+    }
+
+
+def _load_config_or_emit_custom_models_error(project_root: Path, output: OutputFormat):
+    try:
+        return load_config(project_root)
+    except CustomModelsConfigError as exc:
+        payload = {
+            "schema_version": "harness.custom_models_config_validation/v1",
+            "ok": False,
+            "path": str(exc.path),
+            "exists": exc.path.exists(),
+            "errors": exc.errors,
+            "validation_issues": exc.issues,
+            "metadata_only": True,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(f"Invalid model config: {exc.path}")
+            for issue in exc.issues:
+                typer.echo(f"- {issue['code']} at {issue['path']}: {issue['message']} Fix: {issue['fix']}")
+        raise typer.Exit(code=1) from exc
+
+
+def _create_provider_login_account(
+    store: SQLiteStore,
+    project_root: Path,
+    provider_id: str,
+    settings: dict,
+    *,
+    credential_kind: str | None,
+    env_var: str | None,
+    api_key: str | None,
+    description: str,
+    prompt_for_api_key: bool = False,
+) -> tuple[dict, dict]:
+    kind = _resolve_provider_login_kind(settings, credential_kind)
+    metadata: dict[str, str] = {}
+    secret_value: str | None = None
+    if kind == "env":
+        resolved_env = (env_var or settings.get("api_key_env") or settings.get("credential_env") or "").strip()
+        if not resolved_env:
+            raise ValueError("Env credential login requires --env-var or provider api_key_env.")
+        metadata["env_var"] = resolved_env
+        status = "configured" if os.environ.get(resolved_env) else "missing"
+    elif kind == "static_local":
+        status = "configured"
+    elif kind == "api_key":
+        secret_value = api_key
+        if not secret_value and prompt_for_api_key:
+            secret_value = typer.prompt("API key", hide_input=True)
+        if not secret_value:
+            raise ValueError("API key provider login requires --api-key.")
+        metadata["storage"] = "file"
+        status = "configured"
+    elif kind == "aws_env":
+        metadata["env_var"] = "AWS_ACCESS_KEY_ID"
+        status = "configured" if os.environ.get("AWS_ACCESS_KEY_ID") else "missing"
+    elif kind == "aws_profile":
+        resolved_env = str(settings.get("aws_profile_env") or "AWS_PROFILE").strip()
+        metadata["env_var"] = resolved_env
+        status = "configured" if settings.get("aws_profile") or os.environ.get(resolved_env) else "missing"
+    elif kind in {"oauth", "codex_login"}:
+        status = "configured"
+    else:
+        raise ValueError(f"Unsupported provider credential kind: {kind}")
+    account = store.create_provider_account(
+        provider_id=provider_id,
+        credential_kind=kind,
+        status=status,
+        description=description,
+        metadata=metadata,
+    )
+    secret_write = {
+        "schema_version": "harness.provider_secret_write/v1",
+        "ok": True,
+        "provider_id": provider_id,
+        "account_id": account["account_id"],
+        "credential_value_included": False,
+        "credentials_included": False,
+        "credential_written": False,
+        "network_accessed": False,
+        "no_hidden_fallback": True,
+    }
+    if secret_value is not None:
+        secret_write = write_provider_account_secret(project_root, account, secret_value)
+    return account, secret_write
+
+
+def _resolve_provider_login_kind(settings: dict, credential_kind: str | None) -> str:
+    kind = credential_kind.strip() if credential_kind is not None else ""
+    if not kind:
+        if settings.get("api_key_env"):
+            kind = "env"
+        elif "api_key" in settings:
+            kind = "static_local"
+        elif settings.get("auth_mode"):
+            kind = "codex_login"
+        else:
+            kind = "api_key"
+    allowed = {"env", "static_local", "api_key", "oauth", "codex_login", "aws_env", "aws_profile"}
+    if kind not in allowed:
+        raise ValueError(f"Unsupported provider credential kind: {kind}")
+    return kind
 
 
 def _print_codex_direct_progress(event: dict) -> None:

@@ -145,7 +145,9 @@ def test_applyback_blocks_quarantined_artifacts_until_review_promotion() -> None
 
 def test_applyback_cli_writes_durable_evidence_without_granting_authority(tmp_path: Path) -> None:
     input_path = tmp_path / "applyback-request.json"
-    input_path.write_text(json.dumps(_request()), encoding="utf-8")
+    request = _request()
+    request["test_evidence"]["generated_at"] = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+    input_path.write_text(json.dumps(request), encoding="utf-8")
 
     result = runner.invoke(
         app,

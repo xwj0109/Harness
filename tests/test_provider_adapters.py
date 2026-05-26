@@ -11,6 +11,7 @@ from harness.provider_adapters import (
     classify_provider_exception,
     provider_event_from_backend_stream_event,
 )
+from harness.provider_content import CanonicalMessage, CanonicalMessagePart
 from harness.provider_events import ProviderCapabilities, ProviderEventKind, ProviderMessage, ProviderRequest
 
 
@@ -87,6 +88,22 @@ def test_chat_model_provider_adapter_classifies_unavailable_errors_without_fallb
     assert "endpoint down" in error["message"]
 
 
+def test_chat_model_provider_adapter_fails_on_unsupported_canonical_parts() -> None:
+    adapter = ChatModelProviderAdapter(FakeChatModel(ChatResponse(content="unused")), provider_id="local")
+    request = ProviderRequest(
+        canonical_messages=[
+            CanonicalMessage(role="user", parts=[CanonicalMessagePart(kind="image_input", data={"ref": "artifact://img"})])
+        ]
+    )
+
+    events = list(adapter.stream(request))
+
+    assert [event.kind for event in events] == [ProviderEventKind.MODEL_STARTED, ProviderEventKind.MODEL_FAILED]
+    error = events[-1].payload["error"]
+    assert error["error_type"] == "UnsupportedCanonicalPartError"
+    assert "image_input" in error["message"]
+
+
 def test_backend_stream_events_normalize_to_provider_events() -> None:
     request = ProviderRequest(session_id="sess", turn_id="turn", provider_id="codex_cli")
 
@@ -106,7 +123,7 @@ def test_backend_stream_events_normalize_to_provider_events() -> None:
         request=request,
     )
     usage = provider_event_from_backend_stream_event(
-        BackendStreamEvent(type="token_usage", payload={"total_tokens": 42}),
+        BackendStreamEvent(type="token_usage", payload={"prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 42}),
         sequence=5,
         request=request,
     )
@@ -118,6 +135,16 @@ def test_backend_stream_events_normalize_to_provider_events() -> None:
     assert tool.tool_call_id == "call_1"
     assert usage.kind == ProviderEventKind.TOKEN_USAGE_UPDATED
     assert usage.payload["total_tokens"] == 42
+    assert usage.payload["input_tokens"] == 10
+    assert usage.payload["output_tokens"] == 12
+    assert usage.payload["normalized_usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 12,
+        "reasoning_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "total_tokens": 42,
+    }
 
 
 def test_backend_stream_provider_adapter_wraps_stream_with_model_lifecycle() -> None:
@@ -140,6 +167,27 @@ def test_backend_stream_provider_adapter_wraps_stream_with_model_lifecycle() -> 
     ]
     assert all(event.provider_id == "streaming_backend" for event in events)
     assert events[0].payload["capabilities"]["supports_streaming"] is True
+    assert events[2].payload["normalized_usage"] == {
+        "input_tokens": 1,
+        "output_tokens": 2,
+        "reasoning_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "total_tokens": 3,
+    }
+
+
+def test_backend_stream_error_events_are_classified_from_error_shape() -> None:
+    event = provider_event_from_backend_stream_event(
+        BackendStreamEvent(type="error", text="quota exhausted", payload={"error_type": "RESOURCE_EXHAUSTED"}),
+        sequence=2,
+        request=ProviderRequest(messages=[ProviderMessage(role="user", content="Hi")]),
+    )
+
+    assert event.kind == ProviderEventKind.MODEL_FAILED
+    error = event.payload["error"]
+    assert error["category"] == "rate_limit"
+    assert error["retryable"] is True
 
 
 def test_provider_exception_classifier_marks_config_errors_non_retryable() -> None:
@@ -148,3 +196,10 @@ def test_provider_exception_classifier_marks_config_errors_non_retryable() -> No
     assert error.category.value == "configuration"
     assert error.retryable is False
     assert error.no_hidden_fallback is True
+
+
+def test_provider_exception_classifier_uses_normalized_provider_error_terms() -> None:
+    error = classify_provider_exception(RuntimeError("provider overloaded, try again later"))
+
+    assert error.category.value == "server_unavailable"
+    assert error.retryable is True

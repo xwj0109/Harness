@@ -126,6 +126,7 @@ class AutonomyPolicy(BaseModel):
     allow_memory_writes: bool = False
     allow_adapter_dispatch: bool = False
     allow_active_repo_mutation: bool = False
+    allow_hosted_provider_autonomy: bool = False
 
 
 class AutonomyEvaluationInput(BaseModel):
@@ -253,6 +254,7 @@ def builtin_autonomy_policies() -> dict[str, AutonomyPolicy]:
             allow_create_tasks=True,
             allow_memory_writes=True,
             allow_adapter_dispatch=True,
+            allow_hosted_provider_autonomy=True,
         ),
         "daemon-safe": safe_local.model_copy(
             update={
@@ -355,13 +357,27 @@ def evaluate_autonomy(policy: AutonomyPolicy, request: AutonomyEvaluationInput) 
         )
     reasons.append(f"boundary is allowed by autonomy profile: {request.boundary}")
 
-    if (request.requires_paid_or_hosted_boundary or request.requires_network) and not request.has_scoped_approval:
+    if request.requires_network and not request.has_scoped_approval:
         return _decision(
             policy,
             request,
             AutonomyDecisionStatus.APPROVAL_REQUIRED,
-            ["hosted, paid, or network boundary requires scoped approval"],
+            ["network boundary requires scoped approval"],
         )
+    if request.requires_paid_or_hosted_boundary and not request.has_scoped_approval:
+        if (
+            policy.allow_hosted_provider_autonomy
+            and request.boundary == "hosted_provider_codex"
+            and request.tool_name == "edit_isolated"
+        ):
+            reasons.append("hosted-provider Codex boundary is auto-authorized for isolated edit by this autonomy profile")
+        else:
+            return _decision(
+                policy,
+                request,
+                AutonomyDecisionStatus.APPROVAL_REQUIRED,
+                ["hosted or paid provider boundary requires scoped approval"],
+            )
 
     if request.adapter_id is not None:
         if not policy.allow_adapter_dispatch:

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import json
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from harness import __version__
 from harness.event_broker import EventSubscription, subscribe_global_events, subscribe_store_events
@@ -17,7 +22,8 @@ from harness.execution import (
 )
 from harness.config import load_config
 from harness.memory.sqlite_store import DRY_RUN_EXECUTION_ADAPTER, DRY_RUN_TASK_TYPE, SQLiteStore
-from harness.model_catalog import parse_model_ref, validate_model_selection
+from harness.model_catalog import build_model_provider_suggestions, parse_model_ref, validate_model_selection
+from harness.model_discovery import ModelDiscoveryError, list_cached_discovered_models, refresh_model_discovery
 from harness.models import (
     EventRecord,
     EventStreamType,
@@ -25,15 +31,28 @@ from harness.models import (
     RedactionState,
     RunRecord,
     SessionMessageRole,
+    SessionPermissionSource,
     SessionPermissionStatus,
     SessionPartKind,
     SessionSpec,
     SessionStatus,
+    StoredEventRecord,
     TaskLease,
     run_mode_for_task_type,
 )
 from harness.operator_context import build_session_pane_projection, build_tui_dashboard
 from harness.operator_loop import session_operator_status_projection
+from harness.provider_adapters import build_default_provider_adapter
+from harness.provider_auth import (
+    activate_provider_auth_account,
+    connect_provider_api_key,
+    connect_provider_env,
+    connect_provider_local_account,
+    disconnect_provider_auth,
+    provider_oauth_authorize,
+    provider_oauth_callback,
+    provider_auth_methods_projection,
+)
 from harness.security import sanitize_for_logging
 from harness.session_cwd import session_cwd_payload
 from harness.session_runtime import SessionPromptQueuePolicy, SessionPromptRequest, SessionRuntimeManager
@@ -48,6 +67,426 @@ CORE_SCHEMA_VERSION = "harness.core_run/v1"
 APP_SERVICE_SCHEMA_VERSION = "harness.app_service/v1"
 CORE_OWNER = "core_service"
 SUPPORTED_CORE_MODES = {"dry_run", "repo_planning", "codex_isolated_edit"}
+
+
+class HarnessHTTPServiceError(RuntimeError):
+    """Raised when an attached local server rejects or cannot satisfy a service call."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        error_code: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.error_code = error_code
+        self.payload = payload or {}
+
+
+class HarnessHTTPAppService:
+    """HTTP implementation of the app-facing service facade for attached TUI mode."""
+
+    def __init__(self, server_url: str, token: str, *, timeout: float = 5.0) -> None:
+        clean_url = str(server_url or "").strip().rstrip("/")
+        clean_token = str(token or "").strip()
+        if not clean_url:
+            raise ValueError("Missing server URL.")
+        if not clean_token:
+            raise ValueError("Missing server token.")
+        self.server_url = clean_url
+        self.token = clean_token
+        self.timeout = timeout
+        self.project_root = Path(".").resolve()
+
+    @classmethod
+    def from_attach(cls, server_url: str, token: str | None, *, timeout: float = 5.0) -> "HarnessHTTPAppService":
+        if not token:
+            raise ValueError("Missing server token. Pass --token or set HARNESS_SERVER_TOKEN.")
+        service = cls(server_url, token, timeout=timeout)
+        health = service.health()
+        if not health.get("ok"):
+            raise HarnessHTTPServiceError("Attached server health probe failed.", payload=health)
+        return service
+
+    def health(self) -> dict[str, Any]:
+        return self._get("/global/health")
+
+    def dashboard(self, *, selected_session_id: str | None = None) -> dict[str, Any]:
+        query = {"selected_session_id": selected_session_id} if selected_session_id else None
+        return self._get("/tui/dashboard", query=query)
+
+    def session_pane(
+        self,
+        *,
+        selected_session_id: str | None,
+        status_filter: str,
+        query: str,
+    ) -> dict[str, Any]:
+        params = {
+            "status_filter": status_filter,
+            "query": query,
+        }
+        if selected_session_id:
+            params["selected_session_id"] = selected_session_id
+        return self._get("/tui/session-pane", query=params)
+
+    def list_sessions(self) -> dict[str, Any]:
+        return self._get("/sessions")
+
+    def create_session(self, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post("/sessions", body)
+
+    def archive_session(self, session_id: str) -> dict[str, Any]:
+        return self._delete(f"/sessions/{session_id}")
+
+    def restore_session(self, session_id: str) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/restore", {})
+
+    def abort_session(self, session_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/abort", body or {})
+
+    def fork_session(self, session_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/fork", body or {})
+
+    def hard_delete_session(self, session_id: str) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/hard-delete", {})
+
+    def update_session_title(self, session_id: str, title: str | None) -> dict[str, Any]:
+        return self._patch(f"/sessions/{session_id}", {"title": title})
+
+    def update_session_agent(self, session_id: str, agent_id: str | None, *, source: str = "http_app_service") -> dict[str, Any]:
+        return self._patch(f"/sessions/{session_id}", {"agent_id": agent_id, "source": source})
+
+    def update_session_model_selection(
+        self,
+        session_id: str,
+        raw_model_ref: str,
+        *,
+        source: str = "http_app_service_model_picker",
+    ) -> dict[str, Any]:
+        return self._patch(f"/sessions/{session_id}", {"raw_model_ref": raw_model_ref, "source": source})
+
+    def append_message(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/messages", body)
+
+    def prompt_async(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/prompt_async", body)
+
+    def submit_prompt(self, session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/prompt", body)
+
+    def sessions_status(self) -> dict[str, Any]:
+        return self._get("/sessions/status")
+
+    def session_status(self, session_id: str) -> dict[str, Any]:
+        return self._get(f"/sessions/{session_id}/status")
+
+    def list_messages(self, session_id: str, *, limit: int | None = None) -> dict[str, Any]:
+        return self._get(f"/sessions/{session_id}/messages", query={"limit": limit} if limit is not None else None)
+
+    def message_detail(self, session_id: str, message_id: str) -> dict[str, Any]:
+        return self._get(f"/sessions/{session_id}/messages/{message_id}")
+
+    def list_events(
+        self,
+        session_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, Any]:
+        query: dict[str, Any] = {}
+        if after_seq is not None:
+            query["after_seq"] = after_seq
+        if limit is not None:
+            query["limit"] = limit
+        return self._get(f"/sessions/{session_id}/events", query=query or None)
+
+    def runtime_status(self, session_id: str) -> dict[str, Any]:
+        status = self.session_status(session_id)
+        return {
+            "schema_version": "harness.session_runtime_status/v1",
+            "ok": bool(status.get("ok", True)),
+            "session_id": session_id,
+            "runtime": status.get("runtime") or {},
+            "execution_started": False,
+            "permission_granting": False,
+        }
+
+    def list_permissions(self, session_id: str | None = None) -> dict[str, Any]:
+        if session_id is None:
+            return self._get("/permission")
+        return self._get(f"/sessions/{session_id}/permissions")
+
+    def reply_permission(self, session_id: str, permission_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post(f"/sessions/{session_id}/permissions/{permission_id}/reply", body)
+
+    def list_questions(self, session_id: str | None = None) -> dict[str, Any]:
+        if session_id is None:
+            return self._get("/question")
+        return self._get(f"/sessions/{session_id}/questions")
+
+    def settings_tui(self, session_id: str | None = None) -> dict[str, Any]:
+        return self._get("/settings/tui")
+
+    def provider_auth_methods(self) -> dict[str, Any]:
+        return self._get("/provider/auth")
+
+    def list_providers(self) -> dict[str, Any]:
+        return self._get("/providers")
+
+    def provider_detail(self, provider_id: str) -> dict[str, Any]:
+        return self._get(f"/providers/{provider_id}")
+
+    def list_models(self) -> dict[str, Any]:
+        return self._get("/models")
+
+    def model_detail(self, provider_id: str, model_id: str) -> dict[str, Any]:
+        return self._get(f"/models/{provider_id}/{model_id}")
+
+    def validate_model(self, raw_model_ref: str) -> dict[str, Any]:
+        return self._get("/models/validate", query={"model": raw_model_ref})
+
+    def model_preferences(self) -> dict[str, Any]:
+        return self._get("/models/preferences")
+
+    def connect_provider_api_key(
+        self,
+        provider_id: str,
+        api_key: str,
+        *,
+        description: str = "default",
+        active: bool = True,
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/provider/{provider_id}/auth/api-key",
+            {"api_key": api_key, "description": description, "active": active},
+        )
+
+    def connect_provider_env(
+        self,
+        provider_id: str,
+        env_var: str,
+        *,
+        description: str = "default",
+        active: bool = True,
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/provider/{provider_id}/auth/env",
+            {"env_var": env_var, "description": description, "active": active},
+        )
+
+    def connect_provider_local_account(
+        self,
+        provider_id: str,
+        credential_kind: str,
+        *,
+        description: str = "default",
+        active: bool = True,
+        env_var: str | None = None,
+    ) -> dict[str, Any]:
+        return self._post(
+            f"/provider/{provider_id}/auth/local",
+            {
+                "credential_kind": credential_kind,
+                "description": description,
+                "active": active,
+                "env_var": env_var,
+            },
+        )
+
+    def activate_provider_account(self, provider_id: str, account_id: str) -> dict[str, Any]:
+        return self._post(f"/provider/{provider_id}/auth/activate", {"account_id": account_id})
+
+    def disconnect_provider(self, provider_id: str) -> dict[str, Any]:
+        return self._delete(f"/provider/{provider_id}/auth")
+
+    def set_model_favorite(self, raw_model_ref: str, favorite: bool) -> dict[str, Any]:
+        return self._post("/models/preferences/favorite", {"raw_model_ref": raw_model_ref, "favorite": favorite})
+
+    def set_default_model_preference(self, raw_model_ref: str) -> dict[str, Any]:
+        return self._post("/models/preferences/default", {"raw_model_ref": raw_model_ref})
+
+    def inspect_model(self, raw_model_ref: str) -> dict[str, Any]:
+        return self._post("/models/inspect", {"raw_model_ref": raw_model_ref})
+
+    def refresh_provider_models(
+        self,
+        provider_id: str,
+        *,
+        approve_hosted: bool = False,
+        with_credentials: bool = False,
+    ) -> dict[str, Any]:
+        return self._post(
+            "/models/refresh",
+            {
+                "provider_id": provider_id,
+                "approve_hosted": approve_hosted,
+                "with_credentials": with_credentials,
+            },
+        )
+
+    def provider_oauth_authorize(self, provider_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._post(f"/provider/{provider_id}/oauth/authorize", body or {})
+
+    def provider_oauth_callback(self, provider_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._post(f"/provider/{provider_id}/oauth/callback", body)
+
+    def subscribe_global_events(self) -> "_HTTPEventSubscription":
+        return _HTTPEventSubscription(self._url("/global/event", query={"live": 1}), self.token, timeout=self.timeout)
+
+    def subscribe_session_events(self, session_id: str, *, after_seq: int | None = None) -> "_HTTPEventSubscription":
+        query: dict[str, Any] = {"live": 1}
+        if after_seq is not None:
+            query["after_seq"] = after_seq
+        return _HTTPEventSubscription(self._url(f"/sessions/{session_id}/events/stream", query=query), self.token, timeout=self.timeout)
+
+    def _get(self, path: str, *, query: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._request_json("GET", path, query=query)
+
+    def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("POST", path, body=body)
+
+    def _patch(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._request_json("PATCH", path, body=body)
+
+    def _delete(self, path: str) -> dict[str, Any]:
+        return self._request_json("DELETE", path)
+
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        query: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        data = None
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = Request(self._url(path, query=query), data=data, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8") or "{}")
+        except HTTPError as exc:
+            payload = _http_error_payload(exc)
+            error_code = payload.get("error_code") if isinstance(payload, dict) else None
+            message = payload.get("error") if isinstance(payload, dict) else str(exc)
+            raise HarnessHTTPServiceError(
+                str(message),
+                status=exc.code,
+                error_code=str(error_code) if error_code else None,
+                payload=payload if isinstance(payload, dict) else {},
+            ) from exc
+        except (URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            raise HarnessHTTPServiceError(f"Attached server request failed: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HarnessHTTPServiceError("Attached server returned a non-object JSON payload.")
+        return payload
+
+    def _url(self, path: str, *, query: dict[str, Any] | None = None) -> str:
+        if not path.startswith("/"):
+            path = f"/{path}"
+        url = f"{self.server_url}{path}"
+        if query:
+            clean_query = {key: value for key, value in query.items() if value is not None}
+            if clean_query:
+                url = f"{url}?{urlencode(clean_query)}"
+        return url
+
+
+class _HTTPEventSubscription:
+    def __init__(self, url: str, token: str, *, timeout: float = 5.0) -> None:
+        self._url = url
+        self._token = token
+        self._timeout = timeout
+        self._subscription = EventSubscription()
+        self._response = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @property
+    def closed(self) -> bool:
+        return self._subscription.closed
+
+    def next(self, timeout: float | None = None) -> StoredEventRecord | None:
+        return self._subscription.next(timeout=timeout)
+
+    def drain(self, *, limit: int | None = None) -> list[StoredEventRecord]:
+        return self._subscription.drain(limit=limit)
+
+    def close(self) -> None:
+        self._subscription.close()
+        response = self._response
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+
+    def _run(self) -> None:
+        request = Request(self._url, headers={"Authorization": f"Bearer {self._token}", "Accept": "text/event-stream"})
+        try:
+            with urlopen(request, timeout=self._timeout) as response:
+                self._response = response
+                self._read_sse(response)
+        except Exception:
+            pass
+        finally:
+            self._subscription.close()
+            self._response = None
+
+    def _read_sse(self, response: Any) -> None:
+        event_name: str | None = None
+        data_lines: list[str] = []
+        for raw_line in response:
+            if self.closed:
+                return
+            line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                self._dispatch_sse_event(event_name, data_lines)
+                event_name = None
+                data_lines = []
+                continue
+            if line.startswith("event:"):
+                event_name = line.split(":", 1)[1].strip()
+                continue
+            if line.startswith("data:"):
+                data_lines.append(line.split(":", 1)[1].lstrip())
+
+    def _dispatch_sse_event(self, event_name: str | None, data_lines: list[str]) -> None:
+        if not data_lines or event_name in {"harness.ready", "server.connected", "harness.heartbeat"}:
+            return
+        try:
+            payload = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            return
+        if (
+            isinstance(payload, dict)
+            and "kind" not in payload
+            and isinstance(payload.get("payload"), dict)
+            and "kind" in payload["payload"]
+        ):
+            payload = payload["payload"]
+        if not isinstance(payload, dict) or "kind" not in payload or "seq" not in payload:
+            return
+        try:
+            self._subscription.enqueue(StoredEventRecord.model_validate(payload))
+        except Exception:
+            return
+
+
+def _http_error_payload(exc: HTTPError) -> dict[str, Any]:
+    try:
+        raw = exc.read().decode("utf-8")
+        payload = json.loads(raw or "{}")
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 class HarnessAppService:
@@ -289,9 +728,30 @@ class HarnessAppService:
         if not clean_ref:
             raise ValueError("Missing model ref.")
         cfg = load_config(self.project_root)
-        validation = validate_model_selection(cfg, clean_ref)
+        validation = validate_model_selection(
+            cfg,
+            clean_ref,
+            provider_accounts=self.store.list_provider_accounts(),
+        )
         validation_payload = validation.model_dump(mode="json")
         if not validation.executable:
+            suggestions = (
+                build_model_provider_suggestions(
+                    cfg,
+                    clean_ref,
+                    provider_accounts=self.store.list_provider_accounts(),
+                    model_overlays=list_cached_discovered_models(cfg, self.store),
+                )
+                if any(
+                    reason in {"provider_unknown", "provider_not_specified", "model_unknown", "variant_unknown"}
+                    for reason in validation.blocked_reasons
+                )
+                else None
+            )
+            if suggestions is not None:
+                validation_payload["suggestions"] = suggestions["model_suggestions"]
+                validation_payload["model_suggestions"] = suggestions["model_suggestions"]
+                validation_payload["provider_suggestions"] = suggestions["provider_suggestions"]
             event = self._append_model_validation_event(
                 session_id,
                 validation_payload,
@@ -304,6 +764,10 @@ class HarnessAppService:
                 "raw_model_ref": clean_ref,
                 "model_validation": validation_payload,
                 "blocked_reasons": validation.blocked_reasons,
+                "suggestions": suggestions["model_suggestions"] if suggestions is not None else [],
+                "model_suggestions": suggestions["model_suggestions"] if suggestions is not None else [],
+                "provider_suggestions": suggestions["provider_suggestions"] if suggestions is not None else [],
+                "suggestion_only": suggestions is not None,
                 "session_model_selected": False,
                 "session_event_persisted": True,
                 "event": event.model_dump(mode="json"),
@@ -322,13 +786,23 @@ class HarnessAppService:
                 "permission_granting": False,
                 "authority_granting": False,
             }
-        parsed = parse_model_ref(clean_ref)
         session = self.store.update_session_model(
             session_id,
             raw_model_ref=clean_ref,
-            provider_id=parsed["provider_id"],
-            model_id=parsed["model_id"],
-            model_variant=parsed["variant"],
+            provider_id=validation.provider_id,
+            model_id=validation.model_id,
+            model_variant=validation.variant,
+        )
+        self.store.record_model_selection(
+            raw_model_ref=clean_ref,
+            provider_id=validation.provider_id,
+            model_id=validation.model_id,
+            model_variant=validation.variant,
+            last_reasoning_effort=validation.resolved_model_selection.resolved_reasoning_effort
+            if validation.resolved_model_selection is not None
+            else None,
+            source=source,
+            metadata={"session_id": session.id},
         )
         event = self._append_model_validation_event(
             session.id,
@@ -609,6 +1083,49 @@ class HarnessAppService:
             "permission_granting": False,
         }
 
+    def reply_permission(self, session_id: str, permission_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._require_initialized()
+        self.store.get_session(session_id)
+        existing = self.store.get_session_permission(permission_id)
+        if existing.session_id != session_id:
+            raise ValueError(f"Permission {permission_id} does not belong to session {session_id}.")
+        approval_card = build_session_approval_card(self.store, session_id, permission_id)
+        reply = _optional_text(body, "reply") or _optional_text(body, "response")
+        decision = _optional_text(body, "decision") or _optional_text(body, "status")
+        status = _permission_reply_status(reply, decision)
+        reason = _optional_text(body, "reason") or _optional_text(body, "message")
+        permission = self.store.resolve_session_permission(
+            permission_id,
+            status,
+            source=SessionPermissionSource.USER,
+            reason=reason,
+        )
+        runtime_resolution = self._runtime_manager().permission_resolved(
+            session_id,
+            permission_id,
+            decision=status.value,
+            resumed=False,
+        )
+        permissions = self.store.list_session_permissions(session_id)
+        snapshot = self._session_permission_snapshot_payload(session_id, permissions)
+        return {
+            "schema_version": "harness.session_permission_reply/v1",
+            "ok": True,
+            "session_id": session_id,
+            "permission_id": permission_id,
+            "reply": reply,
+            "decision": status.value,
+            "permission": permission.model_dump(mode="json"),
+            "approval_card": approval_card,
+            "runtime": runtime_resolution.model_dump(mode="json"),
+            "snapshot": snapshot,
+            "execution_started": False,
+            "tool_execution_started": False,
+            "scope_broadened": False,
+            "permission_granting": status == SessionPermissionStatus.ALLOWED,
+            "authority_granting": False,
+        }
+
     def list_questions(self, session_id: str | None = None) -> dict[str, Any]:
         self._require_initialized()
         if session_id is None:
@@ -659,6 +1176,249 @@ class HarnessAppService:
             "permission_granting": False,
         }
 
+    def provider_auth_methods(self) -> dict[str, Any]:
+        cfg = load_config(self.project_root)
+        return provider_auth_methods_projection(cfg, self.store)
+
+    def list_providers(self) -> dict[str, Any]:
+        from harness.local_server import _provider_catalog_projection
+
+        cfg = load_config(self.project_root)
+        return _provider_catalog_projection(self.store, cfg)
+
+    def provider_detail(self, provider_id: str) -> dict[str, Any]:
+        from harness.local_server import _provider_catalog_projection
+
+        cfg = load_config(self.project_root)
+        return _provider_catalog_projection(self.store, cfg, provider_id=provider_id)
+
+    def list_models(self) -> dict[str, Any]:
+        from harness.local_server import _model_catalog_projection
+
+        cfg = load_config(self.project_root)
+        return _model_catalog_projection(self.store, cfg)
+
+    def model_detail(self, provider_id: str, model_id: str) -> dict[str, Any]:
+        from harness.local_server import _model_detail_projection
+
+        cfg = load_config(self.project_root)
+        return _model_detail_projection(self.store, cfg, provider_id=provider_id, model_id=model_id)
+
+    def validate_model(self, raw_model_ref: str) -> dict[str, Any]:
+        from harness.local_server import _model_selection_validation_projection
+
+        cfg = load_config(self.project_root)
+        return _model_selection_validation_projection(self.store, cfg, raw_model_ref)
+
+    def model_preferences(self) -> dict[str, Any]:
+        from harness.local_server import _model_preferences_projection
+
+        return _model_preferences_projection(self.store)
+
+    def connect_provider_api_key(
+        self,
+        provider_id: str,
+        api_key: str,
+        *,
+        description: str = "default",
+        active: bool = True,
+    ) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return connect_provider_api_key(
+            self.project_root,
+            self.store,
+            cfg,
+            provider_id,
+            api_key,
+            description=description,
+            active=active,
+        )
+
+    def connect_provider_env(
+        self,
+        provider_id: str,
+        env_var: str,
+        *,
+        description: str = "default",
+        active: bool = True,
+    ) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return connect_provider_env(
+            self.store,
+            cfg,
+            provider_id,
+            env_var,
+            description=description,
+            active=active,
+        )
+
+    def connect_provider_local_account(
+        self,
+        provider_id: str,
+        credential_kind: str,
+        *,
+        description: str = "default",
+        active: bool = True,
+        env_var: str | None = None,
+    ) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return connect_provider_local_account(
+            self.store,
+            cfg,
+            provider_id,
+            credential_kind,
+            description=description,
+            active=active,
+            env_var=env_var,
+        )
+
+    def activate_provider_account(self, provider_id: str, account_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return activate_provider_auth_account(self.store, cfg, provider_id, account_id)
+
+    def disconnect_provider(self, provider_id: str) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return disconnect_provider_auth(self.store, cfg, provider_id)
+
+    def set_model_favorite(self, raw_model_ref: str, favorite: bool) -> dict[str, Any]:
+        self._require_initialized()
+        validation = self._validate_model_preference_ref(raw_model_ref)
+        preference = self.store.set_model_favorite(
+            raw_model_ref,
+            favorite,
+            provider_id=validation.provider_id,
+            model_id=validation.model_id,
+            model_variant=validation.variant,
+            source="tui_models_favorite_action" if favorite else "tui_models_unfavorite_action",
+        )
+        return self._model_preference_update_payload("favorite" if favorite else "unfavorite", preference, validation.model_dump(mode="json"))
+
+    def set_default_model_preference(self, raw_model_ref: str) -> dict[str, Any]:
+        self._require_initialized()
+        validation = self._validate_model_preference_ref(raw_model_ref)
+        preference = self.store.set_default_model_preference(
+            raw_model_ref,
+            provider_id=validation.provider_id,
+            model_id=validation.model_id,
+            model_variant=validation.variant,
+            source="tui_models_default_action",
+        )
+        return self._model_preference_update_payload("default", preference, validation.model_dump(mode="json"))
+
+    def inspect_model(self, raw_model_ref: str) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        validation = validate_model_selection(
+            cfg,
+            raw_model_ref,
+            model_overlays=list_cached_discovered_models(cfg, self.store),
+            provider_accounts=self.store.list_provider_accounts(),
+        )
+        return {
+            "schema_version": "harness.model_inspection/v1",
+            "ok": True,
+            "raw_model_ref": raw_model_ref,
+            "validation": validation.model_dump(mode="json"),
+            "model": validation.matched_model.model_dump(mode="json") if validation.matched_model is not None else None,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
+    def refresh_provider_models(
+        self,
+        provider_id: str,
+        *,
+        approve_hosted: bool = False,
+        with_credentials: bool = False,
+    ) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        try:
+            result = refresh_model_discovery(
+                cfg,
+                provider_id,
+                store=self.store,
+                approve_hosted=approve_hosted,
+                with_credentials=with_credentials,
+            )
+            return result.model_dump(mode="json")
+        except ModelDiscoveryError as exc:
+            return {
+                "schema_version": "harness.model_discovery_result/v1",
+                "ok": False,
+                "provider_id": exc.provider_id,
+                "error": str(exc),
+                "blocked_reasons": exc.blocked_reasons,
+                "source": "discovered",
+                "network_accessed": False,
+                "credentials_included": False,
+                "credential_written": False,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "hidden_provider_fallback": False,
+                "hidden_model_fallback": False,
+                "no_hidden_fallback": True,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+
+    def provider_oauth_authorize(self, provider_id: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return provider_oauth_authorize(cfg, provider_id, body or {})
+
+    def provider_oauth_callback(self, provider_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._require_initialized()
+        cfg = load_config(self.project_root)
+        return provider_oauth_callback(self.project_root, self.store, cfg, provider_id, body)
+
+    def _validate_model_preference_ref(self, raw_model_ref: str):
+        clean_ref = str(raw_model_ref or "").strip()
+        if not clean_ref:
+            raise ValueError("Missing model ref.")
+        cfg = load_config(self.project_root)
+        validation = validate_model_selection(
+            cfg,
+            clean_ref,
+            model_overlays=list_cached_discovered_models(cfg, self.store),
+            provider_accounts=self.store.list_provider_accounts(),
+        )
+        if validation.matched_model is None:
+            raise ValueError(f"Model ref is not present in the local catalog: {clean_ref}")
+        return validation
+
+    @staticmethod
+    def _model_preference_update_payload(action: str, preference: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "schema_version": "harness.model_preference_update/v1",
+            "ok": True,
+            "action": action,
+            "preference": preference,
+            "validation": validation,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "hidden_provider_fallback": False,
+            "hidden_model_fallback": False,
+            "no_hidden_fallback": True,
+            "permission_granting": False,
+            "authority_granting": False,
+        }
+
     def subscribe_session_events(
         self,
         session_id: str,
@@ -702,6 +1462,18 @@ class HarnessAppService:
             "command_started": bool(payload.get("command_started")),
             "process_started": bool(payload.get("process_started")),
             "filesystem_modified": bool(payload.get("filesystem_modified")),
+            "provider_id": payload.get("provider_id"),
+            "method": payload.get("method"),
+            "account_id": payload.get("account_id"),
+            "account_created": bool(payload.get("account_created")),
+            "account_activated": bool(payload.get("account_activated")),
+            "credential_source": payload.get("credential_source"),
+            "credential_value_included": bool(payload.get("credential_value_included")),
+            "credentials_included": bool(payload.get("credentials_included")),
+            "provider_execution_started": bool(payload.get("provider_execution_started")),
+            "model_execution_started": bool(payload.get("model_execution_started")),
+            "network_accessed": bool(payload.get("network_accessed")),
+            "active_model_changed": bool(payload.get("active_model_changed")),
             "permission_granting": bool(payload.get("permission_granting")),
             "authority_granting": bool(payload.get("authority_granting")),
         }
@@ -709,7 +1481,12 @@ class HarnessAppService:
     def _runtime_manager(self) -> SessionRuntimeManager:
         if self.runtime is not None:
             return self.runtime
-        self.runtime = SessionRuntimeManager.for_store(self.store, execution_enabled=self.execution_enabled)
+        provider_adapter = build_default_provider_adapter(self.project_root) if self.execution_enabled else None
+        self.runtime = SessionRuntimeManager.for_store(
+            self.store,
+            provider_adapter=provider_adapter,
+            execution_enabled=self.execution_enabled,
+        )
         return self.runtime
 
     def _submit_prompt(self, session_id: str, body: dict[str, Any], *, mode: str) -> dict[str, Any]:
@@ -761,7 +1538,7 @@ class HarnessAppService:
         if not content:
             raise ValueError("Missing required prompt content.")
         agent_id = _optional_text(body, "agent_id") or _optional_text(body, "agent") or session.agent_id
-        model_ref = _body_model_ref(body) or session.raw_model_ref
+        model_ref = _body_model_ref(body)
         message_payload = self.append_message(
             session.id,
             {
@@ -772,6 +1549,7 @@ class HarnessAppService:
                 "metadata": {
                     "prompt_mode": mode,
                     "model_ref": model_ref,
+                    "session_model_ref": session.raw_model_ref,
                     **(dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}),
                 },
             },
@@ -968,6 +1746,28 @@ def _queue_policy_from_body(body: dict[str, Any]) -> SessionPromptQueuePolicy:
         return SessionPromptQueuePolicy(raw)
     except ValueError as exc:
         raise ValueError(f"Unsupported prompt queue policy: {raw}") from exc
+
+
+def _permission_reply_status(reply: str | None, decision: str | None) -> SessionPermissionStatus:
+    if reply:
+        normalized = reply.strip().lower()
+        if normalized in {"once", "always", "allow", "allowed"}:
+            return SessionPermissionStatus.ALLOWED
+        if normalized in {"reject", "deny", "denied"}:
+            return SessionPermissionStatus.DENIED
+        if normalized in {"cancel", "cancelled", "canceled"}:
+            return SessionPermissionStatus.CANCELLED
+        raise ValueError("Unsupported permission reply. Use once, always, reject, or cancel.")
+    if not decision:
+        raise ValueError("Missing permission reply or decision.")
+    normalized = decision.strip().lower()
+    if normalized == "allow":
+        normalized = SessionPermissionStatus.ALLOWED.value
+    if normalized == "deny":
+        normalized = SessionPermissionStatus.DENIED.value
+    if normalized == "cancel":
+        normalized = SessionPermissionStatus.CANCELLED.value
+    return SessionPermissionStatus(normalized)
 
 
 class CoreEventSummary(BaseModel):

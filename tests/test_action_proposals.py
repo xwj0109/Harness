@@ -177,59 +177,63 @@ def test_confirmed_action_contract_creates_objective_record(tmp_path) -> None:
     assert [objective.title for objective in objectives] == ["Improve chat"]
 
 
-def test_empty_markdown_file_request_is_self_managed_with_report(tmp_path) -> None:
+def test_empty_markdown_file_request_routes_to_isolated_edit_contract(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     state = ChatSessionState()
 
     response = handle_chat_input("create an empty .md file in this directory", tmp_path, state)
 
-    assert response["kind"] == "self_managed_local_action"
+    assert response["kind"] == "action_contract"
     assert response["ok"] is True
-    assert (tmp_path / "scratch.md").exists()
-    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == ""
+    assert response["contract"]["tool"] == "edit_isolated"
+    assert response["contract"]["normalized_arguments"]["goal"] == "create an empty .md file in this directory"
+    assert state.pending_action_contract is not None
+    assert not (tmp_path / "scratch.md").exists()
+    assert state.latest_run_id is None
+
+
+def test_downloads_file_request_blocks_before_orchestration_without_prompt(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState(autonomy_profile_id="supervised-codex")
+
+    response = handle_chat_input("create a file empty in downloads .md", tmp_path, state)
+    rendered = render_chat_response(response)
+
+    assert response["kind"] == "external_filesystem_write_blocked"
+    assert response["ok"] is False
+    assert response["policy_boundary"]["target"] == "Downloads"
+    assert response["policy_boundary"]["filesystem_modified"] is False
+    assert response["policy_boundary"]["orchestration_started"] is False
     assert state.pending_action_contract is None
-    assert state.latest_run_id is not None
-    assert "Report:" in "\n".join(response["lines"])
-    store = SQLiteStore(tmp_path)
-    run = store.get_run(state.latest_run_id)
-    assert run.status == "succeeded"
-    artifacts = store.verify_artifacts(run.id)
-    assert {artifact.kind for artifact in artifacts} >= {"created_file", "final_report"}
+    assert state.latest_objective_id is None
+    assert SQLiteStore(tmp_path).list_objectives() == []
+    assert SQLiteStore(tmp_path).list_tasks() == []
+    assert "No file was created" in rendered
+    assert "no human approval prompt" in rendered
 
 
-def test_golden_self_managed_chat_flow_returns_final_result_without_contract_noise(tmp_path) -> None:
+def test_golden_write_chat_flow_returns_isolated_edit_contract_without_mutating_workspace(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     state = ChatSessionState()
 
     response = handle_chat_input("create an empty .md file in this directory", tmp_path, state)
     rendered = render_chat_response(response)
 
-    assert response["kind"] == "self_managed_local_action"
+    assert response["kind"] == "action_contract"
     assert response["ok"] is True
-    assert response["run_id"] == state.latest_run_id
-    assert response["report_path"]
-    assert (tmp_path / "scratch.md").exists()
-    assert state.pending_action_contract is None
+    assert response["contract"]["tool"] == "edit_isolated"
+    assert not (tmp_path / "scratch.md").exists()
+    assert state.pending_action_contract is not None
     assert state.pending_hosted_approval is False
     assert state.pending_draft is None
     assert state.pending_orchestration is None
     assert state.pending_execute_lease_id is None
-    assert "Created `scratch.md`." in rendered
-    assert "Run:" in rendered
-    assert "Report:" in rendered
-    assert "Action Contract" not in rendered
-    assert "Required approvals" not in rendered
-    assert "Required confirmations" not in rendered
-    assert "type yes" not in rendered.lower()
-    assert "/confirm" not in rendered
-
-    store = SQLiteStore(tmp_path)
-    run = store.get_run(state.latest_run_id)
-    assert run.task_type == "managed_action.create_empty_file"
-    assert run.status == "succeeded"
-    report = Path(response["report_path"]).read_text(encoding="utf-8")
-    assert "# Harness Managed Action Report" in report
-    assert "- Decision: auto_allowed" in report
+    assert "Action Contract" in rendered
+    assert "Tool: edit_isolated" in rendered
+    assert "Required approvals: hosted_provider_codex" in rendered
+    assert "apply_back_separate" in rendered
+    assert "type yes" in rendered.lower()
+    assert "/confirm" in rendered
 
 
 def test_named_empty_markdown_file_request_does_not_overwrite(tmp_path) -> None:
@@ -246,18 +250,18 @@ def test_named_empty_markdown_file_request_does_not_overwrite(tmp_path) -> None:
 
 def test_chat_write_inside_existing_markdown_updates_file_instead_of_creating_another_empty_file(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "scratch.md").write_text("", encoding="utf-8")
     state = ChatSessionState()
 
-    first = handle_chat_input("create an empty .md file called scratch.md in this directory", tmp_path, state)
-    second = handle_chat_input("write in side scratch.md 'hello'", tmp_path, state)
-    rendered = render_chat_response(second)
+    response = handle_chat_input("write in side scratch.md 'hello'", tmp_path, state)
+    rendered = render_chat_response(response)
 
-    assert first["kind"] == "self_managed_local_action"
-    assert second["kind"] == "self_managed_local_action"
-    assert second["intent"] == "write_file"
-    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == "hello\n"
+    assert response["kind"] == "action_contract"
+    assert response["contract"]["tool"] == "edit_isolated"
+    assert response["contract"]["normalized_arguments"]["goal"] == "write in side scratch.md 'hello'"
+    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == ""
     assert not (tmp_path / "scratch-2.md").exists()
-    assert "Updated `scratch.md`." in rendered
+    assert "Tool: edit_isolated" in rendered
     assert "Created `scratch-2.md`." not in rendered
 
 
@@ -330,8 +334,9 @@ def test_denied_contract_is_not_executed_under_safe_local(tmp_path) -> None:
     assert decisions[0]["tool_name"] == "edit_isolated"
 
 
-def test_approval_required_contract_remains_pending_under_supervised_codex(tmp_path) -> None:
+def test_supervised_codex_auto_runs_edit_isolated_without_confirmation(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    monkeypatch.setattr("harness.execution.CodexCliBackend", FakeCodexBackend)
     model = SideEffectRequestModel(
         '{"type":"harness.tool_request/v1","tool":"edit_isolated","arguments":{"goal":"fix chat tool routing"}}'
     )
@@ -339,10 +344,15 @@ def test_approval_required_contract_remains_pending_under_supervised_codex(tmp_p
 
     response = handle_chat_input("please improve this", tmp_path, state, chat_model=model)
 
-    assert response["kind"] == "action_contract"
-    assert response["autonomy_decision"]["status"] == "approval_required"
-    assert state.pending_action_contract is not None
-    assert SQLiteStore(tmp_path).list_objectives() == []
+    assert response["kind"] == "orchestration_result"
+    assert response["autonomy_decision"]["status"] == "auto_allowed"
+    assert response["autonomous_approval"]["policy_id"] == "supervised-codex"
+    assert state.pending_action_contract is None
+    assert SQLiteStore(tmp_path).list_objectives()
+    assert "Prepared autonomous hosted-provider Codex authority" in "\n".join(response["lines"])
+    hosted = ApprovalStore(tmp_path).list()[0]
+    assert hosted.autonomy_scope == "supervised-codex"
+    assert hosted.allowed_adapters == ["repo_planning", "codex_isolated_edit"]
 
 
 def test_autonomous_approval_record_is_written(tmp_path) -> None:

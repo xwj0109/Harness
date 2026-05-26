@@ -137,12 +137,13 @@ class IsolationManager:
         pre_status = _git_status_porcelain(active_project) if git_repo else "NOT_A_GIT_REPO"
         if git_repo and pre_status.strip() and not allow_dirty:
             raise ActiveRepoDirtyError("Active Git repo has uncommitted changes; explicit approval is required.")
-        if git_repo and pre_status.strip() and allow_dirty:
+        dirty_repo_copy_required = bool(git_repo and pre_status.strip() and allow_dirty)
+        if dirty_repo_copy_required:
             warnings.append(
-                "Active Git repo is dirty; isolated workspace may be created from committed state and may not include uncommitted changes."
+                "Active Git repo is dirty; isolated copy includes current workspace state and apply-back still requires freshness checks."
             )
-        temp_path = Path(tempfile.mkdtemp(prefix="harness-isolation-")).resolve()
-        if git_repo and _has_valid_head(active_project):
+        if git_repo and _has_valid_head(active_project) and not dirty_repo_copy_required:
+            temp_path = Path(tempfile.mkdtemp(prefix="harness-isolation-")).resolve()
             created = self._try_git_worktree(active_project, temp_path)
             if created:
                 return IsolationWorkspace(
@@ -155,8 +156,8 @@ class IsolationManager:
                     warnings=warnings,
                     cleanup_commands=[["git", "worktree", "remove", "--force", str(temp_path)]],
                 )
-        if temp_path.exists():
-            shutil.rmtree(temp_path)
+            if temp_path.exists():
+                shutil.rmtree(temp_path)
         copy_path = Path(tempfile.mkdtemp(prefix="harness-isolation-copy-")).resolve()
         _copy_project(active_project, copy_path, self.excluded_patterns)
         return IsolationWorkspace(

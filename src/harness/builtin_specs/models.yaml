@@ -1,0 +1,138 @@
+models:
+  codex_cli/gpt-5.5:
+    provider_id: codex_cli
+    model_id: gpt-5.5
+    protocol: codex_cli
+    input_modalities:
+      - text
+    output_modalities:
+      - text
+    reasoning_support: effort
+    reasoning_effort_map:
+      low: low
+      medium: medium
+      high: high
+      xhigh: xhigh
+    variants:
+      low:
+        display_name: Low reasoning
+        model_options:
+          model_reasoning_effort: low
+      medium:
+        display_name: Medium reasoning
+        model_options:
+          model_reasoning_effort: medium
+      high:
+        display_name: High reasoning
+        model_options:
+          model_reasoning_effort: high
+      xhigh:
+        display_name: Extra high reasoning
+        model_options:
+          model_reasoning_effort: xhigh
+    tool_support: false
+    status: active
+    source: builtin_metadata
+    safety_notes:
+      - Codex CLI model metadata is descriptive; execution still goes through explicit Codex CLI validation and approval paths.
+  local_openai_compatible/qwen3-coder:30b:
+    provider_id: local_openai_compatible
+    model_id: qwen3-coder:30b
+    protocol: openai_chat
+    input_modalities:
+      - text
+    output_modalities:
+      - text
+    reasoning_support: unknown
+    variants:
+      deterministic:
+        display_name: Deterministic local generation
+        model_options:
+          temperature: 0.0
+          max_tokens: 2048
+    tool_support: false
+    status: active
+    source: builtin_metadata
+    safety_notes:
+      - Local model metadata does not imply the local endpoint is running or safe; endpoint validation and preflight remain separate.
+  paid_openai_compatible/gpt-5.3-codex:
+    provider_id: paid_openai_compatible
+    model_id: gpt-5.3-codex
+    protocol: openai_codex_responses
+    input_modalities:
+      - text
+    output_modalities:
+      - text
+    reasoning_support: effort
+    reasoning_effort_map:
+      low: low
+      medium: medium
+      high: high
+    variants:
+      low:
+        display_name: Low reasoning
+        model_options:
+          model_reasoning_effort: low
+      medium:
+        display_name: Medium reasoning
+        model_options:
+          model_reasoning_effort: medium
+      high:
+        display_name: High reasoning
+        model_options:
+          model_reasoning_effort: high
+    tool_support: true
+    status: active
+    source: builtin_metadata
+    safety_notes:
+      - Hosted model metadata does not enable the paid backend; provider configuration and approval gates remain authoritative.
+  anthropic/claude-sonnet-4-20250514:
+    provider_id: anthropic
+    model_id: claude-sonnet-4-20250514
+    protocol: anthropic_messages
+    input_modalities:
+      - text
+    output_modalities:
+      - text
+    context_limit: 200000
+    max_output_tokens: 8192
+    reasoning_support: tokens
+    tool_support: true
+    status: active
+    source: builtin_metadata
+    safety_notes:
+      - Hosted Anthropic model metadata does not enable the provider; provider configuration and approval gates remain authoritative.
+  google/gemini-2.5-flash:
+    provider_id: google
+    model_id: gemini-2.5-flash
+    protocol: google_generative
+    input_modalities:
+      - text
+      - image
+    output_modalities:
+      - text
+    context_limit: 1048576
+    max_output_tokens: 8192
+    reasoning_support: tokens
+    tool_support: true
+    status: active
+    source: builtin_metadata
+    safety_notes:
+      - Hosted Google model metadata does not enable the provider; provider configuration and approval gates remain authoritative.
+  bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0:
+    provider_id: bedrock
+    model_id: anthropic.claude-3-5-sonnet-20241022-v2:0
+    protocol: bedrock_converse
+    input_modalities:
+      - text
+      - image
+    output_modalities:
+      - text
+    context_limit: 200000
+    max_output_tokens: 8192
+    reasoning_support: unknown
+    tool_support: true
+    status: active
+    source: builtin_metadata
+    safety_notes:
+      - Hosted Bedrock model metadata does not enable the provider; provider configuration and approval gates remain authoritative.

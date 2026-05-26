@@ -421,6 +421,7 @@ class CodexIsolatedEditExecutionAdapter:
         )
         goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
         keep_isolation = bool(task.metadata.get("keep_isolation", False))
+        allow_dirty_isolation = approval.autonomy_scope == "supervised-codex"
         try:
             adapter_payload = runner.run_existing(
                 run_id=run.id,
@@ -428,6 +429,7 @@ class CodexIsolatedEditExecutionAdapter:
                 task_type=CODEX_CODE_EDIT_TASK_TYPE,
                 approval=approval,
                 keep_isolation=keep_isolation,
+                allow_dirty_isolation=allow_dirty_isolation,
             )
             decision, success, run_status = _codex_decision_from_status(str(adapter_payload.get("status", "")))
             store.finish_attempt_run(

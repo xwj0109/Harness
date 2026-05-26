@@ -310,7 +310,14 @@ def test_golden_backend_and_approval_json_evidence_contract(tmp_path, monkeypatc
     preflight_by_name = {backend["name"]: backend for backend in preflight["backends"]}
     assert backends["schema_version"] == "harness.backends/v1"
     assert preflight["schema_version"] == "harness.backend_preflight/v1"
-    assert backend_names == {"codex_cli", "local_openai_compatible", "paid_openai_compatible"}
+    assert backend_names == {
+        "codex_cli",
+        "local_openai_compatible",
+        "paid_openai_compatible",
+        "anthropic",
+        "google",
+        "bedrock",
+    }
     assert backend_by_name["paid_openai_compatible"]["constraints"] == [
         "disabled_by_default",
         "no_automatic_fallback",
@@ -320,6 +327,9 @@ def test_golden_backend_and_approval_json_evidence_contract(tmp_path, monkeypatc
     assert preflight_by_name["local_openai_compatible"]["available"] is False
     assert preflight_by_name["paid_openai_compatible"]["available"] is False
     assert preflight_by_name["paid_openai_compatible"]["reason"] == "Paid backend preflight skipped; disabled by default."
+    for hosted_provider in ("anthropic", "google", "bedrock"):
+        assert preflight_by_name[hosted_provider]["available"] is False
+        assert preflight_by_name[hosted_provider]["reason"] == "Paid backend preflight skipped; disabled by default."
     _assert_no_config_internals(backends)
     _assert_no_config_internals(preflight)
 

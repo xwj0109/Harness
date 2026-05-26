@@ -93,6 +93,52 @@ def test_session_event_sequence_is_monotonic_per_stream_and_filterable(tmp_path)
     assert ["run.started", "run.finished"] == [kind for kind in linked_kinds if kind.startswith("run.")]
 
 
+def test_session_timeline_renders_usage_and_cost_evidence(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    session = store.create_session(title="Usage evidence")
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "token_usage.updated",
+        {
+            "normalized_usage": {
+                "input_tokens": 3,
+                "output_tokens": 4,
+                "reasoning_tokens": 1,
+                "cache_read_tokens": 2,
+                "cache_write_tokens": 1,
+                "total_tokens": 8,
+            },
+            "estimated_cost": {
+                "currency": "USD",
+                "input": 0.000003,
+                "output": 0.000008,
+                "total": 0.000011,
+                "estimated": True,
+                "source": "model_descriptor_pricing",
+            },
+            "estimated_cost_usd": 0.000011,
+            "provider_reported_cost": {
+                "currency": "USD",
+                "total": 0.006,
+                "source": "provider_usage_cost",
+            },
+        },
+        session_id=session.id,
+    )
+
+    rendered = "\n".join(render_timeline_event(event) for event in list_session_timeline(store, session.id))
+    timeline_jsonl = "\n".join(timeline_event_jsonl(event) for event in list_session_timeline(store, session.id))
+
+    assert "Token usage updated" in rendered
+    assert "input=3 output=4 reasoning=1 cache_read=2 cache_write=1 total=8" in rendered
+    assert "estimated_cost_usd=1.1e-05 estimated=True source=model_descriptor_pricing" in rendered
+    assert "provider_reported_cost=0.006 USD source=provider_usage_cost" in rendered
+    assert '"estimated": true' in timeline_jsonl
+    assert '"provider_reported_cost"' in timeline_jsonl
+
+
 def test_session_transcript_reconstruction_keeps_part_order_and_json_schema(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()

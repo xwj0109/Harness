@@ -464,6 +464,8 @@ def _context_rows(dashboard: dict[str, Any], state: dict[str, Any], focus_mode: 
         f"Project: {Path(str(dashboard.get('project_root') or '.')).name}",
         f"Branch: {dashboard.get('branch') or 'unknown'}",
         f"Model: {_model_label(dashboard, state)}",
+        f"Model source: {_humanize(active_model.get('selection_source') or 'unresolved')}",
+        f"Context window: {_context_window_label(active_session, active_model)}",
         f"Assistant: {_humanize(state.get('active_orchestrator') or 'default')}",
         f"Mode: {_status_label(state.get('chat_mode') or 'normal')}",
         f"Active: {_session_title(active_session) if active_session else 'none'}",
@@ -491,6 +493,27 @@ def _context_rows(dashboard: dict[str, Any], state: dict[str, Any], focus_mode: 
     if focus_mode == "palette" and query.strip():
         rows.append("Palette: command previews only")
     return rows
+
+
+def _context_window_label(active_session: dict[str, Any], active_model: dict[str, Any]) -> str:
+    composer_context = active_session.get("composer_context") or {}
+    estimated_tokens = _safe_int(composer_context.get("total_estimated_tokens"))
+    context_limit = _safe_int(active_model.get("context_limit"))
+    if context_limit <= 0:
+        return "unknown"
+    percent = (estimated_tokens / context_limit) * 100 if context_limit else 0
+    if estimated_tokens > 0 and percent < 1:
+        percent_label = "<1%"
+    else:
+        percent_label = f"{percent:.0f}%"
+    return f"{percent_label} used"
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _graph_rows(graph: LiveOrchestrationGraph | None, *, expanded: bool) -> list[str]:

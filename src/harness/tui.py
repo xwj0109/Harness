@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import re
 import time
+import json
+from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
+from harness.models import SessionPartKind
 from harness.left_pane import (
     build_left_pane_view,
     left_pane_list_item_labels,
@@ -29,7 +33,8 @@ from harness.right_pane import (
     render_right_pane_top_context,
 )
 from rich.markup import escape
-from textual.markup import MarkupError
+from rich.errors import MarkupError
+from rich.text import Text
 
 
 SESSION_PREVIOUS_KEYS = {"alt+up", "option+up", "meta+up", "ctrl+left", "ctrl+pageup"}
@@ -863,6 +868,37 @@ def _tui_settings_pane_rows(catalog: dict, *, source: str | None = None) -> list
     ]
 
 
+def _evidence_status_text(value: object) -> str:
+    text = str(value or "unknown").strip()
+    return text or "unknown"
+
+
+def _evidence_status_line(value: object) -> str:
+    return f"Evidence: {_evidence_status_text(value)}"
+
+
+def _with_evidence_status(message: str, value: object) -> str:
+    clean = str(message).strip()
+    if clean.endswith("."):
+        clean = clean[:-1]
+    return f"{clean}. {_evidence_status_line(value)}."
+
+
+def _set_text_area_cursor_end(text_area: object) -> None:
+    text = str(getattr(text_area, "text", getattr(text_area, "value", "")) or "")
+    lines = text.split("\n")
+    location = (max(0, len(lines) - 1), len(lines[-1]) if lines else 0)
+    try:
+        text_area.move_cursor(location)
+        return
+    except AttributeError:
+        pass
+    try:
+        text_area.cursor_position = len(text)
+    except AttributeError:
+        pass
+
+
 def _active_session_ui_activation_rows(active_session: dict) -> list[str]:
     activation = active_session.get("latest_ui_activation") or {}
     if not activation:
@@ -932,7 +968,11 @@ def _model_selection_palette_entries(model_catalog: dict) -> list[dict]:
         enabled = bool(provider.get("enabled", True))
         credential_status = str(provider.get("credential_status") or "unknown")
         boundary = str(provider.get("data_boundary") or (provider.get("metadata") or {}).get("data_boundary") or "unknown")
-        suffix = "active" if raw_ref == active_ref else ("enabled" if enabled else "blocked")
+        blocked_reasons = [str(item) for item in model.get("blocked_reasons") or []]
+        executable = bool(model.get("executable", enabled))
+        suffix = "active" if raw_ref == active_ref else ("enabled" if executable else "blocked")
+        protocol = str(model.get("protocol") or "unknown")
+        source = str(model.get("source") or "unknown")
         entries.append(
             _with_palette_activation(
                 {
@@ -940,15 +980,19 @@ def _model_selection_palette_entries(model_catalog: dict) -> list[dict]:
                     "group_id": "model_selection",
                     "title": f"Select model {raw_ref}",
                     "command": f"ui:select-model {raw_ref}",
-                    "description": f"{boundary} | credentials={credential_status} | {suffix}",
+                    "description": f"{protocol} | {source} | {boundary} | credentials={credential_status} | {suffix}",
                     "mutates_when_run": True,
                     "safety_note": "Persists active session model metadata and validation evidence only; no provider call or fallback.",
                     "model_ref": raw_ref,
                     "provider_id": model.get("provider_id"),
                     "model_id": model.get("model_id"),
                     "provider_enabled": enabled,
+                    "executable": executable,
+                    "blocked_reasons": blocked_reasons,
                     "credential_status": credential_status,
                     "data_boundary": boundary,
+                    "protocol": protocol,
+                    "source": source,
                 }
             )
         )
@@ -1067,6 +1111,13 @@ def _safe_palette_policy_boundary() -> dict:
         "session_message_allowed": False,
         "in_memory_ui_state_only": True,
     }
+
+
+def _persisted_palette_evidence_status(activation: dict) -> str:
+    status = str(activation.get("evidence_status") or "")
+    if activation.get("activation_kind") == "ui_action" and status.startswith("ui_") and status.endswith("_in_memory"):
+        return "ui_only_persisted"
+    return status or "ui_only_persisted"
 
 
 def _palette_no_side_effect_flags() -> dict:
@@ -1708,6 +1759,7 @@ def _right_panel_assistant_rows(dashboard: dict, state: dict) -> list[str]:
     )
     rows = [
         f"Model: {model_label}",
+        f"Model source: {_humanize_identifier(active_model.get('selection_source') or 'unresolved')}",
         f"Provider: {_humanize_identifier(active_model.get('provider_id') or 'default')}",
         f"Mode: {_status_label(state.get('chat_mode') or chat_cfg.get('mode') or 'normal')}",
         "Safety: action contracts",
@@ -1918,6 +1970,10 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
         if active.get("session_id"):
             rows.append(f"Switch: harness session model {active['session_id']} <provider/model> --project .")
             rows.append("In app: /models then /model <number>")
+        if active.get("alias_used"):
+            rows.append(f"Canonical: {active.get('canonical_model_ref') or '-'}")
+        if active.get("protocol"):
+            rows.append(f"Protocol: {active.get('protocol')}")
         rows.append(f"Provider enabled: {active.get('provider_enabled')}")
         if active.get("blocked_reasons"):
             rows.append("Blocked: " + ", ".join(active["blocked_reasons"]))
@@ -1934,7 +1990,7 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
     rows.append("Provider status:")
     rows.extend(
         [
-            f"{provider['provider_id']} enabled={provider['enabled']} credentials={provider['credential_status']}"
+            f"{provider['provider_id']} enabled={provider['enabled']} credentials={provider['credential_status']} boundary={provider.get('data_boundary', 'unknown')}"
             for provider in providers[:4]
         ]
         or ["none"]
@@ -1942,7 +1998,7 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
     rows.append("Model refs:")
     rows.extend(
         [
-            f"{index}. {model['raw_model_ref']} profile={model.get('model_profile_id') or '-'}"
+            f"{index}. {model['raw_model_ref']} {model.get('protocol') or '?'} {model.get('source') or '?'} exec={model.get('executable')}"
             for index, model in enumerate(_unique_model_catalog_entries(models)[:8], start=1)
         ]
         or ["none"]
@@ -1950,58 +2006,572 @@ def _model_catalog_pane_rows(dashboard: dict) -> list[str]:
     return rows
 
 
-def render_model_selection_dialog(dashboard: dict, *, query: str = "", selected_index: int = 0) -> str:
+def render_model_selection_dialog(dashboard: dict, *, query: str = "", selected_index: int = 0, width: int = 76) -> str:
     catalog = dashboard.get("model_catalog") or {}
     providers = {provider.get("provider_id"): provider for provider in catalog.get("providers") or []}
     models = _model_selection_dialog_entries(dashboard, query=query)
-    active = catalog.get("active_model") or {}
-    active_ref = active.get("raw_model_ref")
+    active_ref = (catalog.get("active_model") or {}).get("raw_model_ref")
     selected_index = min(max(selected_index, 0), max(len(models) - 1, 0))
+    separator = "─" * width
     lines = [
-        "[bold deep_sky_blue1]Select model[/bold deep_sky_blue1]  [dim]session scope | no provider call[/dim]                 [dim]esc[/dim]",
-        f"[dim]{'─' * 76}[/dim]",
+        _dialog_header("Select model", "session scope | no provider call", "esc", width=width),
+        f"[dim]{separator}[/dim]",
         f"[bold steel_blue1]Search[/bold steel_blue1] {escape(query or 'type to filter')}",
     ]
     lines.append("")
-    if active_ref:
-        lines.append("[bold dark_orange3]Recent[/bold dark_orange3]")
-        active_provider = active.get("provider_id") or str(active_ref).split("/", 1)[0]
-        lines.append(f"  [blue]{escape(str(active_ref).split('/', 1)[-1])}[/] [dim]{escape(str(active_provider))}[/] [dim]current[/dim]")
-        lines.append("")
     if not models:
         lines.append("[dim]No models match.[/dim]")
-    grouped: dict[str, list[dict]] = {}
-    for model in models:
-        grouped.setdefault(str(model.get("provider_id") or "unknown"), []).append(model)
-    row_number = 0
-    for provider_id, provider_models in grouped.items():
+    visible_models, window_note = _visible_model_selection_entries(models, selected_index=selected_index)
+    absolute_index = _model_selection_window_offset(len(models), selected_index)
+    previous_section: str | None = None
+    for model in visible_models:
+        section_title = str(model.get("_picker_section_title") or "Hosted providers")
+        if section_title != previous_section:
+            if previous_section is not None:
+                lines.append("")
+            lines.append(f"[bold dark_orange3]{escape(_truncate_text(section_title, width))}[/bold dark_orange3]")
+            previous_section = section_title
+        absolute_index += 1
+        provider_id = str(model.get("provider_id") or "unknown")
         provider = providers.get(provider_id) or {}
         credential_status = str(provider.get("credential_status") or "unknown")
-        lines.append(f"[bold dark_orange3]{escape(provider_id)}[/bold dark_orange3] [dim]{escape(credential_status)}[/]")
-        for model in provider_models:
-            row_number += 1
-            raw_ref = str(model.get("raw_model_ref") or "")
-            model_name = raw_ref.split("/", 1)[-1]
-            marker = "*" if raw_ref == active_ref else " "
-            text = f"{row_number:>2}. {marker} {model_name}"
-            suffix = ""
-            if not provider.get("enabled", True):
-                suffix = " [dim]disabled[/dim]"
-            elif credential_status == "missing":
-                suffix = " [dim]credentials missing[/dim]"
-            if row_number - 1 == selected_index:
-                lines.append(f"[white on #5f87d7]{escape(('> ' + text)[:66].ljust(66))}[/]{suffix}")
+        boundary = str(provider.get("data_boundary") or "unknown")
+        raw_ref = str(model.get("raw_model_ref") or "")
+        model_name = str(model.get("model_id") or raw_ref.split("/", 1)[-1])
+        marker = "*" if raw_ref == active_ref else " "
+        context_window = _format_model_context_window(model.get("context_limit"))
+        reasoning = str(model.get("reasoning_support") or "unknown")
+        output_window = _format_model_context_window(model.get("max_output_tokens"))
+        provider_name = str(provider.get("display_name") or provider_id)
+        provider_label = _truncate_text(provider_name, 18)
+        text = f"{absolute_index:>2}. {marker} {_truncate_text(model_name, 28)}  ctx {context_window:<6} out {output_window:<5} reason {reasoning}  {provider_label}"
+        suffix = ""
+        blocked = model.get("blocked_reasons") or []
+        if blocked:
+            suffix = f" [dim]blocked: {escape(','.join(str(item) for item in blocked))}[/dim]"
+            if credential_status == "missing":
+                suffix += " [dim]connect credentials[/dim]"
+        elif not provider.get("enabled", True):
+            if boundary == "hosted_provider":
+                suffix = " [dim]approval required[/dim]"
             else:
-                lines.append(f"  {escape(text)}{suffix}")
+                suffix = " [dim]disabled[/dim]"
+        elif credential_status == "missing":
+            suffix = " [dim]connect credentials[/dim]"
+        row_width = max(24, width - 10)
+        if absolute_index - 1 == selected_index:
+            lines.append(f"[white on #5f87d7]{escape(_truncate_text('> ' + text, row_width).ljust(row_width))}[/]{suffix}")
+        else:
+            lines.append(f"  {escape(_truncate_text(text, row_width))}{suffix}")
+    if visible_models:
         lines.append("")
+    if window_note:
+        lines.append(f"[dim]{escape(window_note)}[/dim]")
+        lines.append("")
+    if models:
+        selected_model = models[selected_index]
+        selected_provider = providers.get(str(selected_model.get("provider_id") or ""))
+        provider_models = [model for model in catalog.get("models") or [] if model.get("provider_id") == selected_model.get("provider_id")]
+        lines.extend(_model_selection_detail_lines(selected_model, selected_provider, width=width))
+        lines.extend(_provider_selection_detail_lines(selected_provider, provider_models, width=width))
+        action_hints = _model_selection_action_hint_line(selected_model, selected_provider, provider_models)
+        if action_hints:
+            lines.append("")
+            lines.append(action_hints)
     lines.extend(
         [
-            f"[dim]{'─' * 76}[/dim]",
-            "[bold steel_blue1]Enter[/bold steel_blue1] select   [bold steel_blue1]Slash[/bold steel_blue1] /model <number> or /model <name>   [bold steel_blue1]Arrows[/bold steel_blue1] move",
-            "[bold steel_blue1]Connect provider[/bold steel_blue1] ctrl+a   [bold steel_blue1]Favorite[/bold steel_blue1] ctrl+f",
+            f"[dim]{separator}[/dim]",
+            "[bold steel_blue1]Enter[/bold steel_blue1] select   [bold steel_blue1]Slash[/bold steel_blue1] /model <number|name>   [bold steel_blue1]Arrows[/bold steel_blue1] move",
         ]
     )
     return "\n".join(lines).rstrip()
+
+
+def _dialog_header(title: str, scope: str, action: str, *, width: int) -> str:
+    left = f"{title}  {scope}"
+    gap = max(1, width - len(left) - len(action))
+    return f"[bold deep_sky_blue1]{escape(title)}[/bold deep_sky_blue1]  [dim]{escape(scope)}[/dim]{' ' * gap}[dim]{escape(action)}[/dim]"
+
+
+def _truncate_text(value: object, width: int) -> str:
+    text = str(value or "")
+    if width <= 0 or len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: max(0, width - 1)] + "…"
+
+
+def _visible_model_selection_entries(models: list[dict], *, selected_index: int, limit: int = 18) -> tuple[list[dict], str | None]:
+    if len(models) <= limit:
+        return models, None
+    offset = _model_selection_window_offset(len(models), selected_index, limit=limit)
+    end = min(len(models), offset + limit)
+    note = f"Showing {offset + 1}-{end} of {len(models)} matches"
+    return models[offset:end], note
+
+
+def _model_selection_window_offset(count: int, selected_index: int, *, limit: int = 18) -> int:
+    if count <= limit:
+        return 0
+    half = limit // 2
+    return min(max(0, selected_index - half), max(0, count - limit))
+
+
+def _model_selection_detail_lines(model: dict, provider: dict | None, *, width: int) -> list[str]:
+    provider = provider or {}
+    blocked = ", ".join(str(item) for item in model.get("blocked_reasons") or []) or "none"
+    provider_id = str(model.get("provider_id") or "unknown")
+    credential_status = str(provider.get("credential_status") or "unknown")
+    boundary = str(model.get("data_boundary") or provider.get("data_boundary") or "unknown")
+    canonical_ref = str(model.get("canonical_model_ref") or model.get("raw_model_ref") or "-")
+    limits = (
+        f"ctx {_format_model_context_window(model.get('context_limit'))}, "
+        f"out {_format_model_context_window(model.get('max_output_tokens'))}"
+    )
+    rows = [
+        ("Ref", canonical_ref),
+        ("Provider", f"{provider.get('display_name') or provider_id} ({provider_id})"),
+        ("Protocol", str(model.get("protocol") or "?")),
+        ("Limits", limits),
+        ("Reasoning", str(model.get("reasoning_support") or "unknown")),
+        ("Tools", "yes" if model.get("tool_support") else "no"),
+        ("Boundary", f"{boundary}, credentials={credential_status}"),
+        ("Blocked", blocked),
+    ]
+    label_width = 11
+    value_width = max(16, width - label_width - 2)
+    lines = ["[bold dark_orange3]Model[/bold dark_orange3]"]
+    for label, value in rows:
+        lines.append(f"  [dim]{label + ':' :<{label_width}}[/dim] {escape(_truncate_text(value, value_width))}")
+    return lines
+
+
+def _format_model_variants(model: dict) -> str:
+    variant_list = model.get("variant_list")
+    if isinstance(variant_list, list):
+        variants = [str(item) for item in variant_list if str(item or "").strip()]
+        if variants:
+            return ", ".join(variants)
+    variants_value = model.get("variants")
+    if isinstance(variants_value, dict):
+        variants = [str(key) for key in variants_value if str(key or "").strip()]
+        if variants:
+            return ", ".join(sorted(variants))
+    if isinstance(variants_value, list):
+        variants = [str(item) for item in variants_value if str(item or "").strip()]
+        if variants:
+            return ", ".join(variants)
+    selected = str(model.get("variant") or "").strip()
+    return selected or "none"
+
+
+def _provider_selection_detail_lines(provider: dict | None, provider_models: list[dict], *, width: int) -> list[str]:
+    provider = provider or {}
+    provider_id = str(provider.get("provider_id") or "unknown")
+    display_name = str(provider.get("display_name") or provider_id)
+    enabled = "yes" if provider.get("enabled", True) else "no"
+    connected = "yes" if provider.get("connected") else "no"
+    auth_methods = _format_provider_auth_methods(provider)
+    credential_status = str(provider.get("credential_status") or "unknown")
+    model_count = _provider_model_count(provider, provider_models)
+    available_count = _provider_available_model_count(provider, provider_models)
+    refresh_status = str(provider.get("refresh_status") or _provider_refresh_status(provider, provider_models))
+    rows = [
+        ("Provider", f"{display_name} ({provider_id})"),
+        ("Status", f"connected={connected}, credentials={credential_status}, enabled={enabled}"),
+        ("Auth", auth_methods),
+        ("Models", f"{available_count}/{model_count} available"),
+        ("Refresh", refresh_status),
+    ]
+    label_width = 11
+    value_width = max(16, width - label_width - 2)
+    lines = ["", "[bold dark_orange3]Provider[/bold dark_orange3]"]
+    for label, value in rows:
+        lines.append(f"  [dim]{label + ':' :<{label_width}}[/dim] {escape(_truncate_text(value, value_width))}")
+    return lines
+
+
+def _model_selection_action_hint_line(model: dict, provider: dict | None, provider_models: list[dict] | None = None) -> str:
+    provider = provider or {}
+    provider_models = provider_models or []
+    favorite_action = "unfavorite" if model.get("favorite") else "favorite"
+    hints = [
+        f"[bold steel_blue1]F5[/bold steel_blue1] {favorite_action}",
+        "[bold steel_blue1]F6[/bold steel_blue1] default",
+        "[bold steel_blue1]F7[/bold steel_blue1] inspect",
+    ]
+    provider_id = str(provider.get("provider_id") or model.get("provider_id") or "")
+    if provider_id and _provider_refresh_action_available(provider, provider_models):
+        hints.append("[bold steel_blue1]F8[/bold steel_blue1] refresh")
+    credential_status = str(provider.get("credential_status") or "unknown")
+    if provider_id and (_provider_connect_action_available(provider) or _provider_disconnect_action_available(provider)):
+        hints.append("[bold steel_blue1]Ctrl+A[/bold steel_blue1] account")
+    if _provider_disconnect_action_available(provider):
+        hints.append("[bold steel_blue1]F10[/bold steel_blue1] disconnect")
+    return "   ".join(hints)
+
+
+def _provider_refresh_action_available(provider: dict | None, provider_models: list[dict] | None = None) -> bool:
+    provider = provider or {}
+    provider_models = provider_models or []
+    return bool(provider.get("refresh_supported") or any(model.get("refresh_supported") for model in provider_models))
+
+
+def _provider_disconnect_action_available(provider: dict | None) -> bool:
+    provider = provider or {}
+    credential_status = str(provider.get("credential_status") or "unknown")
+    return bool(credential_status in {"configured", "not_required"} or provider.get("connected"))
+
+
+def _provider_connect_action_available(provider: dict | None) -> bool:
+    provider = provider or {}
+    if _provider_disconnect_action_available(provider):
+        return False
+    for method in provider.get("methods") or []:
+        if isinstance(method, dict) and method.get("supported"):
+            return True
+    return bool(provider.get("auth_methods") or _provider_default_env_var(provider))
+
+
+def _format_provider_auth_methods(provider: dict) -> str:
+    methods = provider.get("auth_methods")
+    if isinstance(methods, list):
+        values = [str(item) for item in methods if str(item or "").strip()]
+        if values:
+            return ", ".join(values)
+    default_env = _provider_default_env_var(provider)
+    if default_env:
+        return f"env:{default_env}"
+    credential_status = str(provider.get("credential_status") or "")
+    if credential_status == "not_required":
+        return "none"
+    source = str(provider.get("credential_source") or "").strip()
+    return source or "unknown"
+
+
+def _provider_model_count(provider: dict, provider_models: list[dict]) -> int:
+    try:
+        configured_count = int(provider.get("model_count") or 0)
+    except (TypeError, ValueError):
+        configured_count = 0
+    return configured_count or len(_unique_model_catalog_entries(provider_models))
+
+
+def _provider_available_model_count(provider: dict, provider_models: list[dict]) -> int:
+    try:
+        configured_count = int(provider.get("available_model_count") or 0)
+    except (TypeError, ValueError):
+        configured_count = 0
+    if configured_count:
+        return configured_count
+    return sum(1 for model in provider_models if model.get("available_model") or model.get("executable"))
+
+
+def _provider_refresh_status(provider: dict, provider_models: list[dict]) -> str:
+    statuses = sorted({str(model.get("cache_status")) for model in provider_models if model.get("cache_status")})
+    if statuses:
+        return statuses[0] if len(statuses) == 1 else "mixed"
+    if provider.get("refresh_supported") or any(model.get("refresh_supported") for model in provider_models):
+        return "not_refreshed"
+    return "unsupported"
+
+
+def _provider_connect_command(provider: dict) -> str:
+    provider_id = str(provider.get("provider_id") or "unknown")
+    credential_status = str(provider.get("credential_status") or "unknown")
+    if credential_status in {"configured", "not_required"} or provider.get("connected"):
+        return "already connected"
+    return f"/models then Ctrl+A on {provider_id}"
+
+
+def _provider_disconnect_command(provider: dict) -> str:
+    provider_id = str(provider.get("provider_id") or "unknown")
+    credential_status = str(provider.get("credential_status") or "unknown")
+    if credential_status == "configured" or provider.get("connected"):
+        return f"harness providers logout {provider_id} --project ."
+    return "none"
+
+
+def _provider_default_env_var(provider: dict | None) -> str | None:
+    for method in (provider or {}).get("auth_methods") or []:
+        text = str(method or "")
+        if text.startswith("env:") and text.removeprefix("env:").strip():
+            return text.removeprefix("env:").strip()
+    for method in (provider or {}).get("methods") or []:
+        if not isinstance(method, dict) or method.get("method") != "env":
+            continue
+        env_var = method.get("default_env_var")
+        if isinstance(env_var, str) and env_var.strip():
+            return env_var.strip()
+    return None
+
+
+_PROVIDER_CONNECT_PRIORITY = {
+    "codex_cli": 0,
+    "paid_openai_compatible": 1,
+    "anthropic": 2,
+    "google": 3,
+    "bedrock": 4,
+    "local_openai_compatible": 5,
+}
+
+
+_PROVIDER_CONNECT_DESCRIPTIONS = {
+    "codex_cli": "Codex CLI subscription login",
+    "paid_openai_compatible": "OpenAI-compatible hosted API key or OAuth",
+    "anthropic": "Anthropic API key",
+    "google": "Google Generative AI credentials",
+    "bedrock": "AWS profile or environment credentials",
+    "local_openai_compatible": "Local OpenAI-compatible endpoint",
+}
+
+
+_PROVIDER_METHOD_LABELS = {
+    "api_key": "API key",
+    "env": "Environment variable",
+    "oauth": "OAuth / manual code",
+    "aws_profile": "AWS profile",
+    "aws_env": "AWS environment",
+    "codex_login": "Codex CLI login",
+    "static_local": "Static local",
+}
+
+
+def render_provider_connect_dialog(auth_projection: dict, *, query: str = "", selected_index: int = 0, width: int = 76) -> str:
+    entries = _provider_connect_dialog_entries(auth_projection, query=query)
+    selected_index = min(max(selected_index, 0), max(len(entries) - 1, 0))
+    separator = "─" * width
+    lines = [
+        _dialog_header("Connect a provider", "account setup | no provider call", "esc", width=width),
+        f"[dim]{separator}[/dim]",
+        f"[bold steel_blue1]Search[/bold steel_blue1] {escape(query or 'type to filter')}",
+        "",
+    ]
+    if not entries:
+        lines.append("[dim]No providers match.[/dim]")
+    previous_category: str | None = None
+    row_width = max(24, width - 4)
+    for index, entry in enumerate(entries):
+        category = str(entry.get("category") or "Providers")
+        if category != previous_category:
+            if previous_category is not None:
+                lines.append("")
+            lines.append(f"[bold dark_orange3]{escape(category)}[/bold dark_orange3]")
+            previous_category = category
+        connected = "✓" if entry.get("connected") else " "
+        title = _truncate_text(entry.get("title") or entry.get("provider_id") or "Unknown", 30)
+        description = _truncate_text(entry.get("description") or "", max(12, width - 39))
+        text = f"{connected} {title:<30} {description}"
+        if index == selected_index:
+            lines.append(f"[white on #5f87d7]{escape(_truncate_text('> ' + text, row_width).ljust(row_width))}[/]")
+        else:
+            lines.append(f"  {escape(_truncate_text(text, row_width))}")
+    lines.extend(
+        [
+            "",
+            f"[dim]{separator}[/dim]",
+            "[bold steel_blue1]Enter[/bold steel_blue1] auth methods   [bold steel_blue1]Arrows[/bold steel_blue1] move   [bold steel_blue1]Slash[/bold steel_blue1] /provider",
+        ]
+    )
+    return "\n".join(lines).rstrip()
+
+
+def _provider_connect_dialog_entries(auth_projection: dict, *, query: str = "") -> list[dict]:
+    normalized = query.strip().casefold()
+    entries = []
+    for provider in auth_projection.get("providers") or []:
+        provider_id = str(provider.get("provider_id") or "").strip()
+        if not provider_id:
+            continue
+        display_name = str(provider.get("display_name") or _humanize_identifier(provider_id))
+        description = _PROVIDER_CONNECT_DESCRIPTIONS.get(provider_id) or _provider_connect_description(provider)
+        entry = {
+            "type": "provider",
+            "provider_id": provider_id,
+            "title": display_name,
+            "description": description,
+            "category": "Popular" if provider_id in _PROVIDER_CONNECT_PRIORITY else "Providers",
+            "connected": bool(provider.get("configured") or provider.get("active_account_id")),
+            "enabled": bool(provider.get("enabled", True)),
+            "provider": provider,
+        }
+        haystack = " ".join([provider_id, display_name, description, str(provider.get("credential_status") or "")]).casefold()
+        if normalized and normalized not in haystack:
+            continue
+        entries.append(entry)
+    if not normalized or normalized in "other custom provider":
+        entries.append(
+            {
+                "type": "custom",
+                "provider_id": "",
+                "title": "Other",
+                "description": "Custom provider via .harness/models.yaml",
+                "category": "Providers",
+                "connected": False,
+                "enabled": True,
+                "provider": {},
+            }
+        )
+    return sorted(
+        entries,
+        key=lambda entry: (
+            0 if entry.get("category") == "Popular" else 1,
+            _PROVIDER_CONNECT_PRIORITY.get(str(entry.get("provider_id") or ""), 99),
+            str(entry.get("title") or ""),
+        ),
+    )
+
+
+def _provider_connect_description(provider: dict) -> str:
+    methods = [str(method) for method in provider.get("auth_methods") or []]
+    if methods:
+        return ", ".join(_PROVIDER_METHOD_LABELS.get(method, _humanize_identifier(method)) for method in methods[:3])
+    status = str(provider.get("credential_status") or "unknown")
+    return f"credentials={status}"
+
+
+def render_provider_auth_method_dialog(provider: dict, *, selected_index: int = 0, width: int = 76) -> str:
+    entries = _provider_auth_method_entries(provider)
+    selected_index = min(max(selected_index, 0), max(len(entries) - 1, 0))
+    provider_id = str(provider.get("provider_id") or "unknown")
+    separator = "─" * width
+    lines = [
+        _dialog_header("Connect provider", provider_id, "esc", width=width),
+        f"[dim]{separator}[/dim]",
+        f"[bold dark_orange3]{escape(str(provider.get('display_name') or provider_id))}[/bold dark_orange3]",
+        f"Status: {escape(str(provider.get('credential_status') or 'unknown'))}   Accounts: {int(provider.get('account_count') or 0)}",
+        "",
+    ]
+    if not entries:
+        lines.append("[dim]No supported auth methods.[/dim]")
+    row_width = max(24, width - 4)
+    for index, entry in enumerate(entries):
+        title = _truncate_text(entry.get("title") or entry.get("method") or "unknown", 24)
+        description = _truncate_text(entry.get("description") or "", max(12, width - 33))
+        text = f"{title:<24} {description}"
+        if index == selected_index:
+            lines.append(f"[white on #5f87d7]{escape(_truncate_text('> ' + text, row_width).ljust(row_width))}[/]")
+        else:
+            lines.append(f"  {escape(_truncate_text(text, row_width))}")
+    lines.extend(
+        [
+            "",
+            "[dim]Connect writes account metadata or local secrets only; it does not validate credentials or run a model.[/dim]",
+            f"[dim]{separator}[/dim]",
+            "[bold steel_blue1]Enter[/bold steel_blue1] choose   [bold steel_blue1]Backspace[/bold steel_blue1] providers   [bold steel_blue1]Esc[/bold steel_blue1] close",
+        ]
+    )
+    return "\n".join(lines).rstrip()
+
+
+def _provider_auth_method_entries(provider: dict) -> list[dict]:
+    entries = []
+    for method in provider.get("methods") or []:
+        if not method.get("supported"):
+            continue
+        method_name = str(method.get("method") or "").strip()
+        if not method_name:
+            continue
+        entries.append(
+            {
+                "type": "method",
+                "method": method_name,
+                "title": _PROVIDER_METHOD_LABELS.get(method_name, _humanize_identifier(method_name)),
+                "description": str(method.get("description") or ""),
+                "method_payload": method,
+            }
+        )
+    if provider.get("active_account_id") or int(provider.get("account_count") or 0) > 0 or provider.get("configured"):
+        entries.append(
+            {
+                "type": "disconnect",
+                "method": "disconnect",
+                "title": "Disconnect",
+                "description": "Remove local provider accounts and matching local secret-store entries.",
+                "method_payload": {},
+            }
+        )
+    return entries
+
+
+def render_provider_env_prompt_dialog(provider: dict, method: dict, *, buffer: str = "", width: int = 76) -> str:
+    provider_id = str(provider.get("provider_id") or "unknown")
+    default_env = str(method.get("default_env_var") or "").strip()
+    if buffer:
+        value = buffer
+    elif default_env:
+        value = f"[default: {default_env}]"
+    else:
+        value = "<ENV_VAR>"
+    separator = "─" * width
+    lines = [
+        _dialog_header("Environment variable", provider_id, "esc", width=width),
+        f"[dim]{separator}[/dim]",
+        f"Env var: {escape(value)}",
+        "",
+        "[dim]Stores the env var name only. Runtime resolves the value later after policy gates pass.[/dim]",
+        f"[dim]{separator}[/dim]",
+        "[bold steel_blue1]Enter[/bold steel_blue1] connect   [bold steel_blue1]Ctrl+U[/bold steel_blue1] clear   [bold steel_blue1]Esc[/bold steel_blue1] cancel",
+    ]
+    return "\n".join(lines).rstrip()
+
+
+def render_provider_api_key_prompt_dialog(provider: dict, *, buffer: str = "", width: int = 76) -> str:
+    provider_id = str(provider.get("provider_id") or "unknown")
+    masked = "*" * len(buffer)
+    separator = "─" * width
+    lines = [
+        _dialog_header("API key", provider_id, "esc", width=width),
+        f"[dim]{separator}[/dim]",
+        f"Key: {escape(masked or '<hidden>')}",
+        "",
+        "[dim]Writes the key to the local provider secret store. The key is never echoed in evidence.[/dim]",
+        f"[dim]{separator}[/dim]",
+        "[bold steel_blue1]Enter[/bold steel_blue1] store   [bold steel_blue1]Ctrl+U[/bold steel_blue1] clear   [bold steel_blue1]Esc[/bold steel_blue1] cancel",
+    ]
+    return "\n".join(lines).rstrip()
+
+
+def render_provider_custom_dialog(*, width: int = 76) -> str:
+    separator = "─" * width
+    lines = [
+        _dialog_header("Custom provider", ".harness/models.yaml", "esc", width=width),
+        f"[dim]{separator}[/dim]",
+        "Add the provider under .harness/models.yaml, then reopen this dialog to connect credentials.",
+        "",
+        "Validate: harness models config validate --project . --output json",
+        "List:     harness models providers --project . --output json",
+        f"[dim]{separator}[/dim]",
+        "[bold steel_blue1]Esc[/bold steel_blue1] close",
+    ]
+    return "\n".join(lines).rstrip()
+
+
+def _format_model_cost(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return "unknown"
+    currency = str(value.get("currency") or "USD")
+    parts = []
+    for label, key in (("in", "input_per_1m"), ("out", "output_per_1m"), ("cache read", "cache_read_per_1m")):
+        rate = value.get(key)
+        if rate is not None:
+            parts.append(f"{label} {rate}/{currency} 1M")
+    return ", ".join(parts) or "metadata"
+
+
+def _format_model_context_window(value: object) -> str:
+    try:
+        tokens = int(value)
+    except (TypeError, ValueError):
+        return "?"
+    if tokens <= 0:
+        return "?"
+    if tokens >= 1000:
+        amount = tokens / 1000
+        formatted = f"{amount:.1f}".rstrip("0").rstrip(".")
+        return f"{formatted}k"
+    return str(tokens)
 
 
 def render_theme_selection_dialog(*, selected_theme: str = "light", selected_index: int = 0) -> str:
@@ -2033,17 +2603,105 @@ def render_theme_selection_dialog(*, selected_theme: str = "light", selected_ind
 
 def _model_selection_dialog_entries(dashboard: dict, *, query: str = "") -> list[dict]:
     catalog = dashboard.get("model_catalog") or {}
-    models = _unique_model_catalog_entries(catalog.get("models") or [])
-    normalized = query.strip().casefold()
-    if not normalized:
-        return models
-    return [
-        model
-        for model in models
-        if normalized in str(model.get("raw_model_ref") or "").casefold()
-        or normalized in str(model.get("model_id") or "").casefold()
-        or normalized in str(model.get("provider_id") or "").casefold()
+    providers = {str(provider.get("provider_id") or ""): provider for provider in catalog.get("providers") or []}
+    active_ref = str((catalog.get("active_model") or {}).get("raw_model_ref") or "")
+    models = [
+        _model_selection_annotated_entry(model, providers.get(str(model.get("provider_id") or "")), active_ref=active_ref, original_index=index)
+        for index, model in enumerate(_unique_model_catalog_entries(catalog.get("models") or []))
     ]
+    normalized = query.strip().casefold()
+    if normalized:
+        terms = [term for term in normalized.replace("/", " ").replace("-", " ").replace("_", " ").split() if term]
+        models = [
+            model
+            for model in models
+            if _model_selection_matches(model, providers.get(str(model.get("provider_id") or "")), normalized, terms)
+        ]
+    return sorted(models, key=_model_selection_dialog_sort_key)
+
+
+_MODEL_SELECTION_SECTION_TITLES = {
+    "current": "Current session model",
+    "favorites": "Favorites",
+    "recents": "Recents",
+    "connected": "Connected providers",
+    "local": "Local providers",
+    "hosted": "Hosted providers",
+    "blocked": "Disabled or blocked providers",
+}
+_MODEL_SELECTION_SECTION_ORDER = {section_id: index for index, section_id in enumerate(_MODEL_SELECTION_SECTION_TITLES)}
+
+
+def _model_selection_annotated_entry(model: dict, provider: dict | None, *, active_ref: str, original_index: int) -> dict:
+    entry = dict(model)
+    section_id = _model_selection_section_id(entry, provider, active_ref=active_ref)
+    entry["_picker_section_id"] = section_id
+    entry["_picker_section_title"] = _MODEL_SELECTION_SECTION_TITLES[section_id]
+    entry["_picker_original_index"] = original_index
+    return entry
+
+
+def _model_selection_section_id(model: dict, provider: dict | None, *, active_ref: str) -> str:
+    provider = provider or {}
+    raw_ref = str(model.get("raw_model_ref") or "")
+    if active_ref and raw_ref == active_ref:
+        return "current"
+    if model.get("favorite"):
+        return "favorites"
+    if model.get("last_selected_at") or _model_selection_count(model) > 0:
+        return "recents"
+    blocked = model.get("blocked_reasons") or []
+    provider_enabled = bool(provider.get("enabled", True))
+    if blocked or model.get("executable") is False or not provider_enabled:
+        return "blocked"
+    boundary = str(model.get("data_boundary") or provider.get("data_boundary") or "unknown")
+    credential_status = str(provider.get("credential_status") or "unknown")
+    if boundary == "local_only":
+        return "local"
+    if credential_status == "configured" or provider.get("connected") or model.get("provider_connected"):
+        return "connected"
+    return "hosted"
+
+
+def _model_selection_count(model: dict) -> int:
+    try:
+        return int(model.get("selection_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _model_selection_dialog_sort_key(model: dict) -> tuple:
+    section_id = str(model.get("_picker_section_id") or "hosted")
+    section_rank = _MODEL_SELECTION_SECTION_ORDER.get(section_id, len(_MODEL_SELECTION_SECTION_ORDER))
+    recency = str(model.get("last_selected_at") or "")
+    return (
+        section_rank,
+        "" if section_id not in {"favorites", "recents"} else _invert_sort_text(recency),
+        str(model.get("provider_id") or ""),
+        str(model.get("model_id") or ""),
+        str(model.get("raw_model_ref") or ""),
+        int(model.get("_picker_original_index") or 0),
+    )
+
+
+def _invert_sort_text(value: str) -> str:
+    return "".join(chr(0x10FFFF - ord(char)) for char in value)
+
+
+def _model_selection_matches(model: dict, provider: dict | None, normalized_query: str, terms: list[str]) -> bool:
+    provider = provider or {}
+    search_text = " ".join(
+        str(value or "")
+        for value in (
+            model.get("raw_model_ref"),
+            model.get("canonical_model_ref"),
+            model.get("alias_of"),
+            model.get("model_id"),
+            model.get("provider_id"),
+            provider.get("display_name"),
+        )
+    ).casefold()
+    return normalized_query in search_text or all(term in search_text for term in terms)
 
 
 def build_functionality_table(slash_commands: dict | None = None) -> dict:
@@ -2764,6 +3422,26 @@ def build_slash_commands(palette: dict | None = None, custom_commands: list[dict
                 },
                 "custom_command": False,
             },
+            {
+                "name": "provider",
+                "slash": "/provider",
+                "entry_id": "provider.connect",
+                "group_id": "provider",
+                "title": "Connect provider from models",
+                "description": "Open the model picker and use the selected provider row to connect credentials.",
+                "command": "/models",
+                "mutates_when_run": True,
+                "safety_note": "Provider connection is launched from /models; account persistence remains explicit and redacted with no provider/model call.",
+                "activation": {
+                    "kind": "provider_connect",
+                    "supported": True,
+                    "process_started": False,
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "permission_granting": False,
+                },
+                "custom_command": False,
+            },
         ]
     )
     for command in custom_commands or []:
@@ -3058,9 +3736,9 @@ def render_codex_like_transcript(
 
 def _update_markup_static(widget, markup: str) -> None:
     try:
-        widget.update(markup)
+        widget.update(Text.from_markup(markup))
     except MarkupError:
-        widget.update(escape(markup))
+        widget.update(Text.from_markup(escape(markup)))
 
 
 def _render_codex_like_message(message: dict, *, separator_width: int) -> str:
@@ -3072,6 +3750,8 @@ def _render_codex_like_message(message: dict, *, separator_width: int) -> str:
     if title == "Harness chat":
         return ""
     if title == "Codex-Like Mode":
+        return ""
+    if title == "Prompt Submitted":
         return ""
     if body_lines == ["Starting model turn..."]:
         return ""
@@ -3196,7 +3876,7 @@ def _style_child_line(text: str) -> str:
     if sep and label:
         return f"  [dim]└[/dim] [{CODEX_ACCENT}]{escape(label)}:[/{CODEX_ACCENT}] [dim]{escape(rest.strip())}[/dim]"
     first, _, tail = text.partition(" ")
-    if first in {"List", "Read"}:
+    if first in {"List", "Read", "Search"}:
         return f"  [dim]└[/dim] [{CODEX_ACCENT}]{escape(first)}[/{CODEX_ACCENT}] {_style_inline_text(tail)}"
     return f"  [dim]└[/dim] [dim]{_style_inline_text(text)}[/dim]"
 
@@ -3259,6 +3939,488 @@ def _merge_codex_stream_and_final_lines(stream_lines: list[str], final_lines: li
         if clean and clean not in merged:
             merged.append(clean)
     return merged[-120:]
+
+
+def build_tui_transcript_projection(
+    app_service,
+    session_id: str | None,
+    local_messages: list[dict],
+    *,
+    transient_events: list[dict] | None = None,
+    message_limit: int = 80,
+    event_limit: int = 120,
+) -> dict:
+    local_messages = [dict(message) for message in local_messages]
+    if not session_id or not hasattr(app_service, "list_messages"):
+        return {
+            "schema_version": "harness.tui_transcript/v1",
+            "ok": True,
+            "session_id": session_id,
+            "source": "local_messages",
+            "messages": local_messages,
+            "persisted_message_count": 0,
+            "event_count": 0,
+            "local_notice_count": len(local_messages),
+            "permission_granting": False,
+        }
+    try:
+        message_payload = app_service.list_messages(session_id, limit=message_limit)
+    except Exception as exc:
+        return {
+            "schema_version": "harness.tui_transcript/v1",
+            "ok": False,
+            "session_id": session_id,
+            "source": "local_messages",
+            "messages": local_messages,
+            "error": str(exc),
+            "persisted_message_count": 0,
+            "event_count": 0,
+            "local_notice_count": len(local_messages),
+            "permission_granting": False,
+        }
+    try:
+        event_payload = app_service.list_events(session_id, limit=event_limit) if hasattr(app_service, "list_events") else {}
+    except Exception:
+        event_payload = {}
+    parts_by_message = message_payload.get("parts") or {}
+    persisted_entries = _persisted_transcript_entries(message_payload.get("messages") or [], parts_by_message)
+    persisted_messages = [entry["message"] for entry in persisted_entries]
+    completed_prompt_ids = _persisted_assistant_prompt_ids(message_payload.get("messages") or [], parts_by_message)
+    events = list(event_payload.get("events") or [])
+    for event in transient_events or []:
+        if isinstance(event, dict) and not any(existing.get("id") == event.get("id") for existing in events):
+            events.append(event)
+    event_entries = _transcript_event_entries(events, persisted_messages, completed_prompt_ids=completed_prompt_ids)
+    local_notices = _local_transcript_notices(local_messages, persisted_messages)
+    local_entries = [
+        {"sort_key": ("~", index, 0, "local"), "message": message}
+        for index, message in enumerate(local_notices)
+    ]
+    messages = [entry["message"] for entry in sorted([*persisted_entries, *event_entries, *local_entries], key=lambda item: item["sort_key"])]
+    if not messages:
+        messages = local_messages
+    return {
+        "schema_version": "harness.tui_transcript/v1",
+        "ok": True,
+        "session_id": session_id,
+        "source": "persisted_session",
+        "messages": messages,
+        "persisted_message_count": len(persisted_messages),
+        "event_count": len(events),
+        "local_notice_count": len(local_notices),
+        "permission_granting": False,
+    }
+
+
+def _persisted_transcript_entries(messages: list[dict], parts_by_message: dict) -> list[dict]:
+    entries: list[dict] = []
+    for index, message in enumerate(messages):
+        rendered = _persisted_message_to_tui_message(message, parts_by_message.get(message.get("id")) or [])
+        if rendered is None:
+            continue
+        entries.append(
+            {
+                "sort_key": _transcript_sort_key(message, fallback_index=index, bucket=0),
+                "message": rendered,
+            }
+        )
+    return entries
+
+
+def _persisted_message_to_tui_message(message: dict, parts: list[dict]) -> dict | None:
+    role = str(message.get("role") or "assistant")
+    lines = _lines_from_persisted_parts(parts)
+    if not lines:
+        preview = _tool_request_summary(message.get("content_preview")) or _safe_transcript_text(message.get("content_preview"))
+        lines = [preview] if preview else []
+    if role == "user":
+        return {"role": "user", "title": _safe_transcript_text(message.get("content_preview")) or "User", "lines": []}
+    if role == "tool":
+        return {"role": "assistant", "title": "Tool", "lines": lines}
+    if role == "system":
+        return {"role": "assistant", "title": "System", "lines": lines}
+    return {"role": "assistant", "title": "Assistant", "lines": lines}
+
+
+def _persisted_assistant_prompt_ids(messages: list[dict], parts_by_message: dict) -> set[str]:
+    assistant_message_ids = {
+        str(message.get("id"))
+        for message in messages
+        if str(message.get("role") or "").casefold() == "assistant" and message.get("id")
+    }
+    prompt_ids: set[str] = set()
+    for message_id in assistant_message_ids:
+        for part in parts_by_message.get(message_id) or []:
+            metadata = part.get("metadata") if isinstance(part.get("metadata"), dict) else {}
+            prompt_id = str(metadata.get("prompt_id") or "").strip()
+            if prompt_id:
+                prompt_ids.add(prompt_id)
+    return prompt_ids
+
+
+def _lines_from_persisted_parts(parts: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for part in sorted(parts, key=lambda item: int(item.get("ordinal") or 0)):
+        kind = str(part.get("kind") or "")
+        metadata = part.get("metadata") if isinstance(part.get("metadata"), dict) else {}
+        if kind == SessionPartKind.TEXT.value:
+            text = _tool_request_summary(part.get("text")) or _safe_transcript_text(part.get("text"))
+            if text:
+                lines.extend(text.splitlines() or [text])
+        elif kind == SessionPartKind.TOOL_CALL.value:
+            tool_id = metadata.get("tool_id") or metadata.get("name") or "tool"
+            lines.append(f"Tool call: {tool_id}")
+        elif kind == SessionPartKind.TOOL_RESULT.value:
+            status = "ok" if metadata.get("ok") else metadata.get("error_type") or "result"
+            lines.append(f"Tool result: {status}")
+            text = _safe_transcript_text(part.get("text"))
+            if text:
+                lines.extend(f"- {line}" for line in text.splitlines()[:8] if line.strip())
+        elif kind == SessionPartKind.PERMISSION_REQUEST.value:
+            lines.append("Permission requested")
+        elif kind == SessionPartKind.ARTIFACT_REF.value:
+            lines.append(f"Artifact: {part.get('artifact_id') or 'recorded'}")
+        elif kind == SessionPartKind.QUESTION.value:
+            text = _safe_transcript_text(part.get("text"))
+            lines.append(f"Question: {text or 'response needed'}")
+    return [line for line in lines if str(line).strip()]
+
+
+def _transcript_event_messages(
+    events: list[dict],
+    persisted_messages: list[dict],
+    *,
+    completed_prompt_ids: set[str] | None = None,
+) -> list[dict]:
+    return [
+        entry["message"]
+        for entry in _transcript_event_entries(
+            events,
+            persisted_messages,
+            completed_prompt_ids=completed_prompt_ids,
+        )
+    ]
+
+
+def _transcript_event_entries(
+    events: list[dict],
+    persisted_messages: list[dict],
+    *,
+    completed_prompt_ids: set[str] | None = None,
+) -> list[dict]:
+    persisted_assistant_text = "\n".join(
+        "\n".join(str(line) for line in message.get("lines", []))
+        for message in persisted_messages
+        if message.get("role") == "assistant"
+    )
+    completed_prompt_ids = set(completed_prompt_ids or set())
+    events_by_prompt: dict[str, list[dict]] = defaultdict(list)
+    loose_events: list[dict] = []
+    for event in events:
+        kind = str(event.get("kind") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        prompt_id = str(payload.get("prompt_id") or "")
+        if prompt_id in completed_prompt_ids and kind not in {"model.failed"}:
+            continue
+        if kind in {
+            "model.started",
+            "model.message_delta",
+            "model.completed",
+            "model.failed",
+            "harness.turn.finished",
+            "tool_call.started",
+            "tool_call.output",
+            "tool_call.finished",
+            "harness.runtime.permission_waiting",
+        }:
+            (events_by_prompt[prompt_id] if prompt_id else loose_events).append(event)
+    rendered: list[dict] = []
+    for prompt_id, prompt_events in events_by_prompt.items():
+        lines = _lines_from_transcript_events(prompt_events, persisted_assistant_text=persisted_assistant_text)
+        if lines:
+            rendered.append(
+                {
+                    "sort_key": _event_group_sort_key(prompt_events),
+                    "message": {"role": "assistant", "title": "Assistant Streaming", "lines": lines, "prompt_id": prompt_id},
+                }
+            )
+    loose_lines = _lines_from_transcript_events(loose_events, persisted_assistant_text=persisted_assistant_text)
+    if loose_lines:
+        rendered.append(
+            {
+                "sort_key": _event_group_sort_key(loose_events),
+                "message": {"role": "assistant", "title": "Session Events", "lines": loose_lines},
+            }
+        )
+    return rendered
+
+
+def _event_group_sort_key(events: list[dict]) -> tuple:
+    if not events:
+        return ("~", 0, 1, "event")
+    ordered = sorted(events, key=lambda event: _transcript_sort_key(event, bucket=1))
+    return _transcript_sort_key(ordered[0], bucket=1)
+
+
+def _transcript_sort_key(item: dict, *, fallback_index: int = 0, bucket: int = 0) -> tuple:
+    created_at = str(item.get("created_at") or item.get("occurred_at") or "")
+    seq = item.get("seq")
+    try:
+        seq_value = int(seq)
+    except Exception:
+        seq_value = fallback_index
+    item_id = str(item.get("id") or item.get("event_id") or fallback_index)
+    return (created_at, seq_value, bucket, item_id)
+
+
+_CONTEXT_TOOL_IDS = {"read", "glob", "grep", "list", "ls", "find"}
+
+
+def _lines_from_transcript_events(events: list[dict], *, persisted_assistant_text: str) -> list[str]:
+    lines: list[str] = []
+    seen_failure_messages: set[str] = set()
+    explored_children: list[str] = []
+    explored_seen: set[str] = set()
+
+    def append_line(line: str) -> None:
+        if line and (not lines or lines[-1] != line):
+            lines.append(line)
+
+    def append_explored_child(child: str) -> None:
+        if child and child not in explored_seen:
+            explored_children.append(child)
+            explored_seen.add(child)
+
+    def flush_explored() -> None:
+        nonlocal explored_children, explored_seen
+        if not explored_children:
+            return
+        append_line("Explored")
+        for child in explored_children:
+            append_line(f"- {child}")
+        explored_children = []
+        explored_seen = set()
+
+    for event in sorted(events, key=lambda item: (int(item.get("seq") or 0), str(item.get("id") or ""))):
+        kind = str(event.get("kind") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        line = ""
+        if kind == "model.message_delta":
+            delta = _safe_transcript_text(payload.get("delta"))
+            if not delta or delta in persisted_assistant_text:
+                continue
+            flush_explored()
+            append_line(delta)
+            continue
+        elif kind == "model.started":
+            continue
+        elif kind == "model.failed":
+            flush_explored()
+            message = _safe_transcript_text(payload.get("message")) or "The runtime turn failed."
+            error_type = _safe_transcript_text(payload.get("error_type"))
+            prefix = f"Runtime failed ({error_type})" if error_type else "Runtime failed"
+            line = f"{prefix}: {message}"
+            seen_failure_messages.add(message)
+        elif kind == "model.completed":
+            if persisted_assistant_text:
+                continue
+            flush_explored()
+            line = "Runtime completed."
+        elif kind == "harness.turn.finished":
+            if payload.get("failed"):
+                flush_explored()
+                message = _safe_transcript_text(payload.get("message")) or "The runtime turn failed."
+                if message in seen_failure_messages:
+                    continue
+                error_type = _safe_transcript_text(payload.get("error_type"))
+                prefix = f"Turn failed ({error_type})" if error_type else "Turn failed"
+                line = f"{prefix}: {message}"
+                seen_failure_messages.add(message)
+            elif not persisted_assistant_text:
+                flush_explored()
+                line = "Turn finished."
+        elif kind.startswith("tool_call."):
+            tool = _event_tool_id(payload)
+            status = kind.rsplit(".", 1)[-1]
+            if tool in _CONTEXT_TOOL_IDS:
+                if status == "started":
+                    append_explored_child(_context_tool_child_line(tool, payload))
+                elif status == "output" and not explored_children:
+                    append_explored_child(_context_tool_child_line(tool, payload))
+                continue
+            flush_explored()
+            if status == "started":
+                line = f"Ran {_tool_run_label(tool, payload)}"
+            elif status == "output":
+                for child in _tool_output_child_lines(tool, payload):
+                    append_line(child)
+                continue
+            else:
+                ok = payload.get("ok")
+                if ok is True:
+                    continue
+                status_label = "failed" if ok is False else _safe_transcript_text(payload.get("status")) or status
+                line = f"- Status: {tool} {status_label}"
+        elif kind == "harness.runtime.permission_waiting":
+            flush_explored()
+            permission_id = payload.get("permission_id") or "pending"
+            line = f"Permission waiting: {permission_id}"
+        append_line(line)
+    flush_explored()
+    return lines[-40:]
+
+
+def _event_tool_id(payload: dict) -> str:
+    return str(payload.get("tool_id") or payload.get("tool") or payload.get("name") or "tool").strip().replace("_", "-") or "tool"
+
+
+def _tool_arguments(payload: dict) -> dict:
+    raw = payload.get("arguments") or payload.get("input") or payload.get("args")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _compact_tool_text(value: object, *, fallback: str = "") -> str:
+    text = " ".join(_safe_transcript_text(value, limit=500).split())
+    return text or fallback
+
+
+def _context_tool_child_line(tool: str, payload: dict) -> str:
+    args = _tool_arguments(payload)
+    if tool == "read":
+        target = args.get("path") or args.get("filePath") or payload.get("target") or payload.get("summary") or "file"
+        return f"Read {_compact_tool_text(target, fallback='file')}"
+    if tool in {"list", "ls"}:
+        target = args.get("path") or args.get("cwd") or payload.get("target") or "."
+        return f"List {_compact_tool_text(target, fallback='.')}"
+    if tool == "glob":
+        pattern = args.get("pattern") or payload.get("summary") or "**/*"
+        cwd = args.get("cwd") or args.get("path")
+        target = _compact_tool_text(pattern, fallback="**/*")
+        if cwd:
+            target = f"{target} in {_compact_tool_text(cwd, fallback='.')}"
+        return f"List {target}"
+    if tool == "grep":
+        pattern = args.get("pattern") or args.get("query") or payload.get("summary") or ""
+        path = args.get("path") or args.get("cwd") or "."
+        target = _compact_tool_text(pattern, fallback="pattern")
+        return f"Search {target} in {_compact_tool_text(path, fallback='.')}"
+    if tool == "find":
+        query = args.get("query") or payload.get("summary") or ""
+        path = args.get("path") or args.get("cwd") or "."
+        target = _compact_tool_text(query, fallback="query")
+        return f"Search {target} in {_compact_tool_text(path, fallback='.')}"
+    return _compact_tool_text(payload.get("summary") or tool, fallback=tool)
+
+
+def _tool_run_label(tool: str, payload: dict) -> str:
+    args = _tool_arguments(payload)
+    if tool in {"shell", "bash"}:
+        return _compact_tool_text(args.get("command") or payload.get("command") or payload.get("summary"), fallback=tool)
+    return _compact_tool_text(payload.get("summary") or tool, fallback=tool)
+
+
+def _tool_output_child_lines(tool: str, payload: dict) -> list[str]:
+    preview = _safe_transcript_text(payload.get("preview") or payload.get("output") or payload.get("summary"), limit=1200)
+    if not preview:
+        return []
+    if tool == "pwd":
+        for line in preview.splitlines():
+            if line.startswith("Resolved cwd:"):
+                return [f"- {line.partition(':')[2].strip()}"]
+    if tool in {"shell", "bash"}:
+        stdout = _section_after_label(preview, "Stdout:", stop_labels=("Stderr:",))
+        stderr = _section_after_label(preview, "Stderr:", stop_labels=())
+        preview = stdout or stderr or preview
+    raw_lines = [line.strip() for line in preview.splitlines() if line.strip()]
+    if not raw_lines:
+        return []
+    selected = raw_lines[:4]
+    if len(raw_lines) > len(selected):
+        selected.append(f"... {len(raw_lines) - len(selected)} more lines")
+    return [f"- {line}" for line in selected]
+
+
+def _section_after_label(text: str, label: str, *, stop_labels: tuple[str, ...]) -> str:
+    marker = f"\n{label}\n"
+    if marker not in text:
+        marker = f"{label}\n"
+    if marker not in text:
+        return ""
+    section = text.split(marker, 1)[1]
+    for stop in stop_labels:
+        stop_marker = f"\n{stop}"
+        if stop_marker in section:
+            section = section.split(stop_marker, 1)[0]
+    return section.strip()
+
+
+def _local_transcript_notices(local_messages: list[dict], persisted_messages: list[dict]) -> list[dict]:
+    persisted_user_titles = {str(message.get("title") or "").strip() for message in persisted_messages if message.get("role") == "user"}
+    persisted_assistant_available = any(message.get("role") == "assistant" for message in persisted_messages)
+    persisted_assistant_text = "\n".join(
+        "\n".join(str(line) for line in message.get("lines", []))
+        for message in persisted_messages
+        if message.get("role") == "assistant"
+    )
+    notices: list[dict] = []
+    for message in local_messages:
+        title = str(message.get("title") or "").strip()
+        role = str(message.get("role") or "")
+        lines = [str(line) for line in message.get("lines", []) if str(line).strip()]
+        local_text = "\n".join(lines)
+        if title in {"Harness chat", "Codex-Like Mode"}:
+            continue
+        if role == "assistant" and title == "Prompt Submitted":
+            continue
+        if role == "user" and title in persisted_user_titles:
+            continue
+        if persisted_assistant_available and role == "assistant" and title in {
+            "Assistant",
+            "Assistant Streaming",
+            "Prompt Submitted",
+            "Session Events",
+            "Tool",
+        }:
+            continue
+        if persisted_assistant_available and local_text and local_text in persisted_assistant_text:
+            continue
+        notices.append(dict(message))
+    return notices[-20:]
+
+
+def _safe_transcript_text(value: object, *, limit: int = 8000) -> str:
+    from harness.security import redact_secret_text
+
+    text = redact_secret_text(str(value or ""))
+    text = re.sub(r"(?i)(artifact body|artifact contents?)\s*[:=].*", "artifact body: [REDACTED]", text)
+    return text[:limit].strip()
+
+
+def _tool_request_summary(value: object) -> str | None:
+    import json
+
+    text = str(value or "").strip()
+    if not text or "harness.tool_request/v1" not in text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("type") != "harness.tool_request/v1":
+        return None
+    tool = str(payload.get("tool") or "tool").strip() or "tool"
+    reason = str(payload.get("reason") or "").strip()
+    if reason:
+        return f"Tool request: {tool} - {reason}"
+    return f"Tool request: {tool}"
 
 
 def render_pixel_art():
@@ -3510,7 +4672,6 @@ def _render_composer_status(
     agent_id = selected_agent_id or active_session.get("agent_id") or "default"
     model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref") or "default"
     attachment_count = composer_context.get("attachment_count", 0)
-    context_tokens = composer_context.get("total_estimated_tokens", 0)
     phase = operator.get("phase") or "idle"
     waiting = operator.get("waiting_approval_id")
     approval = f" approval={waiting}" if waiting else ""
@@ -3521,7 +4682,61 @@ def _render_composer_status(
     approval_detail = f" command={command}" if waiting and command else ""
     cwd = operator.get("cwd") or active_session.get("cwd") or "."
     cwd_detail = f" cwd={cwd}" if cwd and cwd != "." else ""
-    return f"Model {model_ref} · Agent {agent_id} · Operator: {phase}{approval}{cwd_detail}{approval_detail} · ctx {context_tokens} · attachments {attachment_count}"
+    parts = [
+        f"Model {model_ref}",
+        f"Agent {agent_id}",
+        f"Operator: {phase}{approval}{cwd_detail}{approval_detail}",
+        f"ctx {_format_context_window_status(active_session, active_model)}",
+        f"attachments {attachment_count}",
+    ]
+    return " · ".join(parts)
+
+
+def _format_context_window_status(active_session: dict, active_model: dict) -> str:
+    composer_context = active_session.get("composer_context") or {}
+    estimated_tokens = _safe_int(composer_context.get("total_estimated_tokens"))
+    context_limit = _safe_int(active_model.get("context_limit"))
+    if context_limit <= 0:
+        return "unknown"
+    percent = (estimated_tokens / context_limit) * 100
+    if estimated_tokens > 0 and percent < 1:
+        percent_label = "<1%"
+    else:
+        percent_label = f"{percent:.0f}%"
+    return f"{percent_label} used"
+
+
+_ACTIVE_RUNTIME_PHASES = {"queued", "running", "waiting_permission", "compacting", "retry_wait", "aborting"}
+
+
+def _runtime_elapsed_seconds(runtime: dict) -> int | None:
+    started_at = _parse_datetime(runtime.get("active_started_at"))
+    if started_at is not None:
+        return max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+    raw_elapsed = runtime.get("active_elapsed_seconds")
+    if raw_elapsed is not None:
+        return max(0, _safe_int(raw_elapsed))
+    return None
+
+
+def _parse_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _render_session_rail(dashboard: dict, *, selected_index: int = 0) -> str:
@@ -3629,6 +4844,42 @@ def render_session_rename_dialog(session: dict, *, buffer: str = "") -> str:
     )
 
 
+def render_permission_card_dialog(card: dict, *, status: str = "") -> str:
+    command = str(card.get("command") or card.get("operation") or "unknown")
+    lines = [
+        "[bold amber]Session permission[/bold amber]",
+        "",
+        f"Permission: {escape(str(card.get('permission_id') or card.get('approval_id') or 'unknown'))}",
+        f"Tool: {escape(_humanize_identifier(card.get('tool_id')))}",
+        f"Operation: {escape(_first_line(command, limit=96))}",
+        f"Target: {escape(_first_line((card.get('approval_target') or {}).get('normalized_target') or command, limit=96))}",
+        f"Risk: {escape(_humanize_identifier(card.get('risk') or 'unknown'))}",
+        f"Boundary: {escape(_humanize_identifier(card.get('boundary_kind') or 'unknown'))}",
+        f"Scope: {escape(_humanize_identifier(card.get('scope') or 'unknown'))}",
+    ]
+    cwd = card.get("cwd")
+    if cwd:
+        lines.append(f"Cwd: {escape(str(cwd))}")
+    reasons = [str(reason) for reason in card.get("policy_reasons") or [] if str(reason).strip()]
+    if reasons:
+        lines.append("Policy:")
+        lines.extend(f"- {escape(_first_line(reason, limit=96))}" for reason in reasons[:4])
+    reply_route = card.get("reply_route")
+    if reply_route:
+        lines.append(f"Command: harness session approval {escape(str(card.get('session_id') or '<session>'))} {escape(str(card.get('permission_id') or '<permission>'))} once --project .")
+    lines.extend(
+        [
+            "",
+            "Press a to allow once, d to deny, c to cancel, Esc to close.",
+            "Enter only keeps this card open.",
+        ]
+    )
+    if status:
+        lines.append("")
+        lines.append(escape(status))
+    return "\n".join(lines)
+
+
 def render_agent_selection_dialog(agents: list[str], *, selected_agent: str | None, selected_index: int = 0) -> str:
     if not agents:
         agents = ["default"]
@@ -3647,7 +4898,13 @@ def create_read_only_tui_app(project_root: Path):
     return create_harness_app(project_root)
 
 
-def create_harness_app(project_root: Path, *, codex_like: bool = False, app_service=None):
+def create_harness_app(
+    project_root: Path,
+    *,
+    codex_like: bool = False,
+    app_service=None,
+    autonomy_profile_id: str = "supervised-codex",
+):
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Container, Horizontal, Vertical, VerticalScroll
@@ -3676,7 +4933,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
         "",
         "dashboard",
     )
-    initial_messages = [build_chat_welcome_message(project_root)]
+    initial_messages = [{**build_chat_welcome_message(project_root), "scope": "global"}]
 
     harness_light_theme = Theme(
         name="harness-light",
@@ -3718,6 +4975,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 event.prevent_default()
                 event.stop()
                 self.app.action_leader_key()
+            elif self.app.permission_dialog_active:
+                event.prevent_default()
+                event.stop()
+                self.app.action_handle_permission_dialog_key(event)
             elif self.app.session_text_dialog_active:
                 event.prevent_default()
                 event.stop()
@@ -3741,6 +5002,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 event.prevent_default()
                 event.stop()
                 self.app.action_activate_dialog_selection()
+            elif self.app.dialog_visible and self.app.action_handle_model_dialog_action_key(event):
+                return
+            elif self.app.dialog_visible and self.app.action_handle_provider_dialog_key(event):
+                return
             elif self.app.leader_key_active:
                 if self.app.is_leader_shortcut(event.key, event.character):
                     event.prevent_default()
@@ -3793,6 +5058,42 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 event.prevent_default()
                 event.stop()
                 self.app.action_toggle_palette_focus()
+
+    class SessionNavigatorList(ListView):
+        def on_focus(self) -> None:
+            self.app._left_pane_focused = True
+            self.app._leader_key_active = False
+            self.app._hide_dialog()
+            if not self.app._rendering_session_pane:
+                self.app._render_session_pane_only()
+
+        def on_key(self, event) -> None:
+            if self.app.permission_dialog_active:
+                event.prevent_default()
+                event.stop()
+                self.app.action_handle_permission_dialog_key(event)
+                return
+            if self.app.session_text_dialog_active:
+                event.prevent_default()
+                event.stop()
+                self.app.action_handle_text_dialog_key(event)
+                return
+            if self.app.dialog_visible and event.key in {"down", "up"}:
+                event.prevent_default()
+                event.stop()
+                self.app.action_move_dialog_selection(1 if event.key == "down" else -1)
+                return
+            if self.app.dialog_visible and event.key in ENTER_KEYS:
+                event.prevent_default()
+                event.stop()
+                self.app.action_activate_dialog_selection()
+                return
+            if self.app.dialog_visible and self.app.action_handle_model_dialog_action_key(event):
+                return
+            if self.app.dialog_visible and self.app.action_handle_provider_dialog_key(event):
+                return
+            if self.app._handle_session_pane_key(event):
+                return
 
     class HarnessUnifiedApp(App):
         ENABLE_COMMAND_PALETTE = False
@@ -3939,7 +5240,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self.register_theme(harness_light_theme)
             self.theme = "harness-light"
             self._messages = [dict(message) for message in initial_messages]
-            self._chat_state = ChatSessionState(codex_like_mode=codex_like)
+            self._chat_state = ChatSessionState(codex_like_mode=codex_like, autonomy_profile_id=autonomy_profile_id)
             self._latest_response: dict = {}
             self._latest_palette_activation: dict = {}
             self._focus_mode = "dashboard"
@@ -3959,7 +5260,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._left_pane_focused = False
             self._left_pane_mode = "sessions"
             self._left_selected_item_id: str | None = None
+            self._left_pane_cached_projection: dict | None = None
+            self._rendering_session_pane = False
             self._slash_suggestion_index = 0
+            self._slash_suggestions_active = False
             self._request_in_flight = False
             self._request_started_at: float | None = None
             self._prompt_history: list[str] = []
@@ -3977,6 +5281,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._dashboard_cache_session_id: str | None = None
             self._dashboard_cache_at = time.monotonic()
             self._refresh_timer = None
+            self._event_render_timer = None
             self._live_refresh_failures = 0
             self._global_event_subscription = None
             self._session_event_subscription = None
@@ -4017,14 +5322,23 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
 
         @property
         def session_text_dialog_active(self) -> bool:
-            return self._dialog_kind in {"session_delete", "session_rename"}
+            return self._dialog_kind in {
+                "session_delete",
+                "session_rename",
+                "provider_env_prompt",
+                "provider_api_key_prompt",
+            }
+
+        @property
+        def permission_dialog_active(self) -> bool:
+            return self._dialog_kind == "permission"
 
         def compose(self) -> ComposeResult:
             yield Header(show_clock=False)
             with Horizontal(id="layout"):
                 with Vertical(id="session-pane"):
                     yield Static("", id="session-pane-header")
-                    yield ListView(id="session-list")
+                    yield SessionNavigatorList(id="session-list")
                     yield Static("", id="session-pane-detail")
                     yield Static("", id="session-pane-actions")
                 with VerticalScroll(id="chat"):
@@ -4049,15 +5363,23 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._render_chat()
             self._render_current_view()
             self._start_event_subscriptions()
-            self._refresh_timer = self.set_interval(1.5, self._refresh_live_view)
+            self._refresh_timer = self.set_interval(1.0, self._refresh_live_view)
 
         def on_unmount(self) -> None:
             timer = self._refresh_timer
             if timer is not None and hasattr(timer, "stop"):
                 timer.stop()
+            event_timer = self._event_render_timer
+            if event_timer is not None and hasattr(event_timer, "stop"):
+                event_timer.stop()
             self._close_event_subscriptions()
 
         def on_key(self, event) -> None:
+            if self.permission_dialog_active:
+                event.prevent_default()
+                event.stop()
+                self.action_handle_permission_dialog_key(event)
+                return
             if self.session_text_dialog_active:
                 event.prevent_default()
                 event.stop()
@@ -4091,6 +5413,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 event.stop()
                 self.action_activate_dialog_selection()
                 return
+            if self._dialog_visible and self.action_handle_model_dialog_action_key(event):
+                return
+            if self._dialog_visible and self.action_handle_provider_dialog_key(event):
+                return
             if self._left_pane_focused:
                 if self._handle_session_pane_key(event):
                     return
@@ -4119,11 +5445,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._dialog_query = ""
             self._dialog_selected_index = 0
             self._show_functionality_dialog()
-            self._render_palette_activation_status("Leader: m Models, s Sessions.", ok=True)
+            self._render_palette_activation_status("Leader: m Models, s Sessions. p Permission.", ok=True)
 
         def is_leader_shortcut(self, key: str, character: str | None = None) -> bool:
             pressed = (character or key or "").casefold()
-            return pressed in {"m", "s", "t"}
+            return pressed in {"m", "p", "s", "t"}
 
         def action_cancel_leader_key(self) -> None:
             self._leader_key_active = False
@@ -4133,6 +5459,9 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._leader_key_active = False
             if pressed == "m":
                 self._show_models_list(source="leader", slash="ctrl+x m")
+                return
+            if pressed == "p":
+                self.action_open_permission_dialog()
                 return
             if pressed == "s":
                 self.action_focus_session_pane()
@@ -4180,13 +5509,28 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                         self._dialog_selected_index = 0
                     self._dialog_query = command_query
                     self._show_functionality_dialog(query=command_query, selected_index=self._dialog_selected_index)
-                self._render_current_view()
-                self._render_slash_suggestions(event.text_area.text)
+                elif self._dialog_kind == "providers":
+                    provider_query = event.text_area.text.strip()
+                    if provider_query == "/provider" or provider_query.startswith("/provider "):
+                        provider_query = provider_query.removeprefix("/provider").strip()
+                    if provider_query == "connect" or provider_query.startswith("connect "):
+                        provider_query = provider_query.removeprefix("connect").strip()
+                    if provider_query != self._dialog_query:
+                        self._dialog_selected_index = 0
+                    self._dialog_query = provider_query
+                    self._show_provider_dialog(query=provider_query, selected_index=self._dialog_selected_index)
+                elif self._focus_mode == "palette":
+                    self._render_right_pane_only()
+                prompt_text = event.text_area.text
+                if prompt_text.strip().startswith("/") or self._slash_suggestions_active:
+                    self._render_slash_suggestions(prompt_text)
 
         def action_submit_prompt(self) -> None:
             prompt = self.query_one("#prompt", TextArea)
             if self._focus_mode == "palette":
                 self.action_activate_selected_palette_entry()
+                return
+            if self._activate_provider_connect_slash_command(prompt.value):
                 return
             if self._activate_models_slash_command(prompt.value):
                 return
@@ -4225,12 +5569,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 return
             self._prompt_history.append(request)
             self._prompt_history_index = None
+            prompt_session_id = self._bind_prompt_session(request)
             use_runtime_prompt = self._should_use_runtime_prompt(request)
             session_error: dict | None = None
             session_id: str | None = None
             if use_runtime_prompt:
                 try:
-                    session_id = self._ensure_runtime_prompt_session(request)
+                    session_id = self._ensure_runtime_prompt_session(request, preferred_session_id=prompt_session_id)
+                    prompt_session_id = session_id
                 except Exception as exc:
                     session_error = {
                         "ok": False,
@@ -4240,10 +5586,16 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                             SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc),
                         ],
                     }
-            self._messages.append({"role": "user", "title": request, "lines": []})
+            user_message = {"role": "user", "title": request, "lines": []}
+            assistant_message = {"role": "assistant", "title": "Assistant", "lines": []}
+            if prompt_session_id:
+                user_message["session_id"] = prompt_session_id
+                assistant_message["session_id"] = prompt_session_id
+            self._messages.append(user_message)
             stream_index = len(self._messages)
             placeholder = "Queuing runtime turn..." if use_runtime_prompt and session_error is None else "Starting model turn..."
-            self._messages.append({"role": "assistant", "title": "Assistant", "lines": [placeholder]})
+            assistant_message["lines"] = [placeholder]
+            self._messages.append(assistant_message)
             prompt.value = ""
             self._slash_suggestion_index = 0
             self._render_slash_suggestions("")
@@ -4288,9 +5640,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
 
         def _run_runtime_prompt_request(self, request: str, stream_index: int, session_id: str) -> None:
             try:
-                dashboard = self._app_service.dashboard(selected_session_id=session_id)
-                active_session = dashboard.get("active_session") or {}
-                active_model = dashboard.get("active_model") or {}
+                dashboard = self._dashboard_cache if isinstance(self._dashboard_cache, dict) else {}
+                active_session = dashboard.get("active_session") if isinstance(dashboard.get("active_session"), dict) else {}
+                if active_session.get("id") != session_id:
+                    active_session = {}
+                active_model = dashboard.get("active_model") if isinstance(dashboard.get("active_model"), dict) else {}
                 raw_model_ref = active_model.get("raw_model_ref") or active_session.get("raw_model_ref")
                 response = self._app_service.prompt_async(
                     session_id,
@@ -4339,10 +5693,45 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             except Exception:
                 return False
 
-        def _ensure_runtime_prompt_session(self, request: str) -> str:
-            selected_id = self._selected_session_id or self._chat_state.session_id
+        def _visible_chat_session_id(self) -> str | None:
+            return self._selected_session_id or self._chat_state.session_id
+
+        def _append_local_message(self, message: dict, *, session_id: str | None = None) -> None:
+            local_message = dict(message)
+            target_session_id = session_id or self._visible_chat_session_id()
+            if target_session_id:
+                local_message.setdefault("session_id", target_session_id)
+            self._messages.append(local_message)
+
+        def _bind_prompt_session(self, request: str) -> str | None:
+            selected_id = self._visible_chat_session_id()
             if selected_id:
+                self._selected_session_id = selected_id
+                self._chat_state.session_id = selected_id
+                self._left_selected_item_id = f"session:{selected_id}"
+                self._sync_session_event_subscription()
                 return selected_id
+            try:
+                if not self._dashboard_snapshot().get("initialized"):
+                    return None
+            except Exception:
+                return None
+            try:
+                return self._create_prompt_session(request)
+            except Exception:
+                return None
+
+        def _ensure_runtime_prompt_session(self, request: str, *, preferred_session_id: str | None = None) -> str:
+            selected_id = preferred_session_id or self._visible_chat_session_id()
+            if selected_id:
+                self._selected_session_id = selected_id
+                self._chat_state.session_id = selected_id
+                self._left_selected_item_id = f"session:{selected_id}"
+                self._sync_session_event_subscription()
+                return selected_id
+            return self._create_prompt_session(request)
+
+        def _create_prompt_session(self, request: str) -> str:
             title = request[:64].strip() or "New session"
             result = self._app_service.create_session(
                 {
@@ -4358,6 +5747,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._chat_state.session_id = session_id
             self._left_selected_item_id = f"session:{session_id}"
             self._session_filter = "open"
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             return session_id
 
         def _append_stream_update(self, stream_index: int, update: dict) -> None:
@@ -4385,13 +5776,17 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
         def _finish_chat_request(self, stream_index: int, response: dict) -> None:
             self._latest_response = dict(response)
             existing_lines: list[str] = []
+            message_session_id: str | None = None
             if stream_index < len(self._messages):
+                message_session_id = self._messages[stream_index].get("session_id")
                 existing_lines = [
                     str(line)
                     for line in self._messages[stream_index].get("lines", [])
                     if str(line).strip() and str(line).strip() not in {"Starting model turn...", "Queuing runtime turn..."}
                 ]
             final_message = _chat_response_to_tui_message(response)
+            if message_session_id:
+                final_message["session_id"] = message_session_id
             if existing_lines:
                 final_lines = [str(line) for line in final_message.get("lines", []) if str(line).strip()]
                 final_title = str(final_message.get("title") or "")
@@ -4403,15 +5798,21 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             else:
                 self._messages.append(final_message)
             self._request_in_flight = False
+            if response.get("kind") == "runtime_prompt_submitted":
+                self._dashboard_cache = None
             prompt = self.query_one("#prompt", TextArea)
             if self._chat_state.pending_action_contract is not None:
                 prompt.placeholder = "Type yes to confirm, no to cancel, or ask a follow-up"
             else:
                 prompt.placeholder = "Ask Harness or type /help"
-            self._render_chat()
-            self._render_current_view()
             self._render_slash_suggestions(prompt.value)
             self._request_started_at = None
+            if response.get("kind") == "runtime_prompt_submitted":
+                self._render_current_view()
+                self._render_chat()
+            else:
+                self._render_chat()
+                self._render_current_view()
             if response.get("kind") == "quit":
                 self.exit()
 
@@ -4635,10 +6036,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._left_pane_focused = True
             self._leader_key_active = False
             self._hide_dialog()
-            self._render_current_view()
             try:
                 self.query_one("#session-list", ListView).focus()
             except NoMatches:
+                self._render_session_pane_only()
                 return
 
         def action_focus_composer(self) -> None:
@@ -4648,7 +6049,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self.query_one("#prompt", TextArea).focus()
             except NoMatches:
                 return
-            self._render_current_view()
+            self._render_session_pane_only()
 
         def _handle_session_pane_key(self, event) -> bool:
             if self._session_search_active:
@@ -4688,7 +6089,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 event.stop()
                 self._session_search_active = True
                 self._session_query = ""
-                self._render_current_view()
+                self._render_session_pane_only()
                 return True
             if character == "n":
                 event.prevent_default()
@@ -4757,19 +6158,19 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
         def _handle_session_search_key(self, event) -> None:
             if event.key in {"escape", "enter"}:
                 self._session_search_active = False
-                self._render_current_view()
+                self._render_session_pane_only()
                 return
             if event.key == "backspace":
                 self._session_query = self._session_query[:-1]
-                self._render_current_view()
+                self._render_session_pane_only()
                 return
             if event.key == "ctrl+u":
                 self._session_query = ""
-                self._render_current_view()
+                self._render_session_pane_only()
                 return
             if event.character and event.character.isprintable():
                 self._session_query += event.character
-                self._render_current_view()
+                self._render_session_pane_only()
 
         def _session_pane_projection(self) -> dict:
             selected_id = self._selected_session_id or self._chat_state.session_id
@@ -4793,14 +6194,25 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             right_view: dict | None = None,
         ) -> dict:
             dashboard_view = dashboard_snapshot or self._dashboard_snapshot()
-            cockpit_view = right_view or self._current_view()
+            if right_view is not None:
+                cockpit_view = right_view
+            elif self._left_pane_mode == "sessions":
+                cockpit_view = {}
+            else:
+                cockpit_view = self._current_view()
+            session_nav_id = f"session:{self._selected_session_id}" if self._selected_session_id else None
+            left_selected_item_id = self._left_selected_item_id or session_nav_id
+            if (
+                self._left_pane_mode == "sessions"
+                and session_nav_id
+                and self._selected_session_id == self._chat_state.session_id
+            ):
+                left_selected_item_id = session_nav_id
             view = build_left_pane_view(
                 dashboard_view,
                 {
                     "left_pane_mode": self._left_pane_mode,
-                    "left_selected_item_id": f"session:{self._selected_session_id}"
-                    if self._left_pane_mode == "sessions" and self._selected_session_id
-                    else self._left_selected_item_id,
+                    "left_selected_item_id": left_selected_item_id,
                     "session_filter": self._session_filter,
                     "selected_session_id": self._selected_session_id or self._chat_state.session_id,
                     "active_session_id": self._chat_state.session_id,
@@ -4815,6 +6227,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 prefix = "session:"
                 if str(self._left_selected_item_id).startswith(prefix):
                     self._selected_session_id = str(self._left_selected_item_id)[len(prefix) :]
+            self._left_pane_cached_projection = view
             return view
 
         def _selected_session_row(self) -> dict | None:
@@ -4826,12 +6239,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._move_left_pane_selection(step)
 
         def _move_left_pane_selection(self, step: int) -> None:
-            view = self._left_pane_projection()
+            view = self._left_pane_cached_projection or self._left_pane_projection(
+                dashboard_snapshot=self._dashboard_cache,
+                right_view={} if self._left_pane_mode == "sessions" else None,
+            )
             items = left_pane_visible_items(view)
             if not items:
                 self._left_selected_item_id = None
                 self._session_cursor_index = 0
-                self._render_current_view()
+                self._render_session_pane_projection(view)
                 return
             current = self._left_selected_item_id or view.get("selected_item_id") or items[0].get("nav_id")
             current_index = next((index for index, item in enumerate(items) if item.get("nav_id") == current), 0)
@@ -4840,17 +6256,55 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             if selected.get("kind") == "session":
                 self._selected_session_id = str(selected.get("id") or "")
                 self._session_cursor_index = (current_index + step) % len(items)
-            self._render_current_view()
+            self._render_session_pane_projection(
+                self._left_pane_projection_with_selection(view, self._left_selected_item_id)
+            )
+
+        def _sync_left_pane_selection_from_index(self, index: int) -> dict | None:
+            view = self._left_pane_cached_projection or self._left_pane_projection(
+                dashboard_snapshot=self._dashboard_cache,
+                right_view={} if self._left_pane_mode == "sessions" else None,
+            )
+            items = left_pane_visible_items(view)
+            if not items:
+                self._left_selected_item_id = None
+                self._selected_session_id = None
+                self._session_cursor_index = 0
+                return None
+            selected_index = max(0, min(index, len(items) - 1))
+            item = items[selected_index]
+            self._left_selected_item_id = str(item.get("nav_id") or "")
+            if item.get("kind") == "session":
+                self._selected_session_id = str(item.get("id") or "")
+                self._session_cursor_index = selected_index
+            self._left_pane_cached_projection = self._left_pane_projection_with_selection(
+                view,
+                self._left_selected_item_id,
+            )
+            return item
+
+        def on_list_view_selected(self, event: ListView.Selected) -> None:
+            if event.list_view.id != "session-list":
+                return
+            event.prevent_default()
+            event.stop()
+            self._left_pane_focused = True
+            self._sync_left_pane_selection_from_index(event.index)
+            self.action_activate_left_nav_selection()
 
         def action_set_left_pane_mode(self, index: int) -> None:
             modes = ("sessions", "orchestrations", "agents", "queue")
             self._left_pane_mode = modes[max(0, min(index, len(modes) - 1))]
             self._left_selected_item_id = None
             self._session_search_active = False
-            self._render_current_view()
+            self._left_pane_cached_projection = None
+            self._render_session_pane_only()
 
         def action_activate_left_nav_selection(self) -> None:
-            view = self._left_pane_projection()
+            view = self._left_pane_cached_projection or self._left_pane_projection(
+                dashboard_snapshot=self._dashboard_cache,
+                right_view={} if self._left_pane_mode == "sessions" else None,
+            )
             item = selected_left_pane_item(view)
             if item is None:
                 self._render_palette_activation_status("No navigator item selected.", ok=False)
@@ -4877,12 +6331,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 return
             self._chat_state.session_id = session_id
             self._selected_session_id = session_id
+            self._left_selected_item_id = f"session:{session_id}"
             if item.get("agent_id"):
                 self._selected_agent_id = str(item.get("agent_id"))
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             self._right_pane_mode = "overview"
             self.action_focus_right_pane_section("context", render=False)
             self._render_palette_activation_status(f"Switched to {item.get('title') or session_id}.", ok=True)
-            self._render_current_view()
+            self._render_active_session_changed()
 
         def _activate_orchestration_nav_item(self, item: dict) -> None:
             orchestration_id = str(item.get("id") or "")
@@ -4971,8 +6428,10 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._chat_state.session_id = str(row["id"])
             self._left_selected_item_id = f"session:{row['id']}"
             self._selected_agent_id = str(row.get("agent_id") or self._selected_agent_id)
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             self._render_palette_activation_status(f"Switched to {row.get('display_title') or row['id']}.", ok=True)
-            self._render_current_view()
+            self._render_active_session_changed()
 
         def action_create_blank_session(self) -> None:
             try:
@@ -4990,13 +6449,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._selected_session_id = session["id"]
             self._left_selected_item_id = f"session:{session['id']}"
             self._chat_state.session_id = session["id"]
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             self._session_filter = "open"
             self._session_query = ""
             self._session_search_active = False
             self.query_one("#prompt", TextArea).value = ""
             self._dashboard_snapshot(force=True)
             self._render_palette_activation_status(f"Created session {session['id']}.", ok=True)
-            self._render_current_view()
+            self._render_active_session_changed()
 
         def action_archive_selected_session(self) -> None:
             row = self._selected_session_row()
@@ -5032,11 +6493,13 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._selected_session_id = session["id"]
             self._left_selected_item_id = f"session:{session['id']}"
             self._chat_state.session_id = session["id"]
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             if self._session_filter == "archived":
                 self._session_filter = "open"
             self._dashboard_snapshot(force=True)
             self._render_palette_activation_status(f"Restored {row.get('display_title') or row['id']}.", ok=True)
-            self._render_current_view()
+            self._render_active_session_changed()
 
         def action_abort_selected_session(self) -> None:
             row = self._selected_session_row()
@@ -5072,10 +6535,12 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._selected_session_id = child["id"]
             self._left_selected_item_id = f"session:{child['id']}"
             self._chat_state.session_id = child["id"]
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             self._session_filter = "open"
             self._dashboard_snapshot(force=True)
             self._render_palette_activation_status(f"Forked session {child['id']}.", ok=True)
-            self._render_current_view()
+            self._render_active_session_changed()
 
         def action_cycle_session_filter(self) -> None:
             index = SESSION_PANE_FILTERS.index(self._session_filter) if self._session_filter in SESSION_PANE_FILTERS else 0
@@ -5106,6 +6571,94 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._dialog_context = {"session": row}
             self._show_dialog(render_session_rename_dialog(row, buffer=""), kind="session_rename")
 
+        def action_open_permission_dialog(self) -> None:
+            card = self._pending_permission_card()
+            if card is None:
+                self._hide_dialog()
+                self._render_palette_activation_status("No pending permission for the active session.", ok=False)
+                return
+            self._dialog_context = {"permission_card": card}
+            self._show_dialog(render_permission_card_dialog(card), kind="permission")
+            self._render_palette_activation_status("Permission card opened. Press a, d, or c; Enter does not approve.", ok=True)
+
+        def action_handle_permission_dialog_key(self, event) -> None:
+            if event.key == "escape":
+                self._hide_dialog()
+                self._render_palette_activation_status("Permission card closed.", ok=False)
+                return
+            if event.key in ENTER_KEYS:
+                card = self._dialog_context.get("permission_card") or {}
+                self._show_dialog(
+                    render_permission_card_dialog(card, status="Enter does not approve. Press a, d, or c."),
+                    kind="permission",
+                )
+                return
+            pressed = str(event.character or event.key or "").casefold()
+            if pressed == "a":
+                self._reply_to_open_permission("once")
+                return
+            if pressed == "d":
+                self._reply_to_open_permission("deny")
+                return
+            if pressed == "c":
+                self._reply_to_open_permission("cancel")
+                return
+
+        def _pending_permission_card(self) -> dict | None:
+            session_id = self._selected_session_id or self._chat_state.session_id
+            if not session_id:
+                return None
+            try:
+                permissions = self._app_service.list_permissions(session_id)
+            except Exception:
+                return None
+            cards = (permissions.get("snapshot") or {}).get("pending_approval_cards") or permissions.get("approval_cards") or []
+            if cards:
+                return dict(cards[-1])
+            for permission in reversed(permissions.get("permissions") or []):
+                if permission.get("status") == "pending" and isinstance(permission.get("approval_card"), dict):
+                    return dict(permission["approval_card"])
+            return None
+
+        def _reply_to_open_permission(self, reply: str) -> None:
+            card = self._dialog_context.get("permission_card") or {}
+            session_id = str(card.get("session_id") or self._selected_session_id or self._chat_state.session_id or "")
+            permission_id = str(card.get("permission_id") or card.get("approval_id") or "")
+            if not session_id or not permission_id:
+                self._render_palette_activation_status("Permission card is missing an id.", ok=False)
+                return
+            try:
+                result = self._app_service.reply_permission(
+                    session_id,
+                    permission_id,
+                    {"reply": reply, "reason": "tui_permission_card"},
+                )
+            except Exception as exc:
+                self._show_dialog(
+                    render_permission_card_dialog(card, status=f"Reply failed: {exc}"),
+                    kind="permission",
+                )
+                self._render_palette_activation_status(f"Permission reply failed: {exc}", ok=False)
+                return
+            self._hide_dialog()
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_permission_reply/v1",
+                "ok": bool(result.get("ok")),
+                "entry_id": "permissions.reply",
+                "activation_kind": "explicit_permission_reply",
+                "session_id": session_id,
+                "permission_id": permission_id,
+                "decision": result.get("decision"),
+                "execution_started": bool(result.get("execution_started")),
+                "tool_execution_started": bool(result.get("tool_execution_started")),
+                "permission_granting": bool(result.get("permission_granting")),
+                "authority_granting": bool(result.get("authority_granting")),
+            }
+            self._dashboard_snapshot(force=True)
+            decision = str(result.get("decision") or reply)
+            self._render_palette_activation_status(f"Permission {decision}.", ok=bool(result.get("ok")))
+            self._render_current_view()
+
         def _after_session_removed_or_hidden(self, removed_session_id: str) -> None:
             self._dashboard_snapshot(force=True)
             projection = self._app_service.session_pane(
@@ -5127,7 +6680,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
 
         def action_activate_selected_palette_entry(self) -> None:
             prompt = self.query_one("#prompt", TextArea)
-            palette = self._palette_snapshot()
+            palette_dashboard = self._dashboard_snapshot_for_dialog() if self._dialog_kind == "models" else None
+            palette = self._palette_snapshot(palette_dashboard)
             filtered = filter_command_palette(palette, prompt.value)
             entry = filtered["entries"][0] if filtered["entries"] else None
             if entry is None:
@@ -5189,13 +6743,19 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                         self._focus_mode = "dashboard"
                         prompt.value = ""
                         self._render_palette_activation_status(
-                            f"Selected model {activation.get('raw_model_ref')}.",
+                            _with_evidence_status(
+                                f"Selected model {activation.get('raw_model_ref')}.",
+                                activation.get("evidence_status"),
+                            ),
                             ok=True,
                         )
                     else:
                         self._focus_mode = "palette"
                         self._render_palette_activation_status(
-                            f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
+                            _with_evidence_status(
+                                f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
+                                activation.get("evidence_status"),
+                            ),
                             ok=False,
                         )
                 else:
@@ -5219,6 +6779,582 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 )
             self._render_current_view()
 
+        def _activate_provider_connect_slash_command(self, value: str) -> bool:
+            request = value.strip()
+            if not (request == "/provider" or request.startswith("/provider ")):
+                return False
+            prompt = self.query_one("#prompt", TextArea)
+            parts = request.split()
+            if request in {"/provider", "/provider connect"}:
+                prompt.value = "/model "
+                _set_text_area_cursor_end(prompt)
+                dashboard = self._show_model_dialog()
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_provider_connect/v1",
+                    "ok": True,
+                    "entry_id": "provider.connect",
+                    "activation_kind": "provider_connect_model_picker_alias",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": True,
+                    "evidence_status": "model_picker_opened_for_provider_connect",
+                    "blocked_reasons": [],
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "credential_value_included": False,
+                    "credentials_included": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                self._render_palette_activation_status(
+                    "Provider connect is part of /models. Select a model/provider row and press Ctrl+A.",
+                    ok=True,
+                )
+                self._render_current_view(dashboard_snapshot=dashboard)
+                return True
+            if len(parts) in {2, 3} and parts[1] == "connect":
+                query = parts[2] if len(parts) == 3 else ""
+                prompt.value = f"/model {query}".rstrip() + (" " if not query else "")
+                _set_text_area_cursor_end(prompt)
+                dashboard = self._show_model_dialog(query=query)
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_provider_connect/v1",
+                    "ok": True,
+                    "entry_id": "provider.connect",
+                    "activation_kind": "provider_connect_model_picker_alias",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": True,
+                    "provider_id": query or None,
+                    "evidence_status": "model_picker_opened_for_provider_connect",
+                    "blocked_reasons": [],
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "credential_value_included": False,
+                    "credentials_included": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                self._render_palette_activation_status(
+                    "Provider connect is part of /models. Choose the provider row and press Ctrl+A.",
+                    ok=True,
+                )
+                self._render_current_view(dashboard_snapshot=dashboard)
+                return True
+            if len(parts) >= 3 and parts[1] == "oauth":
+                provider_id = parts[2]
+                try:
+                    result = self._app_service.provider_oauth_authorize(provider_id, {})
+                    activation = {
+                        "schema_version": "harness.tui_provider_oauth/v1",
+                        "ok": bool(result.get("ok")),
+                        "entry_id": "provider.oauth",
+                        "activation_kind": "provider_oauth_authorize",
+                        "source": "slash",
+                        "slash": "/provider",
+                        "slash_consumed": True,
+                        "chat_submitted": False,
+                        "ui_action_applied": True,
+                        "provider_id": provider_id,
+                        "method": "oauth",
+                        "oauth_supported": bool(result.get("oauth_supported")),
+                        "credential_value_included": False,
+                        "credentials_included": False,
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "browser_opened": False,
+                        "evidence_status": "provider_oauth_authorize_prepared",
+                        "blocked_reasons": [] if result.get("ok") else ["provider_oauth_unsupported"],
+                        **_palette_no_side_effect_flags(),
+                    }
+                    self._latest_palette_activation = activation
+                    self._record_palette_activation_event(activation, source="slash")
+                    self._append_local_message(
+                        {
+                            "role": "assistant",
+                            "title": "Provider OAuth",
+                            "lines": [
+                                f"Provider: {provider_id}",
+                                f"Method: {result.get('method') or 'unsupported'}",
+                                f"Authorization: {result.get('authorization_url') or 'unavailable'}",
+                                f"Callback: {result.get('callback_route') or 'unavailable'}",
+                                _evidence_status_line(activation.get("evidence_status")),
+                                "Credential value included: false",
+                                "Provider execution: false",
+                            ],
+                        }
+                    )
+                    prompt.value = ""
+                    self._render_chat()
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"OAuth {'ready' if result.get('ok') else 'unsupported'} for {provider_id}.",
+                            activation.get("evidence_status"),
+                        ),
+                        ok=bool(result.get("ok")),
+                    )
+                    self._render_current_view()
+                    return True
+                except Exception as exc:
+                    self._latest_palette_activation = {
+                        "schema_version": "harness.tui_provider_oauth/v1",
+                        "ok": False,
+                        "entry_id": "provider.oauth",
+                        "activation_kind": "provider_oauth_authorize",
+                        "provider_id": provider_id,
+                        "error": str(exc),
+                        "evidence_status": "provider_oauth_authorize_failed",
+                        "blocked_reasons": ["provider_oauth_error"],
+                        **_palette_no_side_effect_flags(),
+                    }
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"OAuth authorize failed: {exc}.",
+                            self._latest_palette_activation.get("evidence_status"),
+                        ),
+                        ok=False,
+                    )
+                    self._render_current_view()
+                    return True
+            if len(parts) >= 5 and parts[1] == "oauth-callback":
+                provider_id = parts[2]
+                try:
+                    result = self._app_service.provider_oauth_callback(
+                        provider_id,
+                        {
+                            "access_token": parts[3],
+                            "refresh_token": parts[4],
+                            "description": "tui_oauth_manual_code",
+                        },
+                    )
+                    activation = {
+                        "schema_version": "harness.tui_provider_oauth/v1",
+                        "ok": bool(result.get("ok")),
+                        "entry_id": "provider.oauth_callback",
+                        "activation_kind": "provider_oauth_callback",
+                        "source": "slash",
+                        "slash": "/provider",
+                        "slash_consumed": True,
+                        "chat_submitted": False,
+                        "ui_action_applied": True,
+                        "provider_id": provider_id,
+                        "method": "oauth",
+                        "account_id": result.get("account_id"),
+                        "account_created": bool(result.get("account_created")),
+                        "account_activated": bool(result.get("account_activated")),
+                        "credential_source": result.get("credential_source"),
+                        "credential_value_included": False,
+                        "credentials_included": False,
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "browser_opened": False,
+                        "evidence_status": "provider_oauth_callback_persisted",
+                        "blocked_reasons": [],
+                        "harness_state_modified": True,
+                        "filesystem_modified": True,
+                        "process_started": False,
+                        "command_started": False,
+                        "permission_granting": False,
+                        "authority_granting": False,
+                        "no_hidden_fallback": True,
+                    }
+                    self._latest_palette_activation = activation
+                    self._record_palette_activation_event(activation, source="slash")
+                    self._append_local_message(
+                        {
+                            "role": "assistant",
+                            "title": "Provider OAuth Callback",
+                            "lines": [
+                                f"Provider: {provider_id}",
+                                "Account created: true",
+                                "Credential source: provider_account_oauth_secret_store",
+                                _evidence_status_line(activation.get("evidence_status")),
+                                "Credential value included: false",
+                                "Provider execution: false",
+                                "Model execution: false",
+                            ],
+                        }
+                    )
+                    prompt.value = ""
+                    self._dashboard_snapshot(force=True)
+                    self._render_chat()
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"Stored OAuth account for {provider_id}.",
+                            activation.get("evidence_status"),
+                        ),
+                        ok=True,
+                    )
+                    self._render_current_view()
+                    return True
+                except Exception as exc:
+                    prompt.value = ""
+                    self._latest_palette_activation = {
+                        "schema_version": "harness.tui_provider_oauth/v1",
+                        "ok": False,
+                        "entry_id": "provider.oauth_callback",
+                        "activation_kind": "provider_oauth_callback",
+                        "provider_id": provider_id,
+                        "error": str(exc),
+                        "evidence_status": "provider_oauth_callback_failed",
+                        "blocked_reasons": ["provider_oauth_callback_error"],
+                        **_palette_no_side_effect_flags(),
+                    }
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"OAuth callback failed: {exc}.",
+                            self._latest_palette_activation.get("evidence_status"),
+                        ),
+                        ok=False,
+                    )
+                    self._render_current_view()
+                    return True
+            if len(parts) >= 3 and parts[1] == "disconnect":
+                provider_id = parts[2]
+                try:
+                    result = self._app_service.disconnect_provider(provider_id)
+                    self._dashboard_snapshot(force=True)
+                    activation = {
+                        "schema_version": "harness.tui_provider_action/v1",
+                        "ok": bool(result.get("ok")),
+                        "entry_id": "provider.disconnect",
+                        "activation_kind": "provider_disconnect",
+                        "source": "slash",
+                        "slash": "/provider",
+                        "slash_consumed": True,
+                        "chat_submitted": False,
+                        "ui_action_applied": True,
+                        "provider_id": provider_id,
+                        "credential_removed": bool(result.get("credential_removed")),
+                        "account_deleted": bool(result.get("account_deleted")),
+                        "credential_value_included": False,
+                        "credentials_included": False,
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "evidence_status": "provider_disconnect_persisted",
+                        "blocked_reasons": [],
+                        "harness_state_modified": True,
+                        "filesystem_modified": True,
+                        "process_started": False,
+                        "command_started": False,
+                        "permission_granting": False,
+                        "authority_granting": False,
+                        "no_hidden_fallback": True,
+                    }
+                    self._latest_palette_activation = activation
+                    self._record_palette_activation_event(activation, source="slash")
+                    self._append_local_message(
+                        {
+                            "role": "assistant",
+                            "title": "Provider Disconnect",
+                            "lines": [
+                                f"Provider: {provider_id}",
+                                f"Accounts removed: {len(result.get('removed_accounts') or [])}",
+                                f"Credential removed: {str(bool(result.get('credential_removed'))).lower()}",
+                                _evidence_status_line(activation.get("evidence_status")),
+                                "Provider execution: false",
+                                "Model execution: false",
+                            ],
+                        }
+                    )
+                    prompt.value = ""
+                    self._render_chat()
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"Disconnected {provider_id}.",
+                            activation.get("evidence_status"),
+                        ),
+                        ok=True,
+                    )
+                    self._render_current_view()
+                    return True
+                except Exception as exc:
+                    prompt.value = ""
+                    self._latest_palette_activation = {
+                        "schema_version": "harness.tui_provider_action/v1",
+                        "ok": False,
+                        "entry_id": "provider.disconnect",
+                        "activation_kind": "provider_disconnect",
+                        "provider_id": provider_id,
+                        "error": str(exc),
+                        "evidence_status": "provider_disconnect_failed",
+                        "blocked_reasons": ["provider_disconnect_error"],
+                        **_palette_no_side_effect_flags(),
+                        "provider_execution_started": False,
+                        "model_execution_started": False,
+                        "network_accessed": False,
+                        "permission_granting": False,
+                        "authority_granting": False,
+                    }
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"Provider disconnect failed: {exc}.",
+                            self._latest_palette_activation.get("evidence_status"),
+                        ),
+                        ok=False,
+                    )
+                    self._render_current_view()
+                    return True
+            if len(parts) >= 3 and parts[1] == "refresh":
+                provider_id = parts[2]
+                approve_hosted = "--approve-hosted" in parts[3:]
+                with_credentials = "--with-credentials" in parts[3:]
+                result = self._app_service.refresh_provider_models(
+                    provider_id,
+                    approve_hosted=approve_hosted,
+                    with_credentials=with_credentials,
+                )
+                self._dashboard_snapshot(force=True)
+                ok = bool(result.get("ok"))
+                activation = {
+                    "schema_version": "harness.tui_provider_action/v1",
+                    "ok": ok,
+                    "entry_id": "provider.refresh",
+                    "activation_kind": "provider_model_refresh",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": True,
+                    "provider_id": provider_id,
+                    "approve_hosted": approve_hosted,
+                    "with_credentials": with_credentials,
+                    "model_count": result.get("model_count"),
+                    "network_accessed": bool(result.get("network_accessed")),
+                    "credentials_included": bool(result.get("credentials_included")),
+                    "credential_value_included": False,
+                    "provider_execution_started": bool(result.get("provider_execution_started", False)),
+                    "model_execution_started": bool(result.get("model_execution_started", False)),
+                    "evidence_status": "provider_model_refresh_persisted" if ok else "provider_model_refresh_blocked",
+                    "blocked_reasons": result.get("blocked_reasons") or [],
+                    "harness_state_modified": ok,
+                    "filesystem_modified": ok,
+                    "process_started": False,
+                    "command_started": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                    "no_hidden_fallback": True,
+                }
+                self._latest_palette_activation = activation
+                self._record_palette_activation_event(activation, source="slash")
+                self._append_local_message(
+                    {
+                        "role": "assistant",
+                        "title": "Provider Model Refresh",
+                        "lines": [
+                            f"Provider: {provider_id}",
+                            f"Status: {'refreshed' if ok else 'blocked'}",
+                            f"Models: {result.get('model_count') or 0}",
+                            f"Network accessed: {str(bool(result.get('network_accessed'))).lower()}",
+                            f"Credentials included: {str(bool(result.get('credentials_included'))).lower()}",
+                            f"Blocked: {', '.join(result.get('blocked_reasons') or []) or 'none'}",
+                            _evidence_status_line(activation.get("evidence_status")),
+                        ],
+                    }
+                )
+                prompt.value = ""
+                self._render_chat()
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        f"Refresh {'completed' if ok else 'blocked'} for {provider_id}.",
+                        activation.get("evidence_status"),
+                    ),
+                    ok=ok,
+                )
+                self._render_current_view()
+                return True
+            if len(parts) < 5 or parts[1] != "connect":
+                prompt.value = "/provider connect "
+                _set_text_area_cursor_end(prompt)
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_provider_connect/v1",
+                    "ok": False,
+                    "entry_id": "provider.connect",
+                    "activation_kind": "provider_connect",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": False,
+                    "evidence_status": "provider_connect_needs_arguments",
+                    "blocked_reasons": ["provider_connect_arguments_missing"],
+                    "hint": "/provider connect <provider_id> env <ENV_VAR> or /provider oauth <provider_id>",
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "credential_value_included": False,
+                    "credentials_included": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        "Use /provider connect <provider_id> env <ENV_VAR> or /provider oauth <provider_id>.",
+                        self._latest_palette_activation.get("evidence_status"),
+                    ),
+                    ok=False,
+                )
+                self._render_current_view()
+                return True
+            provider_id = parts[2]
+            method = parts[3]
+            if method != "env":
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_provider_connect/v1",
+                    "ok": False,
+                    "entry_id": "provider.connect",
+                    "activation_kind": "provider_connect",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": False,
+                    "provider_id": provider_id,
+                    "method": method,
+                    "evidence_status": "provider_connect_method_blocked",
+                    "blocked_reasons": ["provider_connect_method_not_supported_in_tui"],
+                    "hint": "Use env in the TUI, or use the CLI/local server for API-key secret entry.",
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "credential_value_included": False,
+                    "credentials_included": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                prompt.value = ""
+                self._render_chat()
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        "TUI provider connect supports env bindings.",
+                        self._latest_palette_activation.get("evidence_status"),
+                    ),
+                    ok=False,
+                )
+                self._render_current_view()
+                return True
+            env_var = parts[4]
+            try:
+                before = ((self._dashboard_snapshot(force=True).get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+                result = self._app_service.connect_provider_env(
+                    provider_id,
+                    env_var,
+                    description="tui_provider_connect",
+                    active=True,
+                )
+                after = ((self._dashboard_snapshot(force=True).get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+                activation = {
+                    "schema_version": "harness.tui_provider_connect/v1",
+                    "ok": bool(result.get("ok")),
+                    "entry_id": "provider.connect",
+                    "activation_kind": "provider_connect",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": True,
+                    "provider_id": provider_id,
+                    "method": "env",
+                    "env_var": env_var,
+                    "account_id": result.get("account_id"),
+                    "account_created": bool(result.get("account_created")),
+                    "account_activated": bool(result.get("account_activated")),
+                    "credential_source": result.get("credential_source"),
+                    "credential_value_included": False,
+                    "credentials_included": False,
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "browser_opened": False,
+                    "active_model_changed": before != after,
+                    "evidence_status": "provider_connect_persisted",
+                    "blocked_reasons": [],
+                    "harness_state_modified": True,
+                    "filesystem_modified": True,
+                    "process_started": False,
+                    "command_started": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                    "no_hidden_fallback": True,
+                }
+                self._latest_palette_activation = activation
+                self._record_palette_activation_event(activation, source="slash")
+                self._append_local_message(
+                    {
+                        "role": "assistant",
+                        "title": "Provider Connect",
+                        "lines": [
+                            f"Provider: {provider_id}",
+                            "Account created: true",
+                            f"Account active: {str(bool(result.get('account_activated'))).lower()}",
+                            "Credential source: provider_account_env",
+                            _evidence_status_line(activation.get("evidence_status")),
+                            "Credential value included: false",
+                            "Provider execution: false",
+                            "Model execution: false",
+                        ],
+                    }
+                )
+                prompt.value = ""
+                self._render_chat()
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        f"Connected {provider_id} via {env_var}.",
+                        activation.get("evidence_status"),
+                    ),
+                    ok=True,
+                )
+                self._render_current_view()
+                return True
+            except Exception as exc:
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_provider_connect/v1",
+                    "ok": False,
+                    "entry_id": "provider.connect",
+                    "activation_kind": "provider_connect",
+                    "source": "slash",
+                    "slash": "/provider",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": False,
+                    "provider_id": provider_id,
+                    "method": "env",
+                    "env_var": env_var,
+                    "evidence_status": "provider_connect_failed",
+                    "blocked_reasons": ["provider_connect_error"],
+                    "error": str(exc),
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "credential_value_included": False,
+                    "credentials_included": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        f"Provider connect failed: {exc}.",
+                        self._latest_palette_activation.get("evidence_status"),
+                    ),
+                    ok=False,
+                )
+                self._render_current_view()
+                return True
+
         def _activate_model_slash_command(self, value: str) -> bool:
             request = value.strip()
             if not (request == "/model" or request.startswith("/model ")):
@@ -5230,10 +7366,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._active_section_id = "project"
                 self._section_cursor_index = _right_panel_section_index("project")
                 prompt.value = "/model "
-                try:
-                    prompt.cursor_position = len(prompt.value)
-                except AttributeError:
-                    pass
+                _set_text_area_cursor_end(prompt)
                 self._latest_palette_activation = {
                     "schema_version": "harness.tui_palette_activation/v1",
                     "ok": True,
@@ -5251,12 +7384,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                     "blocked_reasons": [],
                     **_palette_no_side_effect_flags(),
                 }
-                self._show_model_dialog()
+                dashboard = self._show_model_dialog()
                 self._render_palette_activation_status("Type /model <provider/model> or /model <search>.", ok=True)
-                self._render_current_view()
+                self._render_current_view(dashboard_snapshot=dashboard)
+                return True
+            if self._activate_model_management_slash_action(query, prompt):
                 return True
 
-            palette = self._palette_snapshot()
+            palette_dashboard = self._dashboard_snapshot_for_dialog() if self._dialog_kind == "models" else None
+            palette = self._palette_snapshot(palette_dashboard)
             model_entries = [entry for entry in palette.get("entries", []) if entry.get("group_id") == "model_selection"]
             matches: list[dict]
             if query.isdigit():
@@ -5304,11 +7440,23 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 }
                 if matches:
                     visible = ", ".join(str(entry.get("model_ref")) for entry in matches[:4])
-                    self._render_palette_activation_status(f"Model query matched {len(matches)} models: {visible}.", ok=False)
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"Model query matched {len(matches)} models: {visible}.",
+                            self._latest_palette_activation.get("evidence_status"),
+                        ),
+                        ok=False,
+                    )
                 else:
-                    self._render_palette_activation_status(f"No model matched {query}.", ok=False)
-                self._show_model_dialog(query=query)
-                self._render_current_view()
+                    self._render_palette_activation_status(
+                        _with_evidence_status(
+                            f"No model matched {query}.",
+                            self._latest_palette_activation.get("evidence_status"),
+                        ),
+                        ok=False,
+                    )
+                dashboard = self._show_model_dialog(query=query)
+                self._render_current_view(dashboard_snapshot=dashboard)
                 return True
 
             entry = matches[0]
@@ -5336,17 +7484,188 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._focus_mode = "dashboard"
                 prompt.value = ""
                 self._hide_dialog()
-                self._render_palette_activation_status(f"Selected model {activation.get('raw_model_ref')}.", ok=True)
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        f"Selected model {activation.get('raw_model_ref')}.",
+                        activation.get("evidence_status"),
+                    ),
+                    ok=True,
+                )
             else:
                 self._focus_mode = "palette"
                 prompt.value = query
                 self._show_model_dialog(query=query)
                 self._render_palette_activation_status(
-                    f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
+                    _with_evidence_status(
+                        f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
+                        activation.get("evidence_status"),
+                    ),
                     ok=False,
                 )
             self._render_current_view()
             return True
+
+        def _activate_model_management_slash_action(self, query: str, prompt: object) -> bool:
+            parts = query.split(maxsplit=1)
+            action = parts[0].casefold() if parts else ""
+            if action not in {"favorite", "unfavorite", "default", "inspect"}:
+                return False
+            raw_ref = parts[1].strip() if len(parts) > 1 else self._selected_model_dialog_ref()
+            if not raw_ref:
+                prompt.value = f"/model {action} "
+                _set_text_area_cursor_end(prompt)
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_model_action/v1",
+                    "ok": False,
+                    "entry_id": f"model.{action}",
+                    "activation_kind": "model_action",
+                    "source": "slash",
+                    "slash": "/model",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "ui_action_applied": False,
+                    "evidence_status": "model_action_needs_ref",
+                    "blocked_reasons": ["model_ref_missing"],
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        f"Use /model {action} <provider/model>.",
+                        self._latest_palette_activation.get("evidence_status"),
+                    ),
+                    ok=False,
+                )
+                self._render_current_view()
+                return True
+            try:
+                if action == "favorite":
+                    result = self._app_service.set_model_favorite(raw_ref, True)
+                    title = "Model Favorite"
+                    status = "model_favorite_persisted"
+                    state_modified = True
+                elif action == "unfavorite":
+                    result = self._app_service.set_model_favorite(raw_ref, False)
+                    title = "Model Unfavorite"
+                    status = "model_unfavorite_persisted"
+                    state_modified = True
+                elif action == "default":
+                    result = self._app_service.set_default_model_preference(raw_ref)
+                    title = "Model Default"
+                    status = "model_default_persisted"
+                    state_modified = True
+                else:
+                    result = self._app_service.inspect_model(raw_ref)
+                    title = "Model Inspect"
+                    status = "model_inspection_rendered"
+                    state_modified = False
+            except Exception as exc:
+                prompt.value = ""
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_model_action/v1",
+                    "ok": False,
+                    "entry_id": f"model.{action}",
+                    "activation_kind": "model_action",
+                    "action": action,
+                    "raw_model_ref": raw_ref,
+                    "error": str(exc),
+                    "evidence_status": "model_action_failed",
+                    "blocked_reasons": ["model_action_error"],
+                    **_palette_no_side_effect_flags(),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "permission_granting": False,
+                    "authority_granting": False,
+                }
+                self._render_palette_activation_status(
+                    _with_evidence_status(
+                        f"Model {action} failed: {exc}.",
+                        self._latest_palette_activation.get("evidence_status"),
+                    ),
+                    ok=False,
+                )
+                self._render_current_view()
+                return True
+            validation = result.get("validation") or {}
+            preference = result.get("preference") or {}
+            activation = {
+                "schema_version": "harness.tui_model_action/v1",
+                "ok": bool(result.get("ok")),
+                "entry_id": f"model.{action}",
+                "activation_kind": "model_action",
+                "source": "slash",
+                "slash": "/model",
+                "slash_consumed": True,
+                "chat_submitted": False,
+                "ui_action_applied": True,
+                "action": {"name": action, "raw_model_ref": raw_ref},
+                "action_name": action,
+                "raw_model_ref": raw_ref,
+                "canonical_model_ref": validation.get("canonical_model_ref"),
+                "provider_id": validation.get("provider_id"),
+                "model_id": validation.get("model_id"),
+                "preference": preference,
+                "evidence_status": status,
+                "blocked_reasons": validation.get("blocked_reasons") or [],
+                "harness_state_modified": state_modified,
+                "filesystem_modified": state_modified,
+                "process_started": False,
+                "command_started": False,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "network_accessed": bool(result.get("network_accessed")),
+                "credentials_included": bool(result.get("credentials_included")),
+                "credential_value_included": False,
+                "hidden_provider_fallback": False,
+                "hidden_model_fallback": False,
+                "no_hidden_fallback": True,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+            self._latest_palette_activation = activation
+            self._record_palette_activation_event(activation, source="slash")
+            self._dashboard_snapshot(force=True)
+            lines = [
+                f"Model: {raw_ref}",
+                f"Canonical: {validation.get('canonical_model_ref') or '-'}",
+                f"Provider: {validation.get('provider_id') or '-'}",
+                f"Executable: {validation.get('executable')}",
+                f"Blocked: {', '.join(validation.get('blocked_reasons') or []) or 'none'}",
+                _evidence_status_line(activation.get("evidence_status")),
+                "Provider execution: false",
+                "Model execution: false",
+            ]
+            if preference:
+                lines.insert(1, f"Favorite: {str(bool(preference.get('favorite'))).lower()}")
+                lines.insert(2, f"Default: {str(bool(preference.get('is_default'))).lower()}")
+            self._append_local_message({"role": "assistant", "title": title, "lines": lines})
+            prompt.value = ""
+            self._hide_dialog()
+            self._render_chat()
+            self._render_palette_activation_status(
+                _with_evidence_status(
+                    f"{title}: {raw_ref}.",
+                    activation.get("evidence_status"),
+                ),
+                ok=bool(result.get("ok")),
+            )
+            self._render_current_view()
+            return True
+
+        def _selected_model_dialog_ref(self) -> str | None:
+            if self._dialog_kind != "models":
+                return None
+            models = _model_selection_dialog_entries(self._dashboard_snapshot_for_dialog(), query=self._dialog_query)
+            if not models:
+                return None
+            selected_index = min(max(self._dialog_selected_index, 0), len(models) - 1)
+            raw_ref = str(models[selected_index].get("raw_model_ref") or "").strip()
+            return raw_ref or None
 
         def _activate_models_slash_command(self, value: str) -> bool:
             request = value.strip()
@@ -5358,7 +7677,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             return True
 
         def _show_models_list(self, *, source: str, slash: str) -> None:
-            dashboard = self._dashboard_snapshot(force=True)
+            dashboard = self._dashboard_snapshot_for_dialog()
             models = _unique_model_catalog_entries((dashboard.get("model_catalog") or {}).get("models") or [])
             active = ((dashboard.get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
             lines = ["Models:"]
@@ -5367,9 +7686,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             for index, model in enumerate(models[:12], start=1):
                 raw_ref = str(model.get("raw_model_ref") or "")
                 marker = "*" if raw_ref == active else " "
-                lines.append(f"{index}. {marker} {raw_ref}")
+                blocked = ",".join(str(item) for item in model.get("blocked_reasons") or [])
+                status = f" blocked={blocked}" if blocked else f" exec={model.get('executable')}"
+                lines.append(
+                    f"{index}. {marker} {raw_ref} "
+                    f"{model.get('protocol') or '?'} src={model.get('source') or '?'}{status}"
+                )
             lines.extend(["Select: /model <number>", "Search: /model <name>", "Exact: /model <provider/model>"])
-            self._messages.append({"role": "assistant", "title": "Model Selection", "lines": lines})
+            self._append_local_message({"role": "assistant", "title": "Model Selection", "lines": lines})
             self._latest_palette_activation = {
                 "schema_version": "harness.tui_palette_activation/v1",
                 "ok": True,
@@ -5388,21 +7712,87 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 "model_count": len(models),
                 **_palette_no_side_effect_flags(),
             }
-            self._show_model_dialog()
+            self._show_model_dialog(dashboard_snapshot=dashboard)
             self._render_chat()
             self._render_palette_activation_status("Listed models. Select with /model <number>.", ok=True)
-            self._render_current_view()
+            self._render_current_view(dashboard_snapshot=dashboard)
 
-        def _show_model_dialog(self, *, query: str = "", selected_index: int = 0) -> None:
-            dashboard = self._app_service.dashboard(
-                selected_session_id=self._selected_session_id or self._chat_state.session_id,
+        def _provider_auth_projection(self) -> dict:
+            try:
+                projection = self._app_service.provider_auth_methods()
+            except Exception as exc:
+                return {
+                    "schema_version": "harness.provider_auth_methods/v1",
+                    "providers": [],
+                    "error": str(exc),
+                    "credentials_included": False,
+                    "credential_value_included": False,
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "network_accessed": False,
+                    "permission_granting": False,
+                    "no_hidden_fallback": True,
+                }
+            return projection if isinstance(projection, dict) else {"providers": []}
+
+        def _show_provider_dialog(self, *, query: str = "", selected_index: int = 0) -> dict:
+            projection = self._provider_auth_projection()
+            self._dialog_query = query
+            self._dialog_selected_index = selected_index
+            self._dialog_context = {"provider_auth": projection}
+            self._show_dialog(
+                render_provider_connect_dialog(projection, query=query, selected_index=selected_index),
+                kind="providers",
             )
+            return projection
+
+        def _show_provider_auth_method_dialog(
+            self,
+            provider_id: str,
+            *,
+            selected_index: int = 0,
+            source: str = "model_picker",
+            return_dialog: str = "models",
+            return_query: str | None = None,
+            return_selected_index: int | None = None,
+        ) -> dict | None:
+            projection = self._provider_auth_projection()
+            provider = self._provider_from_auth_projection(projection, provider_id)
+            if provider is None:
+                self._render_palette_activation_status(f"Unknown provider: {provider_id}.", ok=False)
+                return None
+            self._dialog_query = ""
+            self._dialog_selected_index = selected_index
+            self._dialog_context = {
+                "provider_auth": projection,
+                "provider": provider,
+                "provider_connect_source": source,
+                "return_dialog": return_dialog,
+                "return_query": self._dialog_query if return_query is None else return_query,
+                "return_selected_index": self._dialog_selected_index if return_selected_index is None else return_selected_index,
+            }
+            self._show_dialog(render_provider_auth_method_dialog(provider, selected_index=selected_index), kind="provider_auth_methods")
+            return provider
+
+        def _provider_from_auth_projection(self, projection: dict, provider_id: str) -> dict | None:
+            return next(
+                (
+                    provider
+                    for provider in projection.get("providers") or []
+                    if str(provider.get("provider_id") or "") == provider_id
+                ),
+                None,
+            )
+
+        def _show_model_dialog(self, *, query: str = "", selected_index: int = 0, dashboard_snapshot: dict | None = None) -> dict:
+            dashboard = dashboard_snapshot or self._dashboard_snapshot_for_dialog()
             self._dialog_query = query
             self._dialog_selected_index = selected_index
             self._show_dialog(
                 render_model_selection_dialog(dashboard, query=query, selected_index=selected_index),
                 kind="models",
             )
+            return dashboard
 
         def _show_functionality_dialog(self, *, query: str = "", selected_index: int = 0) -> None:
             self._dialog_query = query
@@ -5424,6 +7814,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._show_model_dialog(query=self._dialog_query, selected_index=self._dialog_selected_index)
             elif self._dialog_kind == "commands":
                 self._show_functionality_dialog(query=self._dialog_query, selected_index=self._dialog_selected_index)
+            elif self._dialog_kind == "providers":
+                self._show_provider_dialog(query=self._dialog_query, selected_index=self._dialog_selected_index)
+            elif self._dialog_kind == "provider_auth_methods":
+                provider = self._dialog_context.get("provider") or {}
+                self._show_provider_auth_method_dialog(str(provider.get("provider_id") or ""), selected_index=self._dialog_selected_index)
             elif self._dialog_kind == "themes":
                 self._show_theme_dialog(selected_index=self._dialog_selected_index)
             elif self._dialog_kind == "agents":
@@ -5434,17 +7829,217 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._activate_selected_model_dialog_entry()
             elif self._dialog_kind == "commands":
                 self._activate_selected_functionality_row()
+            elif self._dialog_kind == "providers":
+                self._activate_selected_provider_dialog_entry()
+            elif self._dialog_kind == "provider_auth_methods":
+                self._activate_selected_provider_auth_method_entry()
             elif self._dialog_kind == "themes":
                 self._activate_selected_theme_dialog_entry()
             elif self._dialog_kind == "agents":
                 self._activate_selected_agent_dialog_entry()
 
+        def action_handle_model_dialog_action_key(self, event) -> bool:
+            if not self._dialog_visible or self._dialog_kind != "models":
+                return False
+            pressed = (event.character or event.key or "").casefold()
+            prompt = self.query_one("#prompt", TextArea)
+            prompt_focused = self.focused is prompt
+            modified_keys = {
+                "f5": "f",
+                "f6": "d",
+                "f7": "i",
+                "f8": "r",
+                "f10": "x",
+                "ctrl+a": "account",
+                "\x01": "account",
+            }
+            if pressed in modified_keys:
+                pressed = modified_keys[pressed]
+            elif prompt_focused:
+                return False
+            if pressed not in {"f", "d", "i", "r", "account", "x"}:
+                return False
+            dashboard = self._dashboard_snapshot_for_dialog()
+            models = _model_selection_dialog_entries(dashboard, query=self._dialog_query)
+            if not models:
+                return False
+            selected_index = min(max(self._dialog_selected_index, 0), len(models) - 1)
+            model = models[selected_index]
+            raw_ref = str(model.get("raw_model_ref") or "").strip()
+            provider_id = str(model.get("provider_id") or "").strip()
+            providers = {
+                str(provider.get("provider_id") or ""): provider
+                for provider in ((dashboard.get("model_catalog") or {}).get("providers") or [])
+            }
+            provider = providers.get(provider_id) or {}
+            provider_models = [
+                item
+                for item in ((dashboard.get("model_catalog") or {}).get("models") or [])
+                if item.get("provider_id") == provider_id
+            ]
+            event.prevent_default()
+            event.stop()
+            if pressed == "f":
+                action = "unfavorite" if model.get("favorite") else "favorite"
+                prompt.value = f"/model {action} {raw_ref}"
+                self._activate_model_slash_command(prompt.value)
+                return True
+            if pressed == "d":
+                prompt.value = f"/model default {raw_ref}"
+                self._activate_model_slash_command(prompt.value)
+                return True
+            if pressed == "i":
+                prompt.value = f"/model inspect {raw_ref}"
+                self._activate_model_slash_command(prompt.value)
+                return True
+            if pressed == "r" and provider_id and _provider_refresh_action_available(provider, provider_models):
+                prompt.value = f"/provider refresh {provider_id}"
+                self._activate_provider_connect_slash_command(prompt.value)
+                return True
+            if pressed == "x" and provider_id and _provider_disconnect_action_available(provider):
+                prompt.value = f"/provider disconnect {provider_id}"
+                self._activate_provider_connect_slash_command(prompt.value)
+                return True
+            if (
+                pressed == "account"
+                and provider_id
+                and (_provider_connect_action_available(provider) or _provider_disconnect_action_available(provider))
+            ):
+                self._show_provider_auth_method_dialog(
+                    provider_id,
+                    source="model_picker",
+                    return_dialog="models",
+                    return_query=self._dialog_query,
+                    return_selected_index=self._dialog_selected_index,
+                )
+                self._render_palette_activation_status(
+                    f"Choose an auth method for {provider_id}. No provider call is started.",
+                    ok=True,
+                )
+                return True
+            return False
+
+        def action_handle_provider_dialog_key(self, event) -> bool:
+            if not self._dialog_visible:
+                return False
+            if self._dialog_kind == "provider_auth_methods" and event.key == "backspace":
+                event.prevent_default()
+                event.stop()
+                if self._dialog_context.get("return_dialog") == "models":
+                    self._show_model_dialog(
+                        query=str(self._dialog_context.get("return_query") or ""),
+                        selected_index=int(self._dialog_context.get("return_selected_index") or 0),
+                    )
+                else:
+                    self._show_provider_dialog()
+                return True
+            return False
+
+        def _activate_selected_provider_dialog_entry(self) -> None:
+            projection = self._dialog_context.get("provider_auth") or self._provider_auth_projection()
+            entries = _provider_connect_dialog_entries(projection, query=self._dialog_query)
+            if not entries:
+                self._render_palette_activation_status("No provider selected.", ok=False)
+                return
+            selected_index = min(max(self._dialog_selected_index, 0), len(entries) - 1)
+            entry = entries[selected_index]
+            if entry.get("type") == "custom":
+                self._dialog_context = {}
+                self._show_dialog(render_provider_custom_dialog(), kind="provider_custom")
+                self._render_palette_activation_status("Custom providers are configured in .harness/models.yaml.", ok=True)
+                return
+            provider_id = str(entry.get("provider_id") or "")
+            if not provider_id:
+                self._render_palette_activation_status("Selected provider is missing an id.", ok=False)
+                return
+            self._show_provider_auth_method_dialog(provider_id, source="provider_dialog", return_dialog="providers")
+            self._render_palette_activation_status(f"Choose an auth method for {provider_id}.", ok=True)
+
+        def _activate_selected_provider_auth_method_entry(self) -> None:
+            provider = self._dialog_context.get("provider") or {}
+            provider_id = str(provider.get("provider_id") or "")
+            entries = _provider_auth_method_entries(provider)
+            if not provider_id or not entries:
+                self._render_palette_activation_status("No provider auth method selected.", ok=False)
+                return
+            selected_index = min(max(self._dialog_selected_index, 0), len(entries) - 1)
+            entry = entries[selected_index]
+            method = str(entry.get("method") or "")
+            method_payload = entry.get("method_payload") or {}
+            if method == "disconnect":
+                prompt = self.query_one("#prompt", TextArea)
+                prompt.value = f"/provider disconnect {provider_id}"
+                self._activate_provider_connect_slash_command(prompt.value)
+                return
+            if method == "env":
+                self._show_provider_env_prompt(provider, method_payload)
+                return
+            if method == "api_key":
+                self._show_provider_api_key_prompt(provider, method_payload)
+                return
+            if method == "oauth":
+                prompt = self.query_one("#prompt", TextArea)
+                prompt.value = f"/provider oauth {provider_id}"
+                self._activate_provider_connect_slash_command(prompt.value)
+                return
+            if method == "aws_profile":
+                self._show_provider_env_prompt(provider, method_payload)
+                return
+            if method in {"aws_env", "codex_login", "static_local"}:
+                self._confirm_provider_local_connect(provider, method)
+                return
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_provider_connect/v1",
+                "ok": False,
+                "entry_id": "provider.connect",
+                "activation_kind": "provider_connect",
+                "source": "provider_dialog",
+                "provider_id": provider_id,
+                "method": method,
+                "evidence_status": "provider_connect_method_blocked",
+                "blocked_reasons": ["provider_connect_method_requires_cli_or_runtime"],
+                "hint": "This method is represented in provider metadata but has no interactive TUI credential prompt yet.",
+                **_palette_no_side_effect_flags(),
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "network_accessed": False,
+                "credential_value_included": False,
+                "credentials_included": False,
+                "permission_granting": False,
+                "authority_granting": False,
+            }
+            self._render_palette_activation_status(
+                _with_evidence_status(
+                    f"{_PROVIDER_METHOD_LABELS.get(method, method)} does not need an interactive TUI secret prompt here.",
+                    self._latest_palette_activation.get("evidence_status"),
+                ),
+                ok=False,
+            )
+            self._render_current_view()
+
+        def _show_provider_env_prompt(self, provider: dict, method: dict) -> None:
+            self._dialog_text_buffer = ""
+            self._dialog_context = {**self._dialog_context, "provider": provider, "method": method}
+            self._show_dialog(render_provider_env_prompt_dialog(provider, method), kind="provider_env_prompt")
+            self._render_palette_activation_status("Enter an environment variable name. The value is not read here.", ok=True)
+
+        def _show_provider_api_key_prompt(self, provider: dict, method: dict) -> None:
+            self._dialog_text_buffer = ""
+            self._dialog_context = {**self._dialog_context, "provider": provider, "method": method}
+            self._show_dialog(render_provider_api_key_prompt_dialog(provider), kind="provider_api_key_prompt")
+            self._render_palette_activation_status("Enter API key. The dialog masks input and stores it in the local secret store.", ok=True)
+
         def _dialog_row_count(self) -> int:
             if self._dialog_kind == "models":
-                return len(_model_selection_dialog_entries(self._dashboard_snapshot(), query=self._dialog_query))
+                return len(_model_selection_dialog_entries(self._dashboard_snapshot_for_dialog(), query=self._dialog_query))
             if self._dialog_kind == "commands":
                 table = build_functionality_table(slash_commands)
                 return len(filter_functionality_table(table, self._dialog_query)["rows"])
+            if self._dialog_kind == "providers":
+                projection = self._dialog_context.get("provider_auth") or self._provider_auth_projection()
+                return len(_provider_connect_dialog_entries(projection, query=self._dialog_query))
+            if self._dialog_kind == "provider_auth_methods":
+                return len(_provider_auth_method_entries(self._dialog_context.get("provider") or {}))
             if self._dialog_kind == "themes":
                 return len(THEME_DIALOG_ENTRIES)
             if self._dialog_kind == "agents":
@@ -5464,11 +8059,15 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._dialog_text_buffer = ""
                 self._refresh_text_dialog()
                 return
-            if event.key == "enter":
+            if event.key in ENTER_KEYS:
                 if self._dialog_kind == "session_delete":
                     self._confirm_session_hard_delete()
                 elif self._dialog_kind == "session_rename":
                     self._confirm_session_rename()
+                elif self._dialog_kind == "provider_env_prompt":
+                    self._confirm_provider_env_connect()
+                elif self._dialog_kind == "provider_api_key_prompt":
+                    self._confirm_provider_api_key_connect()
                 return
             if event.character and event.character.isprintable():
                 self._dialog_text_buffer += event.character
@@ -5480,6 +8079,194 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._show_dialog(render_session_delete_dialog(session, buffer=self._dialog_text_buffer), kind="session_delete")
             elif self._dialog_kind == "session_rename":
                 self._show_dialog(render_session_rename_dialog(session, buffer=self._dialog_text_buffer), kind="session_rename")
+            elif self._dialog_kind == "provider_env_prompt":
+                provider = self._dialog_context.get("provider") or {}
+                method = self._dialog_context.get("method") or {}
+                self._show_dialog(
+                    render_provider_env_prompt_dialog(provider, method, buffer=self._dialog_text_buffer),
+                    kind="provider_env_prompt",
+                )
+            elif self._dialog_kind == "provider_api_key_prompt":
+                provider = self._dialog_context.get("provider") or {}
+                self._show_dialog(
+                    render_provider_api_key_prompt_dialog(provider, buffer=self._dialog_text_buffer),
+                    kind="provider_api_key_prompt",
+                )
+
+        def _confirm_provider_env_connect(self) -> None:
+            provider = self._dialog_context.get("provider") or {}
+            method = self._dialog_context.get("method") or {}
+            provider_id = str(provider.get("provider_id") or "")
+            method_name = str(method.get("method") or "env")
+            env_var = self._dialog_text_buffer.strip() or str(method.get("default_env_var") or "").strip()
+            if not provider_id or not env_var:
+                self._render_palette_activation_status("Provider env connect needs a provider and env var name.", ok=False)
+                self._refresh_text_dialog()
+                return
+            try:
+                before = ((self._dashboard_snapshot_for_dialog().get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+                if method_name == "aws_profile":
+                    result = self._app_service.connect_provider_local_account(
+                        provider_id,
+                        "aws_profile",
+                        description="tui_provider_connect_dialog",
+                        active=True,
+                        env_var=env_var,
+                    )
+                else:
+                    result = self._app_service.connect_provider_env(
+                        provider_id,
+                        env_var,
+                        description="tui_provider_connect_dialog",
+                        active=True,
+                    )
+                refreshed = self._dashboard_snapshot(force=True)
+                after = ((refreshed.get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+            except Exception as exc:
+                self._render_palette_activation_status(f"Provider connect failed: {exc}", ok=False)
+                self._refresh_text_dialog()
+                return
+            self._finish_provider_connect_dialog(
+                provider_id,
+                method_name,
+                result,
+                credential_label=f"{_PROVIDER_METHOD_LABELS.get(method_name, 'Environment')}: {env_var}",
+                active_model_changed=before != after,
+            )
+
+        def _confirm_provider_local_connect(self, provider: dict, method: str) -> None:
+            provider_id = str(provider.get("provider_id") or "")
+            if not provider_id or not method:
+                self._render_palette_activation_status("Provider local connect needs a provider and method.", ok=False)
+                return
+            try:
+                before = ((self._dashboard_snapshot_for_dialog().get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+                result = self._app_service.connect_provider_local_account(
+                    provider_id,
+                    method,
+                    description="tui_provider_connect_dialog",
+                    active=True,
+                )
+                refreshed = self._dashboard_snapshot(force=True)
+                after = ((refreshed.get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+            except Exception as exc:
+                self._render_palette_activation_status(f"Provider connect failed: {exc}", ok=False)
+                return
+            self._finish_provider_connect_dialog(
+                provider_id,
+                method,
+                result,
+                credential_label=_PROVIDER_METHOD_LABELS.get(method, method),
+                active_model_changed=before != after,
+            )
+
+        def _confirm_provider_api_key_connect(self) -> None:
+            provider = self._dialog_context.get("provider") or {}
+            provider_id = str(provider.get("provider_id") or "")
+            api_key = self._dialog_text_buffer
+            if not provider_id or not api_key:
+                self._render_palette_activation_status("Provider API-key connect needs a provider and key.", ok=False)
+                self._refresh_text_dialog()
+                return
+            try:
+                before = ((self._dashboard_snapshot_for_dialog().get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+                result = self._app_service.connect_provider_api_key(
+                    provider_id,
+                    api_key,
+                    description="tui_provider_connect_dialog",
+                    active=True,
+                )
+                self._dialog_text_buffer = ""
+                refreshed = self._dashboard_snapshot(force=True)
+                after = ((refreshed.get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
+            except Exception as exc:
+                self._dialog_text_buffer = ""
+                self._render_palette_activation_status(f"Provider API-key connect failed: {exc}", ok=False)
+                self._refresh_text_dialog()
+                return
+            self._finish_provider_connect_dialog(
+                provider_id,
+                "api_key",
+                result,
+                credential_label="API key: stored locally",
+                active_model_changed=before != after,
+            )
+
+        def _finish_provider_connect_dialog(
+            self,
+            provider_id: str,
+            method: str,
+            result: dict,
+            *,
+            credential_label: str,
+            active_model_changed: bool,
+        ) -> None:
+            activation = {
+                "schema_version": "harness.tui_provider_connect/v1",
+                "ok": bool(result.get("ok", True)),
+                "entry_id": "provider.connect",
+                "activation_kind": "provider_connect",
+                "source": str(self._dialog_context.get("provider_connect_source") or "model_picker"),
+                "slash": "/provider",
+                "slash_consumed": False,
+                "chat_submitted": False,
+                "ui_action_applied": True,
+                "provider_id": provider_id,
+                "method": method,
+                "account_id": result.get("account_id"),
+                "account_created": bool(result.get("account_created")),
+                "account_activated": bool(result.get("account_activated")),
+                "credential_source": result.get("credential_source"),
+                "credential_written": bool(result.get("credential_written")),
+                "credential_value_included": False,
+                "credentials_included": False,
+                "provider_execution_started": False,
+                "model_execution_started": False,
+                "network_accessed": False,
+                "browser_opened": False,
+                "active_model_changed": active_model_changed,
+                "evidence_status": "provider_connect_persisted",
+                "blocked_reasons": [],
+                "harness_state_modified": True,
+                "filesystem_modified": True,
+                "process_started": False,
+                "command_started": False,
+                "permission_granting": False,
+                "authority_granting": False,
+                "no_hidden_fallback": True,
+            }
+            self._latest_palette_activation = activation
+            self._record_palette_activation_event(activation, source="provider_dialog")
+            self._append_local_message(
+                {
+                    "role": "assistant",
+                    "title": "Provider Connect",
+                    "lines": [
+                        f"Provider: {provider_id}",
+                        f"Method: {_PROVIDER_METHOD_LABELS.get(method, method)}",
+                        "Account created: true",
+                        f"Account active: {str(bool(result.get('account_activated'))).lower()}",
+                        credential_label,
+                        _evidence_status_line(activation.get("evidence_status")),
+                        "Credential value included: false",
+                        "Provider execution: false",
+                        "Model execution: false",
+                    ],
+                }
+            )
+            prompt = self.query_one("#prompt", TextArea)
+            prompt.value = ""
+            dashboard = self._dashboard_snapshot_for_dialog()
+            self._show_model_dialog(query=provider_id, dashboard_snapshot=dashboard)
+            self._render_chat()
+            self._render_palette_activation_status(
+                _with_evidence_status(
+                    f"Connected {provider_id}. Select a model from this provider.",
+                    activation.get("evidence_status"),
+                ),
+                ok=True,
+            )
+            self._render_current_view(dashboard_snapshot=dashboard)
 
         def _confirm_session_hard_delete(self) -> None:
             session = self._dialog_context.get("session") or {}
@@ -5539,15 +8326,43 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._render_current_view()
 
         def _activate_selected_model_dialog_entry(self) -> None:
-            dashboard = self._dashboard_snapshot()
+            dashboard = self._dashboard_snapshot_for_dialog()
             models = _model_selection_dialog_entries(dashboard, query=self._dialog_query)
             if not models:
                 self._render_palette_activation_status("No model selected.", ok=False)
                 return
             selected_index = min(max(self._dialog_selected_index, 0), len(models) - 1)
-            raw_ref = str(models[selected_index].get("raw_model_ref") or "")
+            model = models[selected_index]
+            raw_ref = str(model.get("raw_model_ref") or "")
             if not raw_ref:
                 self._render_palette_activation_status("Selected model has no model ref.", ok=False)
+                return
+            provider_id = str(model.get("provider_id") or "")
+            providers = {
+                str(provider.get("provider_id") or ""): provider
+                for provider in ((dashboard.get("model_catalog") or {}).get("providers") or [])
+            }
+            provider = providers.get(provider_id) or {}
+            blocked = {str(reason) for reason in model.get("blocked_reasons") or []}
+            if (
+                provider_id
+                and _provider_connect_action_available(provider)
+                and (
+                    "credential_missing" in blocked
+                    or str(provider.get("credential_status") or "") == "missing"
+                )
+            ):
+                self._show_provider_auth_method_dialog(
+                    provider_id,
+                    source="model_picker",
+                    return_dialog="models",
+                    return_query=self._dialog_query,
+                    return_selected_index=self._dialog_selected_index,
+                )
+                self._render_palette_activation_status(
+                    f"Choose an auth method for {provider_id}. No provider call is started.",
+                    ok=True,
+                )
                 return
             prompt = self.query_one("#prompt", TextArea)
             prompt.value = f"/model {raw_ref}"
@@ -5568,16 +8383,19 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._leader_key_active = False
             if slash == "/model":
                 prompt.value = "/model "
-                try:
-                    prompt.cursor_position = len(prompt.value)
-                except AttributeError:
-                    pass
+                _set_text_area_cursor_end(prompt)
                 self._show_model_dialog()
                 self._render_palette_activation_status("Type a model search or use arrows, then enter.", ok=True)
                 return
             if slash == "/models":
                 prompt.value = ""
                 self._show_models_list(source="command_table", slash="/models")
+                return
+            if slash == "/provider":
+                prompt.value = "/model "
+                _set_text_area_cursor_end(prompt)
+                self._show_model_dialog()
+                self._render_palette_activation_status("Provider connect is part of /models. Select a row and press Ctrl+A.", ok=True)
                 return
             if slash == "/theme":
                 prompt.value = ""
@@ -5588,10 +8406,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._hide_dialog()
                 return
             prompt.value = f"{slash} "
-            try:
-                prompt.cursor_position = len(prompt.value)
-            except AttributeError:
-                pass
+            _set_text_area_cursor_end(prompt)
             self._hide_dialog()
             self._render_palette_activation_status(f"Command ready: {slash}. Fill arguments, then submit.", ok=True)
 
@@ -5743,7 +8558,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                     "authority_granting": False,
                 }
             try:
-                dashboard = self._dashboard_snapshot(force=True)
+                dashboard = self._dashboard_snapshot_for_dialog()
                 active_session = dashboard.get("active_session") or {}
                 session_id = self._selected_session_id or self._chat_state.session_id or active_session.get("id")
                 if not session_id:
@@ -5860,10 +8675,22 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                     "child_process_started": bool(activation.get("child_process_started")),
                     "process_started": bool(activation.get("process_started")),
                     "filesystem_modified": bool(activation.get("filesystem_modified")),
+                    "provider_execution_started": bool(activation.get("provider_execution_started")),
+                    "model_execution_started": bool(activation.get("model_execution_started")),
+                    "network_accessed": bool(activation.get("network_accessed")),
+                    "provider_id": activation.get("provider_id"),
+                    "method": activation.get("method"),
+                    "account_id": activation.get("account_id"),
+                    "account_created": bool(activation.get("account_created")),
+                    "account_activated": bool(activation.get("account_activated")),
+                    "credential_source": activation.get("credential_source"),
+                    "credential_value_included": bool(activation.get("credential_value_included")),
+                    "credentials_included": bool(activation.get("credentials_included")),
+                    "active_model_changed": bool(activation.get("active_model_changed")),
                     "permission_granting": bool(activation.get("permission_granting")),
                     "authority_granting": bool(activation.get("authority_granting")),
                     "session_message_created": bool(activation.get("session_message_created")),
-                    "evidence_status": "ui_only_persisted",
+                    "evidence_status": _persisted_palette_evidence_status(activation),
                     "policy_boundary": activation.get("policy_boundary") or _safe_palette_policy_boundary(),
                     "blocked_reasons": activation.get("blocked_reasons") or [],
                 }
@@ -5985,10 +8812,7 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             if not inserted:
                 return
             prompt.value = inserted
-            try:
-                prompt.cursor_position = len(inserted)
-            except AttributeError:
-                pass
+            _set_text_area_cursor_end(prompt)
             self._slash_suggestion_index = 0
             self._render_slash_suggestions("")
 
@@ -6063,6 +8887,8 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._selected_session_id = str(sessions[self._session_cursor_index].get("id") or "")
             self._left_selected_item_id = f"session:{self._selected_session_id}"
             self._chat_state.session_id = self._selected_session_id
+            self._transient_session_events = []
+            self._sync_session_event_subscription()
             self._focus_mode = "dashboard"
             self._active_section_id = "sessions"
             self._section_cursor_index = _right_panel_section_index("sessions")
@@ -6070,11 +8896,11 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 f"Selected session: {sessions[self._session_cursor_index].get('display_title') or 'Untitled session'}.",
                 ok=True,
             )
-            self._render_current_view()
+            self._render_active_session_changed()
 
-        def _current_view(self) -> dict:
+        def _current_view(self, dashboard_snapshot: dict | None = None) -> dict:
             prompt = self.query_one("#prompt", TextArea)
-            refreshed_dashboard = self._dashboard_snapshot()
+            refreshed_dashboard = dashboard_snapshot or self._dashboard_snapshot()
             return build_right_panel_model(
                 refreshed_dashboard,
                 {
@@ -6125,11 +8951,138 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             # explicitly applying the watcher.
             self._watch_theme(textual_theme)
 
-        def _render_current_view(self) -> None:
+        def _render_current_view(self, dashboard_snapshot: dict | None = None) -> None:
             try:
-                self._render_view(self._current_view())
+                self._render_view(
+                    self._current_view(dashboard_snapshot=dashboard_snapshot),
+                    dashboard_snapshot=dashboard_snapshot,
+                )
             except NoMatches:
                 return
+
+        def _render_active_session_changed(self) -> None:
+            self._render_current_view()
+            try:
+                self._render_chat()
+            except NoMatches:
+                return
+
+        def _start_event_subscriptions(self) -> None:
+            if not hasattr(self._app_service, "subscribe_global_events"):
+                self._event_stream_status = "polling_fallback:service_subscription_missing"
+                return
+            if self._global_event_subscription is None:
+                try:
+                    self._global_event_subscription = self._app_service.subscribe_global_events()
+                    subscription = self._global_event_subscription
+                    self._event_stream_status = "live"
+                    self.run_worker(
+                        lambda subscription=subscription: self._event_subscription_loop("global", subscription),
+                        thread=True,
+                    )
+                except Exception as exc:
+                    self._mark_event_stream_lost("global", exc)
+            self._sync_session_event_subscription()
+
+        def _sync_session_event_subscription(self) -> None:
+            selected_id = self._selected_session_id or self._chat_state.session_id
+            if selected_id == self._session_event_subscription_id:
+                return
+            old_subscription = self._session_event_subscription
+            if old_subscription is not None:
+                self._last_closed_session_event_subscription = old_subscription
+                try:
+                    old_subscription.close()
+                except Exception:
+                    pass
+            self._session_event_subscription = None
+            self._session_event_subscription_id = selected_id
+            if not selected_id or not hasattr(self._app_service, "subscribe_session_events"):
+                return
+            try:
+                subscription = self._app_service.subscribe_session_events(selected_id)
+            except Exception as exc:
+                self._mark_event_stream_lost("session", exc)
+                return
+            self._session_event_subscription = subscription
+            self._event_stream_status = "live"
+            self.run_worker(
+                lambda subscription=subscription: self._event_subscription_loop("session", subscription),
+                thread=True,
+            )
+
+        def _event_subscription_loop(self, scope: str, subscription) -> None:
+            while not getattr(subscription, "closed", False):
+                try:
+                    event = subscription.next(timeout=0.25)
+                except Exception as exc:
+                    try:
+                        self.call_from_thread(self._mark_event_stream_lost, scope, exc)
+                    except Exception:
+                        pass
+                    return
+                if event is None:
+                    continue
+                try:
+                    self.call_from_thread(self._handle_service_event, scope, event)
+                except Exception:
+                    return
+
+        def _handle_service_event(self, scope: str, event) -> None:
+            event_id = str(getattr(event, "id", "") or "")
+            if event_id and event_id in self._event_seen_ids:
+                return
+            if event_id:
+                self._event_seen_ids.add(event_id)
+                if len(self._event_seen_ids) > 512:
+                    self._event_seen_ids = set(list(self._event_seen_ids)[-256:])
+            self._event_refresh_dirty = True
+            self._event_refresh_count += 1
+            self._event_stream_status = "live"
+            self._dashboard_cache = None
+            stream_type = getattr(getattr(event, "stream_type", None), "value", getattr(event, "stream_type", None))
+            stream_id = str(getattr(event, "stream_id", "") or "")
+            selected_id = self._selected_session_id or self._chat_state.session_id
+            if stream_type == "session" and stream_id == selected_id:
+                try:
+                    payload = event.model_dump(mode="json")
+                except Exception:
+                    payload = {"id": event_id, "kind": str(getattr(event, "kind", "unknown"))}
+                self._transient_session_events.append(payload)
+                self._transient_session_events = self._transient_session_events[-80:]
+            self._schedule_event_refresh()
+
+        def _schedule_event_refresh(self) -> None:
+            timer = self._event_render_timer
+            if timer is not None:
+                return
+            self._event_render_timer = self.set_timer(0.15, self._flush_event_refresh)
+
+        def _flush_event_refresh(self) -> None:
+            self._event_render_timer = None
+            self._refresh_live_view()
+
+        def _mark_event_stream_lost(self, scope: str, exc: Exception) -> None:
+            self._event_stream_failures += 1
+            self._event_stream_status = f"polling_fallback:{scope}:{exc.__class__.__name__}"
+            try:
+                self._render_palette_activation_status(
+                    f"Event stream fallback: {scope} {exc.__class__.__name__}.",
+                    ok=False,
+                )
+            except Exception:
+                pass
+
+        def _close_event_subscriptions(self) -> None:
+            for subscription in (self._global_event_subscription, self._session_event_subscription):
+                if subscription is None:
+                    continue
+                try:
+                    subscription.close()
+                except Exception:
+                    pass
+            self._global_event_subscription = None
+            self._session_event_subscription = None
 
         def _render_slash_suggestions(self, prompt_value: str) -> None:
             status = self.query_one("#slash-status", Static)
@@ -6144,24 +9097,38 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 selected_index=self._slash_suggestion_index,
             )
             if rendered:
+                self._slash_suggestions_active = True
                 status.remove_class("hidden")
                 status.update(rendered)
             else:
+                self._slash_suggestions_active = False
                 status.update("")
                 status.add_class("hidden")
 
         def _refresh_live_view(self) -> None:
             try:
-                if self._request_in_flight:
-                    self._render_chat()
+                runtime_active = self._dashboard_runtime_active(self._dashboard_cache or {})
+                if (
+                    self._event_stream_status == "live"
+                    and not self._request_in_flight
+                    and not runtime_active
+                    and not self._event_refresh_dirty
+                ):
+                    return
                 needs_full_refresh = (
                     self._request_in_flight
+                    or runtime_active
+                    or self._event_refresh_dirty
                     or self._dashboard_cache is None
                     or time.monotonic() - self._dashboard_cache_at >= 1.5
                 )
-                self._dashboard_snapshot(force=False)
+                dashboard_snapshot = self._dashboard_snapshot(force=False)
+                runtime_active = self._dashboard_runtime_active(dashboard_snapshot)
+                if self._request_in_flight or runtime_active or self._event_refresh_dirty:
+                    self._render_chat()
                 if needs_full_refresh:
                     self._render_current_view()
+                    self._event_refresh_dirty = False
                 else:
                     self._render_right_pane_only()
                 self._live_refresh_failures = 0
@@ -6188,10 +9155,71 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 or selected_session_id != self._dashboard_cache_session_id
                 or now - self._dashboard_cache_at >= 1.5
             ):
-                self._dashboard_cache = self._app_service.dashboard(selected_session_id=selected_session_id)
+                dashboard_snapshot = self._app_service.dashboard(selected_session_id=selected_session_id)
+                self._dashboard_cache = self._enrich_dashboard_runtime(dashboard_snapshot, selected_session_id)
                 self._dashboard_cache_session_id = selected_session_id
                 self._dashboard_cache_at = now
             return self._dashboard_cache
+
+        def _dashboard_snapshot_for_dialog(self) -> dict:
+            selected_session_id = self._selected_session_id or self._chat_state.session_id
+            if isinstance(self._dashboard_cache, dict) and self._dashboard_cache_matches_selection(
+                self._dashboard_cache,
+                selected_session_id,
+            ):
+                return self._dashboard_cache
+            return self._dashboard_snapshot(force=False)
+
+        def _dashboard_cache_matches_selection(self, dashboard_snapshot: dict, selected_session_id: str | None) -> bool:
+            if not selected_session_id:
+                return True
+            if self._dashboard_cache_session_id == selected_session_id:
+                return True
+            active_session = dashboard_snapshot.get("active_session") if isinstance(dashboard_snapshot.get("active_session"), dict) else {}
+            return active_session.get("id") == selected_session_id
+
+        def _enrich_dashboard_runtime(self, dashboard_snapshot: dict, selected_session_id: str | None) -> dict:
+            active_session_id = selected_session_id
+            if not active_session_id and isinstance(dashboard_snapshot, dict):
+                active_session = dashboard_snapshot.get("active_session") if isinstance(dashboard_snapshot.get("active_session"), dict) else {}
+                active_session_id = active_session.get("id")
+            if not active_session_id or not hasattr(self._app_service, "runtime_status"):
+                return dashboard_snapshot
+            try:
+                status = self._app_service.runtime_status(active_session_id)
+            except Exception:
+                return dashboard_snapshot
+            runtime = status.get("runtime") if isinstance(status, dict) else None
+            if not isinstance(runtime, dict):
+                return dashboard_snapshot
+            enriched = dict(dashboard_snapshot)
+            active_session = dict(enriched.get("active_session") or {})
+            if active_session.get("id") == active_session_id:
+                active_session["runtime"] = runtime
+                enriched["active_session"] = active_session
+            enriched["active_runtime"] = runtime
+            return enriched
+
+        def _dashboard_runtime_active(self, dashboard_snapshot: dict) -> bool:
+            runtime = {}
+            active_session = dashboard_snapshot.get("active_session") if isinstance(dashboard_snapshot, dict) else {}
+            if isinstance(active_session, dict):
+                runtime = active_session.get("runtime") if isinstance(active_session.get("runtime"), dict) else {}
+            if not runtime and isinstance(dashboard_snapshot, dict):
+                runtime = dashboard_snapshot.get("active_runtime") if isinstance(dashboard_snapshot.get("active_runtime"), dict) else {}
+            return str(runtime.get("phase") or "") in _ACTIVE_RUNTIME_PHASES
+
+        def _prompt_elapsed_seconds(self, dashboard_snapshot: dict | None = None) -> int | None:
+            if self._request_in_flight and self._request_started_at is not None:
+                return max(0, int(time.monotonic() - self._request_started_at))
+            dashboard_snapshot = dashboard_snapshot or self._dashboard_cache or {}
+            active_session = dashboard_snapshot.get("active_session") if isinstance(dashboard_snapshot, dict) else {}
+            runtime = active_session.get("runtime") if isinstance(active_session, dict) and isinstance(active_session.get("runtime"), dict) else {}
+            if not runtime and isinstance(dashboard_snapshot, dict):
+                runtime = dashboard_snapshot.get("active_runtime") if isinstance(dashboard_snapshot.get("active_runtime"), dict) else {}
+            if str(runtime.get("phase") or "") in _ACTIVE_RUNTIME_PHASES:
+                return _runtime_elapsed_seconds(runtime)
+            return None
 
         def _clamp_section_cursor(self, view: dict) -> None:
             if not view["sections"]:
@@ -6204,7 +9232,19 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 self._active_section_id = str(view["active_section_id"])
                 self._section_cursor_index = int(view.get("active_section_index") or self._section_cursor_index)
 
+        def _render_session_pane_only(self) -> None:
+            dashboard_snapshot = self._dashboard_cache or self._dashboard_snapshot()
+            projection = self._left_pane_projection(
+                dashboard_snapshot=dashboard_snapshot,
+                right_view={} if self._left_pane_mode == "sessions" else None,
+            )
+            self._render_session_pane_projection(projection)
+
         def _render_session_pane(self, dashboard_snapshot: dict | None = None, right_view: dict | None = None) -> None:
+            projection = self._left_pane_projection(dashboard_snapshot=dashboard_snapshot, right_view=right_view)
+            self._render_session_pane_projection(projection)
+
+        def _render_session_pane_projection(self, projection: dict) -> None:
             try:
                 header = self.query_one("#session-pane-header", Static)
                 session_list = self.query_one("#session-list", ListView)
@@ -6212,19 +9252,21 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
                 actions = self.query_one("#session-pane-actions", Static)
             except NoMatches:
                 return
-            projection = self._left_pane_projection(dashboard_snapshot=dashboard_snapshot, right_view=right_view)
-            items = left_pane_visible_items(projection)
-            items = [
-                ListItem(Label(label))
-                for label in left_pane_list_item_labels(projection, width=32)
-            ]
-            session_list.clear()
-            if items:
-                session_list.extend(items)
+            self._left_pane_cached_projection = projection
+            visible_items = left_pane_visible_items(projection)
+            labels = left_pane_list_item_labels(projection, width=32)
+            self._rendering_session_pane = True
+            try:
+                if not self._update_session_list_labels(session_list, labels):
+                    session_list.clear()
+                    if labels:
+                        session_list.extend([ListItem(Label(label)) for label in labels])
+            finally:
+                self._rendering_session_pane = False
             selected_index = next(
                 (
                     index
-                    for index, item in enumerate(left_pane_visible_items(projection))
+                    for index, item in enumerate(visible_items)
                     if item.get("nav_id") == projection.get("selected_item_id")
                 ),
                 None,
@@ -6240,20 +9282,78 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             else:
                 actions.update(render_left_pane_footer(projection, width=32))
 
+        def _update_session_list_labels(self, session_list: ListView, labels: list[str]) -> bool:
+            children = list(getattr(session_list, "children", []))
+            if len(children) != len(labels):
+                return False
+            try:
+                for item, label in zip(children, labels, strict=False):
+                    item.query_one(Label).update(label)
+            except Exception:
+                return False
+            return True
+
+        def _left_pane_projection_with_selection(self, projection: dict, selected_nav_id: str | None) -> dict:
+            selected_nav_id = selected_nav_id or None
+            view = dict(projection)
+            view["selected_item_id"] = selected_nav_id
+            mode = str(view.get("mode") or "sessions")
+            if mode == "sessions":
+                view["sessions"] = [
+                    {**item, "selected": f"session:{item.get('id')}" == selected_nav_id}
+                    for item in view.get("sessions") or []
+                ]
+            elif mode == "orchestrations":
+                view["orchestrations"] = [
+                    {**item, "selected": f"orchestration:{item.get('id')}" == selected_nav_id}
+                    for item in view.get("orchestrations") or []
+                ]
+            elif mode == "agents":
+                view["agents"] = [
+                    {**item, "selected": f"agent:{item.get('id')}" == selected_nav_id}
+                    for item in view.get("agents") or []
+                ]
+            elif mode == "queue":
+                queue = dict(view.get("queue") or {})
+                queue["items"] = [
+                    {**item, "selected": item.get("id") == selected_nav_id}
+                    for item in queue.get("items") or []
+                ]
+                view["queue"] = queue
+            self._left_pane_cached_projection = view
+            return view
+
         def _render_chat(self) -> None:
-            working_seconds = None
-            if self._request_in_flight and self._request_started_at is not None:
-                working_seconds = max(0, int(time.monotonic() - self._request_started_at))
+            working_seconds = self._prompt_elapsed_seconds(self._dashboard_cache or {})
             chat_width = max(60, min(160, self.query_one("#chat", VerticalScroll).size.width - 4))
+            session_id = self._visible_chat_session_id()
+            transcript_model = build_tui_transcript_projection(
+                self._app_service,
+                session_id,
+                self._local_messages_for_session(session_id),
+                transient_events=self._transient_session_events,
+            )
             transcript = render_codex_like_transcript(
-                self._messages,
+                transcript_model["messages"],
                 working_seconds=working_seconds,
                 separator_width=chat_width,
             )
             _update_markup_static(self.query_one("#chat-content", Static), transcript)
             self.call_after_refresh(lambda: self.query_one("#chat", VerticalScroll).scroll_end(animate=False))
 
-        def _render_view(self, view: dict) -> None:
+        def _local_messages_for_session(self, session_id: str | None) -> list[dict]:
+            visible: list[dict] = []
+            for message in self._messages:
+                message_session_id = message.get("session_id")
+                if message_session_id:
+                    if session_id and message_session_id == session_id:
+                        visible.append(dict(message))
+                    continue
+                if message.get("scope") == "global" or session_id is None:
+                    visible.append(dict(message))
+            return visible
+
+        def _render_view(self, view: dict, dashboard_snapshot: dict | None = None) -> None:
             self._clamp_section_cursor(view)
             self._selected_orchestration_id = view.get("selected_orchestration_id") or self._selected_orchestration_id
             self._selected_graph_node_id = view.get("selected_node_id") or self._selected_graph_node_id
@@ -6261,10 +9361,14 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
             self._show_all_orchestrations = bool(view.get("show_all_orchestrations", self._show_all_orchestrations))
             self.query_one("#search-status", Static).update(render_right_panel_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
-            refreshed_dashboard = self._dashboard_snapshot()
+            refreshed_dashboard = dashboard_snapshot or self._dashboard_snapshot()
             self._render_session_pane(refreshed_dashboard, right_view=view)
             self.query_one("#composer-status", Static).update(
-                _render_composer_status(refreshed_dashboard, self._selected_agent_id, self._chat_state.session_id)
+                _render_composer_status(
+                    refreshed_dashboard,
+                    self._selected_agent_id,
+                    self._chat_state.session_id,
+                )
             )
             container = self.query_one("#pane-container", Static)
             container.update(render_right_panel(view))
@@ -6283,8 +9387,19 @@ def create_harness_app(project_root: Path, *, codex_like: bool = False, app_serv
     return HarnessUnifiedApp()
 
 
-def run_harness_app(project_root: Path, *, codex_like: bool = False) -> None:
-    create_harness_app(project_root, codex_like=codex_like).run()
+def run_harness_app(
+    project_root: Path,
+    *,
+    codex_like: bool = False,
+    app_service=None,
+    autonomy_profile_id: str = "supervised-codex",
+) -> None:
+    create_harness_app(
+        project_root,
+        codex_like=codex_like,
+        app_service=app_service,
+        autonomy_profile_id=autonomy_profile_id,
+    ).run()
 
 
 def run_read_only_tui(project_root: Path) -> None:

@@ -36,6 +36,8 @@ def write_managed_action_report(
                 "## Policy",
                 f"- Decision: {decision.status.value}",
                 f"- Reasons: {'; '.join(decision.reasons) if decision.reasons else 'none'}",
+                f"- Sandbox preflight: {decision.sandbox_assessment.status.value if decision.sandbox_assessment else 'not_recorded'}",
+                f"- Sandbox reasons: {'; '.join(decision.sandbox_assessment.reasons) if decision.sandbox_assessment and decision.sandbox_assessment.reasons else 'none'}",
                 "- Hosted provider: not used",
                 "- External network: not used",
                 "- Active repo write: local low-risk workspace action",
@@ -59,4 +61,3 @@ def write_managed_action_report(
 
 def _join_paths(paths: list[Path]) -> str:
     return ", ".join(str(path) for path in paths) if paths else "none"
-

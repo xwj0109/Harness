@@ -1,0 +1,77 @@
+models:
+  paid_openai_compatible/gpt-5.3:
+    provider_id: paid_openai_compatible
+    model_id: gpt-5.3
+    protocol: openai_responses
+    input_modalities:
+      - text
+      - image
+    output_modalities:
+      - text
+    context_limit: 400000
+    max_output_tokens: 128000
+    reasoning_support: effort
+    tool_support: true
+    status: active
+    release_date: "2026-01-01"
+    family: gpt-5
+    source: generated_static_catalog
+    safety_notes:
+      - Generated static metadata is catalog enrichment only; execution still requires explicit provider selection, credential validation, and policy checks.
+  anthropic/claude-haiku-4-20250514:
+    provider_id: anthropic
+    model_id: claude-haiku-4-20250514
+    protocol: anthropic_messages
+    input_modalities:
+      - text
+      - image
+    output_modalities:
+      - text
+    context_limit: 200000
+    max_output_tokens: 8192
+    reasoning_support: tokens
+    tool_support: true
+    status: active
+    release_date: "2025-05-14"
+    family: claude-4
+    source: generated_static_catalog
+    safety_notes:
+      - Generated static metadata is catalog enrichment only; hosted execution remains disabled unless the Anthropic provider is explicitly enabled and credentialed.
+  google/gemini-2.5-pro:
+    provider_id: google
+    model_id: gemini-2.5-pro
+    protocol: google_generative
+    input_modalities:
+      - text
+      - image
+    output_modalities:
+      - text
+    context_limit: 1048576
+    max_output_tokens: 8192
+    reasoning_support: tokens
+    tool_support: true
+    status: active
+    release_date: "2025-06-17"
+    family: gemini-2.5
+    source: generated_static_catalog
+    safety_notes:
+      - Generated static metadata is catalog enrichment only; hosted execution remains disabled unless the Google provider is explicitly enabled and credentialed.
+  bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0:
+    provider_id: bedrock
+    model_id: anthropic.claude-3-7-sonnet-20250219-v1:0
+    protocol: bedrock_converse
+    input_modalities:
+      - text
+      - image
+    output_modalities:
+      - text
+    context_limit: 200000
+    max_output_tokens: 8192
+    reasoning_support: unknown
+    tool_support: true
+    status: active
+    release_date: "2025-02-19"
+    family: claude-3.7
+    source: generated_static_catalog
+    safety_notes:
+      - Generated static metadata is catalog enrichment only; hosted Bedrock execution remains disabled unless the provider is explicitly enabled and credentialed.

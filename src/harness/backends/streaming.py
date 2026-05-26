@@ -12,8 +12,10 @@ class BackendStreamEvent(BaseModel):
         "message_delta",
         "reasoning_summary_delta",
         "tool_call",
+        "tool_call_delta",
         "tool_result",
         "token_usage",
+        "finish_reason",
         "status",
         "error",
     ]

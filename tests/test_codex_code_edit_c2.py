@@ -246,6 +246,40 @@ def test_policy_violations_in_isolated_diff_are_reported_without_active_change(t
     assert (tmp_path / "app.py").read_bytes() == before
 
 
+def test_supervised_dirty_isolation_uses_copy_with_current_workspace_state(tmp_path) -> None:
+    init_clean_project(tmp_path)
+    (tmp_path / "app.py").write_text("value = 9\n", encoding="utf-8")
+
+    class DirtyAwareBackend(FakeEditBackend):
+        def run_edit(self, isolated_workspace, prompt, final_message_path):
+            assert (Path(isolated_workspace) / "app.py").read_text(encoding="utf-8") == "value = 9\n"
+            (Path(isolated_workspace) / "app.py").write_text("value = 10\n", encoding="utf-8")
+            return (
+                CodexRunResult(["codex", "exec", "--cd", str(isolated_workspace)], "", "", 0, [], ""),
+                self.preflight().capabilities,
+                NETWORK_NOT_ENFORCEABLE,
+            )
+
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    result = CodexCodeEditRunner(
+        tmp_path,
+        store,
+        DirtyAwareBackend(default_config().backends["codex_cli"]),
+        ApprovalStore(tmp_path),
+    ).run(
+        "change value",
+        "codex_code_edit",
+        approval(tmp_path).model_copy(update={"autonomy_scope": "supervised-codex"}),
+        allow_dirty_isolation=True,
+    )
+
+    assert result["status"] == "completed_denied"
+    assert result["isolation_strategy"] == "isolated_copy"
+    assert any("includes current workspace state" in warning for warning in result["isolation_warnings"])
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 9\n"
+
+
 def test_report_states_when_codex_internal_approval_is_not_enforceable(tmp_path) -> None:
     init_clean_project(tmp_path)
 

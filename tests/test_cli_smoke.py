@@ -48,6 +48,7 @@ from harness.tui import (
     render_right_panel_status,
     render_slash_command_suggestions,
     render_view_status,
+    _model_selection_dialog_entries,
     _render_session_rail,
 )
 from harness.command_catalog import build_command_catalog
@@ -454,6 +455,7 @@ def test_chat_read_only_intent_routing() -> None:
     assert route_chat_intent("summarize this repo")["intent"] == "repo_summary"
     assert route_chat_intent("plan how to improve the CLI")["intent"] == "repo_planning"
     assert route_chat_intent("fix the failing test with codex")["intent"] == "coding_fix"
+    assert route_chat_intent("create an empty file in the repository")["intent"] == "coding_fix"
     assert route_chat_intent("initialize this project")["intent"] == "init_project"
 
 
@@ -603,7 +605,10 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert dashboard["daemon"]["latest_events"] == []
     assert dashboard["model_catalog"]["source"] == "default_config"
     assert [provider["provider_id"] for provider in dashboard["model_catalog"]["providers"]] == [
+        "anthropic",
+        "bedrock",
         "codex_cli",
+        "google",
         "local_openai_compatible",
         "paid_openai_compatible",
     ]
@@ -630,7 +635,7 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
     assert "Project" in rendered
     assert "Initialized: False" in rendered
     assert "Commands" in rendered
-    assert "Providers: 3" in rendered
+    assert "Providers: 6" in rendered
     assert "codex_cli/gpt-5.5" in rendered
     assert "Safety" in rendered
     assert "no_hidden_execution" in rendered
@@ -928,7 +933,7 @@ def test_tui_model_picker_persists_session_model_without_provider_execution(tmp_
     local_model_ref = next(
         model["raw_model_ref"]
         for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]
-        if model["raw_model_ref"].startswith("local_openai_compatible/")
+        if model["raw_model_ref"] == "local/qwen3-coder"
     )
 
     async def run_pilot() -> None:
@@ -999,7 +1004,7 @@ def test_tui_model_slash_command_persists_session_model_without_palette_shortcut
     local_model_ref = next(
         model["raw_model_ref"]
         for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]
-        if model["raw_model_ref"].startswith("local_openai_compatible/")
+        if model["raw_model_ref"] == "local/qwen3-coder"
     )
 
     async def run_pilot() -> None:
@@ -1008,7 +1013,7 @@ def test_tui_model_slash_command_persists_session_model_without_palette_shortcut
             prompt = app.query_one("#prompt", TextArea)
             initial_messages = len(app._messages)
 
-            prompt.value = "/model qwen"
+            prompt.value = f"/model {local_model_ref}"
             await pilot.press("ctrl+enter")
             await pilot.pause()
 
@@ -1090,9 +1095,9 @@ def test_tui_models_slash_lists_numbered_models_and_selects_by_number(tmp_path) 
             assert app._messages[-1]["title"] == "Model Selection"
             assert any(f"2. " in line and selected_ref in line for line in app._messages[-1]["lines"])
             assert "Select model" in str(dialog.content)
-            assert "Recent" in str(dialog.content)
+            assert "Current session model" in str(dialog.content)
             assert selected_ref.split("/", 1)[-1] in str(dialog.content)
-            assert "/model <number>" in str(dialog.content)
+            assert "/model <number|name>" in str(dialog.content)
             assert app._latest_palette_activation["activation_kind"] == "model_list"
             assert app._latest_palette_activation["provider_started"] is False
             assert app._latest_palette_activation["process_started"] is False
@@ -1161,10 +1166,11 @@ def test_tui_opencode_leader_key_lists_models_without_palette_focus(tmp_path) ->
             assert app._messages[-1]["title"] == "Model Selection"
             assert any("codex_cli/gpt-5.5" in line for line in app._messages[-1]["lines"])
             assert "Select model" in str(dialog.content)
-            assert "Recent" in str(dialog.content)
+            assert "Current session model" in str(dialog.content)
             assert "gpt-5.5" in str(dialog.content)
             assert "codex_cli" in str(dialog.content)
-            assert "Connect provider" in str(dialog.content)
+            assert "Connect provider" not in str(dialog.content)
+            assert "Favorite" not in str(dialog.content)
             assert app._latest_palette_activation["activation_kind"] == "model_list"
             assert app._latest_palette_activation["source"] == "leader"
             assert app._latest_palette_activation["slash"] == "ctrl+x m"
@@ -1344,12 +1350,9 @@ def test_tui_model_dialog_arrows_select_highlighted_model(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
     session = store.create_session(title="Arrow model", agent_id="plan", raw_model_ref="codex_cli/gpt-5.5")
-    unique_refs = []
-    for model in build_tui_dashboard(tmp_path)["model_catalog"]["models"]:
-        if model["raw_model_ref"] not in unique_refs:
-            unique_refs.append(model["raw_model_ref"])
-    assert len(unique_refs) >= 2
-    selected_ref = unique_refs[1]
+    picker_entries = _model_selection_dialog_entries(build_tui_dashboard(tmp_path, selected_session_id=session.id))
+    assert len(picker_entries) >= 2
+    selected_ref = picker_entries[1]["raw_model_ref"]
 
     async def run_pilot() -> None:
         app = create_harness_app(tmp_path)
@@ -8253,6 +8256,27 @@ def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, mo
         "read_only_summary",
         "codex_isolated_edit",
         "repo_planning",
+    }
+    model_provider = checks["model_provider_release_gates"]["details"]
+    assert model_provider["catalog_secret_values_included"] is False
+    assert model_provider["picker_provider_calls_allowed"] is False
+    assert model_provider["provider_execution_started"] is False
+    assert model_provider["model_execution_started"] is False
+    assert model_provider["network_accessed"] is False
+    assert model_provider["credentials_included"] is False
+    assert model_provider["hidden_provider_fallback"] is False
+    assert model_provider["hidden_model_fallback"] is False
+    assert model_provider["no_hidden_fallback"] is True
+    assert model_provider["protocol_coverage_ok"] is True
+    assert model_provider["unregistered_protocol_blocks_before_execution"] is True
+    assert set(model_provider["registered_protocols"]) >= {
+        "anthropic_messages",
+        "bedrock_converse",
+        "codex_cli",
+        "google_generative",
+        "openai_chat",
+        "openai_codex_responses",
+        "openai_responses",
     }
     runtime = checks["release_runtime_state"]["details"]
     assert runtime["blocked_or_waiting_tasks"][0]["title"] == "Waiting"

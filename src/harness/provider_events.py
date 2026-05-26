@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from harness.provider_content import CanonicalMessage
 from harness.security import sanitize_for_logging
 
 
@@ -29,12 +31,224 @@ class ProviderEventKind(str, Enum):
 
 
 class ProviderErrorCategory(str, Enum):
+    AUTH = "auth"
+    RATE_LIMIT = "rate_limit"
     UNAVAILABLE = "provider_unavailable"
     CONFIGURATION = "configuration"
     CONTEXT_OVERFLOW = "context_overflow"
     ABORTED = "aborted"
+    INVALID_REQUEST = "invalid_request"
     INVALID_RESPONSE = "invalid_response"
+    SERVER_UNAVAILABLE = "server_unavailable"
+    PROVIDER_POLICY_BLOCK = "provider_policy_block"
     UNKNOWN = "unknown"
+
+
+_ERROR_CATEGORY_TOKENS: tuple[tuple[ProviderErrorCategory, tuple[str, ...]], ...] = (
+    (
+        ProviderErrorCategory.AUTH,
+        (
+            "auth",
+            "authentication",
+            "unauthorized",
+            "permission_denied",
+            "forbidden",
+            "invalid_api_key",
+            "access_denied",
+            "accessdenied",
+            "expired_token",
+            "signaturedoesnotmatch",
+        ),
+    ),
+    (
+        ProviderErrorCategory.RATE_LIMIT,
+        ("rate", "quota", "resource_exhausted", "throttl", "too_many_requests", "too many requests", "429"),
+    ),
+    (
+        ProviderErrorCategory.CONTEXT_OVERFLOW,
+        (
+            "context_overflow",
+            "context length",
+            "context_length",
+            "context window",
+            "maximum context",
+            "max context",
+            "token_limit",
+            "too many tokens",
+            "tokens exceeds",
+        ),
+    ),
+    (
+        ProviderErrorCategory.INVALID_REQUEST,
+        ("invalid", "bad_request", "validation", "malformed", "schema", "parse"),
+    ),
+    (
+        ProviderErrorCategory.SERVER_UNAVAILABLE,
+        (
+            "unavailable",
+            "overload",
+            "overloaded",
+            "server",
+            "internal",
+            "timeout",
+            "timed out",
+            "service_unavailable",
+            "500",
+            "502",
+            "503",
+            "504",
+        ),
+    ),
+    (
+        ProviderErrorCategory.UNAVAILABLE,
+        (
+            "provider_unavailable",
+            "connection refused",
+            "connection reset",
+            "network unreachable",
+            "name resolution",
+            "dns",
+            "econnreset",
+            "local endpoint",
+        ),
+    ),
+    (
+        ProviderErrorCategory.PROVIDER_POLICY_BLOCK,
+        ("safety", "policy", "blocked", "content_filter", "moderation", "recitation", "prohibited_content", "spii"),
+    ),
+)
+
+
+def provider_error_category_for(*values: Any, default: ProviderErrorCategory = ProviderErrorCategory.UNKNOWN) -> ProviderErrorCategory:
+    normalized = " ".join(str(value) for value in values if value is not None).casefold()
+    if not normalized:
+        return default
+    for category, tokens in _ERROR_CATEGORY_TOKENS:
+        if any(token in normalized for token in tokens):
+            return category
+    return default
+
+
+_RETRYABLE_ERROR_CATEGORIES = frozenset(
+    {
+        ProviderErrorCategory.RATE_LIMIT,
+        ProviderErrorCategory.UNAVAILABLE,
+        ProviderErrorCategory.CONTEXT_OVERFLOW,
+        ProviderErrorCategory.SERVER_UNAVAILABLE,
+    }
+)
+
+_NON_RETRYABLE_ERROR_TOKENS = (
+    "authentication",
+    "authorization",
+    "unauthorized",
+    "forbidden",
+    "invalid_api_key",
+    "permission_denied",
+    "access_denied",
+    "billing",
+    "payment",
+    "insufficient_quota",
+    "quota_exceeded",
+    "hard limit",
+    "model_not_found",
+    "not_found",
+    "unsupported",
+)
+
+
+def provider_error_retryable_for(category: ProviderErrorCategory | str, *values: Any) -> bool:
+    if isinstance(category, ProviderErrorCategory):
+        normalized_category = category
+    else:
+        try:
+            normalized_category = ProviderErrorCategory(str(category))
+        except ValueError:
+            normalized_category = ProviderErrorCategory.UNKNOWN
+    normalized = " ".join(str(value) for value in values if value is not None).casefold()
+    if normalized and any(token in normalized for token in _NON_RETRYABLE_ERROR_TOKENS):
+        return False
+    return normalized_category in _RETRYABLE_ERROR_CATEGORIES
+
+
+_RETRY_AFTER_KEYS = {
+    "retry-after",
+    "retry_after",
+    "retryafter",
+    "retry-after-seconds",
+    "retry_after_seconds",
+    "retryafterseconds",
+    "retry-delay",
+    "retry_delay",
+    "retrydelay",
+    "reset-after",
+    "reset_after",
+    "resetafter",
+}
+
+_RETRY_AFTER_MS_KEYS = {
+    "retry-after-ms",
+    "retry_after_ms",
+    "retryafterms",
+    "retry-delay-ms",
+    "retry_delay_ms",
+    "retrydelayms",
+}
+
+
+def provider_retry_after_seconds_for(*values: Any) -> float | None:
+    for value in values:
+        parsed = _retry_after_seconds_from_value(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _retry_after_seconds_from_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int | float):
+        return max(0.0, float(value))
+    if isinstance(value, str):
+        return _retry_after_seconds_from_text(value)
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized_key = str(key).strip().casefold()
+            if normalized_key in _RETRY_AFTER_MS_KEYS:
+                parsed = _retry_after_seconds_from_value(item)
+                if parsed is not None:
+                    return parsed / 1000.0
+            if normalized_key in _RETRY_AFTER_KEYS:
+                parsed = _retry_after_seconds_from_value(item)
+                if parsed is not None:
+                    return parsed
+        for item in value.values():
+            parsed = _retry_after_seconds_from_value(item)
+            if parsed is not None:
+                return parsed
+    if isinstance(value, list | tuple):
+        for item in value:
+            parsed = _retry_after_seconds_from_value(item)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def _retry_after_seconds_from_text(value: str) -> float | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text[:-1] if text.casefold().endswith("s") else text))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
 
 
 class ProviderCapabilities(BaseModel):
@@ -61,6 +275,7 @@ class ProviderRequest(BaseModel):
     provider_id: str | None = None
     model_ref: str | None = None
     messages: list[ProviderMessage] = Field(default_factory=list)
+    canonical_messages: list[CanonicalMessage] = Field(default_factory=list)
     context: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -71,8 +286,17 @@ class ProviderError(BaseModel):
     error_type: str
     message: str
     retryable: bool = False
+    retry_after_seconds: float | None = None
     hidden_provider_fallback: bool = False
     no_hidden_fallback: bool = True
+
+
+class ProviderStreamAbortError(RuntimeError):
+    pass
+
+
+class ProviderStreamTimeoutError(TimeoutError):
+    pass
 
 
 class ProviderEvent(BaseModel):
@@ -110,6 +334,73 @@ class ProviderEvent(BaseModel):
         payload.setdefault("hidden_provider_fallback", False)
         payload.setdefault("no_hidden_fallback", True)
         return sanitize_for_logging(payload)
+
+
+def normalized_token_usage(payload: dict[str, Any]) -> dict[str, int | None]:
+    input_tokens = _usage_int(payload, "input_tokens", "prompt_tokens", "inputTokens", "promptTokenCount")
+    output_tokens = _usage_int(payload, "output_tokens", "completion_tokens", "outputTokens", "candidatesTokenCount")
+    reasoning_tokens = _usage_int(payload, "reasoning_tokens", "reasoningTokens", "thoughtsTokenCount")
+    total_tokens = _usage_int(payload, "total_tokens", "totalTokens", "totalTokenCount")
+    input_details = payload.get("input_tokens_details") if isinstance(payload.get("input_tokens_details"), dict) else {}
+    output_details = payload.get("output_tokens_details") if isinstance(payload.get("output_tokens_details"), dict) else {}
+    cache_read_tokens = _usage_int(
+        payload,
+        "cache_read_tokens",
+        "cached_input_tokens",
+        "cache_read_input_tokens",
+        "cached_tokens",
+        "cacheReadInputTokens",
+        "cacheReadTokens",
+    )
+    if cache_read_tokens is None:
+        cache_read_tokens = _usage_int(input_details, "cached_tokens", "cache_read_tokens", "cache_read_input_tokens")
+    cache_write_tokens = _usage_int(
+        payload,
+        "cache_write_tokens",
+        "cache_creation_input_tokens",
+        "cacheCreationInputTokens",
+        "cacheWriteInputTokens",
+        "cacheWriteTokens",
+    )
+    if cache_write_tokens is None:
+        cache_write_tokens = _usage_int(input_details, "cache_creation_tokens", "cache_write_tokens", "cache_creation_input_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = _usage_int(output_details, "reasoning_tokens", "reasoning_tokens_details", "reasoningTokens")
+    if total_tokens is None and (input_tokens is not None or output_tokens is not None or reasoning_tokens is not None):
+        total_tokens = (input_tokens or 0) + (output_tokens or 0)
+        if output_tokens is None:
+            total_tokens += reasoning_tokens or 0
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def normalize_token_usage_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalized_token_usage(payload)
+    usage_payload = {**payload, "normalized_usage": normalized}
+    for key, value in normalized.items():
+        if value is not None:
+            usage_payload.setdefault(key, value)
+    return usage_payload
+
+
+def _usage_int(payload: dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return None
 
 
 def provider_event(

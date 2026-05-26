@@ -5,17 +5,21 @@ import pytest
 from harness.backends.local_openai import (
     BackendConfigError,
     LocalOpenAICompatibleBackend,
+    _stream_sse_json,
     validate_local_base_url,
 )
 from harness.config import default_config
+from harness.provider_events import ProviderStreamAbortError
 
 
 class FakeHttpClient:
-    def __init__(self, post_responses=None, get_error: Exception | None = None):
+    def __init__(self, post_responses=None, get_error: Exception | None = None, stream_chunks=None):
         self.post_responses = list(post_responses or [])
         self.get_error = get_error
+        self.stream_chunks = list(stream_chunks or [])
         self.get_calls = []
         self.post_calls = []
+        self.stream_calls = []
 
     def get_json(self, url, headers, timeout):
         self.get_calls.append((url, headers, timeout))
@@ -27,6 +31,10 @@ class FakeHttpClient:
         self.post_calls.append((url, headers, payload, timeout))
         content = self.post_responses.pop(0)
         return {"choices": [{"message": {"content": content}}]}
+
+    def stream_sse_json(self, url, headers, payload, timeout):
+        self.stream_calls.append((url, headers, payload, timeout))
+        yield from self.stream_chunks
 
 
 def local_backend_config():
@@ -106,3 +114,87 @@ def test_local_backend_rejects_non_local_config() -> None:
     status = backend.preflight()
     assert not status.available
     assert "not local" in status.reason
+
+
+def test_local_backend_streams_openai_compatible_sse_chunks() -> None:
+    client = FakeHttpClient(
+        stream_chunks=[
+            {"choices": [{"delta": {"content": "Hel"}, "finish_reason": None}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "read", "arguments": '{"path"'},
+                                }
+                            ]
+                        },
+                        "finish_reason": None,
+                    }
+                ]
+            },
+            {"choices": [{"delta": {"content": "lo"}, "finish_reason": "stop"}], "usage": {"total_tokens": 3}},
+        ]
+    )
+    backend = LocalOpenAICompatibleBackend(local_backend_config(), client)
+
+    events = list(backend.stream_complete_backend_events([{"role": "user", "content": "hi"}]))
+
+    assert [event.type for event in events] == [
+        "status",
+        "message_delta",
+        "tool_call_delta",
+        "token_usage",
+        "message_delta",
+        "finish_reason",
+        "status",
+    ]
+    assert events[1].text == "Hel"
+    assert events[2].payload["tool_call_id"] == "call_1"
+    assert events[2].payload["tool_name"] == "read"
+    assert events[3].payload["total_tokens"] == 3
+    assert events[4].text == "lo"
+    assert events[5].payload["finish_reason"] == "stop"
+    assert client.stream_calls[0][2]["stream"] is True
+
+
+def test_local_openai_stream_helper_aborts_legacy_client_between_chunks() -> None:
+    client = FakeHttpClient(stream_chunks=[{"first": True}, {"second": True}])
+    checks = {"count": 0}
+
+    def abort_checker() -> bool:
+        checks["count"] += 1
+        return checks["count"] >= 3
+
+    stream = _stream_sse_json(
+        client,
+        "http://localhost:11434/v1/chat/completions",
+        headers={},
+        payload={},
+        timeout=1,
+        abort_checker=abort_checker,
+    )
+
+    assert next(stream) == {"first": True}
+    with pytest.raises(ProviderStreamAbortError):
+        next(stream)
+    assert client.stream_calls
+
+
+def test_local_backend_non_streaming_fallback_is_explicit() -> None:
+    cfg = local_backend_config().model_copy(deep=True)
+    cfg.settings["stream"] = False
+    client = FakeHttpClient(post_responses=["fallback answer"])
+    backend = LocalOpenAICompatibleBackend(cfg, client)
+
+    events = list(backend.stream_complete_backend_events([{"role": "user", "content": "hi"}]))
+
+    assert [event.type for event in events] == ["status", "message_delta", "status"]
+    assert events[0].payload["streaming"] is False
+    assert events[1].text == "fallback answer"
+    assert client.stream_calls == []
+    assert client.post_calls[0][2].get("stream") is None

@@ -166,6 +166,8 @@ def _event_detail(event: StoredEventRecord) -> str:
             f"authority_granting={payload.get('authority_granting', False)}"
         )
         return f"{entry_id} action={action_type} source={payload.get('source') or 'unknown'} {flags}"
+    if event.kind == "token_usage.updated":
+        return _token_usage_detail(payload)
     summary = payload.get("summary")
     if summary:
         return str(sanitize_for_logging(summary))[:160]
@@ -204,3 +206,40 @@ def _render_part(part: SessionPartRecord) -> str:
             return f"[file] {metadata.get('path')}"
         return f"[{part.kind.value}] {json.dumps(metadata, default=json_default, sort_keys=True)}"
     return f"[{part.kind.value}]"
+
+
+def _token_usage_detail(payload: dict[str, Any]) -> str:
+    usage = payload.get("normalized_usage") if isinstance(payload.get("normalized_usage"), dict) else payload
+    parts = []
+    for label, key in (
+        ("input", "input_tokens"),
+        ("output", "output_tokens"),
+        ("reasoning", "reasoning_tokens"),
+        ("cache_read", "cache_read_tokens"),
+        ("cache_write", "cache_write_tokens"),
+        ("total", "total_tokens"),
+    ):
+        value = usage.get(key)
+        if value is not None:
+            parts.append(f"{label}={value}")
+    estimated_cost = payload.get("estimated_cost") if isinstance(payload.get("estimated_cost"), dict) else {}
+    estimated_total = payload.get("estimated_cost_usd")
+    if estimated_total is None:
+        estimated_total = estimated_cost.get("total")
+    if estimated_total is not None:
+        parts.append(
+            "estimated_cost_usd="
+            f"{estimated_total} "
+            f"estimated={estimated_cost.get('estimated', True)} "
+            f"source={estimated_cost.get('source') or 'model_descriptor_pricing'}"
+        )
+    provider_cost = payload.get("provider_reported_cost") if isinstance(payload.get("provider_reported_cost"), dict) else {}
+    provider_total = provider_cost.get("total")
+    provider_currency = provider_cost.get("currency") or "USD"
+    if provider_total is not None:
+        parts.append(
+            "provider_reported_cost="
+            f"{provider_total} {provider_currency} "
+            f"source={provider_cost.get('source') or 'provider_usage_cost'}"
+        )
+    return " ".join(str(sanitize_for_logging(part)) for part in parts)[:320]

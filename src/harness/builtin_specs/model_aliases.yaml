@@ -1,0 +1,16 @@
+aliases:
+  codex/gpt-5.5:
+    target: codex_cli/gpt-5.5
+    source: builtin_alias
+    safety_notes:
+      - Codex alias keeps product-facing naming separate from the executable Codex CLI provider boundary.
+  local/qwen3-coder:
+    target: local_openai_compatible/qwen3-coder:30b
+    source: builtin_alias
+    safety_notes:
+      - Local alias must remain local-only and must not resolve to hosted execution.
+  openai/gpt-5.3-codex:
+    target: paid_openai_compatible/gpt-5.3-codex
+    source: builtin_alias
+    safety_notes:
+      - Hosted alias resolves to the disabled hosted provider and must not bypass provider-disabled checks.

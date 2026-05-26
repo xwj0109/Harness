@@ -1,0 +1,31 @@
+providers:
+  codex_cli:
+    display_name: Codex CLI
+    source: builtin_metadata
+    safety_notes:
+      - Codex CLI execution uses the configured subscription-auth backend and must remain explicit.
+  local_openai_compatible:
+    display_name: Local OpenAI-Compatible
+    source: builtin_metadata
+    safety_notes:
+      - Local OpenAI-compatible execution must validate loopback or explicitly approved LAN endpoints before provider execution.
+  paid_openai_compatible:
+    display_name: Paid OpenAI-Compatible
+    source: builtin_metadata
+    safety_notes:
+      - Hosted OpenAI-compatible execution is disabled by default and must not be used as fallback.
+  anthropic:
+    display_name: Anthropic
+    source: builtin_metadata
+    safety_notes:
+      - Hosted Anthropic execution is disabled by default and must not be used as fallback.
+  google:
+    display_name: Google Generative AI
+    source: builtin_metadata
+    safety_notes:
+      - Hosted Google Generative AI execution is disabled by default and must not be used as fallback.
+  bedrock:
+    display_name: Amazon Bedrock
+    source: builtin_metadata
+    safety_notes:
+      - Hosted Bedrock execution is disabled by default and must not be used as fallback.

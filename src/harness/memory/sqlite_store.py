@@ -186,6 +186,18 @@ def _model_dump_jsonable(value: Any) -> dict[str, Any]:
     raise TypeError(f"Catalog cache values must be Pydantic models or dicts, got {type(value).__name__}.")
 
 
+def _redact_provider_account_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    redacted: dict[str, Any] = {}
+    secret_words = ("secret", "token", "password", "credential", "api_key", "apikey", "authorization")
+    for key, value in metadata.items():
+        key_text = str(key)
+        if any(word in key_text.lower() for word in secret_words):
+            redacted[key_text] = "[redacted]"
+        else:
+            redacted[key_text] = value
+    return redacted
+
+
 TASK_STATUS_QUERY_ALIASES = {
     TaskStatus.READY: ("ready", "queued"),
     TaskStatus.SUCCEEDED: ("succeeded", "completed"),
@@ -274,6 +286,22 @@ def now_iso() -> str:
 
 def parse_dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
+
+
+def _catalog_cache_ttl_metadata(refreshed_at: str, ttl_value: Any) -> dict[str, Any]:
+    try:
+        ttl_seconds = int(ttl_value)
+    except (TypeError, ValueError):
+        ttl_seconds = 24 * 60 * 60
+    if ttl_seconds <= 0:
+        ttl_seconds = 24 * 60 * 60
+    expires_at = parse_dt(refreshed_at) + timedelta(seconds=ttl_seconds)
+    return {
+        "cache_refreshed_at": refreshed_at,
+        "cache_ttl_seconds": ttl_seconds,
+        "cache_expires_at": expires_at.isoformat(),
+        "cache_status": "fresh",
+    }
 
 
 def normalize_task_status(status: str | TaskStatus) -> TaskStatus:
@@ -419,6 +447,8 @@ class SQLiteStore:
             self._ensure_column(conn, "sessions", "estimated_cost_usd", "TEXT")
             self._ensure_column(conn, "sessions", "ui_preferences_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "sessions", "archived_at", "TEXT")
+            self._ensure_provider_accounts_table(conn)
+            self._ensure_model_preferences_table(conn)
             self._migrate_task_rows(conn)
             self._migrate_artifact_rows(conn)
 
@@ -475,6 +505,63 @@ class SQLiteStore:
         columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if column not in columns:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _ensure_provider_accounts_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS provider_accounts (
+              account_id TEXT PRIMARY KEY,
+              provider_id TEXT NOT NULL,
+              description TEXT NOT NULL DEFAULT 'default',
+              credential_kind TEXT NOT NULL,
+              status TEXT NOT NULL,
+              active INTEGER NOT NULL DEFAULT 1,
+              expires_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_provider_accounts_provider_active
+            ON provider_accounts(provider_id, active)
+            """
+        )
+
+    def _ensure_model_preferences_table(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS model_preferences (
+              raw_model_ref TEXT PRIMARY KEY,
+              provider_id TEXT,
+              model_id TEXT,
+              model_variant TEXT,
+              favorite INTEGER NOT NULL DEFAULT 0,
+              is_default INTEGER NOT NULL DEFAULT 0,
+              selection_count INTEGER NOT NULL DEFAULT 0,
+              last_selected_at TEXT,
+              last_reasoning_effort TEXT,
+              source TEXT NOT NULL DEFAULT 'unknown',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_model_preferences_favorite
+            ON model_preferences(favorite, last_selected_at DESC)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_model_preferences_default
+            ON model_preferences(is_default, updated_at DESC)
+            """
+        )
 
     def _record_schema_migration(
         self, conn: sqlite3.Connection, migration_id: str, schema_text: str, description: str
@@ -976,7 +1063,7 @@ class SQLiteStore:
                 )
             )
         with self.connect() as conn:
-            conn.execute("DELETE FROM provider_model_catalog_cache")
+            conn.execute("DELETE FROM provider_model_catalog_cache WHERE id NOT LIKE 'catalog_discovered_%'")
             conn.executemany(
                 """
                 INSERT INTO provider_model_catalog_cache (
@@ -992,6 +1079,84 @@ class SQLiteStore:
             "provider_count": len(provider_rows),
             "model_count": len(model_rows),
             "source": "local_config_and_builtin_specs",
+            "permission_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def replace_discovered_model_catalog_cache(
+        self,
+        provider_id: str,
+        models: list[Any],
+        *,
+        discovery_metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        timestamp = now_iso()
+        cache_metadata = _catalog_cache_ttl_metadata(timestamp, discovery_metadata.get("cache_ttl_seconds"))
+        sanitized_discovery_metadata = sanitize_for_logging({**dict(discovery_metadata), **cache_metadata})
+        rows = []
+        for index, model in enumerate(models):
+            payload = sanitize_for_logging(_model_dump_jsonable(model))
+            payload["source"] = "discovered"
+            model_discovery_metadata = payload.get("discovery_metadata") if isinstance(payload.get("discovery_metadata"), dict) else {}
+            payload["discovery_metadata"] = sanitize_for_logging({**model_discovery_metadata, **sanitized_discovery_metadata})
+            payload.setdefault("discovered_at", sanitized_discovery_metadata.get("discovered_at"))
+            payload.setdefault("endpoint", sanitized_discovery_metadata.get("endpoint"))
+            payload["cache_refreshed_at"] = cache_metadata["cache_refreshed_at"]
+            payload["cache_ttl_seconds"] = cache_metadata["cache_ttl_seconds"]
+            payload["cache_expires_at"] = cache_metadata["cache_expires_at"]
+            payload["cache_status"] = cache_metadata["cache_status"]
+            rows.append(
+                (
+                    f"catalog_discovered_{provider_id}_{index}",
+                    "model",
+                    payload["provider_id"],
+                    payload["backend_id"],
+                    payload["model_id"],
+                    payload.get("model_profile_id"),
+                    payload["raw_model_ref"],
+                    json.dumps(payload, sort_keys=True, default=str),
+                    timestamp,
+                )
+            )
+        with self.connect() as conn:
+            conn.execute("DELETE FROM provider_model_catalog_cache WHERE id LIKE 'catalog_discovered_%' AND provider_id = ?", (provider_id,))
+            conn.executemany(
+                """
+                INSERT INTO provider_model_catalog_cache (
+                  id, catalog_kind, provider_id, backend_id, model_id, model_profile_id,
+                  raw_model_ref, payload_json, refreshed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+        return {
+            "schema_version": "harness.provider_model_catalog_discovery_cache/v1",
+            "refreshed_at": timestamp,
+            "provider_id": provider_id,
+            "model_count": len(rows),
+            "source": "discovered",
+            "discovery_metadata": sanitized_discovery_metadata,
+            **cache_metadata,
+            "permission_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def clear_discovered_model_catalog_cache(self, provider_id: str | None = None) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            if provider_id is None:
+                cursor = conn.execute("DELETE FROM provider_model_catalog_cache WHERE id LIKE 'catalog_discovered_%'")
+            else:
+                cursor = conn.execute(
+                    "DELETE FROM provider_model_catalog_cache WHERE id LIKE 'catalog_discovered_%' AND provider_id = ?",
+                    (provider_id,),
+                )
+        return {
+            "schema_version": "harness.provider_model_catalog_discovery_cache_clear/v1",
+            "cleared_at": timestamp,
+            "provider_id": provider_id,
+            "removed_count": cursor.rowcount,
+            "source": "discovered",
             "permission_granting": False,
             "no_hidden_fallback": True,
         }
@@ -1019,6 +1184,400 @@ class SQLiteStore:
             }
             for row in rows
         ]
+
+    def create_provider_account(
+        self,
+        *,
+        provider_id: str,
+        credential_kind: str,
+        status: str = "configured",
+        description: str = "default",
+        active: bool = True,
+        expires_at: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        provider_id = str(provider_id or "").strip()
+        credential_kind = str(credential_kind or "").strip()
+        status = str(status or "").strip()
+        if not provider_id:
+            raise ValueError("Provider account requires provider_id.")
+        if not credential_kind:
+            raise ValueError("Provider account requires credential_kind.")
+        if status not in {"configured", "missing", "expired", "refresh_required", "unknown", "not_required"}:
+            raise ValueError(f"Unsupported provider account status: {status}")
+        account_id = f"acct_{uuid.uuid4().hex[:12]}"
+        timestamp = now_iso()
+        safe_metadata = _redact_provider_account_metadata(sanitize_for_logging(metadata or {}))
+        with self.connect() as conn:
+            self._ensure_provider_accounts_table(conn)
+            if active:
+                conn.execute("UPDATE provider_accounts SET active = 0 WHERE provider_id = ?", (provider_id,))
+            conn.execute(
+                """
+                INSERT INTO provider_accounts (
+                  account_id, provider_id, description, credential_kind, status, active,
+                  expires_at, created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    provider_id,
+                    description or "default",
+                    credential_kind,
+                    status,
+                    1 if active else 0,
+                    expires_at,
+                    timestamp,
+                    timestamp,
+                    json.dumps(safe_metadata, sort_keys=True, default=str),
+                ),
+            )
+        account = self.get_provider_account(account_id)
+        self._record_provider_account_event("provider.account_created", account)
+        return account
+
+    def list_provider_accounts(self, provider_id: str | None = None) -> list[dict[str, Any]]:
+        params: tuple[Any, ...] = ()
+        query = "SELECT * FROM provider_accounts"
+        if provider_id is not None:
+            query += " WHERE provider_id = ?"
+            params = (provider_id,)
+        query += " ORDER BY provider_id ASC, active DESC, updated_at DESC, account_id ASC"
+        with self.connect() as conn:
+            self._ensure_provider_accounts_table(conn)
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_provider_account(row) for row in rows]
+
+    def get_provider_account(self, account_id: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            self._ensure_provider_accounts_table(conn)
+            row = conn.execute("SELECT * FROM provider_accounts WHERE account_id = ?", (account_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Provider account not found: {account_id}")
+        return self._row_to_provider_account(row)
+
+    def active_provider_account(self, provider_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            self._ensure_provider_accounts_table(conn)
+            row = conn.execute(
+                """
+                SELECT * FROM provider_accounts
+                WHERE provider_id = ? AND active = 1
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (provider_id,),
+            ).fetchone()
+        return self._row_to_provider_account(row) if row is not None else None
+
+    def activate_provider_account(self, provider_id: str, account_id: str) -> dict[str, Any]:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            self._ensure_provider_accounts_table(conn)
+            row = conn.execute(
+                "SELECT * FROM provider_accounts WHERE provider_id = ? AND account_id = ?",
+                (provider_id, account_id),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Provider account not found: {account_id}")
+            conn.execute("UPDATE provider_accounts SET active = 0 WHERE provider_id = ?", (provider_id,))
+            conn.execute(
+                "UPDATE provider_accounts SET active = 1, updated_at = ? WHERE account_id = ?",
+                (timestamp, account_id),
+            )
+        account = self.get_provider_account(account_id)
+        self._record_provider_account_event("provider.account_activated", account)
+        return account
+
+    def remove_provider_account(self, account_id: str) -> dict[str, Any]:
+        account = self.get_provider_account(account_id)
+        secret_removed = False
+        try:
+            from harness.provider_auth import delete_provider_account_secret
+
+            secret_removed = delete_provider_account_secret(self.project_root, account_id)
+        except Exception:
+            secret_removed = False
+        with self.connect() as conn:
+            self._ensure_provider_accounts_table(conn)
+            result = conn.execute("DELETE FROM provider_accounts WHERE account_id = ?", (account_id,))
+            if result.rowcount != 1:
+                raise KeyError(f"Provider account not found: {account_id}")
+        account = {**account, "credential_removed": secret_removed}
+        self._record_provider_account_event("provider.account_deleted", account)
+        return account
+
+    def _row_to_provider_account(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": "harness.provider_account/v1",
+            "account_id": row["account_id"],
+            "provider_id": row["provider_id"],
+            "description": sanitize_for_logging(row["description"]),
+            "credential_kind": row["credential_kind"],
+            "status": row["status"],
+            "active": bool(row["active"]),
+            "expires_at": row["expires_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "metadata": _redact_provider_account_metadata(sanitize_for_logging(json.loads(row["metadata_json"] or "{}"))),
+            "credential_value_included": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
+
+    def _record_provider_account_event(self, kind: str, account: dict[str, Any]) -> None:
+        payload = {
+            "schema_version": "harness.provider_account_event/v1",
+            "provider_id": account.get("provider_id"),
+            "account_id": account.get("account_id"),
+            "credential_kind": account.get("credential_kind"),
+            "status": account.get("status"),
+            "active": account.get("active"),
+            "credential_value_included": False,
+            "credentials_included": False,
+            "credential_written": False,
+            "credential_removed": bool(account.get("credential_removed", False)),
+            "network_accessed": False,
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
+        try:
+            self.append_store_event(
+                EventStreamType.ORCHESTRATION,
+                "provider_accounts",
+                kind,
+                payload,
+                redaction_state=RedactionState.NOT_REQUIRED,
+            )
+        except sqlite3.Error:
+            return
+
+    def record_model_selection(
+        self,
+        *,
+        raw_model_ref: str,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        model_variant: str | None = None,
+        last_reasoning_effort: str | None = None,
+        source: str = "session_model_selection",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        raw_model_ref = str(raw_model_ref or "").strip()
+        if not raw_model_ref:
+            raise ValueError("Model preference requires raw_model_ref.")
+        timestamp = now_iso()
+        payload_metadata = sanitize_for_logging(metadata or {})
+        with self.connect() as conn:
+            self._ensure_model_preferences_table(conn)
+            conn.execute(
+                """
+                INSERT INTO model_preferences (
+                  raw_model_ref, provider_id, model_id, model_variant, favorite, is_default,
+                  selection_count, last_selected_at, last_reasoning_effort, source,
+                  created_at, updated_at, metadata_json
+                ) VALUES (?, ?, ?, ?, 0, 0, 1, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(raw_model_ref) DO UPDATE SET
+                  provider_id = excluded.provider_id,
+                  model_id = excluded.model_id,
+                  model_variant = excluded.model_variant,
+                  selection_count = model_preferences.selection_count + 1,
+                  last_selected_at = excluded.last_selected_at,
+                  last_reasoning_effort = excluded.last_reasoning_effort,
+                  source = excluded.source,
+                  updated_at = excluded.updated_at,
+                  metadata_json = excluded.metadata_json
+                """,
+                (
+                    raw_model_ref,
+                    provider_id,
+                    model_id,
+                    model_variant,
+                    timestamp,
+                    last_reasoning_effort,
+                    source,
+                    timestamp,
+                    timestamp,
+                    json.dumps(payload_metadata, sort_keys=True, default=str),
+                ),
+            )
+        return self.get_model_preference(raw_model_ref)
+
+    def set_model_favorite(
+        self,
+        raw_model_ref: str,
+        favorite: bool,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        model_variant: str | None = None,
+        source: str = "model_favorite_command",
+    ) -> dict[str, Any]:
+        return self._upsert_model_preference_flag(
+            raw_model_ref,
+            provider_id=provider_id,
+            model_id=model_id,
+            model_variant=model_variant,
+            favorite=favorite,
+            is_default=None,
+            source=source,
+        )
+
+    def set_default_model_preference(
+        self,
+        raw_model_ref: str,
+        *,
+        provider_id: str | None = None,
+        model_id: str | None = None,
+        model_variant: str | None = None,
+        source: str = "model_default_command",
+    ) -> dict[str, Any]:
+        raw_model_ref = str(raw_model_ref or "").strip()
+        if not raw_model_ref:
+            raise ValueError("Model preference requires raw_model_ref.")
+        with self.connect() as conn:
+            self._ensure_model_preferences_table(conn)
+            conn.execute("UPDATE model_preferences SET is_default = 0")
+        return self._upsert_model_preference_flag(
+            raw_model_ref,
+            provider_id=provider_id,
+            model_id=model_id,
+            model_variant=model_variant,
+            favorite=None,
+            is_default=True,
+            source=source,
+        )
+
+    def get_default_model_preference(self) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            self._ensure_model_preferences_table(conn)
+            row = conn.execute(
+                """
+                SELECT * FROM model_preferences
+                WHERE is_default = 1
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return self._row_to_model_preference(row) if row is not None else None
+
+    def get_model_preference(self, raw_model_ref: str) -> dict[str, Any]:
+        with self.connect() as conn:
+            self._ensure_model_preferences_table(conn)
+            row = conn.execute("SELECT * FROM model_preferences WHERE raw_model_ref = ?", (raw_model_ref,)).fetchone()
+        if row is None:
+            raise KeyError(f"Model preference not found: {raw_model_ref}")
+        return self._row_to_model_preference(row)
+
+    def list_model_preferences(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            self._ensure_model_preferences_table(conn)
+            rows = conn.execute(
+                """
+                SELECT * FROM model_preferences
+                ORDER BY favorite DESC, is_default DESC, last_selected_at IS NULL ASC, last_selected_at DESC, updated_at DESC, raw_model_ref ASC
+                """
+            ).fetchall()
+        return [self._row_to_model_preference(row) for row in rows]
+
+    def _upsert_model_preference_flag(
+        self,
+        raw_model_ref: str,
+        *,
+        provider_id: str | None,
+        model_id: str | None,
+        model_variant: str | None,
+        favorite: bool | None,
+        is_default: bool | None,
+        source: str,
+    ) -> dict[str, Any]:
+        raw_model_ref = str(raw_model_ref or "").strip()
+        if not raw_model_ref:
+            raise ValueError("Model preference requires raw_model_ref.")
+        timestamp = now_iso()
+        with self.connect() as conn:
+            self._ensure_model_preferences_table(conn)
+            existing = conn.execute("SELECT * FROM model_preferences WHERE raw_model_ref = ?", (raw_model_ref,)).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO model_preferences (
+                      raw_model_ref, provider_id, model_id, model_variant, favorite, is_default,
+                      selection_count, last_selected_at, last_reasoning_effort, source,
+                      created_at, updated_at, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, '{}')
+                    """,
+                    (
+                        raw_model_ref,
+                        provider_id,
+                        model_id,
+                        model_variant,
+                        1 if favorite else 0,
+                        1 if is_default else 0,
+                        source,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE model_preferences
+                    SET provider_id = COALESCE(?, provider_id),
+                        model_id = COALESCE(?, model_id),
+                        model_variant = COALESCE(?, model_variant),
+                        favorite = COALESCE(?, favorite),
+                        is_default = COALESCE(?, is_default),
+                        source = ?,
+                        updated_at = ?
+                    WHERE raw_model_ref = ?
+                    """,
+                    (
+                        provider_id,
+                        model_id,
+                        model_variant,
+                        None if favorite is None else (1 if favorite else 0),
+                        None if is_default is None else (1 if is_default else 0),
+                        source,
+                        timestamp,
+                        raw_model_ref,
+                    ),
+                )
+        return self.get_model_preference(raw_model_ref)
+
+    def _row_to_model_preference(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "schema_version": "harness.model_preference/v1",
+            "raw_model_ref": row["raw_model_ref"],
+            "provider_id": row["provider_id"],
+            "model_id": row["model_id"],
+            "model_variant": row["model_variant"],
+            "favorite": bool(row["favorite"]),
+            "is_default": bool(row["is_default"]),
+            "selection_count": int(row["selection_count"] or 0),
+            "last_selected_at": row["last_selected_at"],
+            "last_reasoning_effort": row["last_reasoning_effort"],
+            "source": row["source"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "metadata": json.loads(row["metadata_json"] or "{}"),
+            "provider_execution_started": False,
+            "model_execution_started": False,
+            "network_accessed": False,
+            "credentials_included": False,
+            "permission_granting": False,
+            "authority_granting": False,
+            "no_hidden_fallback": True,
+        }
 
     def list_sessions(self, status: str | None = None) -> list[SessionSpec]:
         with self.connect() as conn:

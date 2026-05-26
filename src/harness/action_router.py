@@ -28,6 +28,22 @@ class ManagedActionDecisionStatus(str, Enum):
     UNSUPPORTED = "unsupported"
 
 
+class ManagedActionSandboxStatus(str, Enum):
+    NOT_RUN = "not_run"
+    SAFE = "safe"
+    DANGEROUS = "dangerous"
+
+
+class ManagedActionSandboxAssessment(BaseModel):
+    schema_version: str = "harness.managed_action_sandbox_assessment/v1"
+    status: ManagedActionSandboxStatus
+    sandbox_profile: str = "managed_action_preflight"
+    executor: str
+    dangerous: bool = False
+    reasons: list[str] = Field(default_factory=list)
+    expected_paths: list[str] = Field(default_factory=list)
+
+
 class ManagedActionRoute(BaseModel):
     schema_version: str = "harness.managed_action_route/v1"
     intent: str
@@ -46,6 +62,7 @@ class ManagedActionDecision(BaseModel):
     route: ManagedActionRoute
     reasons: list[str] = Field(default_factory=list)
     requires_human: bool = False
+    sandbox_assessment: ManagedActionSandboxAssessment | None = None
 
 
 class ManagedActionResult(BaseModel):
