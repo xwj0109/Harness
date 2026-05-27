@@ -93,6 +93,7 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             "total": 0,
             "recent": [],
         },
+        "session_tools": _session_tools_summary(project_root, active_session=None),
         "progress": {
             "schema_version": "harness.orchestration_progress_summary/v1",
             "objective_id": None,
@@ -338,6 +339,7 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
         source=catalog_source,
         config_error=catalog_error,
     )
+    dashboard["session_tools"] = _session_tools_summary(project_root, active_session=dashboard.get("active_session"))
     dashboard["memory"] = {
         "schema_version": "harness.memory_summary/v1",
         "total": len(store.list_memory_records()),
@@ -754,6 +756,8 @@ def _session_pane_row(store: SQLiteStore, session) -> dict:
 
 
 def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) -> dict:
+    from harness.session_tools import session_planning_mode_projection
+
     session = store.get_session(session_id)
     timeline_events = list_session_timeline(store, session_id, limit=8)
     transcript_entries = list_session_transcript(store, session_id)[-4:]
@@ -787,6 +791,7 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         "token_cache_read": session.token_cache_read,
         "token_cache_write": session.token_cache_write,
         "cwd": cwd,
+        "planning_mode": session_planning_mode_projection(session.metadata),
         "operator": operator,
         "ui_preferences": sanitize_for_logging(session.ui_preferences),
         "latest_ui_activation": _ui_activation_preview(latest_ui_activation) if latest_ui_activation else None,
@@ -842,6 +847,62 @@ def _operator_active_tools() -> list[str]:
     from harness.session_tools import default_session_tool_descriptors
 
     return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+
+
+def _session_tools_summary(project_root: Path, *, active_session: dict | None) -> dict:
+    from harness.session_tools import session_tool_catalog_projection
+
+    planning_mode = (active_session or {}).get("planning_mode") or {"active": False}
+    try:
+        catalog = session_tool_catalog_projection(project_root=project_root)
+        tools = []
+        for tool in catalog.get("tools") or []:
+            if tool.get("id") not in {"plan-enter", "plan-exit", "web-fetch", "web-search"}:
+                continue
+            policy = tool.get("policy") or {}
+            tools.append(
+                {
+                    "id": tool.get("id"),
+                    "title": tool.get("title"),
+                    "enabled": bool(policy.get("enabled")),
+                    "disabled_reason": sanitize_for_logging(policy.get("disabled_reason")),
+                    "permission_required": bool(policy.get("permission_required")),
+                    "boundary_kind": sanitize_for_logging(policy.get("boundary_kind")),
+                    "risk": sanitize_for_logging(policy.get("risk")),
+                    "maturity": list(policy.get("maturity") or []),
+                    "required_config": list(policy.get("required_config") or []),
+                    "policy_reasons": [
+                        sanitize_for_logging(reason)
+                        for reason in (policy.get("policy_reasons") or [])
+                    ],
+                    "planning_only": bool(policy.get("planning_only")),
+                }
+            )
+    except Exception as exc:
+        tools = []
+        error = sanitize_for_logging(str(exc))
+    else:
+        error = None
+    by_id = {str(tool.get("id")): tool for tool in tools}
+    web_search = by_id.get("web-search") or {}
+    web_fetch = by_id.get("web-fetch") or {}
+    plan_enter = by_id.get("plan-enter") or {}
+    return {
+        "schema_version": "harness.session_tools_summary/v1",
+        "planning_mode": planning_mode,
+        "tools": tools,
+        "plan_mode_enabled": bool(plan_enter.get("enabled", True)),
+        "web_search_enabled": bool(web_search.get("enabled")),
+        "web_fetch_enabled": bool(web_fetch.get("enabled")),
+        "web_search_disabled_reason": web_search.get("disabled_reason"),
+        "web_fetch_disabled_reason": web_fetch.get("disabled_reason"),
+        "web_requires_approval": bool(web_search.get("permission_required") or web_fetch.get("permission_required")),
+        "network_called": False,
+        "process_started": False,
+        "filesystem_modified": False,
+        "permission_granting": False,
+        "error": error,
+    }
 
 
 def _session_composer_context(store: SQLiteStore, session_id: str, project_root: Path) -> dict:

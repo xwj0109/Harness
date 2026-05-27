@@ -75,6 +75,7 @@ from harness.session_tools import (
     execute_session_tool,
     get_session_tool_descriptor,
     persist_session_tool_denial,
+    session_planning_mode_projection,
     session_tool_catalog_projection,
     session_tool_descriptor_payload,
 )
@@ -662,6 +663,16 @@ def route_chat_intent(text: str) -> dict[str, Any]:
         intent = "show_memory"
     elif normalized in {"show progress", "show orchestration progress", "where are we", "progress"}:
         intent = "show_progress"
+    elif normalized in {"plan mode", "planning mode", "show plan mode", "plan mode status", "planning mode status"}:
+        intent = "plan_mode_status"
+    elif normalized in {"enter plan mode", "enable plan mode", "turn on plan mode", "start plan mode"}:
+        intent = "plan_mode_enter"
+    elif normalized in {"exit plan mode", "disable plan mode", "turn off plan mode", "finish plan mode"}:
+        intent = "plan_mode_exit"
+    elif _looks_like_web_browse_request(normalized):
+        intent = "web_browse"
+    elif _looks_like_research_request(normalized):
+        intent = "deep_research"
     elif normalized in {"show tasks", "tasks", "list tasks"}:
         intent = "show_tasks"
     elif normalized in {"show latest run", "latest run", "show runs", "runs", "show recent runs", "recent runs"}:
@@ -732,6 +743,55 @@ def route_chat_intent(text: str) -> dict[str, Any]:
     return {"schema_version": CHAT_INTENT_SCHEMA_VERSION, "ok": True, "input": text, "intent": intent}
 
 
+def _looks_like_web_browse_request(normalized: str) -> bool:
+    return (
+        normalized.startswith("browse ")
+        or normalized.startswith("fetch http://")
+        or normalized.startswith("fetch https://")
+        or normalized.startswith("open url ")
+    )
+
+
+def _looks_like_research_request(normalized: str) -> bool:
+    return (
+        normalized.startswith("research ")
+        or normalized.startswith("deep research ")
+        or normalized.startswith("web research ")
+        or normalized.startswith("web search ")
+        or normalized.startswith("search web ")
+        or normalized.startswith("search the web ")
+    )
+
+
+def _extract_browse_target(raw: str) -> str:
+    text = raw.strip()
+    for pattern in (
+        r"^browse\s+(.+)$",
+        r"^fetch\s+(.+)$",
+        r"^open\s+url\s+(.+)$",
+    ):
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return text
+
+
+def _extract_research_query(raw: str) -> str:
+    text = raw.strip()
+    for pattern in (
+        r"^deep\s+research\s+(.+)$",
+        r"^web\s+research\s+(.+)$",
+        r"^research\s+(.+)$",
+        r"^web\s+search\s+(?:for\s+)?(.+)$",
+        r"^search\s+the\s+web\s+(?:for\s+)?(.+)$",
+        r"^search\s+web\s+(?:for\s+)?(.+)$",
+    ):
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return text
+
+
 def _emit_progress(
     progress_callback: Callable[[dict[str, Any]], None] | None,
     kind: str,
@@ -776,6 +836,10 @@ def _handle_slash(
                     "/stop                   stop foreground orchestration at a boundary",
                     "",
                     "Session",
+                    "/plan-mode [on|off|status]  manage session-local planning mode",
+                    "/browse <url>           fetch a URL through web approval",
+                    "/research <query>       deep web research through web approval",
+                    "/reset                  clear in-memory chat references",
                     "/quit                   exit",
                     "",
                     "Advanced: /help all",
@@ -806,6 +870,8 @@ def _handle_slash(
                 "/use <id>               select an orchestrator for this chat",
                 "/agents                 list built-in agents for the active workbench",
                 "/plan [request]         ask the assistant for a plan",
+                "/plan-mode on [reason]  enter session-local planning mode",
+                "/plan-mode off <summary> exit planning mode with evidence",
                 "/act <request>          propose Harness-backed action contracts",
                 "/execute [lease_id]     prepare registered adapter dispatch",
                 "/run                    run pending orchestration or dispatch lease",
@@ -817,13 +883,15 @@ def _handle_slash(
                 "/project <path>         switch active root explicitly",
                 "/mode [normal|codex]    show or change chat action mode",
                 "/tools                  list model-visible session tools",
+                "/browse <url>           fetch a URL through external-network approval",
+                "/research <query>       deep web research through external-network approval",
                 "/remember <text>        save a project-scoped memory note",
                 "/forget <id>            forget a memory record",
                 "",
                 "Codex Edit & Review",
                 "/diff                   show latest isolated diff or git diff",
-                "/apply [approve|deny]   review/apply inspected isolated changes",
-                "/apply-back [deny|approve]  review Codex diff artifacts",
+                "/apply [approve|deny|keep]   review/apply inspected isolated changes",
+                "/apply-back [deny|approve|keep]  review Codex diff artifacts",
                 "/revert                 prepare a revert action contract",
                 "/test [command]         propose a sandboxed test run",
                 "",
@@ -853,6 +921,12 @@ def _handle_slash(
         )
     if command == "tools":
         return _session_tools_response(project_root)
+    if command in {"plan-mode", "planning"}:
+        return _plan_mode_response(project_root, state, tail)
+    if command in {"browse", "fetch", "web-fetch"}:
+        return _browse_response(project_root, state, tail)
+    if command in {"research", "web-search", "search-web"}:
+        return _research_response(project_root, state, tail)
     if command == "pwd":
         return _run_session_tool_response(project_root, state, "pwd", {})
     if command == "cd":
@@ -1066,6 +1140,16 @@ def _handle_intent_routed(
         return _recommend_next_response(project_root, state)
     if intent == "show_status":
         return _status_response(project_root, state)
+    if intent == "plan_mode_status":
+        return _plan_mode_status_response(project_root, state)
+    if intent == "plan_mode_enter":
+        return _plan_mode_response(project_root, state, f"on {raw}")
+    if intent == "plan_mode_exit":
+        return _plan_mode_response(project_root, state, f"off {raw}")
+    if intent == "web_browse":
+        return _browse_response(project_root, state, _extract_browse_target(raw))
+    if intent == "deep_research":
+        return _research_response(project_root, state, _extract_research_query(raw))
     if intent == "continue_workflow":
         return _continue_response(project_root, state)
     if intent == "stop_workflow":
@@ -2218,6 +2302,161 @@ def _session_tools_response(project_root: Path) -> dict[str, Any]:
     )
 
 
+def _plan_mode_response(project_root: Path, state: ChatSessionState, tail: str) -> dict[str, Any]:
+    parts, split_error = _split_command_tail(tail)
+    if split_error:
+        return _response("plan_mode_invalid", "Plan Mode", [split_error], ok=False)
+    action = (parts[0].casefold() if parts else "status").strip()
+    if action in {"", "status", "show"}:
+        return _plan_mode_status_response(project_root, state)
+    rest = " ".join(parts[1:]).strip() if parts else ""
+    if action in {"on", "enter", "enable", "start"}:
+        return _run_session_tool_response(
+            project_root,
+            state,
+            "plan-enter",
+            {"reason": rest or "Operator requested planning mode."},
+        )
+    if action in {"off", "exit", "disable", "done"}:
+        if not rest:
+            return _response(
+                "plan_mode_summary_required",
+                "Plan Mode",
+                [
+                    "Usage: /plan-mode off <summary>",
+                    "Planning mode exit records the summary as session-local evidence.",
+                    "No provider, shell, Docker, web request, filesystem mutation, or permission grant is started.",
+                ],
+                ok=False,
+            )
+        return _run_session_tool_response(
+            project_root,
+            state,
+            "plan-exit",
+            {"summary": rest, "next_action": "", "proposed_tools": []},
+        )
+    return _response(
+        "plan_mode_invalid",
+        "Plan Mode",
+        [
+            "Usage: /plan-mode [status|on|off]",
+            "/plan-mode on [reason]",
+            "/plan-mode off <summary>",
+        ],
+        ok=False,
+    )
+
+
+def _plan_mode_status_response(project_root: Path, state: ChatSessionState) -> dict[str, Any]:
+    if not _is_initialized(project_root):
+        return _response(
+            "plan_mode_status",
+            "Plan Mode",
+            [
+                "State: unavailable",
+                "Initialized: false",
+                "Next: /init before entering session-local plan mode.",
+                "Boundary: read-only status; no provider, shell, Docker, web request, filesystem mutation, or permission grant was started.",
+            ],
+            ok=True,
+            extra={"planning_mode": {"active": False}, "permission_granting": False},
+        )
+    planning_mode = {"active": False}
+    session_id = state.session_id
+    if session_id:
+        try:
+            store = _require_store(project_root)
+            planning_mode = session_planning_mode_projection(store.get_session(session_id).metadata)
+        except KeyError:
+            planning_mode = {"active": False}
+            session_id = None
+    active = bool(planning_mode.get("active"))
+    lines = [
+        f"State: {'active' if active else 'inactive'}",
+        f"Session: {session_id or 'none'}",
+    ]
+    if planning_mode.get("reason"):
+        lines.append(f"Reason: {planning_mode['reason']}")
+    if planning_mode.get("entered_at"):
+        lines.append(f"Entered: {planning_mode['entered_at']}")
+    if planning_mode.get("summary"):
+        lines.append(f"Last summary: {planning_mode['summary']}")
+    if planning_mode.get("next_action"):
+        lines.append(f"Next action: {planning_mode['next_action']}")
+    proposed = planning_mode.get("proposed_tools") or []
+    if proposed:
+        lines.append("Proposed tools: " + ", ".join(str(item) for item in proposed))
+    lines.extend(
+        [
+            "Next: /plan-mode on <reason> or /plan-mode off <summary>.",
+            "Boundary: session-local planning metadata only; no provider, shell, Docker, web request, filesystem mutation, or permission grant was started.",
+        ]
+    )
+    return _response(
+        "plan_mode_status",
+        "Plan Mode",
+        lines,
+        ok=True,
+        extra={"planning_mode": planning_mode, "session_id": session_id, "permission_granting": False},
+    )
+
+
+def _browse_response(project_root: Path, state: ChatSessionState, tail: str) -> dict[str, Any]:
+    parts, split_error = _split_command_tail(tail)
+    if split_error:
+        return _response("browse_invalid", "Browse", [split_error], ok=False)
+    if not parts:
+        return _response(
+            "browse_needs_url",
+            "Browse",
+            [
+                "Usage: /browse <https-url> [markdown|text|html]",
+                "Harness will validate project web_tools policy and pause for exact external-network approval before fetching.",
+            ],
+            ok=False,
+        )
+    requested_format = parts[1].casefold() if len(parts) > 1 else "markdown"
+    return _run_session_tool_response(
+        project_root,
+        state,
+        "web-fetch",
+        {"url": parts[0], "format": requested_format, "timeout": 30},
+    )
+
+
+def _research_response(project_root: Path, state: ChatSessionState, tail: str) -> dict[str, Any]:
+    query = tail.strip()
+    if not query:
+        return _response(
+            "research_needs_query",
+            "Deep Research",
+            [
+                "Usage: /research <query>",
+                "Harness will validate project web_tools policy and pause for exact external-network approval before search.",
+            ],
+            ok=False,
+        )
+    return _run_session_tool_response(
+        project_root,
+        state,
+        "web-search",
+        {
+            "query": query,
+            "num_results": 10,
+            "search_type": "deep",
+            "livecrawl": "preferred",
+            "context_max_characters": 30000,
+        },
+    )
+
+
+def _split_command_tail(tail: str) -> tuple[list[str], str | None]:
+    try:
+        return shlex.split(tail), None
+    except ValueError as exc:
+        return [], f"Could not parse command arguments: {exc}"
+
+
 def _run_session_tool_response(project_root: Path, state: ChatSessionState, tool_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if not _is_initialized(project_root):
         return _uninitialized_response(project_root)
@@ -2270,7 +2509,18 @@ def _run_session_tool_response(project_root: Path, state: ChatSessionState, tool
         flushed_event_count=max(0, after_event_count - before_event_count),
         flushed_artifact_count=1 if result.artifact_id else 0,
     )
-    lines = result.preview.splitlines() or [result.preview]
+    if not result.ok and result.error_type in {
+        "permission_denied",
+        "path_security",
+        "secret_path",
+        "context_excluded",
+        "invalid_cwd",
+        "schema_validation_failed",
+        "tool_error",
+    }:
+        lines = _session_tool_blocked_lines(tool_id, result.preview)
+    else:
+        lines = result.preview.splitlines() or [result.preview]
     if result.artifact_id:
         lines.append(f"Output artifact: {result.artifact_id}")
     return _response(
@@ -2425,6 +2675,18 @@ def _session_tool_blocked_lines(tool_id: str, preview: str) -> list[str]:
                 "  web_tools.search_provider: exa_mcp",
                 "  # or: web_tools.search_provider: configured_http with web_tools.search_endpoint_url set",
                 "After that, Harness will still pause for exact web-search approval before any network request.",
+            ]
+        )
+    if tool_id == "web-fetch" and "web fetch is disabled by project web_tools policy" in normalized_preview:
+        lines.extend(
+            [
+                "",
+                "Web browsing is an external-network session tool and must be enabled in project config before it can request approval.",
+                "Configure .harness/config.yaml:",
+                "  web_tools.enabled: true",
+                "  web_tools.fetch_enabled: true",
+                "  web_tools.allowed_domains: ['docs.example.com']",
+                "After that, Harness will still pause for exact web-fetch approval before any network request.",
             ]
         )
     return lines

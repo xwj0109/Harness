@@ -58,7 +58,7 @@ The v1.8 release is **Local Agent App Readiness**: local infrastructure, declara
 - Explicit `codex_isolated_edit/codex_code_edit` adapter with hosted-boundary approval and isolated apply-back review.
 - Explicit `repo_planning/repo_planning` adapter with hosted-boundary approval and Codex read-only sandbox planning.
 - Foreground Codex-style prompt execution through `harness "prompt"`, with direct workspace edits, Codex CLI workspace-write sandboxing, run artifacts, and final CLI reports.
-- Unified `harness` app with passive dashboard context, deterministic chat actions, first-class summary/planning/coding-fix templates, in-memory transcript/progress, and `--plain` fallback when no prompt is supplied.
+- Unified `harness` app with passive dashboard context, deterministic chat actions, first-class summary/planning/coding-fix templates, session-local plan mode, governed web browsing/deep-research session-tool routes, in-memory transcript/progress, and `--plain` fallback when no prompt is supplied.
 - TUI command-palette and right-panel guidance that reflects the registered adapter set without executing commands.
 - Read-only Capability Catalog over registered adapters through `harness capabilities list|inspect`.
 - Explicit local memory notes through `harness memory save-note|list|inspect|forget`, with scoped records and redaction state.
@@ -84,7 +84,7 @@ harness --project .
 harness --project . --plain --codex-like
 ```
 
-Inside the chat prompt, requests such as `summarize this repo`, `plan how to improve the CLI`, `fix the failing test with codex`, `show progress`, `show capabilities`, `show recent runs`, `review the last result`, `continue`, and `stop` route to explicit Harness actions. Chat first shows the interpreted intent, proposed action, equivalent CLI commands, safety boundary, required approvals, and confirmation prompt. Confirmed work still goes through objective/task records, daemon run-once leases, registered adapter dispatch, artifacts/events/manifests/progress, and an evidence summary with next inspection commands.
+Inside the chat prompt, requests such as `summarize this repo`, `plan how to improve the CLI`, `fix the failing test with codex`, `show progress`, `show capabilities`, `show recent runs`, `review the last result`, `enter plan mode`, `browse https://...`, `deep research <query>`, `continue`, and `stop` route to explicit Harness actions. Chat first shows the interpreted intent, proposed action, equivalent CLI commands, safety boundary, required approvals, and confirmation prompt. Confirmed work still goes through objective/task records, daemon run-once leases, registered adapter dispatch, artifacts/events/manifests/progress, or governed session-tool evidence. Web browsing and deep research require explicit `web_tools` project configuration plus exact external-network approval before any request.
 
 ## Repository Layout
 

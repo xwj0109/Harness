@@ -793,7 +793,7 @@ class RightPaneCockpitModel(BaseModel):
     active_work: dict[str, Any] = Field(default_factory=dict)
     attention: list[str] = Field(default_factory=list)
     evidence_rows: list[str] = Field(default_factory=list)
-    footer: str = "1-9 switch · G graph · E evidence · Enter details · ? shortcuts"
+    footer: str = "Ctrl+X O/G/E modes · Tab section · Enter details · ? shortcuts"
     shortcuts_visible: bool = False
     sections: list[dict[str, Any]] = Field(default_factory=list)
     active_section_id: str | None = None

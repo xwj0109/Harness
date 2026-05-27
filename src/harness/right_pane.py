@@ -33,7 +33,7 @@ COCKPIT_SECTION_IDS = (
     "shortcuts",
     "commands",
 )
-COCKPIT_FOOTER = "1-9 switch · O/G/E modes · Tab next · Enter details · ? shortcuts"
+COCKPIT_FOOTER = "Ctrl+X O/G/E modes · Tab section · Enter details · ? shortcuts"
 _REGISTRIES: dict[Path, OrchestrationGraphRegistry] = {}
 
 
@@ -136,7 +136,7 @@ def build_right_pane_cockpit_model(
         },
         navigation_hints=[
             {"key": "1-9 switch", "label": ""},
-            {"key": "O/G/E modes", "label": ""},
+            {"key": "Ctrl+X O/G/E modes", "label": ""},
             {"key": "Tab next", "label": ""},
             {"key": "Enter details", "label": ""},
             {"key": "? shortcuts", "label": ""},
@@ -314,10 +314,10 @@ def _active_work_rows(
                 f"Pending: {_short(contract.get('summary'))}",
                 f"Tool: {_humanize(contract.get('tool'))}",
                 f"Risk: {_humanize(contract.get('risk'))}",
-                "Next: confirm or cancel in chat",
+                "Next: choose confirm or decline from the decision menu",
             ]
         )
-        return {"rows": rows, "next_action": "confirm or cancel in chat"}
+        return {"rows": rows, "next_action": "confirm or decline from the decision menu"}
     pending_permissions = (dashboard.get("live_activity") or {}).get("pending_permissions") or []
     if pending_permissions:
         permission = pending_permissions[-1]
@@ -328,10 +328,10 @@ def _active_work_rows(
                 f"Permission: {_humanize(permission.get('tool_id'))} {_humanize(permission.get('action'))}",
                 f"Target: {target}",
                 f"Risk: {_humanize(permission.get('risk') or 'unknown')}",
-                "Next: approve or decline through existing controls",
+                "Next: choose allow or deny from the permission menu",
             ]
         )
-        return {"rows": rows, "next_action": "approve or decline through existing controls"}
+        return {"rows": rows, "next_action": "allow or deny from the permission menu"}
     task_node = _selected_or_active_task_node(selected_graph)
     instance_title = selected_instance.title if selected_instance is not None else _fallback_objective_title(dashboard)
     rows.append(f"Orchestration: {instance_title}")
@@ -469,6 +469,8 @@ def _context_rows(dashboard: dict[str, Any], state: dict[str, Any], focus_mode: 
     active_session = dashboard.get("active_session") or {}
     model_catalog = dashboard.get("model_catalog") or {}
     active_model = model_catalog.get("active_model") or {}
+    session_tools = dashboard.get("session_tools") or {}
+    planning_mode = session_tools.get("planning_mode") or {}
     rows = [
         f"Project: {Path(str(dashboard.get('project_root') or '.')).name}",
         f"Branch: {dashboard.get('branch') or 'unknown'}",
@@ -477,6 +479,8 @@ def _context_rows(dashboard: dict[str, Any], state: dict[str, Any], focus_mode: 
         f"Context window: {_context_window_label(active_session, active_model)}",
         f"Assistant: {_humanize(state.get('active_orchestrator') or 'default')}",
         f"Mode: {_status_label(state.get('chat_mode') or 'normal')}",
+        f"Plan mode: {'active' if planning_mode.get('active') else 'inactive'}",
+        f"Research: search={'ready' if session_tools.get('web_search_enabled') else 'blocked'} fetch={'ready' if session_tools.get('web_fetch_enabled') else 'blocked'}",
         f"Active: {_session_title(active_session) if active_session else 'none'}",
         f"Session: {_session_title(active_session) if active_session else 'none'}",
         f"Queue: {_queue_summary(dashboard)}",
@@ -590,9 +594,9 @@ def _selected_node_rows(graph: LiveOrchestrationGraph | None) -> list[str]:
 def _shortcut_rows() -> list[str]:
     return [
         "1-9: switch orchestration",
-        "O/G/E: overview, graph, evidence",
+        "Ctrl+X O/G/E: overview, graph, evidence",
         "G in graph: toggle selected/all orchestrations",
-        "Tab/Shift+Tab: select next or previous node",
+        "Tab/Shift+Tab: switch section",
         "F: focus attention node",
         "Space: pin selected orchestration",
         "Enter: open read-only details",
@@ -695,6 +699,7 @@ def _section_alias(value: object) -> str:
         "queue_daemon": "orchestrations",
         "runtime_evidence": "evidence",
         "agents_specs": "context",
+        "planning_research": "context",
         "settings": "context",
         "safety": "attention",
     }

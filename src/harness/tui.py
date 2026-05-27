@@ -51,6 +51,7 @@ COMMAND_PALETTE_GROUPS = [
     {"id": "model_selection", "title": "Model Selection"},
     {"id": "agent_authoring", "title": "Agent Authoring"},
     {"id": "native_agents", "title": "Native Agents"},
+    {"id": "planning_research", "title": "Planning And Research"},
     {"id": "project_agents", "title": "Project Agents"},
     {"id": "built_in_specs", "title": "Built-In Specs"},
     {"id": "objectives_tasks", "title": "Objectives And Tasks"},
@@ -104,6 +105,33 @@ COMMAND_PALETTE_ENTRIES = [
         "title": "Focus dashboard",
         "command": "ui:focus-dashboard",
         "description": "Switch the side panel back to dashboard focus.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.right_overview",
+        "group_id": "ui_controls",
+        "title": "Show right pane overview",
+        "command": "ui:right-pane overview",
+        "description": "Switch the right pane to the overview cockpit mode.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.right_graph",
+        "group_id": "ui_controls",
+        "title": "Show right pane graph",
+        "command": "ui:right-pane graph",
+        "description": "Switch the right pane to the orchestration graph mode.",
+        "mutates_when_run": False,
+        "safety_note": "In-process UI state only.",
+    },
+    {
+        "id": "ui_controls.right_evidence",
+        "group_id": "ui_controls",
+        "title": "Show right pane evidence",
+        "command": "ui:right-pane evidence",
+        "description": "Switch the right pane to the evidence mode.",
         "mutates_when_run": False,
         "safety_note": "In-process UI state only.",
     },
@@ -223,6 +251,33 @@ COMMAND_PALETTE_ENTRIES = [
         "description": "Set the TUI composer agent mode to plan without running a task.",
         "mutates_when_run": False,
         "safety_note": "In-process UI state only; plan submissions remain read/glob/grep/artifact-read bounded.",
+    },
+    {
+        "id": "planning_research.plan_mode",
+        "group_id": "planning_research",
+        "title": "Manage plan mode",
+        "command": "/plan-mode status",
+        "description": "Inspect, enter, or exit session-local planning mode from the composer.",
+        "mutates_when_run": True,
+        "safety_note": "Runs through chat/session-tool governance; on/off records session-local planning metadata only.",
+    },
+    {
+        "id": "planning_research.deep_research",
+        "group_id": "planning_research",
+        "title": "Deep research",
+        "command": "/research <query>",
+        "description": "Search the web with deep-search settings through external-network approval.",
+        "mutates_when_run": True,
+        "safety_note": "Creates governed session-tool evidence and pauses for exact web-search approval before network access.",
+    },
+    {
+        "id": "planning_research.browse_url",
+        "group_id": "planning_research",
+        "title": "Browse URL",
+        "command": "/browse <https-url>",
+        "description": "Fetch a URL through the governed web-fetch session tool.",
+        "mutates_when_run": True,
+        "safety_note": "Creates governed session-tool evidence and pauses for exact web-fetch approval before network access.",
     },
     {
         "id": "native_agents.general",
@@ -464,6 +519,11 @@ TUI_VIEW_SECTIONS = [
         "pane_ids": ["agents"],
     },
     {
+        "id": "planning_research",
+        "title": "Planning And Research",
+        "pane_ids": ["planning_research"],
+    },
+    {
         "id": "runtime_evidence",
         "title": "Runtime Evidence",
         "pane_ids": ["runs", "terminal"],
@@ -482,6 +542,7 @@ TUI_VIEW_SECTIONS = [
             "command_palette_ui_controls",
             "command_palette_model_selection",
             "command_palette_agent_authoring",
+            "command_palette_planning_research",
             "command_palette_project_agents",
             "command_palette_built_in_specs",
             "command_palette_objectives_tasks",
@@ -532,6 +593,7 @@ RIGHT_PANEL_SECTION_ALIASES = {
     "queue_daemon": "orchestrations",
     "runtime_evidence": "evidence",
     "agents_specs": "context",
+    "planning_research": "context",
     "settings": "context",
     "command_palette": "commands",
     "safety": "attention",
@@ -542,6 +604,9 @@ SLASH_COMMAND_ALIASES = {
     "sessions": "sessions.list",
     "tasks": "objectives_tasks.list_tasks",
     "runs": "runtime_evidence.runs",
+    "overview": "ui_controls.right_overview",
+    "graph": "ui_controls.right_graph",
+    "evidence": "ui_controls.right_evidence",
     "settings": "ui_controls.settings",
     "clear": "ui_controls.clear_search",
 }
@@ -570,6 +635,30 @@ ESSENTIAL_CHAT_SLASH_COMMANDS = [
         "command": "/progress [objective_id]",
         "mutates_when_run": False,
         "safety_note": "Read-only orchestration state projection.",
+    },
+    {
+        "name": "plan-mode",
+        "title": "Plan mode",
+        "description": "Inspect, enter, or exit session-local planning mode.",
+        "command": "/plan-mode [status|on|off]",
+        "mutates_when_run": True,
+        "safety_note": "Session-local planning metadata only; no provider, shell, Docker, web request, file mutation, or permission grant.",
+    },
+    {
+        "name": "research",
+        "title": "Deep research",
+        "description": "Search the web with deep settings through exact external-network approval.",
+        "command": "/research <query>",
+        "mutates_when_run": True,
+        "safety_note": "Routes through web-search session-tool governance and pauses for approval before any network request.",
+    },
+    {
+        "name": "browse",
+        "title": "Browse URL",
+        "description": "Fetch a URL through exact external-network approval.",
+        "command": "/browse <https-url>",
+        "mutates_when_run": True,
+        "safety_note": "Routes through web-fetch session-tool governance and pauses for approval before any network request.",
     },
     {
         "name": "execute",
@@ -669,7 +758,13 @@ SLASH_COMMAND_ORDER = [
     "sessions",
     "tasks",
     "runs",
+    "overview",
+    "graph",
+    "evidence",
     "progress",
+    "plan-mode",
+    "research",
+    "browse",
     "execute",
     "run",
     "confirm",
@@ -687,6 +782,7 @@ FUNCTIONALITY_TABLE_GROUPS = [
     {"id": "suggested", "title": "Suggested"},
     {"id": "session", "title": "Session"},
     {"id": "agent", "title": "Agent"},
+    {"id": "research", "title": "Planning And Research"},
     {"id": "tasks", "title": "Tasks"},
     {"id": "adapters", "title": "Adapters"},
     {"id": "evidence", "title": "Evidence"},
@@ -695,8 +791,8 @@ FUNCTIONALITY_TABLE_GROUPS = [
 ]
 
 FUNCTIONALITY_TABLE_LAYOUT = [
-    ("suggested", ["status", "tasks", "runs", "model"]),
-    ("session", ["sessions"]),
+    ("suggested", ["model", "sessions", "status", "tasks", "runs"]),
+    ("research", ["plan-mode", "research", "browse"]),
     ("tasks", ["init", "progress", "run", "confirm", "decline", "stop"]),
     ("adapters", ["execute"]),
     ("provider", ["models", "model"]),
@@ -710,6 +806,12 @@ FUNCTIONALITY_INVOKES = {
     "palette": "ctrl+p",
     "home": "/home",
     "settings": "/settings",
+    "overview": "ctrl+x o",
+    "graph": "ctrl+x g",
+    "evidence": "ctrl+x e",
+    "plan-mode": "/plan-mode",
+    "research": "/research",
+    "browse": "/browse",
     "theme": "ctrl+x t",
     "dark-mode": "/dark-mode",
     "light-mode": "/light-mode",
@@ -720,9 +822,15 @@ FUNCTIONALITY_TITLES = {
     "models": "Model catalog",
     "status": "Project status",
     "init": "Initialize project",
-    "sessions": "Switch session",
+    "sessions": "Continue session",
     "tasks": "Task queue",
     "runs": "Runs",
+    "overview": "Right pane overview",
+    "graph": "Right pane graph",
+    "evidence": "Right pane evidence",
+    "plan-mode": "Plan mode",
+    "research": "Deep research",
+    "browse": "Browse URL",
     "progress": "Progress",
     "execute": "Prepare dispatch",
     "run": "Run pending work",
@@ -766,6 +874,9 @@ FUNCTIONALITY_EVIDENCE = {
     "plan-task": "task id",
     "lease": "lease id",
     "progress": "objective state",
+    "plan-mode": "session planning metadata",
+    "research": "permission/run/artifacts",
+    "browse": "permission/run/artifacts",
     "execute": "lease/action evidence",
     "run": "run id/artifacts",
     "confirm": "decision/run evidence",
@@ -926,6 +1037,11 @@ def build_tui_panes(dashboard: dict) -> list[dict]:
             "lines": _model_catalog_pane_rows(dashboard),
         },
         {
+            "id": "planning_research",
+            "title": "Planning And Research",
+            "lines": _planning_research_pane_rows(dashboard),
+        },
+        {
             "id": "commands",
             "title": "Commands",
             "lines": dashboard["command_suggestions"],
@@ -984,6 +1100,39 @@ def _tui_settings_pane_rows(catalog: dict, *, source: str | None = None) -> list
         f"Backend settings exposed: {catalog.get('backend_settings_exposed', False)}",
         f"Persist command: {catalog.get('persist_command') or 'none'}",
     ]
+
+
+def _planning_research_pane_rows(dashboard: dict) -> list[str]:
+    summary = dashboard.get("session_tools") or {}
+    planning = summary.get("planning_mode") or {}
+    rows = [
+        f"Plan mode: {'active' if planning.get('active') else 'inactive'}",
+        f"Plan command: /plan-mode [status|on|off]",
+        f"Research command: /research <query>",
+        f"Browse command: /browse <https-url>",
+        f"Web search: {'ready' if summary.get('web_search_enabled') else 'blocked'}",
+        f"Web fetch: {'ready' if summary.get('web_fetch_enabled') else 'blocked'}",
+        f"Requires approval: {summary.get('web_requires_approval', True)}",
+    ]
+    if planning.get("reason"):
+        rows.append(f"Plan reason: {planning['reason']}")
+    if planning.get("summary"):
+        rows.append(f"Last plan: {planning['summary']}")
+    if summary.get("web_search_disabled_reason"):
+        rows.append(f"Search blocked: {summary['web_search_disabled_reason']}")
+    if summary.get("web_fetch_disabled_reason"):
+        rows.append(f"Browse blocked: {summary['web_fetch_disabled_reason']}")
+    if summary.get("error"):
+        rows.append(f"Tool policy: {summary['error']}")
+    rows.extend(
+        [
+            "Network called: false",
+            "Process started: false",
+            "Filesystem modified: false",
+            "Permission granting: false",
+        ]
+    )
+    return rows
 
 
 def _evidence_status_text(value: object) -> str:
@@ -1142,6 +1291,30 @@ _SAFE_PALETTE_UI_ACTIONS = {
         "focus_mode": "dashboard",
         "evidence_status": "ui_focus_in_memory",
         "state_fields": ["focus_mode"],
+    },
+    "ui_controls.right_overview": {
+        "type": "set_right_pane_mode",
+        "right_pane_mode": "overview",
+        "section_id": "active_work",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_right_pane_mode_in_memory",
+        "state_fields": ["focus_mode", "right_pane_mode", "active_section_id", "active_section_index"],
+    },
+    "ui_controls.right_graph": {
+        "type": "set_right_pane_mode",
+        "right_pane_mode": "graph",
+        "section_id": "graph",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_right_pane_mode_in_memory",
+        "state_fields": ["focus_mode", "right_pane_mode", "active_section_id", "active_section_index"],
+    },
+    "ui_controls.right_evidence": {
+        "type": "set_right_pane_mode",
+        "right_pane_mode": "evidence",
+        "section_id": "evidence",
+        "focus_mode": "dashboard",
+        "evidence_status": "ui_right_pane_mode_in_memory",
+        "state_fields": ["focus_mode", "right_pane_mode", "active_section_id", "active_section_index"],
     },
     "ui_controls.toggle_section": {
         "type": "toggle_section",
@@ -1373,6 +1546,19 @@ def activate_command_palette_entry(
         state["query"] = ""
     elif action.get("type") == "set_focus_mode":
         state["focus_mode"] = action.get("focus_mode") or "dashboard"
+    elif action.get("type") == "set_right_pane_mode":
+        requested_mode = str(action.get("right_pane_mode") or "overview")
+        mode = requested_mode if requested_mode in {"overview", "graph", "evidence"} else "overview"
+        resolved_section_id = _right_panel_resolve_section_id(
+            action.get("section_id")
+            or ("graph" if mode == "graph" else "evidence" if mode == "evidence" else "active_work")
+        )
+        state["focus_mode"] = action.get("focus_mode") or "dashboard"
+        state["right_pane_mode"] = mode
+        if mode != "graph":
+            state["show_all_orchestrations"] = False
+        state["active_section_id"] = resolved_section_id
+        state["active_section_index"] = _right_panel_mode_section_index(mode, resolved_section_id)
     elif action.get("type") == "toggle_section":
         section_id = _right_panel_resolve_section_id(state.get("active_section_id"))
         if not state.get("active_section_id"):
@@ -1460,6 +1646,18 @@ def _right_panel_section_index(section_id: object) -> int:
         return list(RIGHT_PANEL_SECTION_IDS).index(resolved)
     except ValueError:
         return 0
+
+
+def _right_panel_mode_section_index(mode: object, section_id: object) -> int:
+    normalized_mode = str(mode or "overview")
+    resolved = _right_panel_resolve_section_id(section_id)
+    if normalized_mode == "graph":
+        sections = ["orchestrations", "graph", "node_details", "attention", "shortcuts", "commands"]
+    elif normalized_mode == "evidence":
+        sections = ["evidence", "node_details", "graph", "shortcuts", "commands"]
+    else:
+        sections = list(RIGHT_PANEL_SECTION_IDS)
+    return sections.index(resolved) if resolved in sections else 0
 
 
 def _right_panel_section_id_at_index(index: object) -> str:
@@ -1910,8 +2108,8 @@ def _right_panel_action_rows(dashboard: dict, state: dict) -> list[str]:
             f"Pending: {contract.get('summary')}",
             f"Tool: {_humanize_identifier(contract.get('tool'))}",
             f"Risk: {_humanize_identifier(contract.get('risk'))}",
-            "Confirm: yes or /confirm",
-            "Cancel: no",
+            "Decision: arrows + Enter",
+            "Fallback: /confirm or /decline",
         ]
     pending_permissions = live_activity.get("pending_permissions") or []
     if pending_permissions:
@@ -1923,7 +2121,9 @@ def _right_panel_action_rows(dashboard: dict, state: dict) -> list[str]:
             f"Risk: {_humanize_identifier(permission.get('risk') or 'unknown')}",
         ]
         command = _approval_command(active_session)
-        rows.append(f"Next: {command or 'approve or decline in chat'}")
+        rows.append("Decision: Ctrl+X P opens allow/deny menu")
+        if command:
+            rows.append(f"Operation: {command}")
         return rows
     latest_activation = state.get("latest_palette_activation") or {}
     if latest_activation:
@@ -2630,7 +2830,7 @@ def render_provider_env_prompt_dialog(provider: dict, method: dict, *, buffer: s
         "",
         "[dim]Stores the env var name only. Runtime resolves the value later after policy gates pass.[/dim]",
         f"[dim]{separator}[/dim]",
-        "[bold steel_blue1]Enter[/bold steel_blue1] connect   [bold steel_blue1]Ctrl+U[/bold steel_blue1] clear   [bold steel_blue1]Esc[/bold steel_blue1] cancel",
+        "[bold steel_blue1]Enter[/bold steel_blue1] review   [bold steel_blue1]Ctrl+U[/bold steel_blue1] clear   [bold steel_blue1]Esc[/bold steel_blue1] cancel",
     ]
     return "\n".join(lines).rstrip()
 
@@ -2646,7 +2846,7 @@ def render_provider_api_key_prompt_dialog(provider: dict, *, buffer: str = "", w
         "",
         "[dim]Writes the key to the local provider secret store. The key is never echoed in evidence.[/dim]",
         f"[dim]{separator}[/dim]",
-        "[bold steel_blue1]Enter[/bold steel_blue1] store   [bold steel_blue1]Ctrl+U[/bold steel_blue1] clear   [bold steel_blue1]Esc[/bold steel_blue1] cancel",
+        "[bold steel_blue1]Enter[/bold steel_blue1] review   [bold steel_blue1]Ctrl+U[/bold steel_blue1] clear   [bold steel_blue1]Esc[/bold steel_blue1] cancel",
     ]
     return "\n".join(lines).rstrip()
 
@@ -4908,8 +5108,52 @@ def _render_session_pane_actions(*, search_active: bool, query: str) -> str:
     return "enter switch | n new | e rename | / search | f filter | a archive"
 
 
-def render_session_delete_dialog(session: dict, *, buffer: str = "") -> str:
-    lines = [
+def render_decision_menu_dialog(
+    title: str,
+    detail_lines: list[str],
+    options: list[dict],
+    *,
+    selected_index: int = 0,
+    status: str = "",
+    width: int = 76,
+) -> str:
+    selected_index = min(max(selected_index, 0), max(len(options) - 1, 0))
+    lines = [title, ""]
+    lines.extend(detail_lines)
+    if detail_lines:
+        lines.append("")
+    row_width = max(24, width - 4)
+    for index, option in enumerate(options):
+        label = str(option.get("label") or option.get("id") or "Option")
+        description = str(option.get("description") or "")
+        text = f"{label:<18} {description}".rstrip()
+        if index == selected_index:
+            lines.append(f"[white on #5f87d7]{escape(_truncate_text('> ' + text, row_width).ljust(row_width))}[/]")
+        else:
+            lines.append(f"  {escape(_truncate_text(text, row_width))}")
+    lines.extend(["", "Arrows move. Enter selects. Esc cancels."])
+    if status:
+        lines.extend(["", escape(status)])
+    return "\n".join(lines).rstrip()
+
+
+def _session_delete_decision_options() -> list[dict]:
+    return [
+        {
+            "id": "cancel",
+            "label": "Cancel",
+            "description": "Keep the session and close this menu.",
+        },
+        {
+            "id": "delete",
+            "label": "Hard delete",
+            "description": "Remove session-owned records; keep linked runs, tasks, artifacts.",
+        },
+    ]
+
+
+def _session_delete_detail_lines(session: dict) -> list[str]:
+    return [
         "[bold red]Hard delete session[/bold red]",
         "",
         f"Title: {escape(str(session.get('display_title') or session.get('title') or 'Untitled session'))}",
@@ -4921,11 +5165,17 @@ def render_session_delete_dialog(session: dict, *, buffer: str = "") -> str:
         "",
         "This removes session-owned messages, parts, todos, permissions, links, events, and session folder.",
         "Linked runs, tasks, artifacts, and active repository files are retained.",
-        "",
-        f"Type DELETE then enter: {escape(buffer)}",
-        "Esc cancels.",
     ]
-    return "\n".join(lines)
+
+
+def render_session_delete_dialog(session: dict, *, selected_index: int = 0, status: str = "") -> str:
+    return render_decision_menu_dialog(
+        "[bold red]Confirm session delete[/bold red]",
+        _session_delete_detail_lines(session),
+        _session_delete_decision_options(),
+        selected_index=selected_index,
+        status=status,
+    )
 
 
 def render_session_rename_dialog(session: dict, *, buffer: str = "") -> str:
@@ -4942,9 +5192,74 @@ def render_session_rename_dialog(session: dict, *, buffer: str = "") -> str:
     )
 
 
-def render_permission_card_dialog(card: dict, *, status: str = "") -> str:
+def _permission_decision_options() -> list[dict]:
+    return [
+        {
+            "id": "deny",
+            "label": "Deny",
+            "description": "Reject this permission request and record the denial.",
+        },
+        {
+            "id": "once",
+            "label": "Allow once",
+            "description": "Allow only this exact pending request.",
+        },
+        {
+            "id": "cancel",
+            "label": "Cancel",
+            "description": "Leave the permission pending.",
+        },
+    ]
+
+
+def _pending_accept_decline_options(*, confirm_label: str = "Confirm", decline_label: str = "Decline") -> list[dict]:
+    return [
+        {
+            "id": "decline",
+            "label": decline_label,
+            "description": "Reject this pending action and record the denial.",
+        },
+        {
+            "id": "confirm",
+            "label": confirm_label,
+            "description": "Continue through the governed confirmation path.",
+        },
+    ]
+
+
+def _provider_connect_decision_options(*, confirm_label: str = "Connect") -> list[dict]:
+    return [
+        {
+            "id": "cancel",
+            "label": "Cancel",
+            "description": "Keep provider settings unchanged.",
+        },
+        {
+            "id": "connect",
+            "label": confirm_label,
+            "description": "Persist this provider account without running a model.",
+        },
+    ]
+
+
+def _provider_disconnect_decision_options() -> list[dict]:
+    return [
+        {
+            "id": "cancel",
+            "label": "Cancel",
+            "description": "Keep provider accounts and credentials.",
+        },
+        {
+            "id": "disconnect",
+            "label": "Disconnect",
+            "description": "Remove local accounts and matching secret-store entries.",
+        },
+    ]
+
+
+def render_permission_card_dialog(card: dict, *, selected_index: int = 0, status: str = "") -> str:
     command = str(card.get("command") or card.get("operation") or "unknown")
-    lines = [
+    detail_lines = [
         "[bold amber]Session permission[/bold amber]",
         "",
         f"Permission: {escape(str(card.get('permission_id') or card.get('approval_id') or 'unknown'))}",
@@ -4957,25 +5272,24 @@ def render_permission_card_dialog(card: dict, *, status: str = "") -> str:
     ]
     cwd = card.get("cwd")
     if cwd:
-        lines.append(f"Cwd: {escape(str(cwd))}")
+        detail_lines.append(f"Cwd: {escape(str(cwd))}")
     reasons = [str(reason) for reason in card.get("policy_reasons") or [] if str(reason).strip()]
     if reasons:
-        lines.append("Policy:")
-        lines.extend(f"- {escape(_first_line(reason, limit=96))}" for reason in reasons[:4])
+        detail_lines.append("Policy:")
+        detail_lines.extend(f"- {escape(_first_line(reason, limit=96))}" for reason in reasons[:4])
     reply_route = card.get("reply_route")
     if reply_route:
-        lines.append(f"Command: harness session approval {escape(str(card.get('session_id') or '<session>'))} {escape(str(card.get('permission_id') or '<permission>'))} once --project .")
-    lines.extend(
-        [
-            "",
-            "Press a to allow once, d to deny, c to cancel, Esc to close.",
-            "Enter only keeps this card open.",
-        ]
+        detail_lines.append(
+            f"Command: harness session approval {escape(str(card.get('session_id') or '<session>'))} "
+            f"{escape(str(card.get('permission_id') or '<permission>'))} once --project ."
+        )
+    return render_decision_menu_dialog(
+        "[bold amber]Resolve permission[/bold amber]",
+        detail_lines,
+        _permission_decision_options(),
+        selected_index=selected_index,
+        status=status,
     )
-    if status:
-        lines.append("")
-        lines.append(escape(status))
-    return "\n".join(lines)
 
 
 def render_agent_selection_dialog(agents: list[str], *, selected_agent: str | None, selected_index: int = 0) -> str:
@@ -5159,6 +5473,18 @@ def create_harness_app(
                 self.app.action_toggle_palette_focus()
 
     class SessionNavigatorList(ListView):
+        def focus(self, scroll_visible: bool = True):
+            self.app._left_pane_focused = True
+            self.app._leader_key_active = False
+            self.app._hide_dialog()
+            try:
+                self.app.set_focus(self, scroll_visible=scroll_visible)
+                self.app.call_later(self.app.set_focus, self, scroll_visible)
+                self.has_focus = True
+            except Exception:
+                super().focus(scroll_visible=scroll_visible)
+            return self
+
         def on_focus(self) -> None:
             self.app._left_pane_focused = True
             self.app._leader_key_active = False
@@ -5422,7 +5748,6 @@ def create_harness_app(
         @property
         def session_text_dialog_active(self) -> bool:
             return self._dialog_kind in {
-                "session_delete",
                 "session_rename",
                 "provider_env_prompt",
                 "provider_api_key_prompt",
@@ -5544,11 +5869,11 @@ def create_harness_app(
             self._dialog_query = ""
             self._dialog_selected_index = 0
             self._show_functionality_dialog()
-            self._render_palette_activation_status("Leader: m Models, s Sessions. p Permission.", ok=True)
+            self._render_palette_activation_status("Leader: m Models, s Sessions. o/g/e Right pane. p Permission.", ok=True)
 
         def is_leader_shortcut(self, key: str, character: str | None = None) -> bool:
             pressed = (character or key or "").casefold()
-            return pressed in {"m", "p", "s", "t"}
+            return pressed in {"m", "p", "s", "t", "o", "g", "e"}
 
         def action_cancel_leader_key(self) -> None:
             self._leader_key_active = False
@@ -5567,6 +5892,44 @@ def create_harness_app(
                 return
             if pressed == "t":
                 self._show_theme_dialog()
+                return
+            if pressed in {"o", "g", "e"}:
+                mode = {"o": "overview", "g": "graph", "e": "evidence"}[pressed]
+                self._hide_dialog()
+                self.action_set_right_pane_mode(mode)
+                entry_id = f"ui_controls.right_{mode}"
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_palette_activation/v1",
+                    "ok": True,
+                    "entry_id": entry_id,
+                    "activation_kind": "leader_key",
+                    "action": {
+                        "type": "set_right_pane_mode",
+                        "right_pane_mode": mode,
+                        "state_fields": ["right_pane_mode", "active_section_id", "active_section_index"],
+                    },
+                    "ui_action_applied": True,
+                    "source": "leader",
+                    "slash": f"ctrl+x {pressed}",
+                    "slash_consumed": True,
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                    "evidence_status": "ui_right_pane_mode_in_memory",
+                    "policy_boundary": _safe_palette_policy_boundary(),
+                    "blocked_reasons": [],
+                    "local_state_changes": {
+                        "changed_fields": ["right_pane_mode", "active_section_id", "active_section_index"],
+                        "creates_message": False,
+                        "starts_request": False,
+                        "executes_command": False,
+                        "mutates_filesystem": False,
+                        "grants_permission": False,
+                    },
+                    **_palette_no_side_effect_flags(),
+                }
+                self._render_palette_activation_status(f"Right pane: {mode}.", ok=True)
+                self._render_current_view()
                 return
             self._latest_palette_activation = {
                 "schema_version": "harness.tui_palette_activation/v1",
@@ -5710,7 +6073,7 @@ def create_harness_app(
             elif use_runtime_prompt and session_id is not None:
                 self.run_worker(lambda: self._run_runtime_prompt_request(request, stream_index, session_id), thread=True)
             else:
-                self.run_worker(lambda: self._run_chat_request(request, stream_index), thread=True)
+                self._run_local_chat_request(request, stream_index)
 
         def action_cycle_prompt_history(self, step: int) -> None:
             if not self._prompt_history:
@@ -5738,6 +6101,22 @@ def create_harness_app(
                     "lines": [error],
                 }
             self.call_from_thread(self._finish_chat_request, stream_index, response)
+
+        def _run_local_chat_request(self, request: str, stream_index: int) -> None:
+            def progress(update: dict) -> None:
+                self._append_stream_update(stream_index, update)
+
+            try:
+                response = handle_chat_input(request, project_root, self._chat_state, progress_callback=progress)
+            except Exception as exc:
+                error = SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)
+                response = {
+                    "ok": False,
+                    "kind": "chat_error",
+                    "title": "Chat Error",
+                    "lines": [error],
+                }
+            self._finish_chat_request(stream_index, response)
 
         def _run_runtime_prompt_request(self, request: str, stream_index: int, session_id: str) -> None:
             try:
@@ -5907,8 +6286,15 @@ def create_harness_app(
             if response.get("kind") == "runtime_prompt_submitted":
                 self._dashboard_cache = None
             prompt = self.query_one("#prompt", TextArea)
-            if self._chat_state.pending_action_contract is not None:
-                prompt.placeholder = "Type yes to confirm, no to cancel, or ask a follow-up"
+            if (
+                self._chat_state.pending_draft is not None
+                or self._chat_state.pending_orchestration is not None
+                or self._chat_state.pending_execute_lease_id is not None
+                or self._chat_state.pending_action_contract is not None
+                or self._chat_state.pending_session_tool_call is not None
+                or self._chat_state.pending_hosted_approval
+            ):
+                prompt.placeholder = "Use the decision menu, /confirm, or /decline"
             else:
                 prompt.placeholder = "Ask Harness, /help, or ? shortcuts"
             self._render_slash_suggestions(prompt.value)
@@ -5919,6 +6305,8 @@ def create_harness_app(
             else:
                 self._render_chat()
                 self._render_current_view()
+            if response.get("kind") != "quit":
+                self._maybe_open_pending_decision_menu(response)
             if response.get("kind") == "quit":
                 self.exit()
 
@@ -6036,7 +6424,7 @@ def create_harness_app(
         def action_focus_right_pane_section(self, section_id: str, *, render: bool = True) -> None:
             resolved = _right_panel_resolve_section_id(section_id)
             self._active_section_id = resolved
-            self._section_cursor_index = _right_panel_section_index(resolved)
+            self._section_cursor_index = _right_panel_mode_section_index(self._right_pane_mode, resolved)
             if render:
                 self._render_current_view()
 
@@ -6072,10 +6460,10 @@ def create_harness_app(
             if node_id is None and graph.get("nodes"):
                 node_id = graph["nodes"][0].get("id")
             self._selected_graph_node_id = str(node_id) if node_id else None
-            self._active_section_id = "node_details"
-            self._section_cursor_index = _right_panel_section_index("node_details")
             if self._right_pane_mode == "overview":
                 self._right_pane_mode = "graph"
+            self._active_section_id = "node_details"
+            self._section_cursor_index = _right_panel_mode_section_index(self._right_pane_mode, "node_details")
             self._render_current_view()
 
         def action_toggle_pinned_orchestration(self) -> None:
@@ -6151,6 +6539,10 @@ def create_harness_app(
         def action_focus_composer(self) -> None:
             self._left_pane_focused = False
             self._session_search_active = False
+            try:
+                self.query_one("#session-list", ListView).has_focus = False
+            except NoMatches:
+                pass
             try:
                 self.query_one("#prompt", TextArea).focus()
             except NoMatches:
@@ -6665,8 +7057,14 @@ def create_harness_app(
                 self._render_palette_activation_status("Cannot hard delete the active in-flight session.", ok=False)
                 return
             self._dialog_text_buffer = ""
-            self._dialog_context = {"session": row}
-            self._show_dialog(render_session_delete_dialog(row, buffer=""), kind="session_delete")
+            self._show_decision_dialog(
+                kind="session_delete",
+                title="[bold red]Confirm session delete[/bold red]",
+                detail_lines=_session_delete_detail_lines(row),
+                options=_session_delete_decision_options(),
+                selected_index=0,
+                context={"decision_type": "session_delete", "session": row},
+            )
 
         def action_open_session_rename_dialog(self) -> None:
             row = self._selected_session_row()
@@ -6683,21 +7081,29 @@ def create_harness_app(
                 self._hide_dialog()
                 self._render_palette_activation_status("No pending permission for the active session.", ok=False)
                 return
+            self._dialog_selected_index = 0
             self._dialog_context = {"permission_card": card}
-            self._show_dialog(render_permission_card_dialog(card), kind="permission")
-            self._render_palette_activation_status("Permission card opened. Press a, d, or c; Enter does not approve.", ok=True)
+            self._show_dialog(render_permission_card_dialog(card, selected_index=0), kind="permission")
+            self._render_palette_activation_status("Permission menu opened. Use arrows and Enter.", ok=True)
 
         def action_handle_permission_dialog_key(self, event) -> None:
             if event.key == "escape":
                 self._hide_dialog()
                 self._render_palette_activation_status("Permission card closed.", ok=False)
                 return
-            if event.key in ENTER_KEYS:
+            if event.key in {"down", "up"}:
+                options = _permission_decision_options()
+                self._dialog_selected_index = (self._dialog_selected_index + (1 if event.key == "down" else -1)) % len(options)
                 card = self._dialog_context.get("permission_card") or {}
                 self._show_dialog(
-                    render_permission_card_dialog(card, status="Enter does not approve. Press a, d, or c."),
+                    render_permission_card_dialog(card, selected_index=self._dialog_selected_index),
                     kind="permission",
                 )
+                return
+            if event.key in ENTER_KEYS:
+                options = _permission_decision_options()
+                selected = options[min(max(self._dialog_selected_index, 0), len(options) - 1)]
+                self._reply_to_open_permission(str(selected["id"]))
                 return
             pressed = str(event.character or event.key or "").casefold()
             if pressed == "a":
@@ -6800,6 +7206,8 @@ def create_harness_app(
                             "active_section_id": self._active_section_id,
                             "active_section_index": self._section_cursor_index,
                             "collapsed_section_ids": self._collapsed_section_ids,
+                            "right_pane_mode": self._right_pane_mode,
+                            "show_all_orchestrations": self._show_all_orchestrations,
                             "selected_theme": self._selected_theme_id,
                         },
                     ),
@@ -6824,6 +7232,8 @@ def create_harness_app(
                     "active_section_id": self._active_section_id,
                     "active_section_index": self._section_cursor_index,
                     "collapsed_section_ids": self._collapsed_section_ids,
+                    "right_pane_mode": self._right_pane_mode,
+                    "show_all_orchestrations": self._show_all_orchestrations,
                     "selected_theme": self._selected_theme_id,
                 },
             )
@@ -6866,12 +7276,16 @@ def create_harness_app(
                         )
                 else:
                     self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
+                    requested_mode = str(state.get("right_pane_mode") or self._right_pane_mode)
+                    if requested_mode in {"overview", "graph", "evidence"}:
+                        self._right_pane_mode = requested_mode
                     self._active_section_id = _right_panel_resolve_section_id(
                         state.get("active_section_id")
                         or _right_panel_section_id_at_index(state.get("active_section_index"))
                     )
-                    self._section_cursor_index = _right_panel_section_index(self._active_section_id)
+                    self._section_cursor_index = _right_panel_mode_section_index(self._right_pane_mode, self._active_section_id)
                     self._collapsed_section_ids = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids")))
+                    self._show_all_orchestrations = bool(state.get("show_all_orchestrations", self._show_all_orchestrations))
                     self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
                     self._apply_theme_selection(str(state.get("selected_theme") or self._selected_theme_id))
                     prompt.value = str(state.get("query", ""))
@@ -7606,9 +8020,10 @@ def create_harness_app(
                         f"Model selection blocked: {', '.join(activation.get('blocked_reasons') or ['unknown'])}.",
                         activation.get("evidence_status"),
                     ),
-                    ok=False,
-                )
-            self._render_current_view()
+                        ok=False,
+                    )
+            dashboard = self._dashboard_snapshot(force=True)
+            self._render_current_view(dashboard_snapshot=dashboard)
             return True
 
         def _activate_model_management_slash_action(self, query: str, prompt: object) -> bool:
@@ -7929,6 +8344,8 @@ def create_harness_app(
                 self._show_theme_dialog(selected_index=self._dialog_selected_index)
             elif self._dialog_kind == "agents":
                 self._show_agent_dialog(selected_index=self._dialog_selected_index)
+            elif self._dialog_kind in {"pending_decision", "session_delete", "provider_connect_confirm", "provider_disconnect_confirm"}:
+                self._refresh_decision_dialog()
 
         def action_activate_dialog_selection(self) -> None:
             if self._dialog_kind == "models":
@@ -7943,6 +8360,8 @@ def create_harness_app(
                 self._activate_selected_theme_dialog_entry()
             elif self._dialog_kind == "agents":
                 self._activate_selected_agent_dialog_entry()
+            elif self._dialog_kind in {"pending_decision", "session_delete", "provider_connect_confirm", "provider_disconnect_confirm"}:
+                self._activate_selected_decision()
 
         def action_handle_model_dialog_action_key(self, event) -> bool:
             if not self._dialog_visible or self._dialog_kind != "models":
@@ -8003,8 +8422,7 @@ def create_harness_app(
                 self._activate_provider_connect_slash_command(prompt.value)
                 return True
             if pressed == "x" and provider_id and _provider_disconnect_action_available(provider):
-                prompt.value = f"/provider disconnect {provider_id}"
-                self._activate_provider_connect_slash_command(prompt.value)
+                self._show_provider_disconnect_decision(provider_id, provider=provider)
                 return True
             if (
                 pressed == "account"
@@ -8073,9 +8491,7 @@ def create_harness_app(
             method = str(entry.get("method") or "")
             method_payload = entry.get("method_payload") or {}
             if method == "disconnect":
-                prompt = self.query_one("#prompt", TextArea)
-                prompt.value = f"/provider disconnect {provider_id}"
-                self._activate_provider_connect_slash_command(prompt.value)
+                self._show_provider_disconnect_decision(provider_id, provider=provider)
                 return
             if method == "env":
                 self._show_provider_env_prompt(provider, method_payload)
@@ -8092,7 +8508,7 @@ def create_harness_app(
                 self._show_provider_env_prompt(provider, method_payload)
                 return
             if method in {"aws_env", "codex_login", "static_local"}:
-                self._confirm_provider_local_connect(provider, method)
+                self._show_provider_local_connect_decision(provider, method)
                 return
             self._latest_palette_activation = {
                 "schema_version": "harness.tui_provider_connect/v1",
@@ -8135,6 +8551,120 @@ def create_harness_app(
             self._show_dialog(render_provider_api_key_prompt_dialog(provider), kind="provider_api_key_prompt")
             self._render_palette_activation_status("Enter API key. The dialog masks input and stores it in the local secret store.", ok=True)
 
+        def _show_provider_env_connect_decision(self) -> None:
+            provider = self._dialog_context.get("provider") or {}
+            method = self._dialog_context.get("method") or {}
+            provider_id = str(provider.get("provider_id") or "")
+            method_name = str(method.get("method") or "env")
+            env_var = self._dialog_text_buffer.strip() or str(method.get("default_env_var") or "").strip()
+            if not provider_id or not env_var:
+                self._render_palette_activation_status("Provider env connect needs a provider and env var name.", ok=False)
+                self._refresh_text_dialog()
+                return
+            self._show_decision_dialog(
+                kind="provider_connect_confirm",
+                title="[bold steel_blue1]Confirm provider connect[/bold steel_blue1]",
+                detail_lines=[
+                    f"Provider: {escape(provider_id)}",
+                    f"Method: {escape(_PROVIDER_METHOD_LABELS.get(method_name, method_name))}",
+                    f"Env var name: {escape(env_var)}",
+                    "",
+                    "Only the env var name is stored. The value is resolved later after policy gates pass.",
+                    "No model, provider request, browser, or credential validation is started by this confirmation.",
+                ],
+                options=_provider_connect_decision_options(),
+                selected_index=0,
+                context={
+                    **self._dialog_context,
+                    "decision_type": "provider_connect",
+                    "provider_confirm_kind": "provider_env_prompt",
+                    "dialog_text_buffer": env_var,
+                },
+            )
+            self._render_palette_activation_status("Review provider connect, then choose Cancel or Connect.", ok=True)
+
+        def _show_provider_api_key_connect_decision(self) -> None:
+            provider = self._dialog_context.get("provider") or {}
+            provider_id = str(provider.get("provider_id") or "")
+            api_key = self._dialog_text_buffer
+            if not provider_id or not api_key:
+                self._render_palette_activation_status("Provider API-key connect needs a provider and key.", ok=False)
+                self._refresh_text_dialog()
+                return
+            self._show_decision_dialog(
+                kind="provider_connect_confirm",
+                title="[bold steel_blue1]Store provider API key[/bold steel_blue1]",
+                detail_lines=[
+                    f"Provider: {escape(provider_id)}",
+                    "Method: API key",
+                    f"Key length: {len(api_key)} characters",
+                    "",
+                    "The key will be written to the local provider secret store and never echoed in evidence.",
+                    "No model, provider request, browser, or credential validation is started by this confirmation.",
+                ],
+                options=_provider_connect_decision_options(confirm_label="Store"),
+                selected_index=0,
+                context={
+                    **self._dialog_context,
+                    "decision_type": "provider_connect",
+                    "provider_confirm_kind": "provider_api_key_prompt",
+                    "dialog_text_buffer": api_key,
+                },
+            )
+            self._dialog_text_buffer = ""
+            self._render_palette_activation_status("Review API-key storage, then choose Cancel or Store.", ok=True)
+
+        def _show_provider_local_connect_decision(self, provider: dict, method: str) -> None:
+            provider_id = str(provider.get("provider_id") or "")
+            method_name = str(method or "")
+            if not provider_id or not method_name:
+                self._render_palette_activation_status("Provider local connect needs a provider and method.", ok=False)
+                return
+            self._show_decision_dialog(
+                kind="provider_connect_confirm",
+                title="[bold steel_blue1]Confirm provider connect[/bold steel_blue1]",
+                detail_lines=[
+                    f"Provider: {escape(provider_id)}",
+                    f"Method: {escape(_PROVIDER_METHOD_LABELS.get(method_name, method_name))}",
+                    "",
+                    "This persists a local provider account without entering a credential value in the TUI.",
+                    "No model, provider request, browser, or credential validation is started by this confirmation.",
+                ],
+                options=_provider_connect_decision_options(),
+                selected_index=0,
+                context={
+                    **self._dialog_context,
+                    "decision_type": "provider_connect",
+                    "provider_confirm_kind": "provider_local",
+                    "provider": provider,
+                    "provider_method": method_name,
+                },
+            )
+            self._render_palette_activation_status("Review provider connect, then choose Cancel or Connect.", ok=True)
+
+        def _show_provider_disconnect_decision(self, provider_id: str, *, provider: dict | None = None) -> None:
+            provider_label = str((provider or {}).get("display_name") or _humanize_identifier(provider_id))
+            self._show_decision_dialog(
+                kind="provider_disconnect_confirm",
+                title="[bold red]Confirm provider disconnect[/bold red]",
+                detail_lines=[
+                    f"Provider: {escape(provider_label)}",
+                    f"ID: {escape(provider_id or 'unknown')}",
+                    "",
+                    "This removes local provider accounts and matching local secret-store entries.",
+                    "It does not run a model or contact the provider.",
+                ],
+                options=_provider_disconnect_decision_options(),
+                selected_index=0,
+                context={
+                    **self._dialog_context,
+                    "decision_type": "provider_disconnect",
+                    "provider_id": provider_id,
+                    "provider": provider or self._dialog_context.get("provider") or {},
+                },
+            )
+            self._render_palette_activation_status("Review provider disconnect, then choose Cancel or Disconnect.", ok=True)
+
         def _dialog_row_count(self) -> int:
             if self._dialog_kind == "models":
                 return len(_model_selection_dialog_entries(self._dashboard_snapshot_for_dialog(), query=self._dialog_query))
@@ -8150,12 +8680,14 @@ def create_harness_app(
                 return len(THEME_DIALOG_ENTRIES)
             if self._dialog_kind == "agents":
                 return len(self._agent_dialog_entries())
+            if self._dialog_kind in {"pending_decision", "session_delete", "provider_connect_confirm", "provider_disconnect_confirm"}:
+                return len(self._dialog_context.get("decision_options") or [])
             return 0
 
         def action_handle_text_dialog_key(self, event) -> None:
             if event.key == "escape":
                 self._hide_dialog()
-                self._render_palette_activation_status("Session action cancelled.", ok=False)
+                self._render_palette_activation_status("Action cancelled.", ok=False)
                 return
             if event.key == "backspace":
                 self._dialog_text_buffer = self._dialog_text_buffer[:-1]
@@ -8166,14 +8698,12 @@ def create_harness_app(
                 self._refresh_text_dialog()
                 return
             if event.key in ENTER_KEYS:
-                if self._dialog_kind == "session_delete":
-                    self._confirm_session_hard_delete()
-                elif self._dialog_kind == "session_rename":
+                if self._dialog_kind == "session_rename":
                     self._confirm_session_rename()
                 elif self._dialog_kind == "provider_env_prompt":
-                    self._confirm_provider_env_connect()
+                    self._show_provider_env_connect_decision()
                 elif self._dialog_kind == "provider_api_key_prompt":
-                    self._confirm_provider_api_key_connect()
+                    self._show_provider_api_key_connect_decision()
                 return
             if event.character and event.character.isprintable():
                 self._dialog_text_buffer += event.character
@@ -8181,9 +8711,7 @@ def create_harness_app(
 
         def _refresh_text_dialog(self) -> None:
             session = self._dialog_context.get("session") or {}
-            if self._dialog_kind == "session_delete":
-                self._show_dialog(render_session_delete_dialog(session, buffer=self._dialog_text_buffer), kind="session_delete")
-            elif self._dialog_kind == "session_rename":
+            if self._dialog_kind == "session_rename":
                 self._show_dialog(render_session_rename_dialog(session, buffer=self._dialog_text_buffer), kind="session_rename")
             elif self._dialog_kind == "provider_env_prompt":
                 provider = self._dialog_context.get("provider") or {}
@@ -8198,6 +8726,37 @@ def create_harness_app(
                     render_provider_api_key_prompt_dialog(provider, buffer=self._dialog_text_buffer),
                     kind="provider_api_key_prompt",
                 )
+
+        def _confirm_provider_connect_from_decision(self) -> None:
+            confirm_kind = str(self._dialog_context.get("provider_confirm_kind") or "")
+            if "dialog_text_buffer" in self._dialog_context:
+                self._dialog_text_buffer = str(self._dialog_context.get("dialog_text_buffer") or "")
+            if confirm_kind == "provider_env_prompt":
+                self._dialog_kind = "provider_env_prompt"
+                self._confirm_provider_env_connect()
+                return
+            if confirm_kind == "provider_api_key_prompt":
+                self._dialog_kind = "provider_api_key_prompt"
+                self._confirm_provider_api_key_connect()
+                return
+            if confirm_kind == "provider_local":
+                provider = self._dialog_context.get("provider") or {}
+                method = str(self._dialog_context.get("provider_method") or "")
+                self._confirm_provider_local_connect(provider, method)
+                return
+            self._refresh_decision_dialog(status="Provider decision is missing a connection method.")
+            self._render_palette_activation_status("Provider decision is missing a connection method.", ok=False)
+
+        def _confirm_provider_disconnect(self, provider_id: str) -> None:
+            provider_id = provider_id.strip()
+            if not provider_id:
+                self._refresh_decision_dialog(status="Provider decision is missing a provider id.")
+                self._render_palette_activation_status("Provider decision is missing a provider id.", ok=False)
+                return
+            self._hide_dialog()
+            prompt = self.query_one("#prompt", TextArea)
+            prompt.value = f"/provider disconnect {provider_id}"
+            self._activate_provider_connect_slash_command(prompt.value)
 
         def _confirm_provider_env_connect(self) -> None:
             provider = self._dialog_context.get("provider") or {}
@@ -8287,6 +8846,7 @@ def create_harness_app(
                 after = ((refreshed.get("model_catalog") or {}).get("active_model") or {}).get("raw_model_ref")
             except Exception as exc:
                 self._dialog_text_buffer = ""
+                self._dialog_context.pop("dialog_text_buffer", None)
                 self._render_palette_activation_status(f"Provider API-key connect failed: {exc}", ok=False)
                 self._refresh_text_dialog()
                 return
@@ -8374,12 +8934,19 @@ def create_harness_app(
             )
             self._render_current_view(dashboard_snapshot=dashboard)
 
-        def _confirm_session_hard_delete(self) -> None:
+        def _confirm_session_hard_delete(self, *, confirmed: bool = False) -> None:
             session = self._dialog_context.get("session") or {}
             session_id = str(session.get("id") or "")
-            if self._dialog_text_buffer != "DELETE":
-                self._render_palette_activation_status("Type DELETE to confirm hard delete.", ok=False)
-                self._refresh_text_dialog()
+            if not confirmed and self._dialog_text_buffer != "DELETE":
+                self._render_palette_activation_status("Choose Hard delete from the decision menu to confirm.", ok=False)
+                if self._dialog_kind == "session_delete":
+                    self._refresh_decision_dialog(status="Choose Hard delete to confirm, or Cancel to keep the session.")
+                else:
+                    self._refresh_text_dialog()
+                return
+            if not session_id:
+                self._hide_dialog()
+                self._render_palette_activation_status("Hard delete failed: session id missing.", ok=False)
                 return
             if self._request_in_flight and session_id == self._chat_state.session_id:
                 self._hide_dialog()
@@ -8625,6 +9192,221 @@ def create_harness_app(
             self._dialog_visible = True
             self._dialog_kind = kind
 
+        def _maybe_open_pending_decision_menu(self, response: dict | None = None) -> None:
+            if self._dialog_visible or self._request_in_flight:
+                return
+            if isinstance(response, dict) and response.get("kind") == "session_tool_permission_required":
+                card = response.get("approval_card") if isinstance(response.get("approval_card"), dict) else None
+                if card is None:
+                    card = self._pending_permission_card()
+                if card is not None:
+                    self._dialog_selected_index = 0
+                    self._dialog_context = {"permission_card": dict(card)}
+                    self._show_dialog(render_permission_card_dialog(dict(card), selected_index=0), kind="permission")
+                    self._render_palette_activation_status("Permission menu opened. Use arrows and Enter.", ok=True)
+                    return
+            payload = self._pending_chat_decision_payload()
+            if payload is None:
+                return
+            self._show_decision_dialog(
+                kind="pending_decision",
+                title=str(payload["title"]),
+                detail_lines=list(payload["detail_lines"]),
+                options=list(payload["options"]),
+                selected_index=int(payload.get("selected_index", 0)),
+                context={"decision_type": "pending_chat", **dict(payload.get("context") or {})},
+            )
+            self._render_palette_activation_status("Decision menu opened. Use arrows and Enter.", ok=True)
+
+        def _pending_chat_decision_payload(self) -> dict | None:
+            contract = self._chat_state.pending_action_contract
+            if contract is not None:
+                payload = contract.to_payload()
+                approvals = ", ".join(str(item) for item in payload.get("required_approvals") or []) or "none"
+                confirmations = ", ".join(str(item) for item in payload.get("required_confirmations") or []) or "none"
+                return {
+                    "title": "[bold amber]Accept or decline pending action[/bold amber]",
+                    "detail_lines": [
+                        f"Summary: {escape(_first_line(payload.get('summary'), limit=96))}",
+                        f"Tool: {escape(_humanize_identifier(payload.get('tool')))}",
+                        f"Risk: {escape(_humanize_identifier(payload.get('risk')))}",
+                        f"Required approvals: {escape(approvals)}",
+                        f"Confirmations: {escape(confirmations)}",
+                        "",
+                        "Confirmation still routes through the recorded action contract and policy checks.",
+                    ],
+                    "options": _pending_accept_decline_options(confirm_label="Accept"),
+                    "selected_index": 0,
+                    "context": {"pending_kind": "action_contract"},
+                }
+            pending_tool = self._chat_state.pending_session_tool_call
+            if pending_tool is not None:
+                card = pending_tool.get("approval_card") if isinstance(pending_tool.get("approval_card"), dict) else {}
+                operation = card.get("command") or card.get("operation") or (pending_tool.get("arguments") or {})
+                target = (card.get("approval_target") or {}).get("normalized_target") if isinstance(card, dict) else None
+                return {
+                    "title": "[bold amber]Allow or deny tool request[/bold amber]",
+                    "detail_lines": [
+                        f"Permission: {escape(str(card.get('permission_id') or card.get('approval_id') or pending_tool.get('permission_id') or 'pending'))}",
+                        f"Tool: {escape(_humanize_identifier(card.get('tool_id') or pending_tool.get('tool_id')))}",
+                        f"Operation: {escape(_first_line(operation, limit=96))}",
+                        f"Target: {escape(_first_line(target or operation, limit=96))}",
+                        f"Risk: {escape(_humanize_identifier(card.get('risk') or 'unknown'))}",
+                        "",
+                        "Allow once confirms only this pending tool request. Deny records a bounded denial.",
+                    ],
+                    "options": _pending_accept_decline_options(confirm_label="Allow once", decline_label="Deny"),
+                    "selected_index": 0,
+                    "context": {"pending_kind": "session_tool_permission"},
+                }
+            if self._chat_state.pending_hosted_approval:
+                return {
+                    "title": "[bold amber]Create or decline hosted-boundary approval[/bold amber]",
+                    "detail_lines": [
+                        "Approval: scoped hosted-provider Codex execution",
+                        "Scope: latest blocked task or objective",
+                        "",
+                        "This is not apply-back approval and does not grant blanket filesystem writes.",
+                    ],
+                    "options": _pending_accept_decline_options(confirm_label="Create approval"),
+                    "selected_index": 0,
+                    "context": {"pending_kind": "hosted_boundary_approval"},
+                }
+            draft = self._chat_state.pending_draft
+            if draft is not None:
+                payload = draft.to_payload()
+                approvals = ", ".join(str(item) for item in payload.get("required_approvals") or []) or "none"
+                return {
+                    "title": "[bold amber]Create or decline task draft[/bold amber]",
+                    "detail_lines": [
+                        f"Title: {escape(_first_line(payload.get('title'), limit=96))}",
+                        f"Adapter: {escape(_humanize_identifier(payload.get('execution_adapter')))}",
+                        f"Task type: {escape(_humanize_identifier(payload.get('task_type')))}",
+                        f"Required approvals: {escape(approvals)}",
+                        f"Mutates when confirmed: {str(bool(payload.get('mutates_when_confirmed'))).lower()}",
+                        "",
+                        "Create records the task through Harness governance. Decline records no task.",
+                    ],
+                    "options": _pending_accept_decline_options(confirm_label="Create"),
+                    "selected_index": 0,
+                    "context": {"pending_kind": "task_draft"},
+                }
+            orchestration = self._chat_state.pending_orchestration
+            if orchestration is not None:
+                payload = orchestration.to_payload()
+                approvals = ", ".join(str(item) for item in payload.get("required_approvals") or []) or "none"
+                return {
+                    "title": "[bold amber]Run or decline orchestration[/bold amber]",
+                    "detail_lines": [
+                        f"Objective: {escape(_first_line(payload.get('objective_title'), limit=96))}",
+                        f"Orchestrator: {escape(_humanize_identifier(payload.get('orchestrator_id')))}",
+                        f"Tasks: {len(payload.get('tasks') or [])}",
+                        f"Required approvals: {escape(approvals)}",
+                        "",
+                        "Run creates the objective graph and uses scoped approvals for this workflow only.",
+                    ],
+                    "options": _pending_accept_decline_options(confirm_label="Run"),
+                    "selected_index": 0,
+                    "context": {"pending_kind": "orchestration_draft"},
+                }
+            if self._chat_state.pending_execute_lease_id is not None:
+                lease_id = str(self._chat_state.pending_execute_lease_id)
+                return {
+                    "title": "[bold amber]Dispatch or decline active lease[/bold amber]",
+                    "detail_lines": [
+                        f"Lease: {escape(lease_id)}",
+                        "Dispatch runs the registered adapter through Harness policy and evidence capture.",
+                        "Decline leaves the lease un-dispatched.",
+                    ],
+                    "options": _pending_accept_decline_options(confirm_label="Dispatch"),
+                    "selected_index": 0,
+                    "context": {"pending_kind": "execute_lease"},
+                }
+            return None
+
+        def _show_decision_dialog(
+            self,
+            *,
+            kind: str,
+            title: str,
+            detail_lines: list[str],
+            options: list[dict],
+            selected_index: int = 0,
+            status: str = "",
+            context: dict | None = None,
+        ) -> None:
+            self._dialog_selected_index = min(max(selected_index, 0), max(len(options) - 1, 0))
+            self._dialog_context = {
+                **(context or {}),
+                "decision_title": title,
+                "decision_detail_lines": list(detail_lines),
+                "decision_options": [dict(option) for option in options],
+                "decision_status": status,
+            }
+            self._show_dialog(
+                render_decision_menu_dialog(
+                    title,
+                    detail_lines,
+                    options,
+                    selected_index=self._dialog_selected_index,
+                    status=status,
+                ),
+                kind=kind,
+            )
+
+        def _refresh_decision_dialog(self, *, status: str | None = None) -> None:
+            options = self._dialog_context.get("decision_options") or []
+            self._dialog_selected_index = min(max(self._dialog_selected_index, 0), max(len(options) - 1, 0))
+            if status is not None:
+                self._dialog_context["decision_status"] = status
+            self._show_dialog(
+                render_decision_menu_dialog(
+                    str(self._dialog_context.get("decision_title") or "Decision"),
+                    [str(line) for line in self._dialog_context.get("decision_detail_lines") or []],
+                    options,
+                    selected_index=self._dialog_selected_index,
+                    status=str(self._dialog_context.get("decision_status") or ""),
+                ),
+                kind=self._dialog_kind,
+            )
+
+        def _activate_selected_decision(self) -> None:
+            options = self._dialog_context.get("decision_options") or []
+            if not options:
+                self._hide_dialog()
+                return
+            selected = options[min(max(self._dialog_selected_index, 0), len(options) - 1)]
+            decision_id = str(selected.get("id") or "")
+            decision_type = str(self._dialog_context.get("decision_type") or self._dialog_kind)
+            if decision_id in {"cancel", "close"}:
+                self._hide_dialog()
+                self._render_palette_activation_status("Decision cancelled.", ok=False)
+                return
+            if decision_type == "pending_chat":
+                if decision_id == "confirm":
+                    self._submit_pending_decision_command("/confirm")
+                elif decision_id == "decline":
+                    self._submit_pending_decision_command("/decline")
+                return
+            if decision_type == "session_delete":
+                if decision_id == "delete":
+                    self._confirm_session_hard_delete(confirmed=True)
+                return
+            if decision_type == "provider_connect":
+                if decision_id == "connect":
+                    self._confirm_provider_connect_from_decision()
+                return
+            if decision_type == "provider_disconnect":
+                if decision_id == "disconnect":
+                    self._confirm_provider_disconnect(str(self._dialog_context.get("provider_id") or ""))
+                return
+
+        def _submit_pending_decision_command(self, command: str) -> None:
+            self._hide_dialog()
+            prompt = self.query_one("#prompt", TextArea)
+            prompt.value = command
+            self.action_submit_prompt()
+
         def _hide_dialog(self) -> None:
             try:
                 overlay = self.query_one("#dialog-overlay", Container)
@@ -8634,6 +9416,7 @@ def create_harness_app(
                 self._dialog_kind = ""
                 self._dialog_context = {}
                 self._dialog_text_buffer = ""
+                self._dialog_selected_index = 0
                 return
             panel.update("")
             overlay.add_class("hidden")
@@ -8641,6 +9424,7 @@ def create_harness_app(
             self._dialog_kind = ""
             self._dialog_context = {}
             self._dialog_text_buffer = ""
+            self._dialog_selected_index = 0
 
         def _persist_model_selection(self, activation: dict, *, source: str) -> dict:
             action = activation.get("action") or {}
@@ -8716,7 +9500,6 @@ def create_harness_app(
                         "authority_granting": False,
                     }
                 session = result["session"]
-                self._dashboard_snapshot(force=True)
                 return {
                     **activation,
                     "ok": True,
@@ -8842,6 +9625,8 @@ def create_harness_app(
                         "active_section_id": self._active_section_id,
                         "active_section_index": self._section_cursor_index,
                         "collapsed_section_ids": self._collapsed_section_ids,
+                        "right_pane_mode": self._right_pane_mode,
+                        "show_all_orchestrations": self._show_all_orchestrations,
                         "selected_theme": self._selected_theme_id,
                     },
                 )
@@ -8858,12 +9643,16 @@ def create_harness_app(
                 }
                 state = result.get("view_state") or {}
                 self._focus_mode = str(state.get("focus_mode") or self._focus_mode)
+                requested_mode = str(state.get("right_pane_mode") or self._right_pane_mode)
+                if requested_mode in {"overview", "graph", "evidence"}:
+                    self._right_pane_mode = requested_mode
                 self._active_section_id = _right_panel_resolve_section_id(
                     state.get("active_section_id")
                     or _right_panel_section_id_at_index(state.get("active_section_index"))
                 )
-                self._section_cursor_index = _right_panel_section_index(self._active_section_id)
+                self._section_cursor_index = _right_panel_mode_section_index(self._right_pane_mode, self._active_section_id)
                 self._collapsed_section_ids = set(normalize_right_panel_collapsed_sections(state.get("collapsed_section_ids")))
+                self._show_all_orchestrations = bool(state.get("show_all_orchestrations", self._show_all_orchestrations))
                 self._selected_agent_id = str(state.get("selected_agent_id") or self._selected_agent_id)
                 self._apply_theme_selection(str(state.get("selected_theme") or self._selected_theme_id))
                 prompt.value = str(state.get("query", ""))
@@ -8989,20 +9778,6 @@ def create_harness_app(
 
         def _move_section_cursor(self, step: int) -> None:
             view = self._current_view()
-            graph = view.get("graph") or {}
-            nodes = graph.get("nodes") or []
-            if nodes and self._right_pane_mode in {"overview", "graph", "evidence"}:
-                ordered = sorted(nodes, key=lambda item: ((item.get("row") or 0), item.get("lane_id") or "", item.get("id") or ""))
-                node_ids = [str(item.get("id")) for item in ordered if item.get("id")]
-                if node_ids:
-                    current = self._selected_graph_node_id or graph.get("selected_node_id") or node_ids[0]
-                    current_index = node_ids.index(current) if current in node_ids else 0
-                    self._selected_graph_node_id = node_ids[(current_index + step) % len(node_ids)]
-                    if self._right_pane_mode in {"graph", "evidence"}:
-                        self._active_section_id = "node_details"
-                        self._section_cursor_index = _right_panel_section_index("node_details")
-                    self._render_current_view()
-                    return
             if not view["sections"]:
                 self._section_cursor_index = 0
                 self._active_section_id = "active_work"
@@ -9128,7 +9903,11 @@ def create_harness_app(
 
         def _sync_session_event_subscription(self) -> None:
             selected_id = self._selected_session_id or self._chat_state.session_id
-            if selected_id == self._session_event_subscription_id:
+            if (
+                selected_id == self._session_event_subscription_id
+                and self._session_event_subscription is not None
+                and not getattr(self._session_event_subscription, "closed", False)
+            ):
                 return
             old_subscription = self._session_event_subscription
             if old_subscription is not None:
@@ -9195,10 +9974,15 @@ def create_harness_app(
             self._schedule_event_refresh()
 
         def _schedule_event_refresh(self) -> None:
-            timer = self._event_render_timer
-            if timer is not None:
+            if self._event_render_timer is not None:
                 return
-            self._event_render_timer = self.set_timer(0.15, self._flush_event_refresh)
+            self._event_render_timer = True
+            try:
+                scheduled = self.call_later(self._flush_event_refresh)
+            except Exception:
+                scheduled = False
+            if not scheduled:
+                self._flush_event_refresh()
 
         def _flush_event_refresh(self) -> None:
             self._event_render_timer = None
@@ -9367,12 +10151,16 @@ def create_harness_app(
             if not view["sections"]:
                 self._section_cursor_index = 0
                 self._active_section_id = "active_work"
+            elif view.get("active_section_id"):
+                self._active_section_id = str(view["active_section_id"])
+                try:
+                    requested_index = int(view.get("active_section_index") or 0)
+                except (TypeError, ValueError):
+                    requested_index = 0
+                self._section_cursor_index = max(0, min(requested_index, len(view["sections"]) - 1))
             elif self._section_cursor_index >= len(view["sections"]):
                 self._section_cursor_index = len(view["sections"]) - 1
                 self._active_section_id = str(view["sections"][self._section_cursor_index]["id"])
-            elif view.get("active_section_id"):
-                self._active_section_id = str(view["active_section_id"])
-                self._section_cursor_index = int(view.get("active_section_index") or self._section_cursor_index)
 
         def _render_session_pane_only(self) -> None:
             dashboard_snapshot = self._dashboard_cache or self._dashboard_snapshot()
@@ -9548,8 +10336,18 @@ def run_read_only_tui(project_root: Path) -> None:
     run_harness_app(project_root)
 
 
+def _tui_decision_prompt_line(line: object) -> str:
+    text = str(line)
+    lowered = text.casefold()
+    if "type yes" in lowered and ("/confirm" in lowered or "no to cancel" in lowered):
+        return "Decision: use the menu, /confirm, or /decline."
+    if "chat shortcut: yes or /confirm" in lowered:
+        return "Chat shortcut: /confirm"
+    return text
+
+
 def _chat_response_to_tui_message(response: dict, *, debug: bool = False) -> dict:
-    lines = list(response.get("lines", []))
+    lines = [_tui_decision_prompt_line(line) for line in response.get("lines", [])]
     if response.get("kind") == "self_managed_local_action":
         title = str(response.get("title") or "Done").strip()
         return {

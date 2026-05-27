@@ -387,6 +387,94 @@ def test_chat_slash_commands_and_plain_text_model_unavailable_without_mutation(t
     assert not (tmp_path / ".harness").exists()
 
 
+def test_chat_plan_mode_slash_persists_session_local_state(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+
+    before = handle_chat_input("/plan-mode", tmp_path, state)
+    entered = handle_chat_input("/plan-mode on inspect before editing", tmp_path, state)
+    status = handle_chat_input("/plan-mode status", tmp_path, state)
+    exited = handle_chat_input("/plan-mode off scoped implementation plan is ready", tmp_path, state)
+
+    assert before["kind"] == "plan_mode_status"
+    assert before["planning_mode"] == {"active": False}
+    assert entered["kind"] == "session_tool_result"
+    assert "Planning mode entered." in "\n".join(entered["lines"])
+    assert status["planning_mode"]["active"] is True
+    assert status["planning_mode"]["reason"] == "inspect before editing"
+    assert exited["ok"] is True
+    session = SQLiteStore(tmp_path).get_session(state.session_id)
+    planning_mode = session.metadata["planning_mode"]
+    assert planning_mode["active"] is False
+    assert planning_mode["summary"] == "scoped implementation plan is ready"
+    assert "session.planning_mode.entered" in [
+        event.kind for event in SQLiteStore(tmp_path).list_session_store_events(state.session_id)
+    ]
+    assert "session.planning_mode.exited" in [
+        event.kind for event in SQLiteStore(tmp_path).list_session_store_events(state.session_id)
+    ]
+
+
+def test_chat_research_and_browse_slashes_prepare_web_approval_without_network(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["web_tools"] = {
+        "enabled": True,
+        "fetch_enabled": True,
+        "search_enabled": True,
+        "approval_required": True,
+        "allowed_domains": ["docs.example.com"],
+        "search_endpoint_url": "http://127.0.0.1:9/search",
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    state = ChatSessionState()
+
+    research = handle_chat_input("/research Harness session tools", tmp_path, state)
+    research_pending = dict(state.pending_session_tool_call or {})
+    research_permission = SQLiteStore(tmp_path).get_session_permission(research["permission_id"])
+    declined = handle_chat_input("/decline not now", tmp_path, state)
+    browse = handle_chat_input("/browse https://docs.example.com/guide", tmp_path, state)
+    browse_pending = dict(state.pending_session_tool_call or {})
+
+    assert route_chat_intent("deep research Harness session tools")["intent"] == "deep_research"
+    assert route_chat_intent("browse https://docs.example.com/guide")["intent"] == "web_browse"
+    assert research["kind"] == "session_tool_permission_required"
+    assert research["tool_request"]["tool"] == "web-search"
+    assert research["tool_request"]["arguments"]["search_type"] == "deep"
+    assert research["tool_request"]["arguments"]["livecrawl"] == "preferred"
+    assert research["tool_request"]["arguments"]["context_max_characters"] == 30000
+    assert research_pending["tool_id"] == "web-search"
+    assert research_permission.status.value == "pending"
+    assert research_permission.boundary_kind.value == "external_network"
+    assert declined["kind"] == "declined"
+    assert browse["kind"] == "session_tool_permission_required"
+    assert browse["tool_request"]["tool"] == "web-fetch"
+    assert browse["tool_request"]["arguments"] == {
+        "url": "https://docs.example.com/guide",
+        "format": "markdown",
+        "timeout": 30,
+    }
+    assert browse_pending["tool_id"] == "web-fetch"
+    browse_permission = SQLiteStore(tmp_path).get_session_permission(browse["permission_id"])
+    assert browse_permission.status.value == "pending"
+    assert browse_permission.normalized_target_pattern == "https://docs.example.com"
+
+
+def test_chat_web_slashes_explain_missing_project_web_config(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    research = handle_chat_input("/research Harness docs", tmp_path, ChatSessionState())
+    browse = handle_chat_input("/browse https://docs.example.com/guide", tmp_path, ChatSessionState())
+
+    assert research["kind"] == "session_tool_result"
+    assert research["ok"] is False
+    assert "web_tools.search_enabled: true" in "\n".join(research["lines"])
+    assert browse["kind"] == "session_tool_result"
+    assert browse["ok"] is False
+    assert "web_tools.fetch_enabled: true" in "\n".join(browse["lines"])
+
+
 def test_cli_chat_interactive_smoke_exits_without_mutation(tmp_path) -> None:
     result = runner.invoke(app, ["--project", str(tmp_path), "--plain"], input="/help\nshow tasks\n/quit\n")
 
@@ -634,6 +722,7 @@ def test_tui_dashboard_reports_uninitialized_project_without_mutation(tmp_path) 
         "settings",
         "sessions",
         "models",
+        "planning_research",
         "commands",
         "guidance",
         "safety",
@@ -836,6 +925,7 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
         "settings",
         "sessions",
         "models",
+        "planning_research",
         "commands",
         "guidance",
         "safety",
@@ -1558,6 +1648,7 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
         "model_selection",
         "agent_authoring",
         "native_agents",
+        "planning_research",
         "project_agents",
         "built_in_specs",
         "objectives_tasks",
@@ -1607,6 +1698,8 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     planning_entries = filter_command_palette(palette, "repo_planning")
     build_entries = filter_command_palette(palette, "build agent")
     plan_agent_entries = filter_command_palette(palette, "plan agent")
+    research_entries = filter_command_palette(palette, "deep research")
+    browse_entries = filter_command_palette(palette, "browse url")
     adapter_entries = filter_command_palette(palette, "adapter")
     packaging_entries = filter_command_palette(palette, "wheel")
     missing_entries = filter_command_palette(palette, "does-not-exist")
@@ -1618,6 +1711,8 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert any(entry["id"] == "objectives_tasks.add_repo_planning_task" for entry in planning_entries["entries"])
     assert any(entry["id"] == "native_agents.build" for entry in build_entries["entries"])
     assert any(entry["id"] == "native_agents.plan" for entry in plan_agent_entries["entries"])
+    assert [entry["id"] for entry in research_entries["entries"]] == ["planning_research.deep_research"]
+    assert [entry["id"] for entry in browse_entries["entries"]] == ["planning_research.browse_url"]
     assert any(entry["id"] == "registered_adapters.execute" for entry in adapter_entries["entries"])
     assert [entry["id"] for entry in packaging_entries["entries"]] == ["packaging_smoke.wheel"]
     assert missing_entries["entries"] == []
@@ -1832,6 +1927,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
         "sessions",
         "queue_daemon",
         "agents_specs",
+        "planning_research",
         "runtime_evidence",
         "settings",
         "command_palette",
@@ -1840,10 +1936,11 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["sections"][0]["pane_ids"] == ["overview", "models", "guidance", "commands"]
     assert view["sections"][1]["pane_ids"] == ["sessions"]
     assert view["sections"][2]["pane_ids"] == ["tasks", "leases", "daemon"]
-    assert view["sections"][5]["pane_ids"] == ["settings"]
-    assert view["sections"][6]["pane_ids"][0] == "command_palette"
-    assert view["sections"][6]["pane_ids"][-1] == "command_palette_selected"
-    assert "command_palette_ui_controls" in view["sections"][6]["pane_ids"]
+    assert view["sections"][4]["pane_ids"] == ["planning_research"]
+    assert view["sections"][6]["pane_ids"] == ["settings"]
+    assert view["sections"][7]["pane_ids"][0] == "command_palette"
+    assert view["sections"][7]["pane_ids"][-1] == "command_palette_selected"
+    assert "command_palette_ui_controls" in view["sections"][7]["pane_ids"]
     assert view["pane_order"][:8] == ["overview", "models", "guidance", "commands", "sessions", "tasks", "leases", "daemon"]
     assert view["pane_order"][-1] == "safety"
     assert view["empty_state"] is None
@@ -1853,7 +1950,7 @@ def test_tui_view_model_sections_order_and_no_match_state(tmp_path) -> None:
     assert view["search"]["dashboard_panes"] == len(panes)
     assert view["search"]["palette_matches"] == len(palette["entries"])
     assert render_view_status(view).startswith(
-        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 8 | Panes:"
+        "View search: none | Focus: dashboard | Collapsed: 0 | Sections: 9 | Panes:"
     )
     assert f"Palette commands: {len(palette['entries'])}" in render_view_status(view)
     assert {hint["key"] for hint in view["navigation_hints"]} == {
@@ -2119,7 +2216,7 @@ def test_tui_right_panel_surfaces_assistant_context_and_pending_action(tmp_path)
     assert "Pending: Create Harness objective: improve chat" in rendered
     assert "Tool: create objective" in rendered
     assert "Risk: control plane write" in rendered
-    assert "Next: confirm or cancel in chat" in rendered
+    assert "Next: choose confirm or decline from the decision menu" in rendered
     assert not (tmp_path / ".harness").exists()
 
 
@@ -2492,7 +2589,7 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             await pilot.pause()
             assert prompt.value == "/"
             assert "... 1 previous. Keep using arrows to navigate." in str(slash_status.content)
-            assert "[bold blue]/run" in str(slash_status.content)
+            assert "[bold blue]/evidence" in str(slash_status.content)
 
             await pilot.press("e", "x", "e")
             await pilot.pause()
@@ -2612,6 +2709,34 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
             rendered = "\n".join(render_chat_message(message) for message in app._messages)
             assert "Orchestrators" in rendered
             assert "coding_orchestrator" in rendered
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_tab_switches_right_panel_sections_with_graph_nodes(tmp_path) -> None:
+    pytest.importorskip("textual")
+
+    store = SQLiteStore.open_initialized(tmp_path)
+    objective = store.create_objective("Section navigation")
+    store.create_task("Plan section switch", objective_id=objective.id, agent_id="Planner")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            assert app._active_section_id == "active_work"
+            assert app._section_cursor_index == 1
+
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert app._active_section_id == "graph"
+            assert app._section_cursor_index == 2
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+
+            assert app._active_section_id == "active_work"
+            assert app._section_cursor_index == 1
 
     asyncio.run(run_pilot())
 
@@ -3107,6 +3232,7 @@ def test_tui_session_rail_uses_topic_titles_and_in_memory_navigation(tmp_path) -
             await pilot.press("d")
             await pilot.pause()
             assert app._dialog_kind == "session_delete"
+            assert "Hard delete" in str(app.query_one("#dialog-panel").content)
             await pilot.press("escape")
             await pilot.pause()
             assert app._dialog_visible is False
@@ -3114,9 +3240,7 @@ def test_tui_session_rail_uses_topic_titles_and_in_memory_navigation(tmp_path) -
 
             purged_session_id = app._selected_session_id
             await pilot.press("d")
-            for char in "DELETE":
-                await pilot.press(char)
-            await pilot.press("enter")
+            await pilot.press("down", "enter")
             await pilot.pause()
             try:
                 store.get_session(purged_session_id)
@@ -3124,6 +3248,58 @@ def test_tui_session_rail_uses_topic_titles_and_in_memory_navigation(tmp_path) -
                 pass
             else:
                 raise AssertionError("confirmed hard delete should purge the selected session")
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_pending_chat_action_opens_accept_decline_menu(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import Static, TextArea
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(120, 44)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            dialog = app.query_one("#dialog-panel", Static)
+
+            prompt.value = "create dry run task"
+            app.action_submit_prompt()
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if app._dialog_kind == "pending_decision":
+                    break
+
+            assert app._dialog_kind == "pending_decision"
+            rendered = str(dialog.content)
+            assert "Create or decline task draft" in rendered
+            assert "Decline" in rendered
+            assert "Create" in rendered
+
+            await pilot.press("enter")
+            await pilot.pause(0.5)
+            assert app._dialog_visible is False
+            assert app._chat_state.pending_draft is None
+            assert store.list_tasks() == []
+
+            prompt.value = "create dry run task"
+            app.action_submit_prompt()
+            for _ in range(20):
+                await pilot.pause(0.1)
+                if app._dialog_kind == "pending_decision":
+                    break
+            assert app._dialog_kind == "pending_decision"
+            await pilot.press("down", "enter")
+            await pilot.pause(0.5)
+
+            tasks = store.list_tasks()
+            assert len(tasks) == 1
+            assert tasks[0].metadata == {
+                "execution_adapter": "dry_run",
+                "task_type": "phase_1a_test",
+            }
 
     asyncio.run(run_pilot())
 
@@ -3327,6 +3503,92 @@ def test_tui_safe_slash_commands_focus_dashboard_sections_without_chat(tmp_path)
     asyncio.run(run_pilot())
 
 
+def test_tui_slash_commands_switch_right_pane_graph_and_evidence_without_chat(tmp_path) -> None:
+    pytest.importorskip("textual")
+    from textual.widgets import TextArea
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            prompt = app.query_one("#prompt", TextArea)
+            initial_messages = len(app._messages)
+
+            for slash, mode, section_id, section_index, entry_id in [
+                ("/graph", "graph", "graph", 1, "ui_controls.right_graph"),
+                ("/evidence", "evidence", "evidence", 0, "ui_controls.right_evidence"),
+                ("/overview", "overview", "active_work", 1, "ui_controls.right_overview"),
+            ]:
+                prompt.value = ""
+                await pilot.press(*list(slash))
+                await pilot.pause()
+                assert prompt.value == slash
+
+                await pilot.press("enter")
+                await pilot.pause()
+
+                assert app._focus_mode == "dashboard"
+                assert app._right_pane_mode == mode
+                assert app._active_section_id == section_id
+                assert app._section_cursor_index == section_index
+                assert prompt.value == ""
+                assert len(app._messages) == initial_messages
+                assert app._request_in_flight is False
+                assert app._latest_palette_activation["entry_id"] == entry_id
+                assert app._latest_palette_activation["source"] == "slash"
+                assert app._latest_palette_activation["slash"] == slash
+                assert app._latest_palette_activation["chat_submitted"] is False
+                assert app._latest_palette_activation["model_request_started"] is False
+                assert app._latest_palette_activation["evidence_status"] == "ui_right_pane_mode_in_memory"
+                assert app._latest_palette_activation["local_state_changes"]["changed_fields"] == [
+                    "focus_mode",
+                    "right_pane_mode",
+                    "active_section_id",
+                    "active_section_index",
+                ]
+                assert app._latest_palette_activation["process_started"] is False
+                assert app._latest_palette_activation["filesystem_modified"] is False
+                assert app._latest_palette_activation["permission_granting"] is False
+                assert app._latest_palette_activation["authority_granting"] is False
+
+    asyncio.run(run_pilot())
+
+
+def test_tui_leader_switches_right_pane_graph_and_evidence(tmp_path) -> None:
+    pytest.importorskip("textual")
+
+    async def run_pilot() -> None:
+        app = create_harness_app(tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.press("ctrl+x", "g")
+            await pilot.pause()
+            assert app._right_pane_mode == "graph"
+            assert app._active_section_id == "graph"
+            assert app._section_cursor_index == 1
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.right_graph"
+            assert app._latest_palette_activation["source"] == "leader"
+            assert app._latest_palette_activation["process_started"] is False
+
+            await pilot.press("ctrl+x", "e")
+            await pilot.pause()
+            assert app._right_pane_mode == "evidence"
+            assert app._active_section_id == "evidence"
+            assert app._section_cursor_index == 0
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.right_evidence"
+            assert app._latest_palette_activation["source"] == "leader"
+            assert app._latest_palette_activation["process_started"] is False
+
+            await pilot.press("ctrl+x", "o")
+            await pilot.pause()
+            assert app._right_pane_mode == "overview"
+            assert app._active_section_id == "active_work"
+            assert app._section_cursor_index == 1
+            assert app._latest_palette_activation["entry_id"] == "ui_controls.right_overview"
+            assert app._latest_palette_activation["source"] == "leader"
+            assert app._latest_palette_activation["process_started"] is False
+
+    asyncio.run(run_pilot())
+
+
 def test_tui_safe_ui_control_slash_commands_mutate_only_local_state(tmp_path) -> None:
     pytest.importorskip("textual")
     from textual.widgets import TextArea
@@ -3489,7 +3751,13 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
         "sessions",
         "tasks",
         "runs",
+        "overview",
+        "graph",
+        "evidence",
         "progress",
+        "plan-mode",
+        "research",
+        "browse",
         "execute",
         "run",
         "confirm",
@@ -3551,6 +3819,9 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     tasks = next(command for command in slash_commands["commands"] if command["name"] == "tasks")
     runs = next(command for command in slash_commands["commands"] if command["name"] == "runs")
     progress = next(command for command in slash_commands["commands"] if command["name"] == "progress")
+    plan_mode = next(command for command in slash_commands["commands"] if command["name"] == "plan-mode")
+    research = next(command for command in slash_commands["commands"] if command["name"] == "research")
+    browse = next(command for command in slash_commands["commands"] if command["name"] == "browse")
     execute = next(command for command in slash_commands["commands"] if command["name"] == "execute")
     run = next(command for command in slash_commands["commands"] if command["name"] == "run")
     confirm = next(command for command in slash_commands["commands"] if command["name"] == "confirm")
@@ -3573,6 +3844,9 @@ def test_tui_slash_commands_cover_palette_templates_without_execution() -> None:
     assert tasks["activation"]["kind"] == "ui_action"
     assert runs["activation"]["kind"] == "ui_action"
     assert progress["activation"]["kind"] == "chat_command"
+    assert plan_mode["activation"]["kind"] == "chat_command"
+    assert research["activation"]["kind"] == "chat_command"
+    assert browse["activation"]["kind"] == "chat_command"
     assert execute["activation"]["kind"] == "chat_command"
     assert run["activation"]["kind"] == "chat_command"
     assert confirm["activation"]["kind"] == "chat_command"
@@ -3608,6 +3882,7 @@ def test_tui_functionality_table_groups_commands_by_operator_workflow() -> None:
         "suggested",
         "session",
         "agent",
+        "research",
         "tasks",
         "adapters",
         "evidence",
@@ -3616,6 +3891,9 @@ def test_tui_functionality_table_groups_commands_by_operator_workflow() -> None:
     ]
     assert any(row["title"] == "Switch model" and row["invoke"] == "ctrl+x m" for row in table["rows"])
     model_row = next(row for row in table["rows"] if row["id"] == "suggested.model")
+    research_row = next(row for row in table["rows"] if row["id"] == "research.research")
+    browse_row = next(row for row in table["rows"] if row["id"] == "research.browse")
+    plan_mode_row = next(row for row in table["rows"] if row["id"] == "research.plan-mode")
     execute_row = next(row for row in table["rows"] if row["id"] == "adapters.execute")
     status_row = next(row for row in table["rows"] if row["id"] == "suggested.status")
     run_row = next(row for row in table["rows"] if row["id"] == "tasks.run")
@@ -3624,6 +3902,11 @@ def test_tui_functionality_table_groups_commands_by_operator_workflow() -> None:
     assert model_row["authority"] == "session metadata"
     assert model_row["status"] == "state"
     assert model_row["does_not"] == "call provider, execute model, hidden fallback"
+    assert plan_mode_row["authority"] == "chat governance"
+    assert plan_mode_row["evidence"] == "session planning metadata"
+    assert research_row["authority"] == "chat governance"
+    assert research_row["evidence"] == "permission/run/artifacts"
+    assert browse_row["authority"] == "chat governance"
     assert execute_row["authority"] == "chat governance"
     assert execute_row["status"] == "chat"
     assert execute_row["does_not"] == "bypass governance, hidden fallback, blanket permission"
@@ -3670,7 +3953,7 @@ def test_tui_slash_command_suggestions_render_like_command_menu() -> None:
     assert "[bold cyan]" not in all_suggestions
     assert "[bold blue]/status" in selected_second
     assert "... 1 previous. Keep using arrows to navigate." in selected_after_first_page
-    assert "[bold blue]/run" in selected_after_first_page
+    assert "[bold blue]/evidence" in selected_after_first_page
     assert "List the compact operator slash commands." in all_suggestions
     assert "/execute" in execute_suggestions
     assert "/execute-read-only" not in execute_suggestions

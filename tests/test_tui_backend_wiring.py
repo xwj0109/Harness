@@ -807,7 +807,15 @@ def test_tui_model_picker_api_key_flow_persists_secret_and_returns_to_model_pick
             assert app._dialog_kind == "provider_api_key_prompt"
 
             app._dialog_text_buffer = "sk-dialog-secret"
-            app._confirm_provider_api_key_connect()
+            await pilot.press("enter")
+            await pilot.pause()
+            assert app._dialog_kind == "provider_connect_confirm"
+            confirm_dialog = str(app.query_one("#dialog-panel", Static).content)
+            assert "Store provider API key" in confirm_dialog
+            assert "Key length: 16 characters" in confirm_dialog
+            assert "sk-dialog-secret" not in confirm_dialog
+
+            await pilot.press("down", "enter")
             await pilot.pause()
 
             activation = app._latest_palette_activation
@@ -837,6 +845,26 @@ def test_tui_model_picker_api_key_flow_persists_secret_and_returns_to_model_pick
             status = str(app.query_one("#slash-status", Static).content)
             assert "Select a model from this provider" in status
             assert "sk-dialog-secret" not in str(app.query_one("#dialog-panel", Static).content)
+
+            app._show_provider_disconnect_decision(
+                "paid_openai_compatible",
+                provider={"provider_id": "paid_openai_compatible", "display_name": "Paid OpenAI Compatible"},
+            )
+            await pilot.pause()
+            assert app._dialog_kind == "provider_disconnect_confirm"
+            disconnect_dialog = str(app.query_one("#dialog-panel", Static).content)
+            assert "Disconnect" in disconnect_dialog
+            assert "secret-store" in disconnect_dialog
+            await pilot.press("down", "enter")
+            await pilot.pause(0.5)
+
+            disconnect_activation = app._latest_palette_activation
+            assert disconnect_activation["ok"] is True
+            assert disconnect_activation["activation_kind"] == "provider_disconnect"
+            assert disconnect_activation["provider_id"] == "paid_openai_compatible"
+            assert disconnect_activation["provider_execution_started"] is False
+            assert disconnect_activation["model_execution_started"] is False
+            assert store.active_provider_account("paid_openai_compatible") is None
 
     asyncio.run(run_pilot())
 
@@ -881,6 +909,13 @@ providers:
             rendered_methods = str(app.query_one("#dialog-panel", Static).content)
             assert "Static local" in rendered_methods
             app.action_activate_dialog_selection()
+            await pilot.pause()
+            assert app._dialog_kind == "provider_connect_confirm"
+            confirm_dialog = str(app.query_one("#dialog-panel", Static).content)
+            assert "Confirm provider connect" in confirm_dialog
+            assert "Static local" in confirm_dialog
+
+            await pilot.press("down", "enter")
             await pilot.pause()
 
             activation = app._latest_palette_activation
@@ -1484,7 +1519,7 @@ def test_tui_event_stream_loss_falls_back_to_polling(tmp_path) -> None:
     asyncio.run(run_pilot())
 
 
-def test_tui_permission_card_renders_and_enter_does_not_approve(tmp_path) -> None:
+def test_tui_permission_card_renders_and_enter_uses_selected_default_denial(tmp_path) -> None:
     pytest.importorskip("textual")
     store = SQLiteStore.open_initialized(tmp_path)
     session = store.create_session(title="Needs approval")
@@ -1513,14 +1548,16 @@ def test_tui_permission_card_renders_and_enter_does_not_approve(tmp_path) -> Non
             assert "Operation: pytest" in rendered
             assert "Risk: medium" in rendered
             assert "Boundary: local only" in rendered
-            assert "Press a to allow once" in rendered
+            assert "Deny" in rendered
+            assert "Allow once" in rendered
+            assert "Enter selects" in rendered
 
             await pilot.press("enter")
             await pilot.pause()
 
-            assert store.get_session_permission(permission.id).status.value == "pending"
-            assert app._dialog_kind == "permission"
-            assert "Enter does not approve" in str(app.query_one("#dialog-panel").content)
+            assert store.get_session_permission(permission.id).status.value == "denied"
+            assert app._dialog_visible is False
+            assert app._latest_palette_activation["permission_granting"] is False
 
     asyncio.run(run_pilot())
 
@@ -1550,7 +1587,7 @@ def test_tui_permission_dialog_allow_deny_cancel_use_service(tmp_path) -> None:
         async with app.run_test(size=(120, 40)) as pilot:
             app._dialog_context = {"permission_card": service.list_permissions(session.id)["snapshot"]["pending_approval_cards"][0]}
             app._show_dialog(render_permission_card_dialog(app._dialog_context["permission_card"]), kind="permission")
-            await pilot.press("a")
+            await pilot.press("down", "enter")
             await pilot.pause()
             assert store.get_session_permission(permissions[0].id).status.value == "allowed"
             assert app._latest_palette_activation["permission_granting"] is True
@@ -1558,7 +1595,7 @@ def test_tui_permission_dialog_allow_deny_cancel_use_service(tmp_path) -> None:
 
             app._dialog_context = {"permission_card": service.list_permissions(session.id)["snapshot"]["pending_approval_cards"][0]}
             app._show_dialog(render_permission_card_dialog(app._dialog_context["permission_card"]), kind="permission")
-            await pilot.press("d")
+            await pilot.press("enter")
             await pilot.pause()
             assert store.get_session_permission(permissions[1].id).status.value == "denied"
             assert app._latest_palette_activation["permission_granting"] is False
@@ -1566,7 +1603,7 @@ def test_tui_permission_dialog_allow_deny_cancel_use_service(tmp_path) -> None:
 
             app._dialog_context = {"permission_card": service.list_permissions(session.id)["snapshot"]["pending_approval_cards"][0]}
             app._show_dialog(render_permission_card_dialog(app._dialog_context["permission_card"]), kind="permission")
-            await pilot.press("c")
+            await pilot.press("down", "down", "enter")
             await pilot.pause()
             assert store.get_session_permission(permissions[2].id).status.value == "cancelled"
             assert app._latest_palette_activation["permission_granting"] is False
