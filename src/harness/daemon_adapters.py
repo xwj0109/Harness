@@ -23,7 +23,7 @@ def execute_read_only_summary_lease(
     owner: str = DEFAULT_TASK_LEASE_OWNER,
 ) -> DaemonReadOnlyResult:
     store = SQLiteStore(project_root)
-    lease, attempt, task = store.validate_read_only_lease_for_execution(lease_id)
+    lease, attempt, task = store.validate_read_only_lease_for_execution(lease_id, owner=owner)
     task_policy = resolve_task_effective_policy(task)
     policy_hash = effective_policy_sha256(task_policy)
     cfg = load_config(project_root)
@@ -154,17 +154,29 @@ def _record_read_only_rejection(
     reason_code: str,
     rejection_reasons: list[str],
 ) -> None:
-    daemon = store.ensure_daemon(owner=lease.owner)
+    refreshed_lease, refreshed_attempt, refreshed_task = store.finalize_rejected_task_lease(
+        lease.id,
+        reason_code=reason_code,
+        rejection_reasons=rejection_reasons,
+        decision="execution_adapter_rejected",
+        adapter_id="read_only_summary",
+        owner=lease.owner,
+    )
+    daemon = store.ensure_daemon(owner=refreshed_lease.owner)
     store.record_daemon_event(
         daemon.id,
         event_type="execution_adapter_rejected",
         message="Read-only summary adapter execution was rejected before run creation.",
         metadata={
-            "lease_id": lease.id,
-            "task_id": task.id,
-            "attempt_id": attempt.id,
+            "lease_id": refreshed_lease.id,
+            "task_id": refreshed_task.id if refreshed_task is not None else task.id,
+            "attempt_id": refreshed_attempt.id if refreshed_attempt is not None else attempt.id,
             "adapter_id": "read_only_summary",
+            "decision": "execution_adapter_rejected",
             "reason_code": reason_code,
             "rejection_reasons": sanitize_for_logging(rejection_reasons),
+            "lease_status": refreshed_lease.status.value,
+            "task_status": refreshed_task.status.value if refreshed_task is not None else None,
+            "attempt_status": refreshed_attempt.status.value if refreshed_attempt is not None else None,
         },
     )

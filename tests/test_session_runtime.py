@@ -1840,8 +1840,14 @@ def test_session_runtime_context_overflow_compacts_and_retries_once_even_when_no
     store = SQLiteStore(tmp_path)
     store.initialize()
     session = store.create_session(title="Runtime compaction")
-    store.append_session_message(session.id, "user", "Earlier request about a parser failure.")
-    store.append_session_message(session.id, "assistant", "Earlier answer with implementation details.")
+    history = [
+        store.append_session_message(
+            session.id,
+            SessionMessageRole.USER if index % 2 == 0 else SessionMessageRole.ASSISTANT,
+            f"History {index} about a parser failure and implementation detail.",
+        )
+        for index in range(10)
+    ]
     adapter = FailsThenSucceedsProviderAdapter(
         ProviderError(
             category=ProviderErrorCategory.CONTEXT_OVERFLOW,
@@ -1863,10 +1869,42 @@ def test_session_runtime_context_overflow_compacts_and_retries_once_even_when_no
     assert first_request.provider_id == retry_request.provider_id
     assert first_request.model_ref == retry_request.model_ref
     assert retry_request.context["attempt"] == 2
-    assert retry_request.context["context_compaction"]["schema_version"] == "harness.runtime_compaction/v1"
-    assert retry_request.context["context_compaction"]["method"] == "deterministic_recent_message_summary"
+    compaction = retry_request.context["context_compaction"]
+    assert compaction["schema_version"] == "harness.runtime_compaction/v1"
+    assert compaction["method"] == "deterministic_recent_message_summary"
+    assert compaction["message_count_before"] == 10
+    assert compaction["group_count_before"] == 10
+    assert compaction["retained_message_ids"] == [message.id for message in history[-8:]]
+    assert compaction["dropped_message_ids"] == [message.id for message in history[:2]]
+    assert compaction["dropped_message_count"] == 2
+    assert compaction["summary_of_message_ids"] == [message.id for message in history[-8:]]
+    assert compaction["retained_group_ids"] == [f"group_{message.id}" for message in history[-8:]]
+    assert compaction["dropped_group_ids"] == [f"group_{message.id}" for message in history[:2]]
+    group_by_id = {group["group_id"]: group for group in compaction["message_groups"]}
+    assert group_by_id[f"group_{history[0].id}"]["dropped_by_compaction"] is True
+    assert group_by_id[f"group_{history[0].id}"]["exclude_reason"] == "outside_recent_retention_window"
+    assert group_by_id[f"group_{history[-1].id}"]["included_in_retry_context"] is True
+    assert group_by_id[f"group_{history[-1].id}"]["summarized_by_summary_id"] == compaction["summary_id"]
+    prompt_groups = [group for group in compaction["message_groups"] if group["source"] == "queued_prompt"]
+    assert len(prompt_groups) == 1
+    assert prompt_groups[0]["included_in_retry_context"] is True
+    assert prompt_groups[0]["summarized_by_summary_id"] == compaction["summary_id"]
+    assert compaction["summary_of_group_ids"] == [f"group_{message.id}" for message in history[-8:]] + [
+        prompt_groups[0]["group_id"]
+    ]
+    assert compaction["strategy"]["reference_pattern"] == "microsoft_agent_framework_compaction_trace"
+    assert compaction["strategy"]["provider_summarization_used"] is False
+    assert compaction["strategy"]["hidden_provider_fallback"] is False
+    assert compaction["content_policy"]["summary_content_included"] is True
+    assert compaction["content_policy"]["source_message_bodies_included"] is False
+    assert compaction["content_policy"]["secret_values_included"] is False
+    assert compaction["provider_execution_started"] is False
+    assert compaction["model_execution_started"] is False
+    assert compaction["network_called"] is False
+    assert compaction["permission_granting"] is False
     assert retry_request.messages[0].role == "system"
-    assert "Earlier request" in retry_request.messages[0].content
+    assert "History 2" in retry_request.messages[0].content
+    assert "History 0" not in retry_request.messages[0].content
     events = store.list_session_store_events(session.id)
     assert "harness.runtime.compaction.started" in [event.kind for event in events]
     provider_events = [
@@ -1880,7 +1918,10 @@ def test_session_runtime_context_overflow_compacts_and_retries_once_even_when_no
     started = [event for event in events if event.kind == "harness.runtime.compaction.started"][-1]
     assert started.payload["provider_error"]["retryable"] is False
     completed = [event for event in events if event.kind == "harness.runtime.compaction.completed"][-1]
-    assert completed.payload["message_count_before"] == 2
+    assert completed.payload["message_count_before"] == 10
+    assert completed.payload["summary_id"] == compaction["summary_id"]
+    assert completed.payload["dropped_message_ids"] == [message.id for message in history[:2]]
+    assert completed.payload["content_policy"]["source_message_bodies_included"] is False
     retry = [event for event in events if event.kind == "harness.runtime.retry_scheduled"][-1]
     assert retry.payload["reason"] == "context_overflow"
     assert retry.payload["attempt"] == 1
@@ -1974,12 +2015,68 @@ def test_session_runtime_provider_unknown_tool_becomes_model_visible_tool_error(
     messages = store.list_session_messages(session.id)
     tool_messages = [message for message in messages if message.role.value == "tool"]
     assert tool_messages
-    assert "Invalid tool call" in tool_messages[-1].content_preview
-    assert "Requested tool: missing-tool" in tool_messages[-1].content_preview
+    assert "Provider emitted unadvertised or policy-blocked tool: missing-tool" in tool_messages[-1].content_preview
     output = [event for event in store.list_session_store_events(session.id) if event.kind == "tool_call.output"][-1]
     assert output.payload["ok"] is False
-    assert output.payload["error_type"] == "invalid_tool_call"
-    assert output.payload["tool_id"] == "invalid"
+    assert output.payload["error_type"] == "provider_tool_not_available"
+    assert output.payload["tool_id"] == "missing-tool"
+    assert output.payload["tool_call_key"]
+    assert store.list_session_permissions(session.id) == []
+
+
+def test_session_runtime_blocks_unrequested_permission_gated_provider_tool(tmp_path) -> None:
+    write_default_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    session = store.create_session(title="Runtime unrequested shell block")
+    adapter = ToolCallingProviderAdapter(
+        tool_name="shell",
+        arguments={"command": "printf blocked", "timeout_seconds": 5, "shell_executable": "/bin/sh"},
+    )
+    manager = SessionRuntimeManager.for_store(store, provider_adapter=adapter)
+
+    manager.submit_prompt(SessionPromptRequest(session_id=session.id, content="Run shell without explicit tool metadata."))
+    final = manager.wait(session.id, timeout=1.0)
+
+    assert final.phase == SessionRuntimePhase.IDLE
+    assert store.get_session(session.id).status.value == "active"
+    assert store.list_session_permissions(session.id) == []
+    output = [event for event in store.list_session_store_events(session.id) if event.kind == "tool_call.output"][-1]
+    assert output.payload["tool_id"] == "shell"
+    assert output.payload["ok"] is False
+    assert output.payload["error_type"] == "provider_tool_not_available"
+    assert "unadvertised or policy-blocked" in output.payload["preview"]
+    assert not [event for event in store.list_session_store_events(session.id) if event.kind == "permission.checked"]
+
+
+def test_session_runtime_blocks_policy_blocked_requested_provider_tool_before_stream(tmp_path) -> None:
+    write_default_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    session = store.create_session(title="Runtime policy blocked tool")
+    adapter = ToolCallingProviderAdapter(tool_name="web-fetch", arguments={"url": "https://example.com"})
+    manager = SessionRuntimeManager.for_store(store, provider_adapter=adapter)
+
+    manager.submit_prompt(
+        SessionPromptRequest(
+            session_id=session.id,
+            content="Fetch external content.",
+            metadata={"requires_tools": True, "allowed_tools": ["web-fetch"]},
+        )
+    )
+    final = manager.wait(session.id, timeout=1.0)
+
+    assert final.phase == SessionRuntimePhase.FAILED
+    assert store.list_session_permissions(session.id) == []
+    events = store.list_session_store_events(session.id)
+    assert "model.started" not in [event.kind for event in events]
+    policy = [event for event in events if event.kind == "harness.runtime.provider_tool_policy"][-1]
+    assert policy.payload["runtime_requested_tools"] == ["web-fetch"]
+    assert policy.payload["runtime_allowed_provider_tools"] == []
+    assert "web-fetch" in policy.payload["runtime_blocked_requested_tools"][0]
+    assert policy.payload["provider_error"]["error_type"] == "ProviderToolPolicyBlocked"
+    finished = [event for event in events if event.kind == "harness.turn.finished"][-1]
+    assert finished.payload["provider_error"]["error_type"] == "ProviderToolPolicyBlocked"
 
 
 def test_session_runtime_suspends_provider_tool_until_permission_reply_resumes(tmp_path) -> None:
@@ -1993,7 +2090,13 @@ def test_session_runtime_suspends_provider_tool_until_permission_reply_resumes(t
     )
     manager = SessionRuntimeManager.for_store(store, provider_adapter=adapter)
 
-    manager.submit_prompt(SessionPromptRequest(session_id=session.id, content="Run approved shell."))
+    manager.submit_prompt(
+        SessionPromptRequest(
+            session_id=session.id,
+            content="Run approved shell.",
+            metadata={"requires_tools": True, "allowed_tools": ["shell"]},
+        )
+    )
     waiting = manager.wait(session.id, timeout=1.0)
 
     assert waiting.phase == SessionRuntimePhase.WAITING_PERMISSION
@@ -2044,7 +2147,13 @@ def test_session_runtime_denied_provider_permission_writes_tool_error_and_clears
     )
     manager = SessionRuntimeManager.for_store(store, provider_adapter=adapter)
 
-    manager.submit_prompt(SessionPromptRequest(session_id=session.id, content="Run denied shell."))
+    manager.submit_prompt(
+        SessionPromptRequest(
+            session_id=session.id,
+            content="Run denied shell.",
+            metadata={"requires_tools": True, "allowed_tools": ["shell"]},
+        )
+    )
     waiting = manager.wait(session.id, timeout=1.0)
     reply = _reply_to_session_permission(
         store,

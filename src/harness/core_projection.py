@@ -7,7 +7,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from harness.config import HARNESS_DIR
-from harness.memory.sqlite_store import SQLiteStore
+from harness.memory.sqlite_store import DAEMON_TASK_PAUSE_DECISIONS, SQLiteStore
 from harness.models import ArtifactRecord, EventRecord, RunRecord, TaskLease, TaskRecord
 from harness.policy import effective_policy_sha256, resolve_run_effective_policy
 from harness.security import is_secret_path, sanitize_for_logging
@@ -344,14 +344,16 @@ def build_core_blocked_state_projection(project_root: Path, task_id: str) -> Cor
     task = store.get_task(task_id)
     lease = _latest_lease(store, task.id)
     daemon_metadata = _latest_daemon_rejection_metadata(store, task.id, lease.id if lease is not None else None)
+    eligibility = _daemon_eligibility_projection(store, task)
     blocked_reasons = _dedupe(
         [
             *[f"Missing required approval: {approval}." for approval in task.required_approvals],
             *[str(item) for item in daemon_metadata.get("rejection_reasons", [])],
+            *_blocked_reasons_from_daemon_eligibility(eligibility),
         ]
     )
-    policy_sha256 = daemon_metadata.get("policy_sha256")
-    decision = str(daemon_metadata.get("decision") or daemon_metadata.get("event_type") or "blocked")
+    policy_sha256 = daemon_metadata.get("policy_sha256") or eligibility.get("effective_policy_sha256")
+    decision = _blocked_decision_from_metadata_or_eligibility(daemon_metadata, eligibility)
     return CoreBlockedStateProjection(
         run_id=None,
         task_id=task.id,
@@ -367,6 +369,53 @@ def build_core_blocked_state_projection(project_root: Path, task_id: str) -> Cor
         blocked_reasons=blocked_reasons,
         next_commands=_next_commands(root, run_id=None, task_id=task.id, lease_id=lease.id if lease else None),
     )
+
+
+def _daemon_eligibility_projection(store: SQLiteStore, task: TaskRecord) -> dict[str, Any]:
+    try:
+        with store.connect() as conn:
+            eligibility = store.daemon_task_eligibility(task, conn=conn)
+    except Exception:
+        return {}
+    sanitized = sanitize_for_logging(eligibility)
+    return sanitized if isinstance(sanitized, dict) else {}
+
+
+def _blocked_decision_from_metadata_or_eligibility(
+    daemon_metadata: dict[str, Any],
+    eligibility: dict[str, Any],
+) -> str:
+    if daemon_metadata:
+        return str(daemon_metadata.get("decision") or daemon_metadata.get("event_type") or "blocked")
+    eligibility_decision = str(eligibility.get("decision") or "")
+    if eligibility_decision == "waiting_approval":
+        return "approval_required"
+    if eligibility_decision in DAEMON_TASK_PAUSE_DECISIONS:
+        return eligibility_decision
+    return "blocked"
+
+
+def _blocked_reasons_from_daemon_eligibility(eligibility: dict[str, Any]) -> list[str]:
+    if not eligibility or eligibility.get("decision") not in DAEMON_TASK_PAUSE_DECISIONS:
+        return []
+    reasons: list[str] = []
+    reason = eligibility.get("reason")
+    if reason:
+        reasons.append(str(reason))
+    for approval in eligibility.get("missing_approvals") or []:
+        reasons.append(f"Missing required approval: {approval}.")
+    if eligibility.get("decision") and eligibility.get("adapter_id"):
+        detail_parts = [
+            f"decision={eligibility.get('decision')}",
+            f"adapter={eligibility.get('adapter_id')}",
+        ]
+        if eligibility.get("task_type"):
+            detail_parts.append(f"task_type={eligibility.get('task_type')}")
+        missing = eligibility.get("missing_approvals") or []
+        if missing:
+            detail_parts.append("missing_approvals=" + ",".join(str(item) for item in missing))
+        reasons.append("Daemon eligibility blocked task before lease: " + "; ".join(detail_parts) + ".")
+    return _dedupe(sanitize_for_logging(reasons))
 
 
 def _artifact_projection(artifact: ArtifactRecord) -> CoreArtifactProjection:

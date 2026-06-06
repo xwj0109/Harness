@@ -6,6 +6,7 @@
         "disabled_reason",
         "enabled",
         "execution_supported",
+        "exposure",
         "maturity",
         "permission_key",
         "permission_required",

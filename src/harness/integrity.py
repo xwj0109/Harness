@@ -18,6 +18,7 @@ from harness.registry import builtin_spec_registry
 from harness.sandbox_profiles import get_sandbox_profile
 from harness.security import sanitize_for_logging
 from harness.specs import HARD_FORBIDDEN_PATHS, REQUIRED_WORKBENCH_FORBIDDEN_ACTIONS, ToolPermission
+from harness.workflow_templates import BUILTIN_WORKFLOW_TEMPLATE_INTENTS, template_for_intent
 
 
 INTEGRITY_RESULT_SCHEMA_VERSION = "harness.integrity_check_result/v1"
@@ -44,6 +45,7 @@ def run_integrity_check(project_root: Path) -> IntegrityCheckResult:
     checks: list[IntegrityCheckRecord] = []
     checks.extend(check_builtin_spec_integrity())
     checks.extend(check_adapter_descriptor_integrity())
+    checks.extend(check_workflow_template_integrity())
     checks.extend(check_security_doc_integrity(project_root))
     checks.extend(check_tui_static_asset_integrity())
     checks.sort(key=lambda item: (item.status.value, item.subject_kind.value, item.subject_id, item.id))
@@ -168,6 +170,51 @@ def adapter_descriptor_evidence() -> list[dict[str, Any]]:
             }
         )
     return evidence
+
+
+def check_workflow_template_integrity() -> list[IntegrityCheckRecord]:
+    checks: list[IntegrityCheckRecord] = []
+    for intent in BUILTIN_WORKFLOW_TEMPLATE_INTENTS:
+        try:
+            template = template_for_intent(intent, "Integrity template validation", Path("."))
+            payload = template.to_payload()
+            task_payloads = payload.get("tasks", [])
+            checks.append(
+                _check(
+                    IntegritySubjectKind.WORKFLOW_TEMPLATE,
+                    template.id,
+                    IntegrityCheckStatus.PASS,
+                    "Built-in workflow template contract validated.",
+                    sha256=stable_json_sha256(payload),
+                    metadata={
+                        "schema_version": payload.get("schema_version"),
+                        "intent": intent,
+                        "tasks": len(task_payloads) if isinstance(task_payloads, list) else 0,
+                        "execution_adapters": [
+                            str(task.get("execution_adapter"))
+                            for task in task_payloads
+                            if isinstance(task, dict) and task.get("execution_adapter")
+                        ],
+                        "task_types": [
+                            str(task.get("task_type"))
+                            for task in task_payloads
+                            if isinstance(task, dict) and task.get("task_type")
+                        ],
+                        "required_approvals": payload.get("required_approvals", []),
+                    },
+                )
+            )
+        except Exception as exc:
+            checks.append(
+                _check(
+                    IntegritySubjectKind.WORKFLOW_TEMPLATE,
+                    intent,
+                    IntegrityCheckStatus.FAIL,
+                    "Built-in workflow template failed contract validation.",
+                    metadata={"intent": intent, "error": str(exc)},
+                )
+            )
+    return checks
 
 
 def check_security_doc_integrity(project_root: Path) -> list[IntegrityCheckRecord]:

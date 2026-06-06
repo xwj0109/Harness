@@ -20,7 +20,9 @@ from harness.models import (
     SessionPermissionSource,
 )
 from harness.operator_context import build_session_pane_projection, build_tui_dashboard
+from harness.session_events import SessionEventKind, append_session_event
 from harness.session_runtime import SessionRuntimeManager
+from harness.session_tools import execute_session_tool
 from harness.tui import (
     build_right_panel_model,
     build_tui_transcript_projection,
@@ -266,6 +268,44 @@ def test_tui_dashboard_displays_default_source_and_active_selected_model(tmp_pat
     assert active_model["model_resolution"]["source"] == "operator_preference"
     assert models_by_ref["codex_cli/gpt-5.5"]["selected_model"] is True
     assert "Model source: operator preference" in context["rows"]
+
+
+def test_tui_dashboard_session_pane_and_right_panel_surface_malformed_transcript_health(tmp_path) -> None:
+    write_default_config(tmp_path)
+    store = SQLiteStore.open_initialized(tmp_path)
+    session = store.create_session(title="Malformed transcript")
+    append_session_event(
+        tmp_path,
+        session_id=session.id,
+        event_type=SessionEventKind.SESSION_STARTED,
+        message="Started",
+    )
+    transcript_path = tmp_path / ".harness" / "sessions" / session.id / "transcript.jsonl"
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("not json with secret sk-abcdefghijklmnopqrstuvwxyz\n")
+
+    dashboard = build_tui_dashboard(tmp_path, selected_session_id=session.id)
+    pane = build_session_pane_projection(tmp_path, selected_session_id=session.id)
+    right_panel = build_right_panel_model(dashboard, {}, "", "dashboard")
+    attention = next(section for section in right_panel["sections"] if section["id"] == "attention")
+
+    active_health = dashboard["active_session"]["transcript_health"]
+    row_health = pane["sessions"][0]["transcript_health"]
+    recent_health = dashboard["recent_sessions"][0]["transcript_health"]
+    for health in (active_health, row_health, recent_health):
+        assert health["schema_version"] == "harness.session_events_read/v1"
+        assert health["ok"] is False
+        assert health["parse_error_count"] == 1
+        assert health["validation_error_count"] == 0
+        assert health["contents_included"] is False
+        assert health["permission_granting"] is False
+    assert dashboard["summary"]["malformed_session_transcripts"] == 1
+    assert pane["counts"]["malformed_session_transcripts"] == 1
+    assert attention["rows"] == ["Session transcript: malformed | parse=1 | validation=0"]
+    serialized = str([dashboard, pane, right_panel])
+    assert "not json" not in serialized
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in serialized
+    assert "Traceback" not in serialized
 
 
 def test_tui_dashboard_model_catalog_hot_reloads_custom_models_config(tmp_path) -> None:
@@ -1732,6 +1772,33 @@ def test_tui_transcript_projection_suppresses_completed_runtime_event_chatter(tm
     assert "Persisted answer" in rendered_text
     assert "Runtime started" not in rendered_text
     assert "Tool started" not in rendered_text
+    assert "Session Events" not in rendered_text
+
+
+def test_tui_transcript_projection_hides_plan_mode_toggle_chatter(tmp_path) -> None:
+    write_default_config(tmp_path)
+    store = SQLiteStore.open_initialized(tmp_path)
+    session = store.create_session(title="Plan mode transcript")
+    execute_session_tool(store, tmp_path, session.id, "plan-enter", {"reason": "shortcut"})
+    execute_session_tool(
+        store,
+        tmp_path,
+        session.id,
+        "plan-exit",
+        {"summary": "done", "next_action": "", "proposed_tools": []},
+    )
+    service = HarnessAppService(tmp_path, store=store)
+
+    projection = build_tui_transcript_projection(service, session.id, [])
+
+    rendered_text = "\n".join(
+        [str(message.get("title") or "") for message in projection["messages"]]
+        + [str(line) for message in projection["messages"] for line in message.get("lines", [])]
+    )
+    assert "plan-enter" not in rendered_text
+    assert "plan-exit" not in rendered_text
+    assert "Planning mode entered" not in rendered_text
+    assert "Planning mode exited" not in rendered_text
     assert "Session Events" not in rendered_text
 
 

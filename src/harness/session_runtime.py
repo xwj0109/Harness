@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import uuid
@@ -35,6 +36,7 @@ from harness.provider_events import (
 )
 from harness.protocol_adapters import ProtocolAdapter, ProtocolAdapterRegistry, protocol_adapter_missing_error
 from harness.security import sanitize_for_logging
+from harness.session_tools import build_session_tool_policy_projection, get_session_tool_descriptor, model_visible_session_tool_ids
 
 
 RUNTIME_SCHEMA_VERSION = "harness.session_runtime_state/v1"
@@ -846,6 +848,40 @@ class SessionRuntimeManager:
     ) -> _ProviderStreamResult:
         if self.provider_adapter is None and self.protocol_adapter_registry is None:
             return _ProviderStreamResult(response_text="", failed=True)
+        requested_tools = self._requested_provider_tools(prompt)
+        if requested_tools:
+            tool_policy = self._runtime_provider_tool_policy(prompt)
+            tool_policy_error = _runtime_provider_tool_policy_error(tool_policy)
+        else:
+            tool_policy = {"allowed_tools": [], "blocked_tools": []}
+            tool_policy_error = None
+        if tool_policy_error is not None:
+            self.store.append_store_event(
+                EventStreamType.SESSION,
+                prompt.session_id,
+                "harness.runtime.provider_tool_policy",
+                {
+                    "turn_id": turn_id,
+                    "prompt_id": prompt.prompt_id,
+                    "runtime_requested_tools": requested_tools,
+                    "runtime_allowed_provider_tools": tool_policy["allowed_tools"],
+                    "runtime_blocked_requested_tools": tool_policy["blocked_tools"],
+                    "provider_error": tool_policy_error.model_dump(mode="json"),
+                    "provider_execution_started": False,
+                    "model_execution_started": False,
+                    "permission_granting": False,
+                    "summary": "runtime provider tool policy blocked before stream",
+                },
+                session_id=prompt.session_id,
+                message_id=prompt.message_id,
+                redaction_state=RedactionState.REDACTED,
+            )
+            return _ProviderStreamResult(
+                response_text="",
+                failed=True,
+                error=tool_policy_error,
+                provider_execution_started=False,
+            )
         messages = self._provider_messages_for_prompt(prompt)
         if compaction is not None:
             summary = str(compaction.get("summary") or "").strip()
@@ -1089,10 +1125,21 @@ class SessionRuntimeManager:
                 )
             requested_tools = self._requested_provider_tools(prompt)
             tools_requested = bool(requested_tools) or _metadata_truthy(prompt.metadata.get("requires_tools"))
+            tool_policy = self._runtime_provider_tool_policy(prompt, include_default=tools_requested)
             validation_payload["runtime_tools_requested"] = tools_requested
             validation_payload["runtime_requested_tools"] = requested_tools
+            validation_payload["runtime_allowed_provider_tools"] = tool_policy["allowed_tools"]
+            validation_payload["runtime_blocked_requested_tools"] = tool_policy["blocked_tools"]
             validation_payload["model_tool_support"] = bool(validation.resolved_model_selection.model.tool_support)
-            if tools_requested and not validation.resolved_model_selection.model.tool_support:
+            if tool_policy["blocked_tools"]:
+                blocked_reasons = list(validation_payload.get("blocked_reasons") or [])
+                if "provider_tool_policy_blocked" not in blocked_reasons:
+                    blocked_reasons.append("provider_tool_policy_blocked")
+                validation_payload["blocked_reasons"] = blocked_reasons
+                validation_payload["executable"] = False
+                validation_payload["runtime_blocked"] = True
+                runtime_tool_error = _runtime_provider_tool_policy_error(tool_policy)
+            elif tools_requested and not validation.resolved_model_selection.model.tool_support:
                 blocked_reasons = list(validation_payload.get("blocked_reasons") or [])
                 if "tool_support_unsupported" not in blocked_reasons:
                     blocked_reasons.append("tool_support_unsupported")
@@ -1413,6 +1460,31 @@ class SessionRuntimeManager:
             if isinstance(metadata, dict):
                 tools.update(_requested_tools_from_metadata(metadata))
         return sorted(tools)
+
+    def _runtime_provider_tool_policy(self, prompt: QueuedPrompt, *, include_default: bool = True) -> dict[str, list[str]]:
+        requested_tools = self._requested_provider_tools(prompt)
+        if not requested_tools:
+            return {
+                "allowed_tools": model_visible_session_tool_ids(project_root=self.project_root) if include_default else [],
+                "blocked_tools": [],
+            }
+        allowed: list[str] = []
+        blocked: list[str] = []
+        for tool_id in requested_tools:
+            try:
+                descriptor = get_session_tool_descriptor(tool_id)
+            except KeyError:
+                blocked.append(f"{tool_id} (unknown tool)")
+                continue
+            if tool_id == "invalid":
+                blocked.append(f"{tool_id} (internal recovery tool)")
+                continue
+            policy = build_session_tool_policy_projection(descriptor, project_root=self.project_root)
+            if not policy.enabled:
+                blocked.append(f"{tool_id} ({policy.disabled_reason or 'policy disabled'})")
+                continue
+            allowed.append(tool_id)
+        return {"allowed_tools": sorted(set(allowed)), "blocked_tools": sorted(set(blocked))}
 
     def _runtime_context_budget_payload(
         self,
@@ -1835,12 +1907,30 @@ class SessionRuntimeManager:
         tool_id = _provider_tool_name(event)
         arguments = _provider_tool_arguments(event)
         tool_call_id = event.tool_call_id or str(event.payload.get("tool_call_id") or "")
+        tool_call_key = _provider_tool_call_key(tool_id or "unknown", arguments)
         if not tool_id:
             self._persist_provider_tool_error(
                 prompt,
                 event,
                 preview="Provider emitted a tool call without a tool name.",
                 error_type="invalid_tool_call",
+                turn_id=turn_id,
+                tool_call_key=tool_call_key,
+            )
+            return None
+        allowed_tools = set(self._runtime_provider_tool_policy(prompt)["allowed_tools"])
+        if tool_id not in allowed_tools:
+            self._persist_provider_tool_error(
+                prompt,
+                event,
+                preview=(
+                    f"Provider emitted unadvertised or policy-blocked tool: {tool_id}. "
+                    "Runtime provider tool calls are limited to the default model-visible session tools unless "
+                    "explicit prompt metadata requests a policy-enabled tool."
+                ),
+                error_type="provider_tool_not_available",
+                turn_id=turn_id,
+                tool_call_key=tool_call_key,
             )
             return None
         try:
@@ -1854,6 +1944,7 @@ class SessionRuntimeManager:
                 tool_id,
                 arguments,
                 tool_call_id=tool_call_id or None,
+                tool_call_key=tool_call_key,
                 turn_id=turn_id,
                 run_mode=RunMode.READ_ONLY,
             )
@@ -1866,6 +1957,8 @@ class SessionRuntimeManager:
                 event,
                 preview=str(sanitize_for_logging(str(exc))),
                 error_type="unknown_tool" if isinstance(exc, KeyError) else "invalid_tool_call",
+                turn_id=turn_id,
+                tool_call_key=tool_call_key,
             )
             return None
 
@@ -1876,6 +1969,8 @@ class SessionRuntimeManager:
         *,
         preview: str,
         error_type: str,
+        turn_id: str | None = None,
+        tool_call_key: str | None = None,
     ) -> None:
         tool_id = _provider_tool_name(event) or "unknown"
         tool_call_id = event.tool_call_id or str(event.payload.get("tool_call_id") or "")
@@ -1889,6 +1984,8 @@ class SessionRuntimeManager:
             metadata={
                 "tool_id": tool_id,
                 "tool_call_id": tool_call_id or None,
+                "tool_call_key": tool_call_key,
+                "turn_id": turn_id,
                 "ok": False,
                 "error_type": error_type,
                 "model_visible": True,
@@ -1900,6 +1997,8 @@ class SessionRuntimeManager:
         payload = {
             "tool_id": tool_id,
             "tool_call_id": tool_call_id or None,
+            "tool_call_key": tool_call_key,
+            "turn_id": turn_id,
             "ok": False,
             "preview": output,
             "error_type": error_type,
@@ -1919,7 +2018,15 @@ class SessionRuntimeManager:
             EventStreamType.SESSION,
             prompt.session_id,
             "tool_call.finished",
-            {"tool_id": tool_id, "tool_call_id": tool_call_id or None, "ok": False, "status": "failed", "summary": "failed"},
+            {
+                "tool_id": tool_id,
+                "tool_call_id": tool_call_id or None,
+                "tool_call_key": tool_call_key,
+                "turn_id": turn_id,
+                "ok": False,
+                "status": "failed",
+                "summary": "failed",
+            },
             session_id=prompt.session_id,
             message_id=message.id,
             redaction_state=RedactionState.NOT_REQUIRED,
@@ -2272,6 +2379,33 @@ def _requested_tools_from_metadata(metadata: Any) -> set[str]:
     return tools
 
 
+def _provider_tool_call_key(tool_name: str, arguments: dict[str, Any]) -> str:
+    return json.dumps(
+        {"tool": tool_name, "arguments": sanitize_for_logging(arguments)},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _runtime_provider_tool_policy_error(tool_policy: dict[str, list[str]]) -> ProviderError | None:
+    blocked_tools = tool_policy.get("blocked_tools") or []
+    if not blocked_tools:
+        return None
+    return ProviderError(
+        category=ProviderErrorCategory.INVALID_REQUEST,
+        error_type="ProviderToolPolicyBlocked",
+        message=(
+            "Provider-native tools were requested but are not allowed by the runtime session-tool policy: "
+            + ", ".join(blocked_tools)
+            + "."
+        ),
+        retryable=False,
+        hidden_provider_fallback=False,
+        no_hidden_fallback=True,
+    )
+
+
 def _tool_names(value: Any) -> set[str]:
     names: set[str] = set()
     if value is None:
@@ -2525,7 +2659,32 @@ def _partial_response_evidence(response_text: str) -> dict[str, Any] | None:
 
 def _build_runtime_compaction(store: SQLiteStore, prompt: QueuedPrompt) -> dict[str, Any]:
     messages = store.list_session_messages(prompt.session_id)
+    message_groups = _runtime_compaction_message_groups(messages)
     retained = messages[-8:]
+    retained_ids = [message.id for message in retained]
+    dropped = messages[: max(0, len(messages) - len(retained))]
+    dropped_ids = [message.id for message in dropped]
+    summary_id = f"summary_{prompt.prompt_id}"
+    retained_id_set = set(retained_ids)
+    dropped_id_set = set(dropped_ids)
+    for group in message_groups:
+        group_ids = set(group["message_ids"])
+        included = bool(group_ids & retained_id_set)
+        dropped_by_compaction = bool(group_ids and group_ids <= dropped_id_set)
+        group["included_in_retry_context"] = included
+        group["summarized_by_summary_id"] = summary_id if included else None
+        group["dropped_by_compaction"] = dropped_by_compaction
+        group["exclude_reason"] = "outside_recent_retention_window" if dropped_by_compaction else None
+    prompt_group = {
+        "group_id": f"group_prompt_{prompt.prompt_id}",
+        "kind": "user",
+        "message_ids": [prompt.message_id] if prompt.message_id else [],
+        "source": "queued_prompt",
+        "included_in_retry_context": True,
+        "summarized_by_summary_id": summary_id,
+        "dropped_by_compaction": False,
+        "exclude_reason": None,
+    }
     summary_lines: list[str] = []
     for message in retained:
         preview = _preview(message.content_preview, limit=180)
@@ -2539,13 +2698,72 @@ def _build_runtime_compaction(store: SQLiteStore, prompt: QueuedPrompt) -> dict[
         "schema_version": RUNTIME_COMPACTION_SCHEMA_VERSION,
         "method": "deterministic_recent_message_summary",
         "message_count_before": len(messages),
-        "retained_message_ids": [message.id for message in retained],
+        "message_groups": message_groups + [prompt_group],
+        "group_count_before": len(message_groups),
+        "retained_group_ids": [
+            group["group_id"]
+            for group in message_groups
+            if any(message_id in retained_ids for message_id in group["message_ids"])
+        ],
+        "dropped_group_ids": [
+            group["group_id"]
+            for group in message_groups
+            if group["message_ids"] and all(message_id in dropped_ids for message_id in group["message_ids"])
+        ],
+        "summary_id": summary_id,
+        "summary_of_message_ids": retained_ids + ([prompt.message_id] if prompt.message_id else []),
+        "summary_of_group_ids": [
+            group["group_id"]
+            for group in message_groups
+            if any(message_id in retained_ids for message_id in group["message_ids"])
+        ]
+        + [prompt_group["group_id"]],
+        "retained_message_ids": retained_ids,
+        "dropped_message_ids": dropped_ids,
         "dropped_message_count": max(0, len(messages) - len(retained)),
+        "strategy": {
+            "reference_pattern": "microsoft_agent_framework_compaction_trace",
+            "provider_summarization_used": False,
+            "hidden_provider_fallback": False,
+            "retain_recent_message_count": 8,
+            "oldest_messages_dropped": bool(dropped_ids),
+            "retry_summary_inserted_as_system_message": True,
+        },
+        "content_policy": {
+            "summary_content_included": True,
+            "source_message_bodies_included": False,
+            "source_message_previews_sanitized": True,
+            "artifact_bodies_included": False,
+            "secret_values_included": False,
+        },
         "summary": summary,
         "hidden_provider_fallback": False,
         "no_hidden_fallback": True,
+        "provider_execution_started": False,
+        "model_execution_started": False,
+        "network_called": False,
+        "filesystem_modified": False,
         "permission_granting": False,
     }
+
+
+def _runtime_compaction_message_groups(messages: list[Any]) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        groups.append(
+            {
+                "group_id": f"group_{message.id}",
+                "kind": message.role.value,
+                "index": index,
+                "message_ids": [message.id],
+                "source": "session_message",
+                "included_in_retry_context": False,
+                "summarized_by_summary_id": None,
+                "dropped_by_compaction": False,
+                "exclude_reason": None,
+            }
+        )
+    return groups
 
 
 def _retry_delay_seconds(prompt: QueuedPrompt, error: ProviderError | None = None) -> float:

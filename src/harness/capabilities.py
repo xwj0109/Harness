@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from harness.execution import list_execution_adapter_descriptors
+from harness.execution import list_execution_adapter_descriptors, runtime_control_matches_descriptor
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import (
     BreakerStatus,
@@ -76,6 +76,7 @@ def _capability_from_descriptor(descriptor: ExecutionAdapterDescriptor, project_
         backend_requirements=list(descriptor.backend_requirements),
         sandbox_requirements=list(descriptor.sandbox_requirements),
         sandbox_profile=sandbox_profile_dict(descriptor.sandbox_profile_id),
+        delegate_budget=descriptor.delegate_budget.model_dump(mode="json"),
         side_effect_summary=descriptor.side_effect_summary,
         replay_policy=descriptor.replay_policy,
         readiness=readiness,
@@ -133,28 +134,6 @@ def _capability_block_reasons(descriptor: ExecutionAdapterDescriptor, controls: 
     for control in controls:
         if not control.disabled:
             continue
-        if _control_matches_descriptor(control, descriptor, task_type):
+        if runtime_control_matches_descriptor(control, descriptor, task_type):
             reasons.append(f"control_disabled: {control.target_kind.value}:{control.target_id}. {control.reason}")
     return reasons
-
-
-def _control_matches_descriptor(
-    control: KillSwitchRecord,
-    descriptor: ExecutionAdapterDescriptor,
-    task_type: str | None,
-) -> bool:
-    target = control.target_id or "*"
-    if control.target_kind == KillSwitchTargetKind.ADAPTER:
-        return target in {"*", descriptor.id}
-    if control.target_kind == KillSwitchTargetKind.TASK_TYPE:
-        return target == "*" or target == task_type or target in descriptor.supported_task_types
-    if control.target_kind == KillSwitchTargetKind.BACKEND:
-        return target in {"*", "codex_cli"} and any("codex_cli" in item for item in descriptor.backend_requirements)
-    if control.target_kind == KillSwitchTargetKind.HOSTED_BOUNDARY:
-        return target == "*" and (
-            "hosted_provider_codex" in descriptor.required_approvals
-            or any("data_boundary=hosted_provider" in item for item in descriptor.backend_requirements)
-        )
-    if control.target_kind == KillSwitchTargetKind.DOCKER_EXECUTION:
-        return target == "*" and (task_type == "docker_run_tests" or "docker" in descriptor.id)
-    return False

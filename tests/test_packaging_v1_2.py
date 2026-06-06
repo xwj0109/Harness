@@ -98,6 +98,7 @@ def test_installed_wheel_cli_loads_packaged_specs(tmp_path) -> None:
     assert {check["subject_kind"] for check in integrity["checks"]} >= {
         "builtin_spec",
         "adapter_descriptor",
+        "workflow_template",
         "tui_static_asset",
     }
 
@@ -130,6 +131,35 @@ def test_installed_wheel_cli_loads_packaged_specs(tmp_path) -> None:
         capture_output=True,
     )
     assert json.loads(quickstart_result.stdout)["schema_version"] == "harness.quickstart_agent/v1"
+
+    initialized_project = tmp_path / "initialized-project"
+    initialized_project.mkdir()
+    subprocess.run(
+        [str(harness), "init", "--project", str(initialized_project)],
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    objective_evidence_result = subprocess.run(
+        [
+            str(harness),
+            "objectives",
+            "verify-evidence",
+            "objective_missing",
+            "--project",
+            str(initialized_project),
+            "--output",
+            "json",
+        ],
+        text=True,
+        check=False,
+        capture_output=True,
+    )
+    objective_evidence = json.loads(objective_evidence_result.stdout)
+    assert objective_evidence_result.returncode == 1
+    assert objective_evidence["schema_version"] == "harness.objective_evidence_verification/v1"
+    assert objective_evidence["ok"] is False
+    assert objective_evidence["checks"][0]["id"] == "objective_exists"
 
 
 def _copy_project_source(tmp_path: Path) -> Path:

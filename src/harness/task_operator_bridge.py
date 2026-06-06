@@ -30,12 +30,28 @@ from harness.operator_loop import (
 from harness.operator_models import HarnessTurnState
 from harness.policy import effective_policy_sha256, resolve_task_effective_policy
 from harness.security import sanitize_for_logging
-from harness.session_tools import SessionToolExecutionResult, default_session_tool_descriptors, execute_session_tool
+from harness.session_tools import (
+    SessionToolExecutionResult,
+    build_session_tool_policy_projection,
+    default_session_tool_descriptors,
+    execute_session_tool,
+    model_visible_session_tool_ids,
+)
 
 
 SESSION_OPERATOR_EXECUTION_ADAPTER = "session_read_tools"
 SESSION_OPERATOR_TASK_TYPES = {"session_plan", "session_read_only_research", "session_operator"}
 SESSION_OPERATOR_DEFAULT_ALLOWED_TOOLS = ["read", "glob", "grep", "artifact-read"]
+
+
+def default_session_operator_tool_ids(project_root: Path) -> list[str]:
+    available = {descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled}
+    model_visible = set(model_visible_session_tool_ids(project_root=project_root))
+    return sorted(
+        tool_id
+        for tool_id in SESSION_OPERATOR_DEFAULT_ALLOWED_TOOLS
+        if tool_id in available and tool_id in model_visible
+    )
 
 
 def execute_operator_task_lease(
@@ -46,7 +62,7 @@ def execute_operator_task_lease(
     model: ChatModel | None = None,
 ) -> DaemonExecuteResult:
     store = SQLiteStore.open_initialized(project_root)
-    lease, attempt, task = store.validate_execution_lease_for_run(lease_id)
+    lease, attempt, task = store.validate_execution_lease_for_run(lease_id, owner=owner)
     try:
         _validate_operator_task(task)
     except ValueError as exc:
@@ -485,6 +501,51 @@ def _validate_operator_task(task: TaskRecord) -> None:
     ]
     if forbidden:
         raise ValueError(f"Operator task execution rejected by task metadata: {', '.join(sorted(forbidden))}.")
+    _validate_operator_allowed_tools(task)
+
+
+def _validate_operator_allowed_tools(task: TaskRecord) -> None:
+    if "allowed_tools" not in task.metadata:
+        return
+    raw = task.metadata.get("allowed_tools")
+    if not isinstance(raw, list) or not raw:
+        raise ValueError("Operator task allowed_tools must be a non-empty list of known session tool ids.")
+    descriptors = {descriptor.id: descriptor for descriptor in default_session_tool_descriptors()}
+    malformed: list[str] = []
+    unknown: list[str] = []
+    disabled: list[str] = []
+    internal: list[str] = []
+    policy_blocked: list[str] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, str) or not item.strip() or item != item.strip():
+            malformed.append(f"allowed_tools[{index}]")
+            continue
+        descriptor = descriptors.get(item)
+        if descriptor is None:
+            unknown.append(item)
+            continue
+        if item == "invalid":
+            internal.append(item)
+            continue
+        if not descriptor.enabled:
+            disabled.append(item)
+            continue
+        policy = build_session_tool_policy_projection(descriptor, project_root=task.project_root)
+        if not policy.enabled:
+            policy_blocked.append(f"{item} ({policy.disabled_reason or 'policy disabled'})")
+    problems: list[str] = []
+    if malformed:
+        problems.append("malformed entries: " + ", ".join(malformed))
+    if unknown:
+        problems.append("unknown tools: " + ", ".join(sorted(set(unknown))))
+    if disabled:
+        problems.append("disabled tools: " + ", ".join(sorted(set(disabled))))
+    if internal:
+        problems.append("internal-only tools: " + ", ".join(sorted(set(internal))))
+    if policy_blocked:
+        problems.append("policy-blocked tools: " + ", ".join(sorted(set(policy_blocked))))
+    if problems:
+        raise ValueError("Operator task allowed_tools rejected: " + "; ".join(problems) + ".")
 
 
 def _ensure_operator_task_session(store: SQLiteStore, task: TaskRecord):
@@ -539,8 +600,12 @@ def _active_tools_for_task(task: TaskRecord) -> list[str]:
     available = {descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled}
     raw = task.metadata.get("allowed_tools")
     if isinstance(raw, list) and raw:
-        return sorted(str(item) for item in raw if isinstance(item, str) and item in available)
-    return sorted(available)
+        return sorted({
+            str(item)
+            for item in raw
+            if isinstance(item, str) and item in available and item != "invalid"
+        })
+    return default_session_operator_tool_ids(task.project_root)
 
 
 def _run_mode_for_operator_task(task: TaskRecord) -> RunMode:

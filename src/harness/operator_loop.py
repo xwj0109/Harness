@@ -32,10 +32,14 @@ from harness.session_cwd import session_cwd_from_metadata
 from harness.session_tools import (
     SessionToolDescriptor,
     SessionToolExecutionResult,
+    SessionToolReplayPolicy,
+    SessionToolSideEffect,
+    build_session_tool_policy_projection,
     build_session_approval_card,
     default_session_tool_descriptors,
     execute_session_tool,
     get_session_tool_descriptor,
+    model_visible_session_tool_ids,
 )
 
 
@@ -270,7 +274,12 @@ class HarnessAgentLoop:
         self.queue_drain_callback = queue_drain_callback
         self.tool_results: list[HarnessAgentLoopToolResult] = []
         self.save_points: list[HarnessSavePoint] = []
-        self._tool_repeat_counts: dict[str, int] = {}
+        self._tool_repeat_counts = _persisted_tool_repeat_counts(store, session_id, turn_state.turn_id)
+        self._completed_rerun_forbidden_tool_call_keys = _persisted_completed_rerun_forbidden_tool_call_keys(
+            store,
+            session_id,
+            turn_state.turn_id,
+        )
         self._tool_steps = 0
         self._project_switches = 0
         self._shell_requests = 0
@@ -280,7 +289,11 @@ class HarnessAgentLoop:
 
     def run(self, user_text: str) -> HarnessAgentLoopResult:
         self._persist_user_message(user_text)
-        tools = native_session_tool_schemas(active_tool_ids=self.turn_state.active_tools)
+        tools = native_session_tool_schemas(
+            active_tool_ids=self.turn_state.active_tools,
+            project_root=self.project_root,
+            plan_mode=self.turn_state.run_mode == RunMode.PLANNING,
+        )
         self._emit("procedure", "Ran provider-native model turn")
         while True:
             if self._wall_clock_exhausted():
@@ -378,7 +391,11 @@ class HarnessAgentLoop:
                 self.turn_state = next_turn_state
                 persist_turn_started(self.store, self.turn_state, prompt="continued after save point")
                 self._apply_drained_queue_messages()
-                tools = native_session_tool_schemas(active_tool_ids=self.turn_state.active_tools)
+                tools = native_session_tool_schemas(
+                    active_tool_ids=self.turn_state.active_tools,
+                    project_root=self.project_root,
+                    plan_mode=self.turn_state.run_mode == RunMode.PLANNING,
+                )
 
     def _result_with_save_point_state(self, result: HarnessAgentLoopResult) -> HarnessAgentLoopResult:
         return HarnessAgentLoopResult(
@@ -421,7 +438,11 @@ class HarnessAgentLoop:
             backend_id=self.turn_state.backend_id,
             agent_id=session.agent_id or self.turn_state.agent_id,
             workbench_id=session.workbench_id or self.turn_state.workbench_id,
-            active_tools=_active_session_tool_ids(),
+            active_tools=(
+                plan_agent_tool_ids(project_root=self.project_root)
+                if self.chat_context.mode == "plan"
+                else _active_session_tool_ids(project_root=self.project_root)
+            ),
             run_mode=self.turn_state.run_mode,
             context_pack_sha256=self.turn_state.context_pack_sha256,
             stream_options=dict(self.turn_state.stream_options),
@@ -484,6 +505,18 @@ class HarnessAgentLoop:
                 f"Unknown session tool: {tool_call.name}",
                 event_kind="harness.agent_loop.tool_error",
             )
+        if self.chat_context.mode == "plan" and (
+            not descriptor.allowed_in_plan_agent or descriptor.permission_required
+        ):
+            return self._persist_model_visible_tool_error(
+                tool_call,
+                "plan_mode_tool_not_available",
+                (
+                    "Plan mode does not create approvals, run execution, call providers, use network, "
+                    "or mutate the active repository. Describe this as a future governed step and produce the plan."
+                ),
+                event_kind="harness.agent_loop.tool_error",
+            )
         if self.turn_state.active_tools and tool_call.name not in set(self.turn_state.active_tools):
             return self._persist_model_visible_tool_error(
                 tool_call,
@@ -518,6 +551,7 @@ class HarnessAgentLoop:
                     event_kind="harness.agent_loop_guard.triggered",
                 )
 
+        tool_call_key = _normalized_tool_call_key(tool_call.name, tool_call.arguments)
         try:
             result = execute_session_tool(
                 self.store,
@@ -526,6 +560,7 @@ class HarnessAgentLoop:
                 tool_call.name,
                 tool_call.arguments,
                 tool_call_id=tool_call.id,
+                tool_call_key=tool_call_key,
                 turn_id=self.turn_state.turn_id,
                 run_mode=self.turn_state.run_mode,
             )
@@ -536,7 +571,7 @@ class HarnessAgentLoop:
                 str(sanitize_for_logging(str(exc))),
                 event_kind="harness.agent_loop.tool_error",
             )
-        return HarnessAgentLoopToolResult(
+        loop_result = HarnessAgentLoopToolResult(
             tool_call_id=tool_call.id,
             tool_id=result.tool_id,
             ok=result.ok,
@@ -551,9 +586,25 @@ class HarnessAgentLoop:
                 "truncated": result.truncated,
             },
         )
+        if loop_result.executed and loop_result.ok and _rerun_forbidden_tool_descriptor(descriptor):
+            self._completed_rerun_forbidden_tool_call_keys.add(tool_call_key)
+        return loop_result
 
     def _guard_tool_call(self, tool_call: ChatToolCall) -> HarnessAgentLoopToolResult | None:
         key = _normalized_tool_call_key(tool_call.name, tool_call.arguments)
+        try:
+            descriptor = get_session_tool_descriptor(tool_call.name)
+        except KeyError:
+            descriptor = None
+        if descriptor is not None and _rerun_forbidden_tool_descriptor(descriptor):
+            if key in self._completed_rerun_forbidden_tool_call_keys:
+                return self._persist_model_visible_tool_error(
+                    tool_call,
+                    "rerun_forbidden_tool_replayed",
+                    f"Stopped duplicate rerun-forbidden tool call: {tool_call.name} with the same normalized arguments.",
+                    event_kind="harness.agent_loop_guard.triggered",
+                    metadata={"tool_call_key": key},
+                )
         count = self._tool_repeat_counts.get(key, 0) + 1
         self._tool_repeat_counts[key] = count
         if count < self.limits.max_same_tool_same_args:
@@ -563,7 +614,7 @@ class HarnessAgentLoop:
             "same_tool_same_args_guard",
             f"Stopped repeated tool call: {tool_call.name} with the same normalized arguments.",
             event_kind="harness.agent_loop_guard.triggered",
-            metadata={"repeat_count": count, "max_repeat_count": self.limits.max_same_tool_same_args},
+            metadata={"repeat_count": count, "max_repeat_count": self.limits.max_same_tool_same_args, "tool_call_key": key},
         )
 
     def _guard_result(self, error_type: str, message: str) -> HarnessAgentLoopResult:
@@ -637,6 +688,7 @@ class HarnessAgentLoop:
                 redaction_state=RedactionState.REDACTED,
             )
         for tool_call in response.tool_calls:
+            tool_call_key = _normalized_tool_call_key(tool_call.name, tool_call.arguments)
             self.store.append_session_part(
                 self.session_id,
                 message.id,
@@ -654,8 +706,24 @@ class HarnessAgentLoop:
                     "turn_id": self.turn_state.turn_id,
                     "tool_call_id": tool_call.id,
                     "tool_id": tool_call.name,
+                    "tool_call_key": tool_call_key,
                     "provider_native": True,
                 },
+                redaction_state=RedactionState.REDACTED,
+            )
+            self.store.append_store_event(
+                EventStreamType.SESSION,
+                self.session_id,
+                "harness.agent_loop.tool_call.requested",
+                {
+                    "turn_id": self.turn_state.turn_id,
+                    "tool_call_id": tool_call.id,
+                    "tool_id": tool_call.name,
+                    "tool_call_key": tool_call_key,
+                    "arguments": sanitize_for_logging(tool_call.arguments),
+                    "summary": f"{tool_call.name} requested",
+                },
+                session_id=self.session_id,
                 redaction_state=RedactionState.REDACTED,
             )
 
@@ -673,6 +741,7 @@ class HarnessAgentLoop:
             "turn_id": self.turn_state.turn_id,
             "tool_call_id": tool_call.id,
             "tool_id": tool_call.name,
+            "tool_call_key": _normalized_tool_call_key(tool_call.name, tool_call.arguments),
             "error_type": error_type,
             "arguments": sanitize_for_logging(tool_call.arguments),
             "summary": message[:240],
@@ -700,6 +769,7 @@ class HarnessAgentLoop:
                 "turn_id": self.turn_state.turn_id,
                 "tool_call_id": tool_call.id,
                 "tool_id": tool_call.name,
+                "tool_call_key": _normalized_tool_call_key(tool_call.name, tool_call.arguments),
                 "ok": False,
                 "error_type": error_type,
                 **metadata,
@@ -741,13 +811,36 @@ def model_supports_native_tools(model: ChatModel) -> bool:
     return callable(getattr(model, "complete_with_tools", None))
 
 
-def native_session_tool_schemas(*, active_tool_ids: list[str] | None = None) -> list[ChatToolSchema]:
-    active = set(active_tool_ids or [])
+def plan_agent_tool_ids(*, project_root: Path | None = None) -> list[str]:
+    return model_visible_session_tool_ids(project_root=project_root, plan_mode=True)
+
+
+def native_session_tool_schemas(
+    *,
+    active_tool_ids: list[str] | None = None,
+    project_root: Path | None = None,
+    plan_mode: bool = False,
+) -> list[ChatToolSchema]:
+    active = set(
+        model_visible_session_tool_ids(project_root=project_root, plan_mode=plan_mode)
+        if active_tool_ids is None
+        else active_tool_ids
+    )
+    active.discard("invalid")
     schemas: list[ChatToolSchema] = []
     for descriptor in default_session_tool_descriptors():
-        if not descriptor.enabled:
+        if descriptor.id == "invalid":
             continue
-        if active and descriptor.id not in active:
+        if descriptor.id not in active:
+            continue
+        policy = build_session_tool_policy_projection(
+            descriptor,
+            project_root=project_root,
+            plan_mode=plan_mode,
+        )
+        if not policy.enabled:
+            continue
+        if plan_mode and not descriptor.allowed_in_plan_agent:
             continue
         schemas.append(
             ChatToolSchema(
@@ -759,8 +852,8 @@ def native_session_tool_schemas(*, active_tool_ids: list[str] | None = None) -> 
     return schemas
 
 
-def _active_session_tool_ids() -> list[str]:
-    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+def _active_session_tool_ids(*, project_root: Path | None = None) -> list[str]:
+    return model_visible_session_tool_ids(project_root=project_root)
 
 
 def _model_visible_tool_result_content(result: SessionToolExecutionResult) -> str:
@@ -781,6 +874,53 @@ def _normalized_tool_call_key(tool_name: str, arguments: dict[str, Any]) -> str:
         separators=(",", ":"),
         default=str,
     )
+
+
+def _rerun_forbidden_tool_descriptor(descriptor: SessionToolDescriptor) -> bool:
+    return (
+        descriptor.replay_policy == SessionToolReplayPolicy.RERUN_FORBIDDEN
+        and descriptor.side_effect not in {SessionToolSideEffect.NONE, SessionToolSideEffect.SESSION_LOCAL}
+    )
+
+
+def _persisted_tool_repeat_counts(store: SQLiteStore, session_id: str, turn_id: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for event in store.list_session_store_events(session_id):
+        if event.kind != "harness.agent_loop.tool_call.requested":
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if payload.get("turn_id") != turn_id:
+            continue
+        tool_call_key = payload.get("tool_call_key")
+        if not isinstance(tool_call_key, str) or not tool_call_key:
+            continue
+        counts[tool_call_key] = counts.get(tool_call_key, 0) + 1
+    return counts
+
+
+def _persisted_completed_rerun_forbidden_tool_call_keys(
+    store: SQLiteStore,
+    session_id: str,
+    turn_id: str,
+) -> set[str]:
+    keys: set[str] = set()
+    for event in store.list_session_store_events(session_id):
+        if event.kind != "tool_call.output":
+            continue
+        payload = event.payload if isinstance(event.payload, dict) else {}
+        if payload.get("turn_id") != turn_id or payload.get("ok") is not True:
+            continue
+        tool_id = payload.get("tool_id")
+        tool_call_key = payload.get("tool_call_key")
+        if not isinstance(tool_id, str) or not isinstance(tool_call_key, str) or not tool_call_key:
+            continue
+        try:
+            descriptor = get_session_tool_descriptor(tool_id)
+        except KeyError:
+            continue
+        if _rerun_forbidden_tool_descriptor(descriptor):
+            keys.add(tool_call_key)
+    return keys
 
 
 def _validate_native_tool_arguments(descriptor: SessionToolDescriptor, arguments: dict[str, Any]) -> str | None:

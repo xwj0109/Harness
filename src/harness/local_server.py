@@ -19,6 +19,11 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from harness import __version__
+from harness.agent_discovery import (
+    build_agent_discovery_catalog,
+    evaluate_delegate_allocation,
+    summarize_agent_discovery,
+)
 from harness.command_catalog import build_command_catalog, command_action_unsupported
 from harness.config import load_config
 from harness.event_broker import reset_event_broker, subscribe_global_events, subscribe_store_events
@@ -35,6 +40,17 @@ from harness.model_catalog import (
     list_provider_catalog,
     validate_model_selection,
 )
+from harness.objective_evidence import verify_objective_evidence
+from harness.orchestration_efficiency import (
+    run_orchestration_efficiency_audit,
+    run_orchestration_microbenchmarks,
+    summarize_orchestration_efficiency,
+    summarize_orchestration_microbenchmarks,
+)
+from harness.orchestration_readiness import run_orchestration_readiness_audit, summarize_orchestration_readiness
+from harness.orchestration_scenarios import build_orchestration_scenario_catalog, summarize_orchestration_scenarios
+from harness.orchestration_synthesis import run_orchestration_synthesis, summarize_orchestration_synthesis
+from harness.orchestration_workflows import build_workflow_coordination_catalog, summarize_workflow_coordination
 from harness.models import (
     EventStreamType,
     RedactionState,
@@ -46,12 +62,27 @@ from harness.models import (
 )
 from harness.operator_context import build_session_pane_projection, build_tui_dashboard
 from harness.operator_loop import session_operator_status_projection
-from harness.paths import is_excluded_relative, relative_to_project, resolve_project_root, resolve_under_project
+from harness.paths import (
+    PathSecurityError,
+    is_excluded_relative,
+    reject_symlink_components_under_project,
+    relative_to_project,
+    resolve_project_root,
+    resolve_under_project,
+)
+from harness.pending_chat_actions import (
+    PENDING_CHAT_ACTION_METADATA_KEY,
+    clear_pending_chat_action_metadata,
+    pending_chat_action_audit,
+    pending_chat_action_projection,
+)
 from harness.plugin_provider_hooks import read_plugin_provider_hooks_from_manifest
 from harness.process_supervisor import reset_process_supervisor
 from harness.provider_auth import provider_auth_methods_projection
 from harness.security import assert_not_secret_path, is_secret_path, redact_secret_text, sanitize_for_logging
 from harness.session_cwd import CwdResolutionError, cwd_recovery_message, session_cwd_payload
+from harness.session_events import read_session_events_with_diagnostics, session_events_read_health_payload
+from harness.session_health import active_run_reference_counts, session_active_run_reference_projection
 from harness.session_replay import build_session_replay_projection
 from harness.session_runtime import (
     SessionPromptQueuePolicy,
@@ -70,6 +101,7 @@ from harness.session_tools import (
     session_planning_mode_projection,
 )
 from harness.task_operator_bridge import apply_operator_task_permission_resolution
+from harness.traces import export_objective_trace, export_run_trace, to_otel_json
 from harness.tui import build_tui_settings_catalog
 from harness.workspace_catalog import build_workspace_catalog, build_workspace_clients_projection, workspace_action_unsupported
 
@@ -362,6 +394,275 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                     },
                     "additionalProperties": True,
                 },
+                "AgentDiscoveryCatalogResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "summary", "safety", "cards"],
+                    "properties": {
+                        "schema_version": {"const": "harness.agent_discovery_catalog/v1"},
+                        "ok": {"type": "boolean"},
+                        "initialized": {"type": "boolean"},
+                        "workbench_id": {"type": ["string", "null"]},
+                        "summary": {"type": "object"},
+                        "cards": {"type": "array", "items": {"type": "object"}},
+                        "sample_allocation": {"type": ["object", "null"]},
+                        "summary_projection": {
+                            "type": "object",
+                            "properties": {"schema_version": {"const": "harness.agent_discovery_summary/v1"}},
+                            "additionalProperties": True,
+                        },
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "metadata_only": {"const": True},
+                                "source_body_loaded": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "agent_execution_started": {"const": False},
+                                "tool_execution_started": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "budget_granting": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "DelegateAllocationResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "announcement", "bids", "selected_agent_ids", "safety"],
+                    "properties": {
+                        "schema_version": {"const": "harness.delegate_allocation/v1"},
+                        "ok": {"type": "boolean"},
+                        "announcement": {"type": "object"},
+                        "selected_agent_ids": {"type": "array", "items": {"type": "string"}},
+                        "selected_bid_ids": {"type": "array", "items": {"type": "string"}},
+                        "bids": {"type": "array", "items": {"type": "object"}},
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "metadata_only": {"const": True},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "agent_execution_started": {"const": False},
+                                "tool_execution_started": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "budget_granting": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "OrchestrationReadinessAuditResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "summary", "safety", "checks"],
+                    "properties": {
+                        "schema_version": {"const": "harness.orchestration_readiness_audit/v1"},
+                        "ok": {"type": "boolean"},
+                        "initialized": {"type": "boolean"},
+                        "summary": {"type": "object"},
+                        "checks": {"type": "array", "items": {"type": "object"}},
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "reference_code_imported": {"const": False},
+                                "reference_contents_included": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "WorkflowCoordinationCatalogResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "summary", "safety", "patterns", "state_classes"],
+                    "properties": {
+                        "schema_version": {"const": "harness.workflow_coordination_catalog/v1"},
+                        "ok": {"type": "boolean"},
+                        "initialized": {"type": "boolean"},
+                        "summary": {"type": "object"},
+                        "patterns": {"type": "array", "items": {"type": "object"}},
+                        "state_classes": {"type": "array", "items": {"type": "object"}},
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "metadata_only": {"const": True},
+                                "reference_code_imported": {"const": False},
+                                "reference_contents_included": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "tool_execution_started": {"const": False},
+                                "agent_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "artifact_bodies_read": {"const": False},
+                                "model_context_allowed": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "OrchestrationScenarioCatalogResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "summary", "safety", "cases"],
+                    "properties": {
+                        "schema_version": {"const": "harness.orchestration_scenario_catalog/v1"},
+                        "ok": {"type": "boolean"},
+                        "initialized": {"type": "boolean"},
+                        "summary": {"type": "object"},
+                        "cases": {"type": "array", "items": {"type": "object"}},
+                        "summary_projection": {
+                            "type": "object",
+                            "properties": {
+                                "schema_version": {"const": "harness.orchestration_scenario_summary/v1"}
+                            },
+                            "additionalProperties": True,
+                        },
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "metadata_only": {"const": True},
+                                "synthetic_probe_only": {"const": True},
+                                "reference_code_imported": {"const": False},
+                                "reference_contents_included": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "tool_execution_started": {"const": False},
+                                "agent_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "artifact_bodies_read": {"const": False},
+                                "model_context_allowed": {"const": False},
+                                "live_benchmark_execution_allowed": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "OrchestrationEfficiencyAuditResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "summary", "safety", "checks"],
+                    "properties": {
+                        "schema_version": {"const": "harness.orchestration_efficiency/v1"},
+                        "ok": {"type": "boolean"},
+                        "summary": {"type": "object"},
+                        "checks": {"type": "array", "items": {"type": "object"}},
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "reference_code_imported": {"const": False},
+                                "reference_contents_included": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "artifact_bodies_read": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "OrchestrationMicrobenchmarksResponse": {
+                    "type": "object",
+                    "required": ["schema_version", "ok", "summary", "safety", "benchmarks"],
+                    "properties": {
+                        "schema_version": {"const": "harness.orchestration_microbenchmarks/v1"},
+                        "ok": {"type": "boolean"},
+                        "summary": {"type": "object"},
+                        "benchmarks": {"type": "array", "items": {"type": "object"}},
+                        "summary_projection": {
+                            "type": "object",
+                            "properties": {
+                                "schema_version": {"const": "harness.orchestration_microbenchmarks_summary/v1"}
+                            },
+                            "additionalProperties": True,
+                        },
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "reference_code_imported": {"const": False},
+                                "reference_contents_included": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "artifact_bodies_read": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
+                "OrchestrationSynthesisResponse": {
+                    "type": "object",
+                    "required": [
+                        "schema_version",
+                        "ok",
+                        "summary",
+                        "source_reports",
+                        "adopted_reference_patterns",
+                        "deliberate_non_adoptions",
+                        "security_complexity_posture",
+                        "safety",
+                    ],
+                    "properties": {
+                        "schema_version": {"const": "harness.orchestration_synthesis/v1"},
+                        "ok": {"type": "boolean"},
+                        "summary": {"type": "object"},
+                        "summary_projection": {
+                            "type": "object",
+                            "properties": {
+                                "schema_version": {"const": "harness.orchestration_synthesis_summary/v1"}
+                            },
+                            "additionalProperties": True,
+                        },
+                        "source_reports": {"type": "object"},
+                        "adopted_reference_patterns": {"type": "array", "items": {"type": "object"}},
+                        "deliberate_non_adoptions": {"type": "array", "items": {"type": "object"}},
+                        "security_complexity_posture": {"type": "object"},
+                        "operator_commands": {"type": "array", "items": {"type": "string"}},
+                        "safety": {
+                            "type": "object",
+                            "properties": {
+                                "read_only": {"const": True},
+                                "reference_code_imported": {"const": False},
+                                "reference_contents_included": {"const": False},
+                                "provider_called": {"const": False},
+                                "network_called": {"const": False},
+                                "adapter_execution_started": {"const": False},
+                                "filesystem_modified": {"const": False},
+                                "permission_granting": {"const": False},
+                                "artifact_bodies_read": {"const": False},
+                                "live_benchmark_execution_allowed": {"const": False},
+                            },
+                            "additionalProperties": True,
+                        },
+                    },
+                    "additionalProperties": True,
+                },
             },
         },
         "paths": {
@@ -636,6 +937,51 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             "/lsp": {"get": {"summary": "OpenCode-compatible LSP status projection", "security": bearer, "responses": _json_response()}},
             "/formatter": {"get": {"summary": "OpenCode-compatible formatter status projection", "security": bearer, "responses": _json_response()}},
             "/agents": {"get": {"summary": "List imported project agents", "security": bearer, "responses": _json_response()}},
+            "/agents/discovery": {
+                "get": {
+                    "summary": "Inspect local agent discovery cards without executing agents or reading source bodies",
+                    "security": bearer,
+                    "parameters": [_query_param("workbench", required=False)],
+                    "responses": _json_response(schema_ref="#/components/schemas/AgentDiscoveryCatalogResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "source_body_loaded": False,
+                        "agent_execution_started": False,
+                        "tool_execution_started": False,
+                        "adapter_execution_started": False,
+                        "filesystem_modified": False,
+                        "permission_granting": False,
+                        "budget_granting": False,
+                    },
+                }
+            },
+            "/agents/allocation": {
+                "get": {
+                    "summary": "Preview deterministic delegate bids without creating tasks or granting authority",
+                    "security": bearer,
+                    "parameters": [
+                        _query_param("workbench", required=False),
+                        _query_param("task_type", required=False),
+                        _query_param("required_kind", required=False),
+                        _query_param("required_tool_policy", required=False),
+                        _query_param("required_output", required=False),
+                        _query_param("required_tag", required=False),
+                        _query_param("required_knowledge", required=False),
+                        _query_param("required_review", required=False),
+                        _query_param("max_candidates", required=False),
+                    ],
+                    "responses": _json_response(schema_ref="#/components/schemas/DelegateAllocationResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "agent_execution_started": False,
+                        "tool_execution_started": False,
+                        "adapter_execution_started": False,
+                        "filesystem_modified": False,
+                        "permission_granting": False,
+                        "budget_granting": False,
+                    },
+                }
+            },
             "/artifacts": {"get": {"summary": "List artifact metadata", "security": bearer, "responses": _json_response()}},
             "/find": {"get": {"summary": "OpenCode-compatible bounded text search across project files", "security": bearer, "responses": _json_response()}},
             "/find/file": {"get": {"summary": "OpenCode-compatible file-name search without loading file contents", "security": bearer, "responses": _json_response()}},
@@ -765,6 +1111,133 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
             },
             "/commands": {"get": {"summary": "Discover project command templates without executing them", "security": bearer, "responses": _json_response()}},
             "/tools": {"get": {"summary": "List Harness session tool descriptors with policy projections", "security": bearer, "responses": _json_response()}},
+            "/orchestration/readiness": {
+                "get": {
+                    "summary": "Inspect read-only orchestration readiness without importing reference code or executing adapters",
+                    "security": bearer,
+                    "parameters": [
+                        _query_param("include_references", required=False),
+                        _query_param("reference_root", required=False),
+                    ],
+                    "responses": _json_response(schema_ref="#/components/schemas/OrchestrationReadinessAuditResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "reference_code_imported": False,
+                        "reference_contents_included": False,
+                        "adapter_execution_started": False,
+                        "filesystem_modified": False,
+                    },
+                }
+            },
+            "/orchestration/workflows": {
+                "get": {
+                    "summary": "Inspect workflow coordination patterns and state-class contracts without executing orchestration",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/WorkflowCoordinationCatalogResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "reference_code_imported": False,
+                        "reference_contents_included": False,
+                        "adapter_execution_started": False,
+                        "tool_execution_started": False,
+                        "agent_execution_started": False,
+                        "artifact_bodies_read": False,
+                        "filesystem_modified": False,
+                    },
+                }
+            },
+            "/orchestration/scenarios": {
+                "get": {
+                    "summary": "Inspect layered orchestration failure-mode scenario coverage without executing work",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/OrchestrationScenarioCatalogResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "reference_code_imported": False,
+                        "reference_contents_included": False,
+                        "adapter_execution_started": False,
+                        "tool_execution_started": False,
+                        "agent_execution_started": False,
+                        "artifact_bodies_read": False,
+                        "filesystem_modified": False,
+                        "live_benchmark_execution_allowed": False,
+                    },
+                }
+            },
+            "/orchestration/efficiency": {
+                "get": {
+                    "summary": "Inspect read-only orchestration security-versus-complexity measurements without executing adapters",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/OrchestrationEfficiencyAuditResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "reference_code_imported": False,
+                        "reference_contents_included": False,
+                        "adapter_execution_started": False,
+                        "artifact_bodies_read": False,
+                        "filesystem_modified": False,
+                    },
+                }
+            },
+            "/orchestration/microbenchmarks": {
+                "get": {
+                    "summary": "Run passive orchestration microbenchmarks without executing live provider or sandbox rows",
+                    "security": bearer,
+                    "responses": _json_response(schema_ref="#/components/schemas/OrchestrationMicrobenchmarksResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "reference_code_imported": False,
+                        "reference_contents_included": False,
+                        "adapter_execution_started": False,
+                        "artifact_bodies_read": False,
+                        "filesystem_modified": False,
+                    },
+                }
+            },
+            "/orchestration/synthesis": {
+                "get": {
+                    "summary": "Synthesize reference, readiness, efficiency, and benchmark evidence without importing reference code",
+                    "security": bearer,
+                    "parameters": [
+                        _query_param("include_references", required=False),
+                        _query_param("reference_root", required=False),
+                    ],
+                    "responses": _json_response(schema_ref="#/components/schemas/OrchestrationSynthesisResponse"),
+                    "x-harness-safety": {
+                        **_metadata_only_safety(),
+                        "reference_code_imported": False,
+                        "reference_contents_included": False,
+                        "adapter_execution_started": False,
+                        "artifact_bodies_read": False,
+                        "filesystem_modified": False,
+                        "live_benchmark_execution_allowed": False,
+                    },
+                }
+            },
+            "/objectives/{objective_id}/evidence": {
+                "get": {
+                    "summary": "Verify objective JSONL evidence against persisted state without executing adapters",
+                    "security": bearer,
+                    "parameters": [_path_param("objective_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/objectives/{objective_id}/trace": {
+                "get": {
+                    "summary": "Export objective evidence as OpenTelemetry JSON without executing adapters",
+                    "security": bearer,
+                    "parameters": [_path_param("objective_id")],
+                    "responses": _json_response(),
+                }
+            },
+            "/runs/{run_id}/trace": {
+                "get": {
+                    "summary": "Export run evidence as OpenTelemetry JSON without executing adapters",
+                    "security": bearer,
+                    "parameters": [_path_param("run_id")],
+                    "responses": _json_response(),
+                }
+            },
             "/commands/run": {"post": {"summary": "Fail-closed placeholder for user-defined command execution", "security": bearer, "responses": _json_response(status="501")}},
             "/pr/checkout": {"post": {"summary": "Fail-closed placeholder for PR checkout without network or git mutation", "security": bearer, "responses": _json_response(status="501")}},
             "/pr/run": {"post": {"summary": "Fail-closed placeholder for PR checkout and run without network, git mutation, or adapter execution", "security": bearer, "responses": _json_response(status="501")}},
@@ -859,6 +1332,20 @@ def build_openapi_spec(*, server_url: str = "http://127.0.0.1:8765") -> dict[str
                     "parameters": [_path_param("session_id")],
                     "responses": _json_response(),
                 }
+            },
+            "/sessions/{session_id}/pending-action": {
+                "get": {
+                    "summary": "Audit recoverable pending chat action metadata without restoring or executing it",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(),
+                },
+                "delete": {
+                    "summary": "Clear only pending chat action proposal metadata for one session",
+                    "security": bearer,
+                    "parameters": [_path_param("session_id")],
+                    "responses": _json_response(status="200"),
+                },
             },
             "/sessions/{session_id}/children": {
                 "get": {
@@ -1299,9 +1786,9 @@ class HarnessLocalHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, server_address: tuple[str, int], handler_class: type[BaseHTTPRequestHandler], *, project_root: Path) -> None:
-        super().__init__(server_address, handler_class)
         self.project_root = Path(project_root).resolve()
         self._harness_closed = False
+        super().__init__(server_address, handler_class)
 
     def server_close(self) -> None:
         if not self._harness_closed:
@@ -1732,6 +2219,31 @@ def _route_get(
         return _vcs_diff_projection(project_root, raw=False)
     if path == "/vcs/diff/raw":
         return _vcs_diff_projection(project_root, raw=True)
+    if path in {"/agents/discovery", "/agent/discovery"}:
+        catalog = build_agent_discovery_catalog(
+            project_root,
+            workbench_id=_single_query_value(query, "workbench"),
+        )
+        return {
+            **catalog.model_dump(mode="json"),
+            "summary_projection": summarize_agent_discovery(catalog),
+        }
+    if path in {"/agents/allocation", "/agent/allocation"}:
+        allocation = evaluate_delegate_allocation(
+            project_root,
+            workbench_id=_single_query_value(query, "workbench"),
+            task_type=_single_query_value(query, "task_type"),
+            required_kind=_single_query_value(query, "required_kind"),  # type: ignore[arg-type]
+            required_tool_policy_id=_single_query_value(query, "required_tool_policy"),
+            required_outputs=query.get("required_output") or None,
+            required_tags=query.get("required_tag") or None,
+            required_knowledge_domains=query.get("required_knowledge") or None,
+            required_review_responsibilities=query.get("required_review") or None,
+            required_forbidden_actions=query.get("required_forbidden_action") or None,
+            excluded_agent_ids=query.get("exclude_agent") or None,
+            max_candidates=_optional_query_int(query, "max_candidates") or 3,
+        )
+        return allocation.model_dump(mode="json")
     if path in {"/agents", "/agent"}:
         return {
             "schema_version": "harness.project_agents/v1",
@@ -1785,7 +2297,7 @@ def _route_get(
     if path in {"/mcp/status", "/mcp"}:
         return _mcp_status_projection(cfg)
     if path == "/mcp/resources":
-        return _mcp_resources_projection(cfg)
+        return _mcp_resources_projection(project_root, cfg)
     if path == "/plugins":
         return _plugin_catalog(project_root, cfg)
     if path in {"/skills", "/skill"}:
@@ -1863,6 +2375,66 @@ def _route_get(
         tool_id = path.removeprefix("/tools/").strip("/")
         if tool_id:
             return session_tool_catalog_projection(project_root=project_root, tool_id=tool_id)
+    if path in {"/orchestration/readiness", "/orchestration/audit"}:
+        include_references = _optional_query_bool(query, "include_references", default=False)
+        reference_root_value = _single_query_value(query, "reference_root")
+        reference_root = Path(reference_root_value) if reference_root_value else None
+        audit = run_orchestration_readiness_audit(
+            project_root,
+            reference_root=reference_root,
+            include_references=include_references,
+        )
+        return {
+            **audit.model_dump(mode="json"),
+            "summary_projection": summarize_orchestration_readiness(audit),
+        }
+    if path in {"/orchestration/workflows", "/orchestration/coordination"}:
+        catalog = build_workflow_coordination_catalog(project_root)
+        return {
+            **catalog.model_dump(mode="json"),
+            "summary_projection": summarize_workflow_coordination(catalog),
+        }
+    if path in {"/orchestration/scenarios", "/orchestration/scenario-suite"}:
+        catalog = build_orchestration_scenario_catalog(project_root)
+        return {
+            **catalog.model_dump(mode="json"),
+            "summary_projection": summarize_orchestration_scenarios(catalog),
+        }
+    if path in {"/orchestration/efficiency", "/orchestration/efficiency-audit"}:
+        audit = run_orchestration_efficiency_audit(project_root)
+        return {
+            **audit.model_dump(mode="json"),
+            "summary_projection": summarize_orchestration_efficiency(audit),
+        }
+    if path in {"/orchestration/microbenchmarks", "/orchestration/microbenchmark-suite"}:
+        result = run_orchestration_microbenchmarks(project_root)
+        return {
+            **result.model_dump(mode="json"),
+            "summary_projection": summarize_orchestration_microbenchmarks(result),
+        }
+    if path in {"/orchestration/synthesis", "/orchestration/reference-synthesis"}:
+        include_references = _optional_query_bool(query, "include_references", default=False)
+        reference_root_value = _single_query_value(query, "reference_root")
+        reference_root = Path(reference_root_value) if reference_root_value else None
+        result = run_orchestration_synthesis(
+            project_root,
+            reference_root=reference_root,
+            include_references=include_references,
+        )
+        return {
+            **result.model_dump(mode="json"),
+            "summary_projection": summarize_orchestration_synthesis(result),
+        }
+    if path.startswith("/objectives/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[2] == "evidence":
+            return _objective_evidence_projection(project_root, store, parts[1])
+        if len(parts) == 3 and parts[2] == "trace":
+            return _objective_trace_projection(project_root, store, parts[1])
+    if path.startswith("/runs/"):
+        parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[2] == "trace":
+            return _run_trace_projection(project_root, store, parts[1])
     if path == "/permission":
         return _global_permission_queue_projection(store)
     if path == "/question":
@@ -1879,12 +2451,22 @@ def _route_get(
         return {
             "schema_version": "harness.sessions/v1",
             "ok": True,
-            "sessions": [session.model_dump(mode="json") for session in store.list_sessions()],
+            "sessions": [_session_payload_with_pending_action(store, session) for session in store.list_sessions()],
         }
     if path.startswith("/sessions/"):
         parts = [part for part in path.split("/") if part]
         if len(parts) == 2 and parts[1] == "status":
             return _sessions_status_projection(store)
+        if len(parts) == 3 and parts[2] == "pending-action":
+            session = store.get_session(parts[1])
+            return {
+                "schema_version": "harness.pending_chat_action_endpoint/v1",
+                "ok": True,
+                "session_id": session.id,
+                "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
+                "execution_started": False,
+                "permission_granting": False,
+            }
         if len(parts) == 2:
             session = store.get_session(parts[1])
             try:
@@ -1894,7 +2476,11 @@ def _route_get(
             return {
                 "schema_version": "harness.session/v1",
                 "ok": True,
-                "session": session.model_dump(mode="json"),
+                "session": _session_payload_with_pending_action(store, session),
+                "transcript_health": _session_transcript_health_projection(store, session.id),
+                "active_run_reference": session_active_run_reference_projection(store, session),
+                "pending_action": _pending_chat_action_projection_for_session(store, session),
+                "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
                 "cwd": cwd,
                 "latest_ui_activation": _latest_session_ui_activation(store, session.id),
                 "permission_granting": False,
@@ -2682,6 +3268,61 @@ def _route_post(
     return None
 
 
+def _objective_evidence_projection(project_root: Path, store: SQLiteStore, objective_id: str) -> dict[str, Any]:
+    _ensure_project_persistence_exists(store)
+    payload = verify_objective_evidence(project_root, objective_id).model_dump(mode="json")
+    return _read_only_evidence_payload(payload)
+
+
+def _objective_trace_projection(project_root: Path, store: SQLiteStore, objective_id: str) -> dict[str, Any]:
+    _ensure_project_persistence_exists(store)
+    try:
+        payload = to_otel_json(export_objective_trace(project_root, store, objective_id))
+    except (KeyError, ValueError) as exc:
+        payload = {
+            "schema_version": "harness.trace_export/v1",
+            "ok": False,
+            "format": "otel-json",
+            "objective_id": objective_id,
+            "errors": [str(exc).strip("'")],
+        }
+    return _read_only_evidence_payload(payload)
+
+
+def _run_trace_projection(project_root: Path, store: SQLiteStore, run_id: str) -> dict[str, Any]:
+    _ensure_project_persistence_exists(store)
+    try:
+        payload = to_otel_json(export_run_trace(project_root, store, run_id))
+    except (KeyError, ValueError) as exc:
+        payload = {
+            "schema_version": "harness.trace_export/v1",
+            "ok": False,
+            "format": "otel-json",
+            "run_id": run_id,
+            "errors": [str(exc).strip("'")],
+        }
+    return _read_only_evidence_payload(payload)
+
+
+def _ensure_project_persistence_exists(store: SQLiteStore) -> None:
+    if not store.db_path.exists():
+        raise ValueError(f"Project is not initialized: {store.project_root}")
+
+
+def _read_only_evidence_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **payload,
+        "execution_started": False,
+        "adapter_started": False,
+        "provider_execution_started": False,
+        "network_called": False,
+        "filesystem_modified": False,
+        "contents_included": False,
+        "artifact_contents_included": False,
+        "permission_granting": False,
+    }
+
+
 def _uses_session_schema(path: str) -> bool:
     return (
         path == "/sessions"
@@ -2847,6 +3488,8 @@ def _route_delete(
         if len(parts) == 3 and parts[2] == "share":
             store.get_session(parts[1])
             return _session_unshare_unsupported(parts[1])
+        if len(parts) == 3 and parts[2] == "pending-action":
+            return clear_pending_chat_action_metadata(store, parts[1], actor="local_server")
         if len(parts) == 4 and parts[2] == "message":
             session_id = parts[1]
             message_id = parts[3]
@@ -3077,8 +3720,8 @@ def _api_session_list_projection(store: SQLiteStore, query: dict[str, list[str]]
     return {
         "schema_version": "harness.api_sessions/v1",
         "ok": True,
-        "items": [session.model_dump(mode="json") for session in sessions],
-        "sessions": [session.model_dump(mode="json") for session in sessions],
+        "items": [_session_payload_with_pending_action(store, session) for session in sessions],
+        "sessions": [_session_payload_with_pending_action(store, session) for session in sessions],
         "limit": limit,
         "cursor": None,
         "execution_started": False,
@@ -4132,6 +4775,7 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
     events = store.list_session_store_events(session.id)
     messages = store.list_session_messages(session.id)
     children = store.list_child_sessions(session.id)
+    transcript_health = _session_transcript_health_projection(store, session.id)
     runtime = SessionRuntimeManager.for_store(store).status(session.id)
     try:
         cwd = session_cwd_payload(store.project_root, session.metadata, load_config(store.project_root).context_excludes)
@@ -4155,14 +4799,18 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
         "estimated_cost_usd": str(session.estimated_cost_usd) if session.estimated_cost_usd is not None else None,
         "message_count": len(messages),
         "event_count": len(events),
+        "transcript_health": transcript_health,
         "cwd": cwd,
         "planning_mode": session_planning_mode_projection(session.metadata),
+        "active_run_reference": session_active_run_reference_projection(store, session),
+        "pending_action": _pending_chat_action_projection_for_session(store, session),
+        "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
         "operator": session_operator_status_projection(
             store,
             session.id,
             project_root=store.project_root,
             cwd=str(cwd.get("cwd") or "."),
-            active_tools=_operator_active_tools(),
+            active_tools=_operator_active_tools(project_root=store.project_root),
         ),
         "runtime": runtime.model_dump(mode="json"),
         "child_session_ids": [child.id for child in children],
@@ -4174,10 +4822,10 @@ def _session_status_projection(store: SQLiteStore, session_id: str) -> dict[str,
     }
 
 
-def _operator_active_tools() -> list[str]:
-    from harness.session_tools import default_session_tool_descriptors
+def _operator_active_tools(*, project_root: Path | None = None) -> list[str]:
+    from harness.session_tools import model_visible_session_tool_ids
 
-    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+    return model_visible_session_tool_ids(project_root=project_root)
 
 
 def _latest_session_ui_activation(store: SQLiteStore, session_id: str) -> dict[str, Any] | None:
@@ -4214,10 +4862,33 @@ def _latest_session_ui_activation(store: SQLiteStore, session_id: str) -> dict[s
     }
 
 
+def _session_payload_with_pending_action(store: SQLiteStore, session) -> dict[str, Any]:
+    payload = session.model_dump(mode="json")
+    metadata = dict(payload.get("metadata") or {})
+    metadata.pop(PENDING_CHAT_ACTION_METADATA_KEY, None)
+    payload["metadata"] = metadata
+    return {
+        **payload,
+        "active_run_reference": session_active_run_reference_projection(store, session),
+        "pending_action": _pending_chat_action_projection_for_session(store, session),
+        "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
+        "transcript_health": _session_transcript_health_projection(store, session.id),
+    }
+
+
+def _session_transcript_health_projection(store: SQLiteStore, session_id: str) -> dict[str, Any]:
+    return session_events_read_health_payload(read_session_events_with_diagnostics(store.project_root, session_id))
+
+
 def _sessions_status_projection(store: SQLiteStore) -> dict[str, Any]:
     sessions = store.list_sessions()
+    known_run_ids = {run.id for run in store.list_runs()}
+    run_ref_counts = active_run_reference_counts(store, sessions, known_run_ids=known_run_ids)
     runtime_manager = SessionRuntimeManager.for_store(store)
     status_by_session = {session.id: session.status.value for session in sessions}
+    transcript_health_by_session = {
+        session.id: _session_transcript_health_projection(store, session.id) for session in sessions
+    }
     active_session_ids = [
         session.id
         for session in sessions
@@ -4232,17 +4903,59 @@ def _sessions_status_projection(store: SQLiteStore) -> dict[str, Any]:
                 "session_id": session.id,
                 "status": session.status.value,
                 "active_run_id": session.active_run_id,
+                "active_run_reference": session_active_run_reference_projection(
+                    store,
+                    session,
+                    known_run_ids=known_run_ids,
+                ),
                 "active_task_id": session.active_task_id,
+                "pending_action": _pending_chat_action_projection_for_session(store, session),
+                "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
+                "transcript_health": transcript_health_by_session[session.id],
                 "runtime": runtime_manager.status(session.id).model_dump(mode="json"),
                 "updated_at": session.updated_at.isoformat(),
             }
             for session in sessions
         ],
+        "transcript_health_by_session": transcript_health_by_session,
+        "malformed_transcript_session_ids": [
+            session_id for session_id, health in transcript_health_by_session.items() if not health["ok"]
+        ],
         "active_session_ids": active_session_ids,
         "session_count": len(sessions),
+        **run_ref_counts,
         "execution_started": False,
         "permission_granting": False,
     }
+
+
+def _pending_chat_action_projection_for_session(store: SQLiteStore, session) -> dict[str, Any] | None:
+    return pending_chat_action_projection(
+        session.metadata,
+        session_id=session.id,
+        lease_status=_pending_chat_action_lease_status(store, session.metadata),
+    )
+
+
+def _pending_chat_action_audit_for_session(store: SQLiteStore, session) -> dict[str, Any]:
+    return pending_chat_action_audit(
+        session.metadata,
+        session_id=session.id,
+        lease_status=_pending_chat_action_lease_status(store, session.metadata),
+    )
+
+
+def _pending_chat_action_lease_status(store: SQLiteStore, metadata: dict[str, Any] | None) -> str | None:
+    raw = (metadata or {}).get(PENDING_CHAT_ACTION_METADATA_KEY)
+    if not isinstance(raw, dict) or raw.get("kind") != "execute_lease":
+        return None
+    lease_id = raw.get("lease_id")
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        return None
+    try:
+        return store.get_task_lease(lease_id).status.value
+    except KeyError:
+        return "missing"
 
 
 def _session_children_projection(store: SQLiteStore, session_id: str) -> dict[str, Any]:
@@ -5855,6 +6568,18 @@ def _optional_query_int(query: dict[str, list[str]], key: str) -> int | None:
     return parsed
 
 
+def _optional_query_bool(query: dict[str, list[str]], key: str, *, default: bool = False) -> bool:
+    value = _single_query_value(query, key)
+    if value is None or value == "":
+        return default
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean query parameter: {key}")
+
+
 def _optional_body_text(body: dict[str, Any], key: str) -> str | None:
     value = body.get(key)
     if value is None:
@@ -6333,10 +7058,61 @@ def _mcp_status_projection(cfg) -> dict[str, Any]:
     }
 
 
-def _mcp_resources_projection(cfg) -> dict[str, Any]:
+def _configured_path_safety_projection(project_root: Path, configured_path: str | None) -> tuple[dict[str, Any], Path | None]:
+    payload: dict[str, Any] = {
+        "schema_version": "harness.configured_path_safety/v1",
+        "ok": False,
+        "configured_path": configured_path,
+        "symlink_policy": "reject_configured_path_components",
+        "symlink_checked": True,
+        "symlink_safe": False,
+        "project_boundary_checked": True,
+        "relative_path": None,
+        "error_type": None,
+        "message": None,
+        "blocked_reasons": [],
+    }
+    if not configured_path:
+        payload.update(
+            {
+                "error_type": "missing_path",
+                "message": "No configured path.",
+                "blocked_reasons": ["configured_path_missing"],
+            }
+        )
+        return payload, None
+    try:
+        reject_symlink_components_under_project(project_root, configured_path)
+        path = resolve_under_project(project_root, configured_path)
+    except PathSecurityError as exc:
+        message = str(sanitize_for_logging(str(exc)))
+        payload.update(
+            {
+                "error_type": "path_security",
+                "message": message,
+                "blocked_reasons": ["configured_path_security_failed"],
+            }
+        )
+        return payload, None
+    payload.update(
+        {
+            "ok": True,
+            "symlink_safe": True,
+            "relative_path": relative_to_project(project_root, path),
+            "blocked_reasons": [],
+        }
+    )
+    return payload, path
+
+
+def _mcp_resources_projection(project_root: Path, cfg) -> dict[str, Any]:
     resources: list[dict[str, Any]] = []
     for server_name, server in sorted(cfg.mcp.servers.items()):
         for resource_name, resource in sorted(server.resources.items()):
+            path_safety, _path = _configured_path_safety_projection(project_root, resource.path)
+            blocked_reasons = ["mcp_resource_read_requires_permission", "mcp_connection_disabled"]
+            if not path_safety["ok"]:
+                blocked_reasons = [*path_safety["blocked_reasons"], *blocked_reasons]
             resources.append(
                 {
                     "name": resource_name,
@@ -6345,12 +7121,16 @@ def _mcp_resources_projection(cfg) -> dict[str, Any]:
                     "enabled": bool(cfg.mcp.enabled and server.enabled and resource.enabled),
                     "cached": bool(resource.path),
                     "path": resource.path,
+                    "path_safety": path_safety,
+                    "symlink_policy": path_safety["symlink_policy"],
+                    "symlink_checked": path_safety["symlink_checked"],
+                    "symlink_safe": path_safety["symlink_safe"],
                     "content_type": resource.content_type,
                     "description": resource.description,
                     "contents_included": False,
                     "evidence_status": "metadata_only",
                     "resource_read_supported": False,
-                    "session_tool_resource_read_supported": True,
+                    "session_tool_resource_read_supported": bool(path_safety["ok"]),
                     "tool_execution_supported": False,
                     "requires_permission": True,
                     "policy_boundary": {
@@ -6361,20 +7141,24 @@ def _mcp_resources_projection(cfg) -> dict[str, Any]:
                         "tool_execution_allowed": False,
                         "session_tool_permission_required": True,
                         "contents_included": False,
+                        "symlink_policy": path_safety["symlink_policy"],
+                        "symlink_safe": path_safety["symlink_safe"],
                     },
-                    "blocked_reasons": ["mcp_resource_read_requires_permission", "mcp_connection_disabled"],
+                    "blocked_reasons": blocked_reasons,
                     "connected": False,
                     "process_started": False,
                     "network_called": False,
                     "permission_granting": False,
                 }
             )
+    unsafe_resource_count = len([resource for resource in resources if not resource.get("symlink_safe")])
     return {
         "schema_version": "harness.mcp_resources/v1",
         "ok": True,
         "enabled": bool(cfg.mcp.enabled),
         "resources": resources,
         "resource_count": len(resources),
+        "unsafe_resource_count": unsafe_resource_count,
         "cached_only": True,
         "contents_included": False,
         "tool_execution_supported": False,
@@ -6388,6 +7172,7 @@ def _mcp_resources_projection(cfg) -> dict[str, Any]:
             "contents_included": False,
             "resource_read_source": "configured_cached_metadata_only",
             "requires_permission": True,
+            "symlink_policy": "reject_configured_path_components",
         },
         "blocked_reasons": ["mcp_connection_disabled", "mcp_tool_execution_disabled"],
         "connected": False,
@@ -6658,17 +7443,35 @@ def _skill_catalog(project_root: Path, cfg) -> dict[str, Any]:
             "permission_granting": False,
         }
         if skill.path:
-            path = resolve_under_project(project_root, skill.path)
-            skill_file = path / "SKILL.md" if path.is_dir() else path
+            path_safety, path = _configured_path_safety_projection(project_root, skill.path)
+            skill_file_safety = path_safety
+            skill_file: Path | None = None
+            if path is not None:
+                skill_file_candidate = Path(skill.path) / "SKILL.md" if path.is_dir() else Path(skill.path)
+                skill_file_safety, _skill_file_path = _configured_path_safety_projection(project_root, str(skill_file_candidate))
+                skill_file = path / "SKILL.md" if path.is_dir() else path
+            symlink_safe = bool(path_safety["ok"] and skill_file_safety["ok"])
+            if not symlink_safe:
+                payload["blocked_reasons"] = [
+                    *path_safety["blocked_reasons"],
+                    *[reason for reason in skill_file_safety["blocked_reasons"] if reason not in path_safety["blocked_reasons"]],
+                    *payload["blocked_reasons"],
+                ]
             payload.update(
                 {
-                    "path": relative_to_project(project_root, path),
-                    "exists": path.exists(),
-                    "directory": path.is_dir(),
-                    "skill_file": str(skill_file),
-                    "skill_file_path": relative_to_project(project_root, skill_file),
-                    "skill_file_exists": skill_file.exists(),
-                    "content_bytes": skill_file.stat().st_size if skill_file.exists() and skill_file.is_file() else None,
+                    "path": relative_to_project(project_root, path) if path is not None else skill.path,
+                    "path_safety": path_safety,
+                    "skill_file_path_safety": skill_file_safety,
+                    "symlink_policy": "reject_configured_path_components",
+                    "symlink_checked": True,
+                    "symlink_safe": symlink_safe,
+                    "exists": path.exists() if path is not None else False,
+                    "directory": path.is_dir() if path is not None else False,
+                    "skill_file": str(skill_file) if skill_file is not None else None,
+                    "skill_file_path": relative_to_project(project_root, skill_file) if skill_file is not None else None,
+                    "skill_file_exists": skill_file.exists() if skill_file is not None else False,
+                    "content_bytes": skill_file.stat().st_size if skill_file is not None and skill_file.exists() and skill_file.is_file() else None,
+                    "session_tool_load_supported": bool(symlink_safe),
                 }
             )
         skills.append(payload)
@@ -6721,6 +7524,7 @@ def _skill_catalog(project_root: Path, cfg) -> dict[str, Any]:
         "ok": True,
         "enabled": bool(cfg.skills.enabled),
         "skills": skills,
+        "unsafe_skill_count": len([skill for skill in skills if skill.get("symlink_checked") and not skill.get("symlink_safe", True)]),
         "runtime_loaded": False,
         "skill_body_loaded": False,
         "tool_registered": False,
@@ -6753,7 +7557,7 @@ def _global_skill_paths() -> list[Path]:
 
 def _extensibility_status_projection(project_root: Path, cfg) -> dict[str, Any]:
     mcp_status = _mcp_status_projection(cfg)
-    mcp_resources = _mcp_resources_projection(cfg)
+    mcp_resources = _mcp_resources_projection(project_root, cfg)
     plugins = _plugin_catalog(project_root, cfg)
     skills = _skill_catalog(project_root, cfg)
     web_tools = _web_tool_policy_projection(cfg)
@@ -6770,6 +7574,7 @@ def _extensibility_status_projection(project_root: Path, cfg) -> dict[str, Any]:
             "enabled": mcp_status["enabled"],
             "server_count": len(mcp_status["servers"]),
             "resource_count": len(mcp_resources["resources"]),
+            "unsafe_resource_count": mcp_resources["unsafe_resource_count"],
             "connected": mcp_status["connected"],
             "process_started": mcp_status["process_started"],
             "network_called": mcp_status["network_called"],
@@ -6794,6 +7599,7 @@ def _extensibility_status_projection(project_root: Path, cfg) -> dict[str, Any]:
             "skill_count": len(skills["skills"]),
             "project_skill_count": len(project_skills),
             "global_skill_count": len(global_skills),
+            "unsafe_skill_count": skills["unsafe_skill_count"],
             "runtime_loaded": skills["runtime_loaded"],
             "skill_body_loaded": skills["skill_body_loaded"],
             "tool_registered": skills["tool_registered"],

@@ -348,71 +348,12 @@ def _looks_like_simple_python_script_request(normalized: str, filename: str | No
         return False
     if not {"create", "make", "add", "write"}.intersection(words):
         return False
-    return any(marker in normalized for marker in (" script", " code", " file", " program", " prints", " print"))
+    if "print" in words or "prints" in words:
+        return True
+    return bool(re.search(r"['\"][^'\"]+['\"]", normalized))
 
 
 def _python_script_text_from_text(text: str) -> str:
-    if _looks_like_black_scholes_request(text):
-        return "\n".join(
-            [
-                "from __future__ import annotations",
-                "",
-                "import argparse",
-                "import math",
-                "",
-                "",
-                "def normal_cdf(value: float) -> float:",
-                "    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))",
-                "",
-                "",
-                "def black_scholes_price(",
-                "    spot: float,",
-                "    strike: float,",
-                "    time_to_expiry: float,",
-                "    risk_free_rate: float,",
-                "    volatility: float,",
-                "    option_type: str = \"call\",",
-                ") -> float:",
-                "    if spot <= 0 or strike <= 0:",
-                "        raise ValueError(\"spot and strike must be positive\")",
-                "    if time_to_expiry <= 0:",
-                "        raise ValueError(\"time_to_expiry must be positive\")",
-                "    if volatility <= 0:",
-                "        raise ValueError(\"volatility must be positive\")",
-                "",
-                "    sigma_sqrt_t = volatility * math.sqrt(time_to_expiry)",
-                "    d1 = (",
-                "        math.log(spot / strike)",
-                "        + (risk_free_rate + 0.5 * volatility * volatility) * time_to_expiry",
-                "    ) / sigma_sqrt_t",
-                "    d2 = d1 - sigma_sqrt_t",
-                "    discounted_strike = strike * math.exp(-risk_free_rate * time_to_expiry)",
-                "",
-                "    normalized_type = option_type.lower()",
-                "    if normalized_type == \"call\":",
-                "        return spot * normal_cdf(d1) - discounted_strike * normal_cdf(d2)",
-                "    if normalized_type == \"put\":",
-                "        return discounted_strike * normal_cdf(-d2) - spot * normal_cdf(-d1)",
-                "    raise ValueError(\"option_type must be 'call' or 'put'\")",
-                "",
-                "",
-                "def main() -> None:",
-                "    parser = argparse.ArgumentParser(description=\"Black-Scholes option pricing\")",
-                "    parser.add_argument(\"--spot\", type=float, default=100.0)",
-                "    parser.add_argument(\"--strike\", type=float, default=100.0)",
-                "    parser.add_argument(\"--time\", type=float, default=1.0, help=\"Years to expiry\")",
-                "    parser.add_argument(\"--rate\", type=float, default=0.05, help=\"Continuously compounded risk-free rate\")",
-                "    parser.add_argument(\"--vol\", type=float, default=0.2, help=\"Annualized volatility\")",
-                "    parser.add_argument(\"--type\", choices=(\"call\", \"put\"), default=\"call\")",
-                "    args = parser.parse_args()",
-                "    price = black_scholes_price(args.spot, args.strike, args.time, args.rate, args.vol, args.type)",
-                "    print(f\"{args.type.title()} price: {price:.6f}\")",
-                "",
-                "",
-                "if __name__ == \"__main__\":",
-                "    main()",
-            ]
-        )
     quoted = re.search(r"['\"]([^'\"]+)['\"]", text)
     if quoted:
         sentence = quoted.group(1).strip()
@@ -428,11 +369,4 @@ def _python_script_text_from_text(text: str) -> str:
 def _python_script_filename_from_text(text: str, filename: str | None) -> str:
     if filename:
         return filename
-    if _looks_like_black_scholes_request(text):
-        return "black_scholes_pricing.py"
     return "simple_script.py"
-
-
-def _looks_like_black_scholes_request(text: str) -> bool:
-    normalized = _normalize(text).replace("-", " ")
-    return "black scholes" in normalized or "blackscholes" in normalized

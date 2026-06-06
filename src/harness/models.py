@@ -83,8 +83,12 @@ class SessionStatus(str, Enum):
 class ObjectiveStatus(str, Enum):
     CREATED = "created"
     ACTIVE = "active"
+    WAITING_APPROVAL = "waiting_approval"
+    SUSPENDED = "suspended"
+    RETRYING = "retrying"
     COMPLETED = "completed"
     CANCELLED = "cancelled"
+    TIMED_OUT = "timed_out"
 
 
 class TaskDependencyType(str, Enum):
@@ -182,6 +186,7 @@ class BreakerStatus(str, Enum):
 class IntegritySubjectKind(str, Enum):
     BUILTIN_SPEC = "builtin_spec"
     ADAPTER_DESCRIPTOR = "adapter_descriptor"
+    WORKFLOW_TEMPLATE = "workflow_template"
     SECURITY_DOC = "security_doc"
     ARTIFACT = "artifact"
     TRACE_EXPORT = "trace_export"
@@ -483,6 +488,38 @@ class ToolCapabilityDescriptor(BaseModel):
     policy_keys: list[str] = Field(default_factory=list)
 
 
+class DelegateBudgetPolicy(BaseModel):
+    schema_version: str = "harness.delegate_budget/v1"
+    timeout_seconds: int = Field(ge=0)
+    max_runtime_invocations: int = Field(ge=0)
+    max_model_calls: int = Field(ge=0)
+    max_tool_calls: int = Field(ge=0)
+    max_parallel_branches: int = Field(default=1, ge=1)
+    max_input_tokens: int | None = Field(default=None, ge=0)
+    max_output_tokens: int | None = Field(default=None, ge=0)
+    max_cost_usd: Decimal | None = Field(default=None, ge=0)
+    max_cpu_seconds: int | None = Field(default=None, ge=0)
+    max_memory_mb: int | None = Field(default=None, ge=0)
+    cost_policy: Literal[
+        "record_only",
+        "local_no_api_cost",
+        "subscription_boundary",
+        "provider_policy_validated",
+        "paid_cost_cap",
+    ]
+    network_policy: SandboxNetworkPolicy = SandboxNetworkPolicy.FORBIDDEN
+    active_repo_write: SandboxActiveRepoWritePolicy = SandboxActiveRepoWritePolicy.FORBIDDEN
+    filesystem_scope: Literal[
+        "none",
+        "harness_artifacts",
+        "project_read_only",
+        "isolated_workspace",
+        "session_policy",
+    ]
+    tool_allowlist: list[str] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class ExecutionAdapterDescriptor(BaseModel):
     schema_version: str = "harness.execution_adapter/v1"
     id: str
@@ -499,6 +536,7 @@ class ExecutionAdapterDescriptor(BaseModel):
     safety_notes: list[str] = Field(default_factory=list)
     autonomy_default: Literal["auto_allowed", "approval_required", "forbidden"] = "approval_required"
     max_autonomous_retries: int = 0
+    delegate_budget: DelegateBudgetPolicy
     required_autonomy_scopes: list[str] = Field(default_factory=list)
     output_contracts: list[str] = Field(default_factory=list)
     terminal_evidence_required: list[str] = Field(default_factory=list)
@@ -515,6 +553,7 @@ class CapabilityRecord(BaseModel):
     backend_requirements: list[str] = Field(default_factory=list)
     sandbox_requirements: list[str] = Field(default_factory=list)
     sandbox_profile: dict[str, Any] | None = None
+    delegate_budget: dict[str, Any]
     side_effect_summary: str
     replay_policy: ToolReplayPolicy
     readiness: str
@@ -836,6 +875,8 @@ class OrchestrationProgress(BaseModel):
     active_run_ids: list[str] = Field(default_factory=list)
     blocked_reasons: list[str] = Field(default_factory=list)
     untrusted_context_warnings: list[str] = Field(default_factory=list)
+    checkpoints: dict[str, Any] | None = None
+    objective_evidence: dict[str, Any] | None = None
     next_action: str | None = None
     equivalent_commands: list[str] = Field(default_factory=list)
 
@@ -1258,6 +1299,7 @@ class RunManifest(BaseModel):
     effective_policy_sha256: str | None = None
     backend_descriptor_sha256: str | None = None
     sandbox_profile: dict[str, Any] | None = None
+    delegate_budget: dict[str, Any] | None = None
     validation_results: dict[str, Any] | None = None
     autonomy_decision_id: str | None = None
     autonomous_approval_id: str | None = None
@@ -1435,6 +1477,66 @@ class SecurityLayerAuditResult(BaseModel):
     summary: dict[str, int] = Field(default_factory=dict)
 
 
+class OrchestrationEfficiencyCheck(BaseModel):
+    schema_version: str = "harness.orchestration_efficiency_check/v1"
+    id: str
+    status: str
+    message: str
+    reference_patterns: list[str] = Field(default_factory=list)
+    measurements: dict[str, Any] = Field(default_factory=dict)
+    gaps: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+
+
+class OrchestrationEfficiencyResult(BaseModel):
+    schema_version: str = "harness.orchestration_efficiency/v1"
+    ok: bool
+    suite: str = "orchestration-efficiency"
+    project_root: Path
+    safety: dict[str, bool] = Field(default_factory=dict)
+    summary: dict[str, int] = Field(default_factory=dict)
+    checks: list[OrchestrationEfficiencyCheck] = Field(default_factory=list)
+
+
+class OrchestrationMicrobenchmarkCase(BaseModel):
+    schema_version: str = "harness.orchestration_microbenchmark_case/v1"
+    id: str
+    status: str
+    measurement_mode: str
+    message: str
+    source_checks: list[str] = Field(default_factory=list)
+    metrics: list[str] = Field(default_factory=list)
+    measurements: dict[str, Any] = Field(default_factory=dict)
+    samples: list[dict[str, Any]] = Field(default_factory=list)
+    gaps: list[str] = Field(default_factory=list)
+    next_actions: list[str] = Field(default_factory=list)
+
+
+class OrchestrationMicrobenchmarkResult(BaseModel):
+    schema_version: str = "harness.orchestration_microbenchmarks/v1"
+    ok: bool
+    suite: str = "orchestration-microbenchmarks"
+    project_root: Path
+    safety: dict[str, bool] = Field(default_factory=dict)
+    summary: dict[str, int] = Field(default_factory=dict)
+    benchmarks: list[OrchestrationMicrobenchmarkCase] = Field(default_factory=list)
+
+
+class OrchestrationSynthesisReport(BaseModel):
+    schema_version: str = "harness.orchestration_synthesis/v1"
+    ok: bool
+    suite: str = "orchestration-synthesis"
+    project_root: Path
+    reference_root: Path | None = None
+    summary: dict[str, Any] = Field(default_factory=dict)
+    source_reports: dict[str, Any] = Field(default_factory=dict)
+    adopted_reference_patterns: list[dict[str, Any]] = Field(default_factory=list)
+    deliberate_non_adoptions: list[dict[str, Any]] = Field(default_factory=list)
+    security_complexity_posture: dict[str, Any] = Field(default_factory=dict)
+    operator_commands: list[str] = Field(default_factory=list)
+    safety: dict[str, bool] = Field(default_factory=dict)
+
+
 class TraceSpan(BaseModel):
     trace_id: str
     span_id: str
@@ -1446,10 +1548,30 @@ class TraceSpan(BaseModel):
     attributes: dict[str, Any] = Field(default_factory=dict)
 
 
+TRACE_SEMANTIC_CONVENTIONS = [
+    "opentelemetry.trace",
+    "opentelemetry.semconv.gen_ai",
+    "opentelemetry.semconv.gen_ai.agent",
+    "opentelemetry.semconv.gen_ai.mcp",
+]
+
+
+TRACE_CONTEXT_PROPAGATION = {
+    "w3c_trace_context": True,
+    "carrier_keys": ["traceparent", "tracestate"],
+    "external_protocol_propagation_required": True,
+    "sensitive_bodies_included": False,
+}
+
+
 class TraceExport(BaseModel):
     schema_version: str = "harness.trace_export/v1"
     ok: bool = True
     format: str = "otel-json"
-    run_id: str
+    semantic_conventions: list[str] = Field(default_factory=lambda: list(TRACE_SEMANTIC_CONVENTIONS))
+    trace_context: dict[str, Any] = Field(default_factory=lambda: dict(TRACE_CONTEXT_PROPAGATION))
+    run_id: str | None = None
+    objective_id: str | None = None
+    objective_run_ids: list[str] = Field(default_factory=list)
     trace_id: str
     spans: list[TraceSpan] = Field(default_factory=list)

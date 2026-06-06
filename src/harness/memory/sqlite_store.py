@@ -71,6 +71,7 @@ from harness.models import (
     TaskRecord,
     TaskStatus,
     TaskTransitionRecord,
+    ToolReplayPolicy,
     PolicyLevel,
     RedactionState,
     RunEventType,
@@ -103,6 +104,14 @@ LEGACY_TASK_STATUS_VALUES = {
 }
 
 SESSION_TODO_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
+DAEMON_TASK_PAUSE_DECISIONS = {
+    "active_lease",
+    "blocked_dependency",
+    "breaker_open",
+    "control_disabled",
+    "policy_forbidden",
+    "waiting_approval",
+}
 SCHEMA_MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     (
         "20260516_001_sessions",
@@ -233,6 +242,8 @@ DRY_RUN_FORBIDDEN_METADATA_KEYS = DAEMON_POLICY_FORBIDDEN_METADATA_KEYS | {
 }
 READ_ONLY_FORBIDDEN_METADATA_KEYS = DRY_RUN_FORBIDDEN_METADATA_KEYS
 
+TASK_REPLAY_RECEIPT_SCHEMA_VERSION = "harness.task_replay_receipt/v1"
+
 ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.CREATED: {TaskStatus.READY, TaskStatus.BLOCKED, TaskStatus.WAITING_APPROVAL},
     TaskStatus.READY: {
@@ -281,6 +292,29 @@ ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.SKIPPED: set(),
 }
 
+ALLOWED_OBJECTIVE_TRANSITIONS = {
+    ObjectiveStatus.CREATED: {ObjectiveStatus.ACTIVE, ObjectiveStatus.CANCELLED},
+    ObjectiveStatus.ACTIVE: {
+        ObjectiveStatus.WAITING_APPROVAL,
+        ObjectiveStatus.SUSPENDED,
+        ObjectiveStatus.RETRYING,
+        ObjectiveStatus.COMPLETED,
+        ObjectiveStatus.CANCELLED,
+        ObjectiveStatus.TIMED_OUT,
+    },
+    ObjectiveStatus.WAITING_APPROVAL: {
+        ObjectiveStatus.ACTIVE,
+        ObjectiveStatus.SUSPENDED,
+        ObjectiveStatus.CANCELLED,
+        ObjectiveStatus.TIMED_OUT,
+    },
+    ObjectiveStatus.SUSPENDED: {ObjectiveStatus.ACTIVE, ObjectiveStatus.CANCELLED, ObjectiveStatus.TIMED_OUT},
+    ObjectiveStatus.RETRYING: {ObjectiveStatus.ACTIVE, ObjectiveStatus.CANCELLED, ObjectiveStatus.TIMED_OUT},
+    ObjectiveStatus.COMPLETED: set(),
+    ObjectiveStatus.CANCELLED: set(),
+    ObjectiveStatus.TIMED_OUT: {ObjectiveStatus.RETRYING},
+}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -310,6 +344,10 @@ def normalize_task_status(status: str | TaskStatus) -> TaskStatus:
     return TaskStatus(status.value if isinstance(status, TaskStatus) else status)
 
 
+def normalize_objective_status(status: str | ObjectiveStatus) -> ObjectiveStatus:
+    return ObjectiveStatus(status.value if isinstance(status, ObjectiveStatus) else status)
+
+
 def _sort_json(value):
     if isinstance(value, dict):
         return {key: _sort_json(value[key]) for key in sorted(value)}
@@ -325,6 +363,15 @@ def validate_task_transition(from_status: str | TaskStatus, to_status: str | Tas
         return
     if next_status not in ALLOWED_TASK_TRANSITIONS[current]:
         raise ValueError(f"Invalid task transition: {current.value} -> {next_status.value}")
+
+
+def validate_objective_transition(from_status: str | ObjectiveStatus, to_status: str | ObjectiveStatus) -> None:
+    current = normalize_objective_status(from_status)
+    next_status = normalize_objective_status(to_status)
+    if current == next_status:
+        return
+    if next_status not in ALLOWED_OBJECTIVE_TRANSITIONS[current]:
+        raise ValueError(f"Invalid objective transition: {current.value} -> {next_status.value}")
 
 
 def _execution_control_id(target_kind: KillSwitchTargetKind, target_id: str) -> str:
@@ -2534,6 +2581,53 @@ class SQLiteStore:
         self.write_run_manifest(run_id)
         return self.update_session(session_id, active_run_id=run_id)
 
+    def clear_stale_session_active_run(
+        self,
+        session_id: str,
+        *,
+        missing_run_id: str,
+        actor: str = "doctor",
+    ) -> StoredEventRecord:
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT active_run_id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+            active_run_id = row["active_run_id"]
+            if active_run_id != missing_run_id:
+                raise ValueError(f"Session {session_id} active_run_id changed while repairing.")
+            run_row = conn.execute("SELECT id FROM runs WHERE id = ?", (missing_run_id,)).fetchone()
+            if run_row is not None:
+                raise ValueError(f"Run exists and cannot be cleared as stale: {missing_run_id}")
+            conn.execute(
+                "UPDATE sessions SET active_run_id = NULL, updated_at = ? WHERE id = ?",
+                (timestamp, session_id),
+            )
+        return self.append_store_event(
+            EventStreamType.SESSION,
+            session_id,
+            "session.active_run_repaired",
+            {
+                "actor": actor,
+                "missing_run_id": missing_run_id,
+                "active_run_id_cleared": True,
+                "mutation_scope": "session_active_run_pointer_only",
+                "runs_deleted": False,
+                "tasks_mutated": False,
+                "artifacts_deleted": False,
+                "messages_mutated": False,
+                "events_deleted": False,
+                "process_started": False,
+                "provider_called": False,
+                "network_called": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+            },
+            session_id=session_id,
+            redaction_state=RedactionState.NOT_REQUIRED,
+        )
+
     def disable_execution_control(
         self,
         target_kind: KillSwitchTargetKind | str,
@@ -2641,6 +2735,16 @@ class SQLiteStore:
     def active_execution_controls(self) -> list[KillSwitchRecord]:
         return [control for control in self.list_execution_controls() if control.disabled]
 
+    def _active_execution_controls_in_conn(self, conn: sqlite3.Connection) -> list[KillSwitchRecord]:
+        rows = conn.execute(
+            """
+            SELECT * FROM execution_controls
+            WHERE disabled = 1
+            ORDER BY target_kind ASC, target_id ASC
+            """
+        ).fetchall()
+        return [self._row_to_kill_switch(row) for row in rows]
+
     def reset_adapter_breaker(
         self,
         adapter_id: str,
@@ -2736,8 +2840,9 @@ class SQLiteStore:
 
     def connect(self) -> sqlite3.Connection:
         self.harness_dir.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
         return conn
 
     def inspect_required_session_schema(self) -> dict[str, Any]:
@@ -2777,41 +2882,18 @@ class SQLiteStore:
         run_id = f"run_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         with self.connect() as conn:
-            if task_id is not None:
-                self._require_task(conn, task_id)
-            if objective_id is not None:
-                self._require_objective(conn, objective_id)
-            if session_id is not None:
-                row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
-                if row is None:
-                    raise KeyError(f"Session not found: {session_id}")
-            conn.execute(
-                """
-                INSERT INTO runs (
-                  id, goal, task_type, status, project_root, created_at, updated_at,
-                  backend_name, backend_kind, billing_mode, execution_location,
-                  data_boundary, allow_network, approval_id, task_id, objective_id, session_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    sanitize_for_logging(goal) if goal is not None else None,
-                    task_type,
-                    status,
-                    str(self.project_root),
-                    timestamp,
-                    timestamp,
-                    backend.name if backend else None,
-                    backend.kind.value if backend else None,
-                    backend.metadata.billing_mode.value if backend else None,
-                    backend.metadata.execution_location.value if backend else None,
-                    backend.metadata.data_boundary.value if backend else None,
-                    int(backend.metadata.allow_network) if backend else None,
-                    approval_id,
-                    task_id,
-                    objective_id,
-                    session_id,
-                ),
+            self._insert_run_in_conn(
+                conn,
+                run_id=run_id,
+                timestamp=timestamp,
+                goal=goal,
+                task_type=task_type,
+                status=status,
+                backend=backend,
+                approval_id=approval_id,
+                task_id=task_id,
+                objective_id=objective_id,
+                session_id=session_id,
             )
         self.initialize_run_artifacts(run_id)
         if backend:
@@ -2820,6 +2902,58 @@ class SQLiteStore:
         if session_id is not None:
             self.update_session(session_id, active_run_id=run_id)
         return self.get_run(run_id)
+
+    def _insert_run_in_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        run_id: str,
+        timestamp: str,
+        goal: str | None,
+        task_type: str | None,
+        status: str,
+        backend: BackendConfig | None,
+        approval_id: str | None,
+        task_id: str | None,
+        objective_id: str | None,
+        session_id: str | None = None,
+    ) -> None:
+        if task_id is not None:
+            self._require_task(conn, task_id)
+        if objective_id is not None:
+            self._require_objective(conn, objective_id)
+        if session_id is not None:
+            row = conn.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Session not found: {session_id}")
+        conn.execute(
+            """
+            INSERT INTO runs (
+              id, goal, task_type, status, project_root, created_at, updated_at,
+              backend_name, backend_kind, billing_mode, execution_location,
+              data_boundary, allow_network, approval_id, task_id, objective_id, session_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                sanitize_for_logging(goal) if goal is not None else None,
+                task_type,
+                status,
+                str(self.project_root),
+                timestamp,
+                timestamp,
+                backend.name if backend else None,
+                backend.kind.value if backend else None,
+                backend.metadata.billing_mode.value if backend else None,
+                backend.metadata.execution_location.value if backend else None,
+                backend.metadata.data_boundary.value if backend else None,
+                int(backend.metadata.allow_network) if backend else None,
+                approval_id,
+                task_id,
+                objective_id,
+                session_id,
+            ),
+        )
 
     def initialize_run_artifacts(self, run_id: str) -> dict[str, Path]:
         run_dir = self.runs_dir / run_id
@@ -2898,6 +3032,29 @@ class SQLiteStore:
             raise KeyError(f"Task lease not found: {lease_id}")
         return self._row_to_task_lease(row)
 
+    def _require_active_lease_authority(self, lease: TaskLease, owner: str, *, action: str) -> None:
+        if lease.status != TaskLeaseStatus.ACTIVE:
+            raise ValueError(f"{action} requires active lease: {lease.status.value}")
+        if lease.owner != owner:
+            raise ValueError(f"Lease owner mismatch: lease is owned by {lease.owner}, not {owner}.")
+
+    def _refreshed_task_lease_context(
+        self,
+        lease_or_id: TaskLease | str,
+    ) -> tuple[TaskLease, TaskAttempt | None, TaskRecord | None]:
+        lease = self.get_task_lease(lease_or_id.id if isinstance(lease_or_id, TaskLease) else lease_or_id)
+        attempt = None
+        if lease.attempt_id is not None:
+            try:
+                attempt = self.get_task_attempt(lease.attempt_id)
+            except KeyError:
+                attempt = None
+        try:
+            task = self.get_task(lease.task_id)
+        except KeyError:
+            task = None
+        return lease, attempt, task
+
     def update_run_status(self, run_id: str, status: str) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -2914,10 +3071,14 @@ class SQLiteStore:
         workbench_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         session_id: str | None = None,
+        status: str | ObjectiveStatus = ObjectiveStatus.ACTIVE,
     ) -> ObjectiveRecord:
         objective_id = f"obj_{uuid.uuid4().hex[:12]}"
         timestamp = now_iso()
         metadata = metadata or {}
+        initial_status = normalize_objective_status(status)
+        if initial_status not in {ObjectiveStatus.CREATED, ObjectiveStatus.ACTIVE}:
+            raise ValueError(f"Objective creation supports only created or active status: {initial_status.value}")
         with self.connect() as conn:
             conn.execute(
                 """
@@ -2930,7 +3091,7 @@ class SQLiteStore:
                     objective_id,
                     str(sanitize_for_logging(title)),
                     str(sanitize_for_logging(description)),
-                    ObjectiveStatus.ACTIVE.value,
+                    initial_status.value,
                     str(self.project_root),
                     timestamp,
                     timestamp,
@@ -2957,6 +3118,103 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Objective not found: {objective_id}")
         return self._row_to_objective(row)
+
+    def update_objective_status(
+        self,
+        objective_id: str,
+        status: str | ObjectiveStatus,
+        *,
+        reason: str = "",
+        actor: str = "operator",
+        metadata: dict[str, Any] | None = None,
+    ) -> ObjectiveRecord:
+        next_status = normalize_objective_status(status)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM objectives WHERE id = ?", (objective_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Objective not found: {objective_id}")
+            objective = self._row_to_objective(row)
+            validate_objective_transition(objective.status, next_status)
+            objective_metadata = dict(objective.metadata)
+            raw_events = objective_metadata.get("lifecycle_events")
+            lifecycle_events = list(raw_events) if isinstance(raw_events, list) else []
+            lifecycle_event = sanitize_for_logging(
+                {
+                    "from_status": objective.status.value,
+                    "to_status": next_status.value,
+                    "reason": reason,
+                    "actor": actor,
+                    "created_at": timestamp,
+                    "metadata": metadata or {},
+                }
+            )
+            lifecycle_events.append(lifecycle_event)
+            objective_metadata["lifecycle_events"] = lifecycle_events[-50:]
+            objective_metadata["last_lifecycle_event"] = lifecycle_event
+            conn.execute(
+                """
+                UPDATE objectives
+                SET status = ?, updated_at = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (
+                    next_status.value,
+                    timestamp,
+                    json.dumps(sanitize_for_logging(objective_metadata), sort_keys=True, default=str),
+                    objective_id,
+                ),
+            )
+        return self.get_objective(objective_id)
+
+    def retry_objective(
+        self,
+        objective_id: str,
+        *,
+        reason: str = "",
+        actor: str = "operator",
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[ObjectiveRecord, list[TaskRecord]]:
+        objective = self.get_objective(objective_id)
+        tasks = self.list_tasks(objective_id=objective_id)
+        failed_tasks = [task for task in tasks if task.status == TaskStatus.FAILED]
+        if objective.status not in {ObjectiveStatus.ACTIVE, ObjectiveStatus.TIMED_OUT}:
+            raise ValueError(f"Objective retry requires active or timed_out status: {objective.status.value}")
+        if objective.status == ObjectiveStatus.ACTIVE and not failed_tasks:
+            raise ValueError("Objective retry requires failed tasks for active objectives")
+        replay_rejections = [
+            rejection
+            for task in failed_tasks
+            if (rejection := self._task_retry_replay_rejection(task))
+        ]
+        if replay_rejections:
+            raise ValueError("; ".join(replay_rejections))
+        retry_metadata = {
+            "source": "objective_retry",
+            "failed_task_count": len(failed_tasks),
+            "retried_task_ids": [task.id for task in failed_tasks],
+            **(metadata or {}),
+        }
+        retrying = self.update_objective_status(
+            objective_id,
+            ObjectiveStatus.RETRYING,
+            reason=reason or "Objective retry started.",
+            actor=actor,
+            metadata=retry_metadata,
+        )
+        retried_tasks = [self.retry_task(task.id) for task in failed_tasks]
+        retried_statuses = {task.id: task.status.value for task in retried_tasks}
+        objective = self.update_objective_status(
+            retrying.id,
+            ObjectiveStatus.ACTIVE,
+            reason=reason or "Objective retry ready.",
+            actor=actor,
+            metadata={
+                **retry_metadata,
+                "retried_task_statuses": retried_statuses,
+            },
+        )
+        return objective, retried_tasks
 
     def import_project_agent(self, loaded_bundle: LoadedAgentBundle) -> ProjectAgentRecord:
         agent_id = loaded_bundle.bundle.agent.id
@@ -3092,6 +3350,7 @@ class SQLiteStore:
             existing = conn.execute("SELECT * FROM tasks WHERE idempotency_key = ?", (idempotency_key,)).fetchone()
             if existing is not None:
                 return self._row_to_task(existing)
+            _validate_registered_execution_task_payload(metadata, agent_id=agent_id, depends_on=depends_on)
             if objective_id is not None:
                 self._require_objective(conn, objective_id)
             if session_id is not None:
@@ -3211,6 +3470,26 @@ class SQLiteStore:
         if row is None:
             raise KeyError(f"Task not found: {task_id}")
         return self._row_to_task(row)
+
+    def update_task_metadata(self, task_id: str, metadata_patch: dict[str, Any]) -> TaskRecord:
+        current = self.get_task(task_id)
+        metadata = dict(current.metadata or {})
+        metadata.update(metadata_patch)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE tasks
+                SET metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(sanitize_for_logging(metadata), sort_keys=True, default=str),
+                    timestamp,
+                    task_id,
+                ),
+            )
+        return self.get_task(task_id)
 
     def save_memory_note(
         self,
@@ -3761,14 +4040,271 @@ class SQLiteStore:
         return self.update_task_status(task.id, TaskStatus.CANCELLED)
 
     def retry_task(self, task_id: str) -> TaskRecord:
-        task = self.get_task(task_id)
-        if task.status != TaskStatus.FAILED:
-            raise ValueError(f"Task retry requires failed status: {task.status.value}")
-        if task.required_approvals:
-            return self.update_task_status(task.id, TaskStatus.WAITING_APPROVAL)
-        if not self._task_dependencies_completed(task):
-            return self.update_task_status(task.id, TaskStatus.BLOCKED)
-        return self.update_task_status(task.id, TaskStatus.READY)
+        timestamp = now_iso()
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            task = self._row_to_task(row)
+            if task.status != TaskStatus.FAILED:
+                raise ValueError(f"Task retry requires failed status: {task.status.value}")
+            replay_rejection = self._task_retry_replay_rejection(task)
+            if replay_rejection:
+                raise ValueError(replay_rejection)
+            next_status = (
+                TaskStatus.WAITING_APPROVAL
+                if task.required_approvals
+                else TaskStatus.BLOCKED
+                if not self._dependency_ids_completed(conn, task.depends_on)
+                else TaskStatus.READY
+            )
+            validate_task_transition(task.status, next_status)
+            replay_receipt = self._task_retry_replay_receipt(
+                conn,
+                task=task,
+                next_status=next_status,
+                created_at=timestamp,
+            )
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (next_status.value, timestamp, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=task.status,
+                to_status=next_status,
+                reason="task_retry_authorized",
+                actor="operator",
+                metadata={"replay_receipt": replay_receipt},
+                created_at=timestamp,
+            )
+        return self.get_task(task_id)
+
+    def _task_retry_replay_rejection(self, task: TaskRecord) -> str | None:
+        adapter_id = task.metadata.get("execution_adapter")
+        if not isinstance(adapter_id, str) or not adapter_id.strip():
+            return None
+        from harness.execution import get_execution_adapter_descriptor
+
+        descriptor = get_execution_adapter_descriptor(adapter_id)
+        if descriptor is None:
+            return f"Task retry requires registered execution adapter: {adapter_id}"
+        if descriptor.replay_policy in {ToolReplayPolicy.SAFE, ToolReplayPolicy.IDEMPOTENT_WITH_KEY}:
+            return None
+        if descriptor.replay_policy == ToolReplayPolicy.NOT_REPLAYABLE:
+            return f"Task retry is not allowed for {descriptor.id}: replay_policy={descriptor.replay_policy.value}"
+        if descriptor.replay_policy == ToolReplayPolicy.REQUIRES_FRESH_APPROVAL:
+            missing = self._missing_registered_adapter_approvals(task, descriptor)
+            if missing:
+                return f"Task retry requires fresh approval for {descriptor.id}: {', '.join(missing)}"
+            if not descriptor.required_approvals:
+                return (
+                    f"Task retry requires fresh approval for {descriptor.id}: "
+                    f"replay_policy={descriptor.replay_policy.value}"
+                )
+            return None
+        return f"Task retry is not allowed for {descriptor.id}: replay_policy={descriptor.replay_policy.value}"
+
+    def _task_replay_policy_projection(self, task: TaskRecord) -> dict[str, Any]:
+        adapter_id = task.metadata.get("execution_adapter")
+        adapter_id_value = adapter_id.strip() if isinstance(adapter_id, str) and adapter_id.strip() else None
+        if adapter_id_value is None:
+            return {
+                "adapter_id": None,
+                "descriptor_registered": False,
+                "replay_policy": None,
+                "retry_gate": "legacy_unregistered_task",
+                "retry_allowed": True,
+                "fresh_approval_required": False,
+                "fresh_approval_revalidated": False,
+            }
+        from harness.execution import get_execution_adapter_descriptor
+
+        descriptor = get_execution_adapter_descriptor(adapter_id_value)
+        if descriptor is None:
+            return {
+                "adapter_id": adapter_id_value,
+                "descriptor_registered": False,
+                "replay_policy": None,
+                "retry_gate": "unknown_execution_adapter",
+                "retry_allowed": False,
+                "fresh_approval_required": False,
+                "fresh_approval_revalidated": False,
+            }
+        replay_policy = descriptor.replay_policy
+        fresh_approval_required = replay_policy == ToolReplayPolicy.REQUIRES_FRESH_APPROVAL
+        missing_approvals = self._missing_registered_adapter_approvals(task, descriptor)
+        if replay_policy in {ToolReplayPolicy.SAFE, ToolReplayPolicy.IDEMPOTENT_WITH_KEY}:
+            retry_gate = "safe_replay_policy"
+            retry_allowed = True
+        elif fresh_approval_required and not missing_approvals:
+            retry_gate = "fresh_approval_revalidated"
+            retry_allowed = True
+        elif replay_policy == ToolReplayPolicy.NOT_REPLAYABLE:
+            retry_gate = "not_replayable"
+            retry_allowed = False
+        else:
+            retry_gate = "fresh_approval_missing" if fresh_approval_required else f"replay_{replay_policy.value}"
+            retry_allowed = False
+        return {
+            "adapter_id": descriptor.id,
+            "descriptor_registered": True,
+            "replay_policy": replay_policy.value,
+            "retry_gate": retry_gate,
+            "retry_allowed": retry_allowed,
+            "fresh_approval_required": fresh_approval_required,
+            "fresh_approval_revalidated": fresh_approval_required and not missing_approvals,
+            "missing_approvals": sorted(set(missing_approvals)),
+        }
+
+    def _task_retry_replay_receipt(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        task: TaskRecord,
+        next_status: TaskStatus,
+        created_at: str,
+    ) -> dict[str, Any]:
+        policy = self._task_replay_policy_projection(task)
+        attempt_count = self._task_attempt_count(conn, task.id)
+        return {
+            "schema_version": TASK_REPLAY_RECEIPT_SCHEMA_VERSION,
+            "receipt_kind": "retry_authorization",
+            "task_id": task.id,
+            "task_idempotency_key": task.idempotency_key,
+            "previous_status": task.status.value,
+            "next_status": next_status.value,
+            "prior_attempt_count": attempt_count,
+            "active_lease_duplicate_guard": "active_lease_exclusion_before_attempt_insert",
+            "created_at": created_at,
+            **policy,
+        }
+
+    def _attempt_replay_receipt(
+        self,
+        *,
+        task: TaskRecord,
+        attempt_number: int,
+        attempt_idempotency_key: str,
+        created_at: str,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": TASK_REPLAY_RECEIPT_SCHEMA_VERSION,
+            "receipt_kind": "attempt_replay_guard",
+            "task_id": task.id,
+            "task_idempotency_key": task.idempotency_key,
+            "attempt_number": attempt_number,
+            "attempt_idempotency_key": attempt_idempotency_key,
+            "prior_attempt_count": max(0, attempt_number - 1),
+            "active_lease_duplicate_guard": "active_lease_exclusion_before_attempt_insert",
+            "created_at": created_at,
+            **self._task_replay_policy_projection(task),
+        }
+
+    def _missing_registered_adapter_approvals(self, task: TaskRecord, descriptor: Any) -> list[str]:
+        required = [str(item) for item in descriptor.required_approvals if str(item).strip()]
+        if not required:
+            return []
+        missing: list[str] = []
+        task_type = task.metadata.get("task_type")
+        for approval in required:
+            if approval == "hosted_provider_codex":
+                if not isinstance(task_type, str) or not task_type.strip():
+                    missing.append(approval)
+                    continue
+                from harness.approvals import ApprovalStore
+
+                found = ApprovalStore(self.project_root).find_valid(
+                    "codex_cli",
+                    "hosted_provider",
+                    task_type,
+                    adapter_id=descriptor.id,
+                    workbench_id=task.workbench_id,
+                    objective_id=task.objective_id,
+                )
+                if found is None:
+                    missing.append(approval)
+                continue
+            missing.append(approval)
+        return missing
+
+    def _daemon_registered_adapter_pause(
+        self,
+        task: TaskRecord,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> dict[str, Any] | None:
+        adapter_id = task.metadata.get("execution_adapter")
+        if not isinstance(adapter_id, str) or not adapter_id.strip():
+            return None
+        from harness.execution import get_execution_adapter_descriptor, runtime_control_matches_descriptor
+
+        descriptor = get_execution_adapter_descriptor(adapter_id)
+        if descriptor is None:
+            return {
+                "decision": "policy_forbidden",
+                "reason": f"Task references unknown execution adapter: {adapter_id}",
+                "adapter_id": adapter_id,
+                "approval_source": "execution_adapter_descriptor",
+                "forbidden_policy_keys": ["unknown_execution_adapter"],
+            }
+        task_type = task.metadata.get("task_type")
+        task_type_value = task_type if isinstance(task_type, str) else None
+        controls = (
+            self._active_execution_controls_in_conn(conn)
+            if conn is not None
+            else self.active_execution_controls()
+        )
+        for control in controls:
+            if runtime_control_matches_descriptor(control, descriptor, task_type_value):
+                return {
+                    "decision": "control_disabled",
+                    "reason": str(
+                        sanitize_for_logging(
+                            f"Execution control disabled {control.target_kind.value}:{control.target_id}. {control.reason}"
+                        )
+                    ),
+                    "adapter_id": descriptor.id,
+                    "task_type": task_type_value,
+                    "control_id": control.id,
+                    "target_kind": control.target_kind.value,
+                    "target_id": control.target_id,
+                    "control_reason": control.reason,
+                    "control_source": "execution_control",
+                }
+        missing = self._missing_registered_adapter_approvals(task, descriptor)
+        if not missing:
+            breaker = self.adapter_breaker_state(descriptor.id)
+            if breaker.status == BreakerStatus.OPEN:
+                return {
+                    "decision": "breaker_open",
+                    "reason": (
+                        f"Adapter breaker is open for {descriptor.id}: "
+                        f"{breaker.failure_count}/{breaker.threshold} failures in {breaker.window_seconds} seconds."
+                    ),
+                    "adapter_id": descriptor.id,
+                    "task_type": task_type_value,
+                    "failure_count": breaker.failure_count,
+                    "threshold": breaker.threshold,
+                    "window_seconds": breaker.window_seconds,
+                    "opened_at": breaker.opened_at.isoformat() if breaker.opened_at is not None else None,
+                    "control_source": "adapter_breaker",
+                }
+            return None
+        descriptor_required = sorted(
+            {str(item) for item in descriptor.required_approvals if str(item).strip()}
+        )
+        return {
+            "decision": "waiting_approval",
+            "reason": "Registered adapter requires approval before daemon lease acquisition.",
+            "required_approvals": sorted(set(task.required_approvals + missing)),
+            "missing_approvals": sorted(set(missing)),
+            "descriptor_required_approvals": descriptor_required,
+            "adapter_id": descriptor.id,
+            "task_type": task_type_value,
+            "approval_source": "execution_adapter_descriptor",
+        }
 
     def select_next_task(self) -> TaskRecord | None:
         selection = self.select_next_task_for_lease()
@@ -3821,9 +4357,9 @@ class SQLiteStore:
                 )
         return None
 
-    def select_next_daemon_task_for_lease(
+    def select_next_guarded_task_for_lease(
         self,
-        owner: str,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
         lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
         objective_id: str | None = None,
     ) -> tuple[dict[str, TaskAttempt | TaskLease | TaskRecord] | None, list[dict[str, Any]]]:
@@ -3833,23 +4369,25 @@ class SQLiteStore:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             if objective_id is not None:
-                rows = conn.execute(
+                self._require_objective(conn, objective_id)
+            rows = conn.execute(
+                (
                     """
                     SELECT * FROM tasks
                     WHERE status IN (?, ?, ?) AND objective_id = ?
                     ORDER BY priority DESC, created_at ASC
-                    """,
-                    (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value, objective_id),
-                ).fetchall()
-            else:
-                rows = conn.execute(
                     """
+                    if objective_id is not None
+                    else """
                     SELECT * FROM tasks
                     WHERE status IN (?, ?, ?)
                     ORDER BY priority DESC, created_at ASC
-                    """,
-                    (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value),
-                ).fetchall()
+                    """
+                ),
+                (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value, objective_id)
+                if objective_id is not None
+                else (TaskStatus.READY.value, TaskStatus.BLOCKED.value, TaskStatus.WAITING_APPROVAL.value),
+            ).fetchall()
             for row in rows:
                 task = self._row_to_task(row)
                 eligibility = self.daemon_task_eligibility(task, conn=conn)
@@ -3864,14 +4402,91 @@ class SQLiteStore:
                         ),
                         pause_reasons,
                     )
-                if eligibility["decision"] in {
-                    "blocked_dependency",
-                    "waiting_approval",
-                    "policy_forbidden",
-                    "active_lease",
-                }:
+                if eligibility["decision"] in DAEMON_TASK_PAUSE_DECISIONS:
                     pause_reasons.append(eligibility)
         return None, pause_reasons
+
+    def select_task_for_lease(
+        self,
+        task_id: str,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+        lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+        objective_id: str | None = None,
+    ) -> dict[str, TaskAttempt | TaskLease | TaskRecord] | None:
+        timestamp = now_iso()
+        expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            task = self._row_to_task(row)
+            if objective_id is not None and task.objective_id != objective_id:
+                return None
+            if task.status not in {TaskStatus.READY, TaskStatus.BLOCKED}:
+                return None
+            if self._task_has_active_lease(conn, task.id):
+                return None
+            if task.required_approvals:
+                return None
+            if not self._dependency_ids_completed(conn, task.depends_on):
+                return None
+            return self._lease_task_in_conn(
+                conn,
+                task=task,
+                owner=owner,
+                timestamp=timestamp,
+                expires_at=expires_at,
+            )
+
+    def select_guarded_task_for_lease(
+        self,
+        task_id: str,
+        owner: str = DEFAULT_TASK_LEASE_OWNER,
+        lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+        objective_id: str | None = None,
+    ) -> tuple[dict[str, TaskAttempt | TaskLease | TaskRecord] | None, list[dict[str, Any]]]:
+        timestamp = now_iso()
+        expires_at = (parse_dt(timestamp) + timedelta(minutes=lease_duration_minutes)).isoformat()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if objective_id is not None:
+                self._require_objective(conn, objective_id)
+            row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Task not found: {task_id}")
+            task = self._row_to_task(row)
+            if objective_id is not None and task.objective_id != objective_id:
+                return None, []
+            eligibility = self.daemon_task_eligibility(task, conn=conn)
+            if eligibility["decision"] == "eligible":
+                return (
+                    self._lease_task_in_conn(
+                        conn,
+                        task=task,
+                        owner=owner,
+                        timestamp=timestamp,
+                        expires_at=expires_at,
+                    ),
+                    [],
+                )
+            if eligibility["decision"] in DAEMON_TASK_PAUSE_DECISIONS:
+                return None, [eligibility]
+        return None, []
+
+    def select_next_daemon_task_for_lease(
+        self,
+        owner: str,
+        lease_duration_minutes: int = DEFAULT_TASK_LEASE_MINUTES,
+        objective_id: str | None = None,
+    ) -> tuple[dict[str, TaskAttempt | TaskLease | TaskRecord] | None, list[dict[str, Any]]]:
+        return self.select_next_guarded_task_for_lease(
+            owner=owner,
+            lease_duration_minutes=lease_duration_minutes,
+            objective_id=objective_id,
+        )
 
     def daemon_task_eligibility(
         self,
@@ -3912,6 +4527,12 @@ class SQLiteStore:
                 "decision": "waiting_approval",
                 "reason": "Task has unresolved required approvals.",
             }
+        adapter_pause = self._daemon_registered_adapter_pause(task, conn=conn)
+        if adapter_pause is not None:
+            return {
+                **base,
+                **adapter_pause,
+            }
         forbidden_keys = self._daemon_policy_forbidden_keys(task, policy)
         if forbidden_keys:
             return {
@@ -3951,12 +4572,7 @@ class SQLiteStore:
         return [
             item
             for item in paused
-            if item["decision"] in {
-                "blocked_dependency",
-                "waiting_approval",
-                "policy_forbidden",
-                "active_lease",
-            }
+            if item["decision"] in DAEMON_TASK_PAUSE_DECISIONS
         ]
 
     def _daemon_policy_forbidden_keys(
@@ -4027,9 +4643,16 @@ class SQLiteStore:
         attempt_number = self._next_attempt_number(conn, task.id)
         attempt_id = f"task_attempt_{uuid.uuid4().hex[:12]}"
         lease_id = f"task_lease_{uuid.uuid4().hex[:12]}"
+        attempt_idempotency_key = f"{task.idempotency_key}:attempt:{attempt_number}"
         attempt_metadata = {
             "task_idempotency_key": task.idempotency_key,
-            "attempt_idempotency_key": f"{task.idempotency_key}:attempt:{attempt_number}",
+            "attempt_idempotency_key": attempt_idempotency_key,
+            "replay_receipt": self._attempt_replay_receipt(
+                task=task,
+                attempt_number=attempt_number,
+                attempt_idempotency_key=attempt_idempotency_key,
+                created_at=timestamp,
+            ),
         }
         conn.execute(
             """
@@ -4156,8 +4779,7 @@ class SQLiteStore:
 
     def execute_dry_run_lease(self, lease_id: str, owner: str = DEFAULT_TASK_LEASE_OWNER) -> DaemonDryRunResult:
         lease = self.get_task_lease(lease_id)
-        if lease.status != TaskLeaseStatus.ACTIVE:
-            raise ValueError(f"Dry-run execution requires active lease: {lease.status.value}")
+        self._require_active_lease_authority(lease, owner, action="Dry-run execution")
         if lease.attempt_id is None:
             raise ValueError(f"Dry-run execution requires linked task attempt: {lease.id}")
         attempt = self.get_task_attempt(lease.attempt_id)
@@ -4174,31 +4796,53 @@ class SQLiteStore:
         task_policy = resolve_task_effective_policy(task)
         policy_hash = effective_policy_sha256(task_policy)
         goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
-        run = self.create_run(
-            goal=goal,
-            task_type=DRY_RUN_TASK_TYPE,
-            status="running",
-            backend=None,
-            task_id=task.id,
-            objective_id=task.objective_id,
-        )
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
         started_at = now_iso()
         with self.connect() as conn:
+            self._insert_run_in_conn(
+                conn,
+                run_id=run_id,
+                timestamp=started_at,
+                goal=goal,
+                task_type=DRY_RUN_TASK_TYPE,
+                status="running",
+                backend=None,
+                approval_id=None,
+                task_id=task.id,
+                objective_id=task.objective_id,
+            )
             validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
             result = conn.execute(
                 """
                 UPDATE task_attempts
                 SET status = ?, run_id = ?, started_at = ?
-                WHERE id = ? AND run_id IS NULL
+                WHERE id = ?
+                  AND run_id IS NULL
+                  AND lease_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM task_leases
+                    WHERE id = ? AND status = ? AND owner = ?
+                  )
                 """,
-                (TaskStatus.RUNNING.value, run.id, started_at, attempt.id),
+                (
+                    TaskStatus.RUNNING.value,
+                    run_id,
+                    started_at,
+                    attempt.id,
+                    lease.id,
+                    lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
+                ),
             )
             if result.rowcount == 0:
-                raise ValueError(f"Task attempt already has run_id: {attempt.id}")
-            conn.execute(
-                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ?",
-                (TaskStatus.RUNNING.value, run.id, started_at, task.id),
+                raise ValueError(f"Dry-run execution requires active lease owned by {owner}: {lease.id}")
+            task_result = conn.execute(
+                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (TaskStatus.RUNNING.value, run_id, started_at, task.id, TaskStatus.LEASED.value),
             )
+            if task_result.rowcount == 0:
+                raise ValueError(f"Dry-run execution requires leased task status: {task.status.value}")
             self._record_task_transition(
                 conn,
                 task_id=task.id,
@@ -4206,10 +4850,10 @@ class SQLiteStore:
                 to_status=TaskStatus.RUNNING,
                 reason="dry_run_execution_started",
                 actor=owner,
-                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run_id},
                 created_at=started_at,
             )
-        paths = self.initialize_run_artifacts(run.id)
+        paths = self.initialize_run_artifacts(run_id)
         append_jsonl(
             paths["transcript"],
             sanitize_for_logging(
@@ -4218,7 +4862,7 @@ class SQLiteStore:
                     "task_id": task.id,
                     "attempt_id": attempt.id,
                     "lease_id": lease.id,
-                    "run_id": run.id,
+                    "run_id": run_id,
                     "policy_sha256": policy_hash,
                 }
             ),
@@ -4226,7 +4870,7 @@ class SQLiteStore:
         paths["final_report"].write_text(
             "\n".join(
                 [
-                    f"# Dry-run execution contract {run.id}",
+                    f"# Dry-run execution contract {run_id}",
                     "",
                     "This run was created by the daemon dry-run execution adapter.",
                     "No backend, tool, Docker, shell, network, hosted provider, or paid provider was invoked.",
@@ -4237,7 +4881,7 @@ class SQLiteStore:
                     f"- Agent id: {task.agent_id or 'none'}",
                     f"- Attempt id: {attempt.id}",
                     f"- Lease id: {lease.id}",
-                    f"- Run id: {run.id}",
+                    f"- Run id: {run_id}",
                     f"- Policy sha256: {policy_hash}",
                     f"- Workflow stage: {task.metadata.get('workflow_stage') or 'none'}",
                     f"- Review role: {task.metadata.get('review_role') or 'none'}",
@@ -4248,7 +4892,7 @@ class SQLiteStore:
             encoding="utf-8",
         )
         self.append_event(
-            run.id,
+            run_id,
             "info",
             "dry_run_no_tool_execution",
             "Dry-run execution contract completed without tool execution.",
@@ -4261,7 +4905,7 @@ class SQLiteStore:
         )
         for kind in ("events", "transcript", "final_report", "manifest"):
             self.register_artifact(
-                run.id,
+                run_id,
                 kind=kind,
                 path=paths[kind],
                 producer="daemon_execute_dry_run",
@@ -4269,36 +4913,64 @@ class SQLiteStore:
                 metadata={"dry_run": True},
             )
         finished_at = now_iso()
-        self.update_run_status(run.id, "completed")
         with self.connect() as conn:
             validate_task_transition(TaskStatus.RUNNING, TaskStatus.SUCCEEDED)
-            conn.execute(
+            attempt_result = conn.execute(
                 """
                 UPDATE task_attempts
                 SET status = ?, finished_at = ?
                 WHERE id = ?
+                  AND status = ?
+                  AND run_id = ?
+                  AND lease_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM task_leases
+                    WHERE id = ? AND status = ? AND owner = ?
+                  )
                 """,
-                (TaskStatus.SUCCEEDED.value, finished_at, attempt.id),
+                (
+                    TaskStatus.SUCCEEDED.value,
+                    finished_at,
+                    attempt.id,
+                    TaskStatus.RUNNING.value,
+                    run_id,
+                    lease.id,
+                    lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
+                ),
             )
-            conn.execute(
+            if attempt_result.rowcount == 0:
+                raise ValueError(f"Dry-run finalization requires active lease owned by {owner}: {lease.id}")
+            lease_result = conn.execute(
                 """
                 UPDATE task_leases
                 SET status = ?, released_at = ?, metadata_json = ?
-                WHERE id = ?
+                WHERE id = ? AND status = ? AND owner = ?
                 """,
                 (
                     TaskLeaseStatus.RELEASED.value,
                     finished_at,
                     json.dumps(
-                        sanitize_for_logging({"run_id": run.id, "decision": "dry_run_no_tool_execution"}),
+                        sanitize_for_logging({"run_id": run_id, "decision": "dry_run_no_tool_execution"}),
                         sort_keys=True,
                     ),
                     lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
                 ),
             )
+            if lease_result.rowcount == 0:
+                raise ValueError(f"Dry-run finalization requires active lease owned by {owner}: {lease.id}")
+            task_result = conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ? AND run_id = ?",
+                (TaskStatus.SUCCEEDED.value, finished_at, task.id, TaskStatus.RUNNING.value, run_id),
+            )
+            if task_result.rowcount == 0:
+                raise ValueError(f"Dry-run finalization requires running task linked to run: {task.id}")
             conn.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                (TaskStatus.SUCCEEDED.value, finished_at, task.id),
+                "UPDATE runs SET status = ?, updated_at = ? WHERE id = ?",
+                ("completed", finished_at, run_id),
             )
             self._record_task_transition(
                 conn,
@@ -4307,7 +4979,7 @@ class SQLiteStore:
                 to_status=TaskStatus.SUCCEEDED,
                 reason="dry_run_execution_succeeded",
                 actor=owner,
-                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run_id},
                 created_at=finished_at,
             )
         daemon = self.ensure_daemon(owner=lease.owner)
@@ -4319,20 +4991,20 @@ class SQLiteStore:
                 "lease_id": lease.id,
                 "attempt_id": attempt.id,
                 "task_id": task.id,
-                "run_id": run.id,
+                "run_id": run_id,
                 "decision": "dry_run_no_tool_execution",
                 "policy_sha256": policy_hash,
             },
         )
-        self.write_run_manifest(run.id)
+        self.write_run_manifest(run_id)
         return DaemonDryRunResult(
             decision="dry_run_no_tool_execution",
             project_root=self.project_root,
             task=self.get_task(task.id),
             attempt=self.get_task_attempt(attempt.id),
             lease=self.get_task_lease(lease.id),
-            run=self.get_run(run.id),
-            manifest=self.build_run_manifest(run.id),
+            run=self.get_run(run_id),
+            manifest=self.build_run_manifest(run_id),
             policy_sha256=policy_hash,
         )
 
@@ -4345,10 +5017,17 @@ class SQLiteStore:
         if forbidden:
             raise ValueError(f"Dry-run execution rejected by task metadata: {', '.join(forbidden)}")
 
-    def validate_read_only_lease_for_execution(self, lease_id: str) -> tuple[TaskLease, TaskAttempt, TaskRecord]:
+    def validate_read_only_lease_for_execution(
+        self,
+        lease_id: str,
+        *,
+        owner: str | None = None,
+    ) -> tuple[TaskLease, TaskAttempt, TaskRecord]:
         lease = self.get_task_lease(lease_id)
         if lease.status != TaskLeaseStatus.ACTIVE:
             raise ValueError(f"Read-only execution requires active lease: {lease.status.value}")
+        if owner is not None:
+            self._require_active_lease_authority(lease, owner, action="Read-only execution")
         if lease.attempt_id is None:
             raise ValueError(f"Read-only execution requires linked task attempt: {lease.id}")
         attempt = self.get_task_attempt(lease.attempt_id)
@@ -4364,10 +5043,17 @@ class SQLiteStore:
         self._validate_read_only_task_metadata(task)
         return lease, attempt, task
 
-    def validate_execution_lease_for_run(self, lease_id: str) -> tuple[TaskLease, TaskAttempt, TaskRecord]:
+    def validate_execution_lease_for_run(
+        self,
+        lease_id: str,
+        *,
+        owner: str | None = None,
+    ) -> tuple[TaskLease, TaskAttempt, TaskRecord]:
         lease = self.get_task_lease(lease_id)
         if lease.status != TaskLeaseStatus.ACTIVE:
             raise ValueError(f"Execution requires active lease: {lease.status.value}")
+        if owner is not None:
+            self._require_active_lease_authority(lease, owner, action="Execution")
         if lease.attempt_id is None:
             raise ValueError(f"Execution requires linked task attempt: {lease.id}")
         attempt = self.get_task_attempt(lease.attempt_id)
@@ -4382,6 +5068,123 @@ class SQLiteStore:
             raise ValueError("Execution rejected: task has unresolved required approvals")
         return lease, attempt, task
 
+    def finalize_rejected_task_lease(
+        self,
+        lease_id: str,
+        *,
+        reason_code: str,
+        rejection_reasons: list[str],
+        decision: str,
+        adapter_id: str | None = None,
+        security_decision_id: str | None = None,
+        policy_sha256: str | None = None,
+        owner: str | None = None,
+    ) -> tuple[TaskLease, TaskAttempt | None, TaskRecord | None]:
+        """Close a no-run adapter rejection without relying on stale lease recovery."""
+
+        terminal_skip_codes = {"duplicate_run", "lease_owner_mismatch"}
+        approval_required_codes = {
+            "missing_required_approval",
+            "unresolved_task_approvals",
+            "missing_hosted_approval",
+        }
+        sanitized_reasons = [str(sanitize_for_logging(str(reason))) for reason in rejection_reasons]
+
+        with self.connect() as conn:
+            lease_row = conn.execute("SELECT * FROM task_leases WHERE id = ?", (lease_id,)).fetchone()
+            if lease_row is None:
+                raise KeyError(f"Task lease not found: {lease_id}")
+            lease = self._row_to_task_lease(lease_row)
+            attempt: TaskAttempt | None = None
+            if lease.attempt_id is not None:
+                attempt_row = conn.execute("SELECT * FROM task_attempts WHERE id = ?", (lease.attempt_id,)).fetchone()
+                attempt = self._row_to_task_attempt(attempt_row) if attempt_row is not None else None
+            task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+            task = self._row_to_task(task_row) if task_row is not None else None
+
+            if (
+                reason_code in terminal_skip_codes
+                or lease.status != TaskLeaseStatus.ACTIVE
+                or (attempt is not None and attempt.run_id is not None)
+                or (task is not None and task.run_id is not None)
+            ):
+                return self._refreshed_task_lease_context(lease)
+
+            timestamp = now_iso()
+            final_status = (
+                TaskStatus.WAITING_APPROVAL
+                if reason_code in approval_required_codes or "approval" in reason_code
+                else TaskStatus.FAILED
+            )
+            transition_reason = (
+                "adapter_rejection_waiting_approval"
+                if final_status == TaskStatus.WAITING_APPROVAL
+                else "adapter_rejection_failed"
+            )
+            failure_message = "; ".join(sanitized_reasons) if sanitized_reasons else reason_code
+            finalizer_metadata = {
+                "decision": decision,
+                "adapter_id": adapter_id,
+                "reason_code": reason_code,
+                "rejection_reasons": sanitized_reasons,
+                "security_decision_id": security_decision_id,
+                "policy_sha256": policy_sha256,
+                "terminal_task_status": final_status.value,
+                "finalized_by": "adapter_rejection",
+            }
+            conn.execute(
+                """
+                UPDATE task_leases
+                SET status = ?, released_at = ?, metadata_json = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    TaskLeaseStatus.RELEASED.value,
+                    timestamp,
+                    json.dumps(sanitize_for_logging({**lease.metadata, **finalizer_metadata}), sort_keys=True),
+                    lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                ),
+            )
+            if attempt is not None:
+                conn.execute(
+                    """
+                    UPDATE task_attempts
+                    SET status = ?,
+                        finished_at = COALESCE(finished_at, ?),
+                        failure_code = ?,
+                        failure_message = ?
+                    WHERE id = ? AND run_id IS NULL
+                    """,
+                    (final_status.value, timestamp, reason_code, failure_message, attempt.id),
+                )
+            if task is not None and task.status != final_status:
+                validate_task_transition(task.status, final_status)
+                conn.execute(
+                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                    (final_status.value, timestamp, task.id),
+                )
+                self._record_task_transition(
+                    conn,
+                    task_id=task.id,
+                    from_status=task.status,
+                    to_status=final_status,
+                    reason=transition_reason,
+                    actor=owner or lease.owner,
+                    metadata={
+                        "lease_id": lease.id,
+                        "attempt_id": lease.attempt_id,
+                        "decision": decision,
+                        "adapter_id": adapter_id,
+                        "reason_code": reason_code,
+                        "rejection_reasons": sanitized_reasons,
+                        "security_decision_id": security_decision_id,
+                        "policy_sha256": policy_sha256,
+                    },
+                    created_at=timestamp,
+                )
+        return self._refreshed_task_lease_context(lease_id)
+
     def start_attempt_run(
         self,
         lease_id: str,
@@ -4391,34 +5194,55 @@ class SQLiteStore:
         approval_id: str | None,
         owner: str = DEFAULT_TASK_LEASE_OWNER,
     ) -> RunRecord:
-        lease, attempt, task = self.validate_execution_lease_for_run(lease_id)
+        lease, attempt, task = self.validate_execution_lease_for_run(lease_id, owner=owner)
         goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
-        run = self.create_run(
-            goal=goal,
-            task_type=task_type,
-            status="running",
-            backend=backend,
-            approval_id=approval_id,
-            task_id=task.id,
-            objective_id=task.objective_id,
-        )
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
         started_at = now_iso()
         with self.connect() as conn:
+            self._insert_run_in_conn(
+                conn,
+                run_id=run_id,
+                timestamp=started_at,
+                goal=goal,
+                task_type=task_type,
+                status="running",
+                backend=backend,
+                approval_id=approval_id,
+                task_id=task.id,
+                objective_id=task.objective_id,
+            )
             validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
             result = conn.execute(
                 """
                 UPDATE task_attempts
                 SET status = ?, run_id = ?, started_at = ?
-                WHERE id = ? AND run_id IS NULL
+                WHERE id = ?
+                  AND run_id IS NULL
+                  AND lease_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM task_leases
+                    WHERE id = ? AND status = ? AND owner = ?
+                  )
                 """,
-                (TaskStatus.RUNNING.value, run.id, started_at, attempt.id),
+                (
+                    TaskStatus.RUNNING.value,
+                    run_id,
+                    started_at,
+                    attempt.id,
+                    lease.id,
+                    lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
+                ),
             )
             if result.rowcount == 0:
-                raise ValueError(f"Task attempt already has run_id: {attempt.id}")
-            conn.execute(
-                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ?",
-                (TaskStatus.RUNNING.value, run.id, started_at, task.id),
+                raise ValueError(f"Execution requires active lease owned by {owner}: {lease.id}")
+            task_result = conn.execute(
+                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (TaskStatus.RUNNING.value, run_id, started_at, task.id, TaskStatus.LEASED.value),
             )
+            if task_result.rowcount == 0:
+                raise ValueError(f"Execution requires leased task status: {task.status.value}")
             self._record_task_transition(
                 conn,
                 task_id=task.id,
@@ -4426,10 +5250,14 @@ class SQLiteStore:
                 to_status=TaskStatus.RUNNING,
                 reason="execution_started",
                 actor=owner,
-                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run_id},
                 created_at=started_at,
             )
-        return self.get_run(run.id)
+        self.initialize_run_artifacts(run_id)
+        if backend:
+            self.persist_backend_snapshot(run_id, backend)
+        self.write_run_manifest(run_id)
+        return self.get_run(run_id)
 
     def finish_attempt_run(
         self,
@@ -4444,6 +5272,7 @@ class SQLiteStore:
         failure_message: str | None = None,
     ) -> None:
         lease = self.get_task_lease(lease_id)
+        self._require_active_lease_authority(lease, owner, action="Execution finalization")
         if lease.attempt_id is None:
             raise ValueError(f"Execution requires linked task attempt: {lease.id}")
         attempt = self.get_task_attempt(lease.attempt_id)
@@ -4453,8 +5282,11 @@ class SQLiteStore:
         finished_at = now_iso()
         next_status = TaskStatus.SUCCEEDED if success else TaskStatus.FAILED
         reason = "execution_succeeded" if success else "execution_failed"
-        self.update_run_status(run_id, run_status)
         with self.connect() as conn:
+            conn.execute(
+                "UPDATE runs SET status = ?, updated_at = ? WHERE id = ?",
+                (run_status, finished_at, run_id),
+            )
             current_status = task.status
             if current_status == TaskStatus.LEASED:
                 validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
@@ -4505,11 +5337,11 @@ class SQLiteStore:
                 """,
                 (next_status.value, finished_at, failure_code, failure_message, attempt.id),
             )
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE task_leases
                 SET status = ?, released_at = ?, metadata_json = ?
-                WHERE id = ?
+                WHERE id = ? AND status = ? AND owner = ?
                 """,
                 (
                     TaskLeaseStatus.RELEASED.value,
@@ -4519,8 +5351,13 @@ class SQLiteStore:
                         sort_keys=True,
                     ),
                     lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
                 ),
             )
+            if result.rowcount == 0:
+                raise ValueError(f"Execution finalization requires active lease owned by {owner}: {lease.id}")
+        self.write_run_manifest(run_id)
 
     def start_read_only_lease_run(
         self,
@@ -4530,34 +5367,55 @@ class SQLiteStore:
         approval_id: str | None = None,
         owner: str = DEFAULT_TASK_LEASE_OWNER,
     ) -> RunRecord:
-        lease, attempt, task = self.validate_read_only_lease_for_execution(lease_id)
+        lease, attempt, task = self.validate_read_only_lease_for_execution(lease_id, owner=owner)
         goal = task.title if not task.description else f"{task.title}\n\n{task.description}"
-        run = self.create_run(
-            goal=goal,
-            task_type=READ_ONLY_TASK_TYPE,
-            status="running",
-            backend=backend,
-            approval_id=approval_id,
-            task_id=task.id,
-            objective_id=task.objective_id,
-        )
+        run_id = f"run_{uuid.uuid4().hex[:12]}"
         started_at = now_iso()
         with self.connect() as conn:
+            self._insert_run_in_conn(
+                conn,
+                run_id=run_id,
+                timestamp=started_at,
+                goal=goal,
+                task_type=READ_ONLY_TASK_TYPE,
+                status="running",
+                backend=backend,
+                approval_id=approval_id,
+                task_id=task.id,
+                objective_id=task.objective_id,
+            )
             validate_task_transition(TaskStatus.LEASED, TaskStatus.RUNNING)
             result = conn.execute(
                 """
                 UPDATE task_attempts
                 SET status = ?, run_id = ?, started_at = ?
-                WHERE id = ? AND run_id IS NULL
+                WHERE id = ?
+                  AND run_id IS NULL
+                  AND lease_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM task_leases
+                    WHERE id = ? AND status = ? AND owner = ?
+                  )
                 """,
-                (TaskStatus.RUNNING.value, run.id, started_at, attempt.id),
+                (
+                    TaskStatus.RUNNING.value,
+                    run_id,
+                    started_at,
+                    attempt.id,
+                    lease.id,
+                    lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
+                ),
             )
             if result.rowcount == 0:
-                raise ValueError(f"Task attempt already has run_id: {attempt.id}")
-            conn.execute(
-                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ?",
-                (TaskStatus.RUNNING.value, run.id, started_at, task.id),
+                raise ValueError(f"Read-only execution requires active lease owned by {owner}: {lease.id}")
+            task_result = conn.execute(
+                "UPDATE tasks SET status = ?, run_id = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (TaskStatus.RUNNING.value, run_id, started_at, task.id, TaskStatus.LEASED.value),
             )
+            if task_result.rowcount == 0:
+                raise ValueError(f"Read-only execution requires leased task status: {task.status.value}")
             self._record_task_transition(
                 conn,
                 task_id=task.id,
@@ -4565,10 +5423,13 @@ class SQLiteStore:
                 to_status=TaskStatus.RUNNING,
                 reason="read_only_execution_started",
                 actor=owner,
-                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run.id},
+                metadata={"lease_id": lease.id, "attempt_id": attempt.id, "run_id": run_id},
                 created_at=started_at,
             )
-        return self.get_run(run.id)
+        self.initialize_run_artifacts(run_id)
+        self.persist_backend_snapshot(run_id, backend)
+        self.write_run_manifest(run_id)
+        return self.get_run(run_id)
 
     def finish_read_only_lease_run(
         self,
@@ -4581,6 +5442,7 @@ class SQLiteStore:
         failure_message: str | None = None,
     ) -> None:
         lease = self.get_task_lease(lease_id)
+        self._require_active_lease_authority(lease, owner, action="Read-only execution finalization")
         if lease.attempt_id is None:
             raise ValueError(f"Read-only execution requires linked task attempt: {lease.id}")
         attempt = self.get_task_attempt(lease.attempt_id)
@@ -4636,11 +5498,11 @@ class SQLiteStore:
                 """,
                 (next_status.value, finished_at, failure_code, failure_message, attempt.id),
             )
-            conn.execute(
+            result = conn.execute(
                 """
                 UPDATE task_leases
                 SET status = ?, released_at = ?, metadata_json = ?
-                WHERE id = ?
+                WHERE id = ? AND status = ? AND owner = ?
                 """,
                 (
                     TaskLeaseStatus.RELEASED.value,
@@ -4656,8 +5518,12 @@ class SQLiteStore:
                         sort_keys=True,
                     ),
                     lease.id,
+                    TaskLeaseStatus.ACTIVE.value,
+                    owner,
                 ),
             )
+            if result.rowcount == 0:
+                raise ValueError(f"Read-only execution finalization requires active lease owned by {owner}: {lease.id}")
 
     def _validate_read_only_task_metadata(self, task: TaskRecord) -> None:
         if task.metadata.get("execution_adapter") != READ_ONLY_EXECUTION_ADAPTER:
@@ -4846,13 +5712,186 @@ class SQLiteStore:
                     """,
                     (owner, TaskLeaseStatus.ACTIVE.value, timestamp),
                 ).fetchall()
+            daemon: DaemonRecord | None = None
             for row in rows:
+                lease = self._row_to_task_lease(row)
+                renewal_rejection = self._active_lease_renewal_rejection(conn, lease)
+                if renewal_rejection is not None:
+                    if daemon is None:
+                        daemon = self.ensure_daemon(owner=owner)
+                    self._release_inconsistent_active_lease(
+                        conn,
+                        daemon_id=daemon.id,
+                        lease=lease,
+                        owner=owner,
+                        reason=renewal_rejection["reason"],
+                        timestamp=timestamp,
+                    )
+                    continue
                 conn.execute(
                     "UPDATE task_leases SET heartbeat_at = ?, expires_at = ? WHERE id = ?",
                     (timestamp, expires_at, row["id"]),
                 )
                 renewed_ids.append(row["id"])
         return [lease for lease in self.list_task_leases() if lease.id in set(renewed_ids)]
+
+    def _active_lease_renewal_rejection(
+        self,
+        conn: sqlite3.Connection,
+        lease: TaskLease,
+    ) -> dict[str, str] | None:
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+        if task_row is None:
+            return {"reason": "missing_task"}
+        task = self._row_to_task(task_row)
+        if task.status not in {TaskStatus.LEASED, TaskStatus.RUNNING}:
+            return {"reason": f"task_status_{task.status.value}"}
+        if lease.attempt_id is None:
+            return {"reason": "missing_attempt"}
+        attempt_row = conn.execute("SELECT * FROM task_attempts WHERE id = ?", (lease.attempt_id,)).fetchone()
+        if attempt_row is None:
+            return {"reason": "missing_attempt"}
+        attempt = self._row_to_task_attempt(attempt_row)
+        if attempt.run_id is None:
+            if task.status == TaskStatus.LEASED and attempt.status == TaskStatus.LEASED:
+                return None
+            return {"reason": f"no_run_attempt_status_{attempt.status.value}"}
+        run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (attempt.run_id,)).fetchone()
+        if run_row is None:
+            return {"reason": "missing_run"}
+        run = self._row_to_run(run_row)
+        if task.status == TaskStatus.RUNNING and attempt.status == TaskStatus.RUNNING and run.status not in {
+            "completed",
+            "failed",
+        }:
+            return None
+        return {"reason": f"linked_run_status_{run.status}"}
+
+    def _release_inconsistent_active_lease(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        lease: TaskLease,
+        owner: str,
+        reason: str,
+        timestamp: str,
+    ) -> str | None:
+        if lease.status != TaskLeaseStatus.ACTIVE:
+            return None
+        task: TaskRecord | None = None
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+        if task_row is not None:
+            task = self._row_to_task(task_row)
+        attempt: TaskAttempt | None = None
+        if lease.attempt_id is not None:
+            attempt_row = conn.execute("SELECT * FROM task_attempts WHERE id = ?", (lease.attempt_id,)).fetchone()
+            if attempt_row is not None:
+                attempt = self._row_to_task_attempt(attempt_row)
+        next_task_status: TaskStatus | None = None
+        next_attempt_status: TaskStatus | None = None
+        if task is not None and task.status in {TaskStatus.LEASED, TaskStatus.RUNNING}:
+            if attempt is None:
+                next_task_status = self._task_requeue_status(task)
+            elif attempt.run_id is None:
+                if attempt.status in {
+                    TaskStatus.WAITING_APPROVAL,
+                    TaskStatus.FAILED,
+                    TaskStatus.CANCELLED,
+                    TaskStatus.SKIPPED,
+                }:
+                    next_task_status = attempt.status
+                else:
+                    next_task_status = TaskStatus.FAILED
+                next_attempt_status = next_task_status
+        if next_attempt_status is not None and attempt is not None and attempt.status != next_attempt_status:
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?,
+                    finished_at = COALESCE(finished_at, ?),
+                    failure_code = COALESCE(failure_code, ?),
+                    failure_message = COALESCE(failure_message, ?)
+                WHERE id = ? AND run_id IS NULL
+                """,
+                (
+                    next_attempt_status.value,
+                    timestamp,
+                    "inconsistent_active_lease",
+                    "Daemon renewal released an inconsistent active lease before run creation.",
+                    attempt.id,
+                ),
+            )
+        if next_task_status is not None and task is not None and task.status != next_task_status:
+            validate_task_transition(task.status, next_task_status)
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (next_task_status.value, timestamp, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=task.status,
+                to_status=next_task_status,
+                reason="inconsistent_active_lease_released",
+                actor=owner,
+                metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id, "reason": reason},
+                created_at=timestamp,
+            )
+        conn.execute(
+            """
+            UPDATE task_leases
+            SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?), metadata_json = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                TaskLeaseStatus.RELEASED.value,
+                timestamp,
+                timestamp,
+                json.dumps(
+                    sanitize_for_logging(
+                        {
+                            **lease.metadata,
+                            "decision": "inconsistent_active_lease_released",
+                            "reason": reason,
+                        }
+                    ),
+                    sort_keys=True,
+                    default=str,
+                ),
+                lease.id,
+                TaskLeaseStatus.ACTIVE.value,
+            ),
+        )
+        return self._record_daemon_event(
+            conn,
+            daemon_id=daemon_id,
+            event_type="release_inconsistent_lease",
+            message="Released inconsistent active lease instead of renewing it.",
+            metadata={
+                "lease_id": lease.id,
+                "task_id": lease.task_id,
+                "attempt_id": lease.attempt_id,
+                "owner": owner,
+                "reason": reason,
+                "lease_status": TaskLeaseStatus.RELEASED.value,
+                "task_status": (
+                    next_task_status.value
+                    if next_task_status is not None
+                    else task.status.value
+                    if task is not None
+                    else None
+                ),
+                "attempt_status": (
+                    next_attempt_status.value
+                    if next_attempt_status is not None
+                    else attempt.status.value
+                    if attempt is not None
+                    else None
+                ),
+            },
+            created_at=timestamp,
+        )
 
     def recover_daemon_leases(self, owner: str, pid: int | None = None) -> DaemonRecoveryResult:
         daemon = self.ensure_daemon(owner=owner, pid=pid)
@@ -4882,70 +5921,19 @@ class SQLiteStore:
                 lease = self._row_to_task_lease(row)
                 if lease.id in set(expired_ids):
                     continue
-                task_row = conn.execute(
-                    "SELECT * FROM tasks WHERE id = ?", (lease.task_id,)
-                ).fetchone()
-                if task_row is None:
-                    continue
-                task = self._row_to_task(task_row)
-                if task.status not in {TaskStatus.LEASED, TaskStatus.RUNNING}:
-                    continue
-                next_status = self._task_requeue_status(task)
-                validate_task_transition(task.status, next_status)
-                conn.execute(
-                    """
-                    UPDATE task_leases
-                    SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?)
-                    WHERE id = ?
-                    """,
-                    (TaskLeaseStatus.EXPIRED.value, timestamp, timestamp, lease.id),
-                )
-                if lease.attempt_id is not None:
-                    conn.execute(
-                        """
-                        UPDATE task_attempts
-                        SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
-                        WHERE id = ? AND run_id IS NULL
-                        """,
-                        (
-                            TaskStatus.FAILED.value,
-                            timestamp,
-                            "lease_expired",
-                            "Daemon recovery expired an active lease before execution.",
-                            lease.attempt_id,
-                        ),
-                    )
-                conn.execute(
-                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                    (next_status.value, timestamp, task.id),
-                )
-                self._record_task_transition(
+                recovery = self._recover_expired_active_lease(
                     conn,
-                    task_id=task.id,
-                    from_status=task.status,
-                    to_status=next_status,
-                    reason="lease_expired",
-                    actor=owner,
-                    metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id},
-                    created_at=timestamp,
+                    daemon_id=daemon.id,
+                    owner=owner,
+                    lease=lease,
+                    timestamp=timestamp,
                 )
-                event_ids.append(
-                    self._record_daemon_event(
-                        conn,
-                        daemon_id=daemon.id,
-                        event_type="recover_lease",
-                        message="Expired active lease and returned task to queue.",
-                        metadata={
-                            "lease_id": lease.id,
-                            "task_id": task.id,
-                            "attempt_id": lease.attempt_id,
-                            "next_status": next_status.value,
-                        },
-                        created_at=timestamp,
-                    )
-                )
-                expired_ids.append(lease.id)
-                recovered_task_ids.append(task.id)
+                if recovery["lease_status"] == TaskLeaseStatus.EXPIRED.value:
+                    expired_ids.append(lease.id)
+                if recovery["recovered_task_id"] is not None:
+                    recovered_task_ids.append(recovery["recovered_task_id"])
+                if recovery["event_id"] is not None:
+                    event_ids.append(recovery["event_id"])
         return DaemonRecoveryResult(
             daemon_id=daemon.id,
             owner=daemon.owner,
@@ -4954,6 +5942,314 @@ class SQLiteStore:
             expired_leases=[lease for lease in self.list_task_leases() if lease.id in set(expired_ids)],
             recovered_tasks=[self.get_task(task_id) for task_id in recovered_task_ids],
             events=[self.get_daemon_event(event_id) for event_id in event_ids],
+        )
+
+    def _recover_expired_active_lease(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        owner: str,
+        lease: TaskLease,
+        timestamp: str,
+    ) -> dict[str, str | None]:
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+        task = self._row_to_task(task_row) if task_row is not None else None
+        attempt: TaskAttempt | None = None
+        if lease.attempt_id is not None:
+            attempt_row = conn.execute("SELECT * FROM task_attempts WHERE id = ?", (lease.attempt_id,)).fetchone()
+            if attempt_row is not None:
+                attempt = self._row_to_task_attempt(attempt_row)
+
+        if task is None:
+            event_id = self._expire_inconsistent_active_lease(
+                conn,
+                daemon_id=daemon_id,
+                owner=owner,
+                lease=lease,
+                task=None,
+                attempt=attempt,
+                reason="missing_task",
+                timestamp=timestamp,
+            )
+            return {
+                "lease_status": TaskLeaseStatus.EXPIRED.value,
+                "recovered_task_id": None,
+                "event_id": event_id,
+            }
+
+        if attempt is not None and attempt.run_id is not None:
+            run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (attempt.run_id,)).fetchone()
+            run = self._row_to_run(run_row) if run_row is not None else None
+            if run is not None and run.status == "completed":
+                changed = self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.SUCCEEDED,
+                    lease_status=TaskLeaseStatus.RELEASED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason="execution_recovery_succeeded",
+                    failure_code=None,
+                    failure_message=None,
+                )
+                event_id = self._record_daemon_event(
+                    conn,
+                    daemon_id=daemon_id,
+                    event_type="recover_execution",
+                    message="Reconciled completed execution evidence to succeeded task state.",
+                    metadata={
+                        "lease_id": lease.id,
+                        "attempt_id": attempt.id,
+                        "task_id": task.id,
+                        "run_id": run.id,
+                        "run_status": run.status,
+                        "next_status": TaskStatus.SUCCEEDED.value,
+                    },
+                    created_at=timestamp,
+                )
+                return {
+                    "lease_status": TaskLeaseStatus.RELEASED.value,
+                    "recovered_task_id": task.id if changed else None,
+                    "event_id": event_id,
+                }
+            if run is not None and run.status == "failed":
+                changed = self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.FAILED,
+                    lease_status=TaskLeaseStatus.RELEASED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason="execution_recovery_failed",
+                    failure_code="execution_failed",
+                    failure_message="Execution recovery reconciled failed run evidence.",
+                )
+                event_id = self._record_daemon_event(
+                    conn,
+                    daemon_id=daemon_id,
+                    event_type="recover_execution",
+                    message="Reconciled failed execution evidence to failed task state.",
+                    metadata={
+                        "lease_id": lease.id,
+                        "attempt_id": attempt.id,
+                        "task_id": task.id,
+                        "run_id": run.id,
+                        "run_status": run.status,
+                        "next_status": TaskStatus.FAILED.value,
+                    },
+                    created_at=timestamp,
+                )
+                return {
+                    "lease_status": TaskLeaseStatus.RELEASED.value,
+                    "recovered_task_id": task.id if changed else None,
+                    "event_id": event_id,
+                }
+
+            failure_reason = "missing_run" if run is None else "nonterminal_linked_run"
+            changed = self._reconcile_dry_run_terminal_state(
+                conn,
+                task=task,
+                attempt=attempt,
+                lease=lease,
+                next_status=TaskStatus.FAILED,
+                lease_status=TaskLeaseStatus.EXPIRED,
+                timestamp=timestamp,
+                actor=owner,
+                reason="execution_recovery_required",
+                failure_code="execution_recovery_required",
+                failure_message="Daemon recovery found an expired lease with missing or non-terminal linked run.",
+            )
+            event_id = self._record_daemon_event(
+                conn,
+                daemon_id=daemon_id,
+                event_type="recover_execution",
+                message="Failed execution task for operator inspection after expired linked run.",
+                metadata={
+                    "lease_id": lease.id,
+                    "attempt_id": attempt.id,
+                    "task_id": task.id,
+                    "run_id": attempt.run_id,
+                    "run_status": run.status if run is not None else None,
+                    "reason": failure_reason,
+                    "next_status": TaskStatus.FAILED.value,
+                    "failure_code": "execution_recovery_required",
+                },
+                created_at=timestamp,
+            )
+            return {
+                "lease_status": TaskLeaseStatus.EXPIRED.value,
+                "recovered_task_id": task.id if changed else None,
+                "event_id": event_id,
+            }
+
+        if task.status not in {TaskStatus.LEASED, TaskStatus.RUNNING}:
+            event_id = self._expire_inconsistent_active_lease(
+                conn,
+                daemon_id=daemon_id,
+                owner=owner,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                reason=f"task_status_{task.status.value}",
+                timestamp=timestamp,
+            )
+            return {
+                "lease_status": TaskLeaseStatus.EXPIRED.value,
+                "recovered_task_id": None,
+                "event_id": event_id,
+            }
+
+        next_status = self._task_requeue_status(task)
+        validate_task_transition(task.status, next_status)
+        conn.execute(
+            """
+            UPDATE task_leases
+            SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?), metadata_json = ?
+            WHERE id = ?
+            """,
+            (
+                TaskLeaseStatus.EXPIRED.value,
+                timestamp,
+                timestamp,
+                json.dumps(
+                    sanitize_for_logging(
+                        {
+                            **lease.metadata,
+                            "decision": "lease_expired",
+                            "reason": "expired_before_execution",
+                        }
+                    ),
+                    sort_keys=True,
+                    default=str,
+                ),
+                lease.id,
+            ),
+        )
+        if lease.attempt_id is not None:
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
+                WHERE id = ? AND run_id IS NULL
+                """,
+                (
+                    TaskStatus.FAILED.value,
+                    timestamp,
+                    "lease_expired",
+                    "Daemon recovery expired an active lease before execution.",
+                    lease.attempt_id,
+                ),
+            )
+        conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+            (next_status.value, timestamp, task.id),
+        )
+        self._record_task_transition(
+            conn,
+            task_id=task.id,
+            from_status=task.status,
+            to_status=next_status,
+            reason="lease_expired",
+            actor=owner,
+            metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id},
+            created_at=timestamp,
+        )
+        event_id = self._record_daemon_event(
+            conn,
+            daemon_id=daemon_id,
+            event_type="recover_lease",
+            message="Expired active lease and returned task to queue.",
+            metadata={
+                "lease_id": lease.id,
+                "task_id": task.id,
+                "attempt_id": lease.attempt_id,
+                "next_status": next_status.value,
+            },
+            created_at=timestamp,
+        )
+        return {
+            "lease_status": TaskLeaseStatus.EXPIRED.value,
+            "recovered_task_id": task.id,
+            "event_id": event_id,
+        }
+
+    def _expire_inconsistent_active_lease(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        owner: str,
+        lease: TaskLease,
+        task: TaskRecord | None,
+        attempt: TaskAttempt | None,
+        reason: str,
+        timestamp: str,
+    ) -> str:
+        if attempt is not None and attempt.run_id is None and attempt.status in {TaskStatus.LEASED, TaskStatus.RUNNING}:
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?,
+                    finished_at = COALESCE(finished_at, ?),
+                    failure_code = COALESCE(failure_code, ?),
+                    failure_message = COALESCE(failure_message, ?)
+                WHERE id = ?
+                """,
+                (
+                    TaskStatus.FAILED.value,
+                    timestamp,
+                    "inconsistent_expired_lease",
+                    "Daemon recovery expired an inconsistent active lease.",
+                    attempt.id,
+                ),
+            )
+            attempt = attempt.model_copy(update={"status": TaskStatus.FAILED})
+        conn.execute(
+            """
+            UPDATE task_leases
+            SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?), metadata_json = ?
+            WHERE id = ? AND status = ?
+            """,
+            (
+                TaskLeaseStatus.EXPIRED.value,
+                timestamp,
+                timestamp,
+                json.dumps(
+                    sanitize_for_logging(
+                        {
+                            **lease.metadata,
+                            "decision": "inconsistent_expired_lease",
+                            "reason": reason,
+                        }
+                    ),
+                    sort_keys=True,
+                    default=str,
+                ),
+                lease.id,
+                TaskLeaseStatus.ACTIVE.value,
+            ),
+        )
+        return self._record_daemon_event(
+            conn,
+            daemon_id=daemon_id,
+            event_type="recover_inconsistent_lease",
+            message="Expired inconsistent active lease during daemon recovery.",
+            metadata={
+                "lease_id": lease.id,
+                "task_id": lease.task_id,
+                "attempt_id": lease.attempt_id,
+                "owner": owner,
+                "reason": reason,
+                "lease_status": TaskLeaseStatus.EXPIRED.value,
+                "task_status": task.status.value if task is not None else None,
+                "attempt_status": attempt.status.value if attempt is not None else None,
+            },
+            created_at=timestamp,
         )
 
     def _recover_dry_run_contracts(
@@ -5408,70 +6704,273 @@ class SQLiteStore:
         expired_ids: list[str] = []
         for row in rows:
             lease = self._row_to_task_lease(row)
-            task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
-            if task_row is None:
-                conn.execute(
-                    """
-                    UPDATE task_leases
-                    SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?)
-                    WHERE id = ?
-                    """,
-                    (TaskLeaseStatus.EXPIRED.value, timestamp, timestamp, lease.id),
-                )
+            if self._expire_active_daemon_lease_for_shutdown(
+                conn,
+                daemon_id=daemon_id,
+                owner=owner,
+                lease=lease,
+                timestamp=timestamp,
+                event_type=event_type,
+                message=message,
+                transition_reason=transition_reason,
+            ):
                 expired_ids.append(lease.id)
-                continue
-            task = self._row_to_task(task_row)
-            next_status = self._task_requeue_status(task) if task.status in {TaskStatus.LEASED, TaskStatus.RUNNING} else task.status
-            if task.status != next_status:
-                validate_task_transition(task.status, next_status)
+        return expired_ids
+
+    def _expire_active_daemon_lease_for_shutdown(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        daemon_id: str,
+        owner: str,
+        lease: TaskLease,
+        timestamp: str,
+        event_type: str,
+        message: str,
+        transition_reason: str,
+    ) -> bool:
+        task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (lease.task_id,)).fetchone()
+        task = self._row_to_task(task_row) if task_row is not None else None
+        attempt: TaskAttempt | None = None
+        if lease.attempt_id is not None:
+            attempt_row = conn.execute("SELECT * FROM task_attempts WHERE id = ?", (lease.attempt_id,)).fetchone()
+            if attempt_row is not None:
+                attempt = self._row_to_task_attempt(attempt_row)
+
+        if task is None:
             conn.execute(
                 """
                 UPDATE task_leases
-                SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?)
+                SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?), metadata_json = ?
                 WHERE id = ?
                 """,
-                (TaskLeaseStatus.EXPIRED.value, timestamp, timestamp, lease.id),
-            )
-            if lease.attempt_id is not None:
-                conn.execute(
-                    """
-                    UPDATE task_attempts
-                    SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
-                    WHERE id = ? AND run_id IS NULL
-                    """,
-                    (
-                        TaskStatus.FAILED.value,
-                        timestamp,
-                        transition_reason,
-                        message,
-                        lease.attempt_id,
+                (
+                    TaskLeaseStatus.EXPIRED.value,
+                    timestamp,
+                    timestamp,
+                    json.dumps(
+                        sanitize_for_logging(
+                            {**lease.metadata, "decision": transition_reason, "reason": "missing_task"}
+                        ),
+                        sort_keys=True,
+                        default=str,
                     ),
-                )
-            if task.status != next_status:
-                conn.execute(
-                    "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
-                    (next_status.value, timestamp, task.id),
-                )
-                self._record_task_transition(
-                    conn,
-                    task_id=task.id,
-                    from_status=task.status,
-                    to_status=next_status,
-                    reason=transition_reason,
-                    actor=owner,
-                    metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id, "daemon_id": daemon_id},
-                    created_at=timestamp,
-                )
+                    lease.id,
+                ),
+            )
             self._record_daemon_event(
                 conn,
                 daemon_id=daemon_id,
                 event_type=event_type,
                 message=message,
-                metadata={"lease_id": lease.id, "task_id": task.id, "attempt_id": lease.attempt_id},
+                metadata={
+                    "lease_id": lease.id,
+                    "task_id": lease.task_id,
+                    "attempt_id": lease.attempt_id,
+                    "lease_status": TaskLeaseStatus.EXPIRED.value,
+                    "reason": "missing_task",
+                },
                 created_at=timestamp,
             )
-            expired_ids.append(lease.id)
-        return expired_ids
+            return True
+
+        if attempt is not None and attempt.run_id is not None:
+            run_row = conn.execute("SELECT * FROM runs WHERE id = ?", (attempt.run_id,)).fetchone()
+            run = self._row_to_run(run_row) if run_row is not None else None
+            if run is not None and run.status == "completed":
+                self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.SUCCEEDED,
+                    lease_status=TaskLeaseStatus.RELEASED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason=f"{transition_reason}_execution_succeeded",
+                    failure_code=None,
+                    failure_message=None,
+                )
+                self._record_daemon_event(
+                    conn,
+                    daemon_id=daemon_id,
+                    event_type=event_type,
+                    message="Reconciled completed linked-run evidence while expiring daemon-owned leases.",
+                    metadata={
+                        "lease_id": lease.id,
+                        "task_id": task.id,
+                        "attempt_id": attempt.id,
+                        "run_id": run.id,
+                        "run_status": run.status,
+                        "lease_status": TaskLeaseStatus.RELEASED.value,
+                        "next_status": TaskStatus.SUCCEEDED.value,
+                        "reason": "linked_run_completed",
+                    },
+                    created_at=timestamp,
+                )
+                return False
+            if run is not None and run.status == "failed":
+                self._reconcile_dry_run_terminal_state(
+                    conn,
+                    task=task,
+                    attempt=attempt,
+                    lease=lease,
+                    next_status=TaskStatus.FAILED,
+                    lease_status=TaskLeaseStatus.RELEASED,
+                    timestamp=timestamp,
+                    actor=owner,
+                    reason=f"{transition_reason}_execution_failed",
+                    failure_code=transition_reason,
+                    failure_message="Daemon shutdown reconciled failed linked-run evidence.",
+                )
+                self._record_daemon_event(
+                    conn,
+                    daemon_id=daemon_id,
+                    event_type=event_type,
+                    message="Reconciled failed linked-run evidence while expiring daemon-owned leases.",
+                    metadata={
+                        "lease_id": lease.id,
+                        "task_id": task.id,
+                        "attempt_id": attempt.id,
+                        "run_id": run.id,
+                        "run_status": run.status,
+                        "lease_status": TaskLeaseStatus.RELEASED.value,
+                        "next_status": TaskStatus.FAILED.value,
+                        "reason": "linked_run_failed",
+                    },
+                    created_at=timestamp,
+                )
+                return False
+            failure_reason = "missing_run" if run is None else "nonterminal_linked_run"
+            self._reconcile_dry_run_terminal_state(
+                conn,
+                task=task,
+                attempt=attempt,
+                lease=lease,
+                next_status=TaskStatus.FAILED,
+                lease_status=TaskLeaseStatus.EXPIRED,
+                timestamp=timestamp,
+                actor=owner,
+                reason=transition_reason,
+                failure_code=transition_reason,
+                failure_message="Daemon shutdown found an active lease with missing or non-terminal linked run.",
+            )
+            self._record_daemon_event(
+                conn,
+                daemon_id=daemon_id,
+                event_type=event_type,
+                message="Failed linked-run task for operator inspection while expiring daemon-owned leases.",
+                metadata={
+                    "lease_id": lease.id,
+                    "task_id": task.id,
+                    "attempt_id": attempt.id,
+                    "run_id": attempt.run_id,
+                    "run_status": run.status if run is not None else None,
+                    "lease_status": TaskLeaseStatus.EXPIRED.value,
+                    "next_status": TaskStatus.FAILED.value,
+                    "reason": failure_reason,
+                    "failure_code": transition_reason,
+                },
+                created_at=timestamp,
+            )
+            return True
+
+        if task.status not in {TaskStatus.LEASED, TaskStatus.RUNNING}:
+            self._expire_inconsistent_active_lease(
+                conn,
+                daemon_id=daemon_id,
+                owner=owner,
+                lease=lease,
+                task=task,
+                attempt=attempt,
+                reason=f"task_status_{task.status.value}",
+                timestamp=timestamp,
+            )
+            self._record_daemon_event(
+                conn,
+                daemon_id=daemon_id,
+                event_type=event_type,
+                message="Expired inconsistent daemon-owned active lease.",
+                metadata={
+                    "lease_id": lease.id,
+                    "task_id": task.id,
+                    "attempt_id": lease.attempt_id,
+                    "lease_status": TaskLeaseStatus.EXPIRED.value,
+                    "task_status": task.status.value,
+                    "reason": f"task_status_{task.status.value}",
+                },
+                created_at=timestamp,
+            )
+            return True
+
+        next_status = self._task_requeue_status(task)
+        validate_task_transition(task.status, next_status)
+        conn.execute(
+            """
+            UPDATE task_leases
+            SET status = ?, released_at = ?, heartbeat_at = COALESCE(heartbeat_at, ?), metadata_json = ?
+            WHERE id = ?
+            """,
+            (
+                TaskLeaseStatus.EXPIRED.value,
+                timestamp,
+                timestamp,
+                json.dumps(
+                    sanitize_for_logging(
+                        {**lease.metadata, "decision": transition_reason, "reason": "expired_before_execution"}
+                    ),
+                    sort_keys=True,
+                    default=str,
+                ),
+                lease.id,
+            ),
+        )
+        if lease.attempt_id is not None:
+            conn.execute(
+                """
+                UPDATE task_attempts
+                SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
+                WHERE id = ? AND run_id IS NULL
+                """,
+                (
+                    TaskStatus.FAILED.value,
+                    timestamp,
+                    transition_reason,
+                    message,
+                    lease.attempt_id,
+                ),
+            )
+        if task.status != next_status:
+            conn.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (next_status.value, timestamp, task.id),
+            )
+            self._record_task_transition(
+                conn,
+                task_id=task.id,
+                from_status=task.status,
+                to_status=next_status,
+                reason=transition_reason,
+                actor=owner,
+                metadata={"lease_id": lease.id, "attempt_id": lease.attempt_id, "daemon_id": daemon_id},
+                created_at=timestamp,
+            )
+        self._record_daemon_event(
+            conn,
+            daemon_id=daemon_id,
+            event_type=event_type,
+            message=message,
+            metadata={
+                "lease_id": lease.id,
+                "task_id": task.id,
+                "attempt_id": lease.attempt_id,
+                "lease_status": TaskLeaseStatus.EXPIRED.value,
+                "next_status": next_status.value,
+                "reason": "expired_before_execution",
+            },
+            created_at=timestamp,
+        )
+        return True
 
     def get_daemon(self, daemon_id: str) -> DaemonRecord:
         with self.connect() as conn:
@@ -5641,6 +7140,13 @@ class SQLiteStore:
             (task_id,),
         ).fetchone()
         return int(row["max_attempt"]) + 1
+
+    def _task_attempt_count(self, conn: sqlite3.Connection, task_id: str) -> int:
+        row = conn.execute(
+            "SELECT COUNT(*) AS attempt_count FROM task_attempts WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return int(row["attempt_count"])
 
     def _task_dependencies_completed(self, task: TaskRecord) -> bool:
         for dependency_id in task.depends_on:
@@ -6634,6 +8140,12 @@ class SQLiteStore:
             None,
         )
         autonomy_payload = autonomy_event.payload if autonomy_event is not None else {}
+        adapter_descriptor = _execution_adapter_descriptor_for_run_record(self, run)
+        sandbox_profile_id = (
+            adapter_descriptor.sandbox_profile_id
+            if adapter_descriptor is not None
+            else _legacy_sandbox_profile_id_for_task_type(run.task_type)
+        )
         return RunManifest(
             run_id=run.id,
             goal=run.goal,
@@ -6651,7 +8163,8 @@ class SQLiteStore:
             effective_policy=effective_policy,
             effective_policy_sha256=effective_policy_sha256(effective_policy),
             backend_descriptor_sha256=backend_descriptor_sha256(backend_descriptor),
-            sandbox_profile=sandbox_profile_dict(_sandbox_profile_id_for_run(run.task_type)),
+            sandbox_profile=sandbox_profile_dict(sandbox_profile_id),
+            delegate_budget=_delegate_budget_for_run_descriptor(adapter_descriptor),
             autonomy_decision_id=autonomy_payload.get("autonomy_decision_id"),
             autonomous_approval_id=autonomy_payload.get("autonomous_approval_id"),
             autonomous_outcome_id=autonomy_payload.get("autonomous_outcome_id"),
@@ -7217,7 +8730,31 @@ class SQLiteStore:
         )
 
 
-def _sandbox_profile_id_for_run(task_type: str | None) -> str | None:
+def _execution_adapter_descriptor_for_run_record(store: SQLiteStore, run: RunRecord):
+    if run.task_id is not None:
+        try:
+            task = store.get_task(run.task_id)
+        except KeyError:
+            task = None
+        adapter_id = task.metadata.get("execution_adapter") if task is not None else None
+        if isinstance(adapter_id, str) and adapter_id.strip():
+            from harness.execution import get_execution_adapter_descriptor
+
+            descriptor = get_execution_adapter_descriptor(adapter_id)
+            if descriptor is not None:
+                return descriptor
+    return None
+
+
+def _delegate_budget_for_run_descriptor(descriptor) -> dict[str, Any] | None:
+    if descriptor is None:
+        return None
+    from harness.delegate_budgets import adapter_delegate_budget_projection
+
+    return adapter_delegate_budget_projection(descriptor)
+
+
+def _legacy_sandbox_profile_id_for_task_type(task_type: str | None) -> str | None:
     mapping = {
         DRY_RUN_TASK_TYPE: "none",
         READ_ONLY_TASK_TYPE: "read_only_codex",
@@ -7226,6 +8763,34 @@ def _sandbox_profile_id_for_run(task_type: str | None) -> str | None:
         "docker_run_tests": "docker_test_sandbox",
     }
     return mapping.get(task_type or "")
+
+
+def _validate_registered_execution_task_payload(
+    metadata: dict[str, Any],
+    *,
+    agent_id: str | None,
+    depends_on: list[str],
+) -> None:
+    has_adapter_metadata = "execution_adapter" in metadata or "task_type" in metadata
+    if not has_adapter_metadata:
+        return
+    execution_adapter = metadata.get("execution_adapter")
+    task_type = metadata.get("task_type")
+    if not isinstance(execution_adapter, str) or not execution_adapter.strip():
+        raise ValueError("Task execution metadata requires execution_adapter.")
+    if not isinstance(task_type, str) or not task_type.strip():
+        raise ValueError("Task execution metadata requires task_type.")
+    from harness.execution import validate_execution_task_payload
+
+    reasons = validate_execution_task_payload(
+        execution_adapter=execution_adapter,
+        task_type=task_type,
+        metadata=metadata,
+        agent_id=agent_id,
+        depends_on=depends_on,
+    )
+    if reasons:
+        raise ValueError("Invalid execution task metadata: " + " ".join(reasons))
 
 
 def _redacted_artifact_path(path: Path) -> Path:

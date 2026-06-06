@@ -318,6 +318,55 @@ def _active_work_rows(
             ]
         )
         return {"rows": rows, "next_action": "confirm or decline from the decision menu"}
+    pending_action = (dashboard.get("active_session") or {}).get("pending_action")
+    if pending_action:
+        rows.extend(
+            [
+                "State: needs confirmation",
+                f"Pending: {_short(pending_action.get('summary') or pending_action.get('label'))}",
+                f"Kind: {_humanize(pending_action.get('kind'))}",
+                "Next: /confirm or /decline",
+            ]
+        )
+        return {"rows": rows, "next_action": "/confirm or /decline"}
+    pending_action_audit = (dashboard.get("active_session") or {}).get("pending_action_audit") or {}
+    if pending_action_audit.get("status") in {"invalid", "stale"}:
+        issues = pending_action_audit.get("issues") or []
+        issue = issues[0] if issues else {}
+        cleanup_command = pending_action_audit.get("cleanup_command") or "inspect pending action"
+        rows.extend(
+            [
+                "State: pending metadata needs cleanup",
+                f"Status: {_humanize(pending_action_audit.get('status'))}",
+                f"Issue: {_short(issue.get('code') or 'unknown')}",
+                f"Next: {cleanup_command}",
+            ]
+        )
+        return {"rows": rows, "next_action": cleanup_command}
+    transcript_health = (dashboard.get("active_session") or {}).get("transcript_health") or {}
+    if transcript_health and not transcript_health.get("ok", True):
+        inspect_command = f"harness session inspect {transcript_health.get('session_id')} --output json"
+        rows.extend(
+            [
+                "State: session transcript needs inspection",
+                f"Parse errors: {transcript_health.get('parse_error_count', 0)}",
+                f"Validation errors: {transcript_health.get('validation_error_count', 0)}",
+                f"Next: {inspect_command}",
+            ]
+        )
+        return {"rows": rows, "next_action": inspect_command}
+    active_run_reference = (dashboard.get("active_session") or {}).get("active_run_reference") or {}
+    if active_run_reference.get("status") == "stale":
+        repair_command = active_run_reference.get("repair_command") or "harness doctor --repair --output json"
+        rows.extend(
+            [
+                "State: session active run needs cleanup",
+                f"Missing run: {_short(active_run_reference.get('missing_run_id') or active_run_reference.get('active_run_id'))}",
+                "Scope: session active_run_id pointer only",
+                f"Next: {repair_command}",
+            ]
+        )
+        return {"rows": rows, "next_action": repair_command}
     pending_permissions = (dashboard.get("live_activity") or {}).get("pending_permissions") or []
     if pending_permissions:
         permission = pending_permissions[-1]
@@ -409,6 +458,33 @@ def _task_node_active_rows(node: GraphNode | dict[str, Any]) -> list[str]:
 
 
 def _attention_rows(dashboard: dict[str, Any], graph: LiveOrchestrationGraph | None, active_work: dict[str, Any]) -> list[str]:
+    pending_action = (dashboard.get("active_session") or {}).get("pending_action")
+    if pending_action:
+        return [f"Pending action: {pending_action.get('label')} | {pending_action.get('summary')}"]
+    pending_action_audit = (dashboard.get("active_session") or {}).get("pending_action_audit") or {}
+    if pending_action_audit.get("status") in {"invalid", "stale"}:
+        issues = pending_action_audit.get("issues") or []
+        issue = issues[0] if issues else {}
+        return [
+            "Pending action metadata: "
+            f"{pending_action_audit.get('status')} | "
+            f"{issue.get('code') or 'unknown'} | "
+            f"{pending_action_audit.get('cleanup_command') or 'inspect pending action'}"
+        ]
+    transcript_health = (dashboard.get("active_session") or {}).get("transcript_health") or {}
+    if transcript_health and not transcript_health.get("ok", True):
+        return [
+            "Session transcript: "
+            f"malformed | parse={transcript_health.get('parse_error_count', 0)} | "
+            f"validation={transcript_health.get('validation_error_count', 0)}"
+        ]
+    active_run_reference = (dashboard.get("active_session") or {}).get("active_run_reference") or {}
+    if active_run_reference.get("status") == "stale":
+        return [
+            "Session active run: "
+            f"stale | {active_run_reference.get('missing_run_id') or active_run_reference.get('active_run_id')} | "
+            f"{active_run_reference.get('repair_command') or 'harness doctor --repair --output json'}"
+        ]
     pending_permissions = (dashboard.get("live_activity") or {}).get("pending_permissions") or []
     if pending_permissions:
         permission = pending_permissions[-1]
@@ -433,6 +509,7 @@ def _attention_rows(dashboard: dict[str, Any], graph: LiveOrchestrationGraph | N
 
 def _evidence_rows(dashboard: dict[str, Any], graph: LiveOrchestrationGraph | None) -> list[str]:
     rows: list[str] = []
+    rows.extend(_readiness_evidence_rows(dashboard))
     if graph is not None:
         for node in graph.nodes:
             if node.kind == "adapter_run":
@@ -462,7 +539,105 @@ def _evidence_rows(dashboard: dict[str, Any], graph: LiveOrchestrationGraph | No
         )
     for run in dashboard.get("recent_runs") or []:
         rows.append(f"Recent run: {_humanize(run.get('task_type') or 'unknown')} | {run.get('status') or 'unknown'}")
-    return rows[:8] or ["No run, artifact, or verification metadata yet."]
+    rows.extend(_efficiency_evidence_rows(dashboard))
+    rows.extend(_synthesis_evidence_rows(dashboard))
+    return rows[:12] or ["No run, artifact, or verification metadata yet."]
+
+
+def _readiness_evidence_rows(dashboard: dict[str, Any]) -> list[str]:
+    readiness = dashboard.get("orchestration_readiness") or {}
+    if not readiness:
+        return []
+    summary = readiness.get("summary") or {}
+    rows = [
+        "Readiness: "
+        f"{_status_label(readiness.get('status') or 'unknown')} | "
+        f"pass {summary.get('pass', 0)} / warn {summary.get('warning', 0)} / fail {summary.get('fail', 0)}",
+    ]
+    failing = readiness.get("failing_check_ids") or []
+    warnings = readiness.get("warning_check_ids") or []
+    if failing:
+        rows.append("Readiness fail: " + ", ".join(str(item) for item in failing[:3]))
+    elif warnings:
+        rows.append("Readiness warn: " + ", ".join(str(item) for item in warnings[:3]))
+    rows.append("Audit: harness orchestration audit --project . --output json")
+    return rows
+
+
+def _efficiency_evidence_rows(dashboard: dict[str, Any]) -> list[str]:
+    efficiency = dashboard.get("orchestration_efficiency") or {}
+    if not efficiency:
+        return []
+    summary = efficiency.get("summary") or {}
+    rows = [
+        "Efficiency: "
+        f"{_status_label(efficiency.get('status') or 'unknown')} | "
+        f"pass {summary.get('pass', 0)} / warn {summary.get('warning', 0)} / fail {summary.get('fail', 0)}",
+    ]
+    failing = efficiency.get("failing_check_ids") or []
+    warnings = efficiency.get("warning_check_ids") or []
+    skipped = efficiency.get("skipped_check_ids") or []
+    if failing:
+        rows.append("Efficiency fail: " + ", ".join(str(item) for item in failing[:3]))
+    elif warnings:
+        rows.append("Efficiency warn: " + ", ".join(str(item) for item in warnings[:3]))
+    elif skipped:
+        rows.append("Efficiency skipped: " + ", ".join(str(item) for item in skipped[:3]))
+    rows.append("Efficiency audit: harness evals run --suite orchestration-efficiency --project . --output json")
+    rows.extend(_microbenchmark_evidence_rows(dashboard))
+    return rows
+
+
+def _microbenchmark_evidence_rows(dashboard: dict[str, Any]) -> list[str]:
+    microbenchmarks = dashboard.get("orchestration_microbenchmarks") or {}
+    if not microbenchmarks:
+        return []
+    summary = microbenchmarks.get("summary") or {}
+    rows = [
+        "Microbenchmarks: "
+        f"{_status_label(microbenchmarks.get('status') or 'unknown')} | "
+        f"pass {summary.get('pass', 0)} / skipped {summary.get('skipped', 0)} / fail {summary.get('fail', 0)}",
+    ]
+    failing = microbenchmarks.get("failing_benchmark_ids") or []
+    warnings = microbenchmarks.get("warning_benchmark_ids") or []
+    skipped = microbenchmarks.get("skipped_benchmark_ids") or []
+    if failing:
+        rows.append("Microbenchmarks fail: " + ", ".join(str(item) for item in failing[:3]))
+    elif warnings:
+        rows.append("Microbenchmarks warn: " + ", ".join(str(item) for item in warnings[:3]))
+    elif skipped:
+        rows.append("Microbenchmarks skipped: " + ", ".join(str(item) for item in skipped[:3]))
+    rows.append("Microbenchmarks: harness evals run --suite orchestration-microbenchmarks --project . --output json")
+    return rows
+
+
+def _synthesis_evidence_rows(dashboard: dict[str, Any]) -> list[str]:
+    synthesis = dashboard.get("orchestration_synthesis") or {}
+    if not synthesis:
+        return []
+    summary = synthesis.get("summary") or {}
+    posture = synthesis.get("security_complexity_posture") or {}
+    source_statuses = synthesis.get("source_report_statuses") or {}
+    rows = [
+        "Synthesis: "
+        f"{_status_label(synthesis.get('status') or 'unknown')} | "
+        f"posture {posture.get('posture') or 'unknown'} | "
+        f"adopted {summary.get('adopted_pattern_count', synthesis.get('adopted_reference_pattern_count', 0))} / "
+        f"held back {summary.get('deliberate_non_adoption_count', synthesis.get('deliberate_non_adoption_count', 0))}",
+    ]
+    failing = synthesis.get("failing_source_report_ids") or []
+    warnings = synthesis.get("warning_source_report_ids") or []
+    if failing:
+        rows.append("Synthesis fail: " + ", ".join(str(item) for item in failing[:3]))
+    elif warnings:
+        rows.append("Synthesis warn: " + ", ".join(str(item) for item in warnings[:3]))
+    elif source_statuses:
+        rows.append(
+            "Synthesis sources: "
+            + " ".join(f"{name}={status}" for name, status in sorted(source_statuses.items()))
+        )
+    rows.append("Synthesis: harness evals run --suite orchestration-synthesis --project . --output json")
+    return rows
 
 
 def _context_rows(dashboard: dict[str, Any], state: dict[str, Any], focus_mode: str, query: str) -> list[str]:
@@ -785,6 +960,10 @@ def _summary(dashboard: dict[str, Any], instances: list[OrchestrationInstance], 
         "running": live_counts.get("running", 0),
         "blocked": live_counts.get("blocked", 0),
         "waiting_approval": live_counts.get("waiting_approval", 0),
+        "pending_chat_actions": live_counts.get("pending_chat_actions", 0),
+        "invalid_pending_chat_actions": live_counts.get("invalid_pending_chat_actions", 0),
+        "stale_pending_chat_actions": live_counts.get("stale_pending_chat_actions", 0),
+        "stale_active_run_refs": live_counts.get("stale_active_run_refs", 0),
     }
 
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.chat_tools import ChatToolRequest, ChatToolRisk, default_chat_tools
-from harness.execution import list_execution_adapter_descriptors
+from harness.execution import list_execution_adapter_descriptors, validate_execution_task_payload
 from harness.security import sanitize_for_logging
 from harness.workflow_templates import template_for_intent
 
@@ -97,12 +97,22 @@ def _normalize_arguments(tool: str, arguments: dict[str, Any], *, project_root: 
         _validate_adapter_task_type(adapter, task_type)
         metadata = safe_args.get("metadata") if isinstance(safe_args.get("metadata"), dict) else {}
         _validate_adapter_task_metadata(adapter, metadata)
+        depends_on = _string_list_arg(safe_args, "depends_on")
+        _validate_execution_task_payload_for_contract(
+            execution_adapter=adapter,
+            task_type=task_type,
+            metadata=metadata,
+            agent_id=_optional_string_arg(safe_args, "agent_id"),
+            depends_on=depends_on,
+            context="task payload",
+        )
         return {
             "title": _string_arg(safe_args, "title") or _string_arg(safe_args, "goal") or "Chat-created task",
             "description": _string_arg(safe_args, "description") or _string_arg(safe_args, "goal") or "",
             "objective_id": _optional_string_arg(safe_args, "objective_id"),
             "workbench_id": _optional_string_arg(safe_args, "workbench_id"),
             "agent_id": _optional_string_arg(safe_args, "agent_id"),
+            "depends_on": depends_on,
             "execution_adapter": adapter,
             "task_type": task_type,
             "metadata": metadata,
@@ -115,23 +125,19 @@ def _normalize_arguments(tool: str, arguments: dict[str, Any], *, project_root: 
                 template = template_for_intent(template_id, goal, project_root or Path.cwd())
             except KeyError as exc:
                 raise ValueError(str(exc)) from exc
+            tasks = _normalize_task_graph_payloads([task.to_payload() for task in template.tasks])
+            checkpoints = list(template.to_payload().get("checkpoints") or [])
             return {
                 "goal": goal,
                 "workbench_id": _optional_string_arg(safe_args, "workbench_id"),
                 "template_id": template.id,
                 "template": template.to_payload(),
-                "tasks": [task.to_payload() for task in template.tasks],
+                "tasks": tasks,
+                "checkpoints": checkpoints,
             }
         raw_tasks = list(safe_args.get("tasks") or [])
-        for raw_task in raw_tasks:
-            if not isinstance(raw_task, dict):
-                continue
-            adapter = _optional_string_arg(raw_task, "execution_adapter") or "dry_run"
-            task_type = _optional_string_arg(raw_task, "task_type") or _default_task_type(adapter)
-            _validate_adapter_task_type(adapter, task_type)
-            metadata = raw_task.get("metadata") if isinstance(raw_task.get("metadata"), dict) else {}
-            _validate_adapter_task_metadata(adapter, metadata)
-        return {"goal": goal, "workbench_id": _optional_string_arg(safe_args, "workbench_id"), "tasks": raw_tasks}
+        tasks = _normalize_task_graph_payloads(raw_tasks)
+        return {"goal": goal, "workbench_id": _optional_string_arg(safe_args, "workbench_id"), "tasks": tasks}
     if tool in {"edit_isolated", "run_tests", "dispatch_registered_adapter", "apply_back", "deny_apply_back", "revert_pending_change", "request_approval", "remember", "forget_memory"}:
         normalized = dict(safe_args)
         if "goal" not in normalized and "summary" in normalized:
@@ -184,7 +190,10 @@ def _execution_plan(tool: str, args: dict[str, Any]) -> list[dict[str, Any]]:
             }
         ]
     if tool == "create_task_graph":
-        plan = [{"step": "create_objective"}, {"step": "create_tasks", "count": len(args.get("tasks") or [])}]
+        plan = [{"step": "create_objective"}]
+        if args.get("checkpoints"):
+            plan.append({"step": "approve_supervisor_checkpoints", "count": len(args.get("checkpoints") or [])})
+        plan.append({"step": "create_tasks", "count": len(args.get("tasks") or [])})
         if args.get("template_id"):
             plan.insert(0, {"step": "select_workflow_template", "template_id": args["template_id"]})
         return plan
@@ -241,6 +250,91 @@ def _validate_adapter_task_metadata(adapter: str, metadata: dict[str, Any]) -> N
         return
 
 
+def _normalize_task_graph_payloads(raw_tasks: list[Any]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, raw_task in enumerate(raw_tasks):
+        if not isinstance(raw_task, dict):
+            errors.append(f"Task graph task[{index}] must be an object.")
+            continue
+        adapter = _optional_string_arg(raw_task, "execution_adapter") or "dry_run"
+        task_type = _optional_string_arg(raw_task, "task_type") or _default_task_type(adapter)
+        try:
+            _validate_adapter_task_type(adapter, task_type)
+        except ValueError as exc:
+            errors.append(f"Task graph task[{index}]: {exc}")
+        metadata = raw_task.get("metadata") if isinstance(raw_task.get("metadata"), dict) else {}
+        try:
+            _validate_adapter_task_metadata(adapter, metadata)
+        except ValueError as exc:
+            errors.append(f"Task graph task[{index}]: {exc}")
+        normalized_task = {**raw_task, "execution_adapter": adapter, "task_type": task_type, "metadata": metadata}
+        normalized.append(normalized_task)
+
+    if not errors:
+        errors.extend(_task_graph_contract_errors(normalized))
+    if errors:
+        raise ValueError("Invalid task graph: " + " ".join(errors))
+    return normalized
+
+
+def _task_graph_contract_errors(tasks: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    for index, task in enumerate(tasks):
+        depends_on, dependency_errors = _depends_on_tokens_for_graph_task(index, task)
+        errors.extend(dependency_errors)
+        errors.extend(
+            f"Task graph task[{index}]: {reason}"
+            for reason in validate_execution_task_payload(
+                execution_adapter=str(task["execution_adapter"]),
+                task_type=str(task["task_type"]),
+                metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
+                agent_id=_optional_string_arg(task, "agent_id"),
+                depends_on=depends_on,
+            )
+        )
+    return errors
+
+
+def _depends_on_tokens_for_graph_task(index: int, task: dict[str, Any]) -> tuple[list[str], list[str]]:
+    raw_indexes = task.get("depends_on_indexes") or []
+    if not isinstance(raw_indexes, list):
+        return [], [f"Task graph task[{index}] depends_on_indexes must be a list."]
+    depends_on: list[str] = []
+    errors: list[str] = []
+    for raw_index in raw_indexes:
+        if not isinstance(raw_index, int):
+            errors.append(f"Task graph task[{index}] has non-integer dependency index: {raw_index}.")
+            continue
+        if raw_index < 0 or raw_index >= index:
+            errors.append(
+                f"Task graph task[{index}] has invalid dependency index {raw_index}; dependencies must point to earlier tasks."
+            )
+            continue
+        depends_on.append(f"task_index_{raw_index}")
+    return depends_on, errors
+
+
+def _validate_execution_task_payload_for_contract(
+    *,
+    execution_adapter: str,
+    task_type: str,
+    metadata: dict[str, Any],
+    agent_id: str | None,
+    depends_on: list[str],
+    context: str,
+) -> None:
+    reasons = validate_execution_task_payload(
+        execution_adapter=execution_adapter,
+        task_type=task_type,
+        metadata=metadata,
+        agent_id=agent_id,
+        depends_on=depends_on,
+    )
+    if reasons:
+        raise ValueError(f"Invalid {context}: " + " ".join(reasons))
+
+
 def _string_arg(arguments: dict[str, Any], key: str) -> str:
     value = arguments.get(key)
     return str(value).strip() if value is not None and str(value).strip() else ""
@@ -249,3 +343,10 @@ def _string_arg(arguments: dict[str, Any], key: str) -> str:
 def _optional_string_arg(arguments: dict[str, Any], key: str) -> str | None:
     value = _string_arg(arguments, key)
     return value or None
+
+
+def _string_list_arg(arguments: dict[str, Any], key: str) -> list[str]:
+    value = arguments.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]

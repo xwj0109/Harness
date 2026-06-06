@@ -30,10 +30,12 @@ from harness.local_server import (
 )
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import EventStreamType, SessionPermissionBoundaryKind, SessionPermissionScope, SessionPermissionStatus
+from harness.objective_runner import run_objective_autonomously
 from harness.operator_loop import create_turn_state_from_session, persist_turn_finished, persist_turn_started
 from harness.operator_models import HarnessAgentPhase
 from harness.process_supervisor import get_process_supervisor
 from harness.provider_auth import read_provider_account_secret, read_provider_oauth_tokens
+from harness.session_events import SessionEventKind, append_session_event
 
 
 runner = CliRunner()
@@ -108,6 +110,8 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "/lsp",
         "/formatter",
         "/agents",
+        "/agents/discovery",
+        "/agents/allocation",
         "/artifacts",
         "/find",
         "/find/file",
@@ -191,6 +195,15 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "/question/{question_id}/reply",
         "/question/{question_id}/reject",
         "/commands",
+        "/orchestration/readiness",
+        "/orchestration/workflows",
+        "/orchestration/scenarios",
+        "/orchestration/efficiency",
+        "/orchestration/microbenchmarks",
+        "/orchestration/synthesis",
+        "/objectives/{objective_id}/evidence",
+        "/objectives/{objective_id}/trace",
+        "/runs/{run_id}/trace",
         "/commands/run",
         "/pr/checkout",
         "/pr/run",
@@ -208,6 +221,7 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "/sessions/{session_id}",
         "/sessions/{session_id}/events",
         "/sessions/{session_id}/status",
+        "/sessions/{session_id}/pending-action",
         "/sessions/{session_id}/children",
         "/sessions/{session_id}/fork",
         "/sessions/{session_id}/summary",
@@ -273,6 +287,8 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
     assert spec["paths"]["/session"]["x-harness-alias-for"] == "/sessions"
     assert "patch" in spec["paths"]["/sessions/{session_id}"]
     assert "delete" in spec["paths"]["/sessions/{session_id}"]
+    assert "get" in spec["paths"]["/sessions/{session_id}/pending-action"]
+    assert "delete" in spec["paths"]["/sessions/{session_id}/pending-action"]
     assert "post" in spec["paths"]["/sessions/{session_id}/messages"]
     assert spec["paths"]["/session/{session_id}/message"]["x-harness-alias-for"] == "/sessions/{session_id}/message"
     assert spec["paths"]["/api/provider"]["x-harness-alias-for"] == "/providers"
@@ -289,6 +305,9 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         "ModelPreferencesResponse",
         "ModelPreferenceUpdateResponse",
         "SessionModelSelectionResponse",
+        "AgentDiscoveryCatalogResponse",
+        "DelegateAllocationResponse",
+        "OrchestrationEfficiencyAuditResponse",
         "ModelSuggestion",
         "ProviderSuggestion",
     ):
@@ -335,6 +354,16 @@ def test_openapi_spec_exposes_phase_6_read_only_endpoints() -> None:
         spec["paths"]["/sessions/{session_id}/model"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
         == "#/components/schemas/SessionModelSelectionResponse"
     )
+    assert (
+        spec["paths"]["/agents/discovery"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/AgentDiscoveryCatalogResponse"
+    )
+    assert (
+        spec["paths"]["/agents/allocation"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        == "#/components/schemas/DelegateAllocationResponse"
+    )
+    assert spec["paths"]["/agents/discovery"]["get"]["x-harness-safety"]["agent_execution_started"] is False
+    assert spec["paths"]["/agents/allocation"]["get"]["x-harness-safety"]["permission_granting"] is False
     assert spec["paths"]["/provider/{provider_id}/oauth/authorize"]["post"]["responses"].keys() == {"200"}
     assert spec["paths"]["/provider/{provider_id}/oauth/callback"]["post"]["responses"].keys() == {"200"}
     assert spec["paths"]["/provider/{provider_id}/oauth/callback"]["post"]["x-harness-safety"]["credential_written"] is True
@@ -1201,6 +1230,195 @@ def test_local_server_routes_require_token_and_return_store_projections(tmp_path
     assert '"api_key":' not in serialized
     assert "ollama" not in serialized
     assert "server artifact body" not in serialized
+
+
+def test_local_server_session_projections_surface_malformed_transcript_health_without_body(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Malformed transcript")
+    append_session_event(
+        tmp_path,
+        session_id=session.id,
+        event_type=SessionEventKind.SESSION_STARTED,
+        message="Started",
+    )
+    transcript_path = tmp_path / ".harness" / "sessions" / session.id / "transcript.jsonl"
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("not json with secret sk-abcdefghijklmnopqrstuvwxyz\n")
+
+    sessions = _route_get("/sessions", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    api_sessions = _route_get("/api/session", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    sessions_status = _route_get("/sessions/status", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    inspected = _route_get(f"/sessions/{session.id}", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    status = _route_get(
+        f"/sessions/{session.id}/status",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    health_payloads = [
+        sessions["sessions"][0]["transcript_health"],
+        api_sessions["items"][0]["transcript_health"],
+        sessions_status["sessions"][0]["transcript_health"],
+        sessions_status["transcript_health_by_session"][session.id],
+        inspected["transcript_health"],
+        inspected["session"]["transcript_health"],
+        status["transcript_health"],
+    ]
+    assert sessions_status["malformed_transcript_session_ids"] == [session.id]
+    for health in health_payloads:
+        assert health["schema_version"] == "harness.session_events_read/v1"
+        assert health["ok"] is False
+        assert health["parse_error_count"] == 1
+        assert health["validation_error_count"] == 0
+        assert health["contents_included"] is False
+        assert health["permission_granting"] is False
+    serialized = json.dumps([sessions, api_sessions, sessions_status, inspected, status])
+    assert "not json" not in serialized
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in serialized
+    assert "Traceback" not in serialized
+
+
+def test_local_server_session_routes_expose_pending_chat_action_projection(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    state = ChatSessionState()
+    draft = handle_chat_input("create dry run task", tmp_path, state)
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+
+    sessions = _route_get("/sessions", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    api_sessions = _route_get("/api/session", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    sessions_status = _route_get("/sessions/status", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    inspected = _route_get(f"/sessions/{state.session_id}", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    status = _route_get(f"/sessions/{state.session_id}/status", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    assert draft["kind"] == "task_draft"
+    assert sessions["sessions"][0]["pending_action"]["kind"] == "task_draft"
+    assert sessions["sessions"][0]["pending_action_audit"]["status"] == "recoverable"
+    assert sessions["sessions"][0]["pending_action_audit"]["raw_metadata_exposed"] is False
+    assert api_sessions["items"][0]["pending_action"]["requires_confirmation"] is True
+    assert api_sessions["items"][0]["pending_action_audit"]["recoverable"] is True
+    assert sessions_status["sessions"][0]["pending_action"]["process_started"] is False
+    assert sessions_status["sessions"][0]["pending_action_audit"]["cleanup_supported"] is True
+    assert inspected["pending_action"]["adapter_dispatch_started"] is False
+    assert inspected["pending_action_audit"]["pending_action"]["kind"] == "task_draft"
+    assert inspected["session"]["pending_action"]["permission_granting"] is False
+    assert inspected["session"]["pending_action_audit"]["process_started"] is False
+    assert status["pending_action"]["next_commands"] == ["/confirm", "/decline"]
+    assert status["pending_action_audit"]["next_commands"] == ["/confirm", "/decline"]
+    assert "pending_chat_action" not in sessions["sessions"][0]["metadata"]
+    assert "pending_chat_action" not in api_sessions["items"][0]["metadata"]
+    assert "pending_chat_action" not in inspected["session"]["metadata"]
+    assert len(store.list_tasks()) == 0
+
+
+def test_local_server_session_routes_expose_stale_active_run_projection_without_repair(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(title="Stale active run")
+    missing_run_id = "run_missing_for_server_projection"
+    with store.connect() as conn:
+        conn.execute("UPDATE sessions SET active_run_id = ? WHERE id = ?", (missing_run_id, session.id))
+
+    sessions = _route_get("/sessions", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    api_sessions = _route_get("/api/session", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    sessions_status = _route_get("/sessions/status", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    inspected = _route_get(f"/sessions/{session.id}", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    status = _route_get(f"/sessions/{session.id}/status", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    for payload in (
+        sessions["sessions"][0]["active_run_reference"],
+        api_sessions["items"][0]["active_run_reference"],
+        sessions_status["sessions"][0]["active_run_reference"],
+        inspected["active_run_reference"],
+        inspected["session"]["active_run_reference"],
+        status["active_run_reference"],
+    ):
+        assert payload["schema_version"] == "harness.session_active_run_reference/v1"
+        assert payload["status"] == "stale"
+        assert payload["missing_run_id"] == missing_run_id
+        assert payload["repairable"] is True
+        assert payload["repair_scope"] == "session_active_run_pointer_only"
+        assert payload["process_started"] is False
+        assert payload["provider_called"] is False
+        assert payload["network_called"] is False
+        assert payload["filesystem_modified"] is False
+        assert payload["permission_granting"] is False
+        assert "harness doctor --repair" in payload["repair_command"]
+
+    assert sessions_status["stale_active_run_refs"] == 1
+    assert sessions_status["valid_active_run_refs"] == 0
+    assert sessions_status["active_run_refs"] == 1
+    assert SQLiteStore(tmp_path).get_session(session.id).active_run_id == missing_run_id
+    assert not SQLiteStore(tmp_path).list_runs()
+    assert not SQLiteStore(tmp_path).list_tasks()
+
+
+def test_local_server_audits_and_clears_invalid_pending_chat_action_metadata_only(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    cfg = load_config(tmp_path)
+    session = store.create_session(
+        title="Broken pending action",
+        metadata={
+            "pending_chat_action": {
+                "schema_version": "harness.pending_chat_action/v1",
+                "kind": "task_draft",
+            },
+            "cwd": ".",
+        },
+    )
+
+    sessions = _route_get("/sessions", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    inspected = _route_get(f"/sessions/{session.id}", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    audit = _route_get(
+        f"/sessions/{session.id}/pending-action",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert sessions["sessions"][0]["pending_action"] is None
+    assert sessions["sessions"][0]["pending_action_audit"]["status"] == "invalid"
+    assert sessions["sessions"][0]["pending_action_audit"]["issues"][0]["code"] == "missing_task_draft"
+    assert "pending_chat_action" not in sessions["sessions"][0]["metadata"]
+    assert inspected["pending_action"] is None
+    assert inspected["pending_action_audit"]["cleanup_route"] == f"DELETE /sessions/{session.id}/pending-action"
+    assert audit["pending_action_audit"]["recoverable"] is False
+    assert audit["pending_action_audit"]["process_started"] is False
+    assert len(store.list_tasks()) == 0
+
+    cleared = _route_delete(f"/sessions/{session.id}/pending-action", store=store, project_root=tmp_path, cfg=cfg)
+    after = _route_get(
+        f"/sessions/{session.id}/pending-action",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert cleared["cleared"] is True
+    assert cleared["audit_before"]["status"] == "invalid"
+    assert cleared["audit_after"]["status"] == "missing"
+    assert cleared["mutation_scope"] == "session_metadata_only"
+    assert cleared["tasks_mutated"] is False
+    assert cleared["leases_mutated"] is False
+    assert cleared["runs_mutated"] is False
+    assert cleared["approvals_mutated"] is False
+    assert cleared["artifacts_mutated"] is False
+    assert cleared["messages_mutated"] is False
+    assert cleared["events_deleted"] is False
+    assert "pending_chat_action" not in store.get_session(session.id).metadata
+    assert after["pending_action_audit"]["status"] == "missing"
+    assert len(store.list_tasks()) == 0
 
 
 def test_local_server_session_projections_surface_latest_ui_activation_as_passive_context(tmp_path) -> None:
@@ -3075,6 +3293,166 @@ def test_local_server_packaging_smoke_plan_and_run_are_safe_contracts(tmp_path) 
     assert run["permission_granting"] is False
 
 
+def test_local_server_objective_evidence_and_trace_projections_are_read_only(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    objective = store.create_objective("Server objective evidence")
+    store.create_task(
+        title="Server dry run",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    run_result = run_objective_autonomously(tmp_path, objective.id, autonomy_profile_id="safe-local")
+    cfg = load_config(tmp_path)
+
+    evidence = _route_get(
+        f"/objectives/{objective.id}/evidence",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    trace = _route_get(
+        f"/objectives/{objective.id}/trace",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    missing_trace = _route_get(
+        "/objectives/objective_missing/trace",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    assert run_result.ok is True
+    assert evidence["schema_version"] == "harness.objective_evidence_verification/v1"
+    assert evidence["ok"] is True
+    checks = {check["id"]: check for check in evidence["checks"]}
+    assert checks["event_identity"]["status"] == "pass"
+    assert checks["event_hash_chain"]["status"] == "pass"
+    assert checks["event_timestamps"]["status"] == "pass"
+    assert checks["event_hash_chain"]["evidence"]["head_sha256"]
+    assert evidence["execution_started"] is False
+    assert evidence["adapter_started"] is False
+    assert evidence["provider_execution_started"] is False
+    assert evidence["filesystem_modified"] is False
+    assert evidence["network_called"] is False
+    assert evidence["artifact_contents_included"] is False
+    assert evidence["permission_granting"] is False
+
+    assert trace["schema_version"] == "harness.trace_export/v1"
+    assert trace["ok"] is True
+    assert trace["objective_id"] == objective.id
+    assert trace["objective_run_ids"]
+    root_span = next(
+        span
+        for resource in trace["resourceSpans"]
+        for scope in resource["scopeSpans"]
+        for span in scope["spans"]
+        if span["name"] == "harness.objective"
+    )
+    root_attributes = {attribute["key"]: attribute["value"] for attribute in root_span["attributes"]}
+    assert root_attributes["objective.evidence_verification_ok"] is True
+    assert root_attributes["objective.evidence_hash_chain_ok"] is True
+    assert root_attributes["objective.evidence_head_sha256"]
+    assert trace["execution_started"] is False
+    assert trace["adapter_started"] is False
+    assert trace["provider_execution_started"] is False
+    assert trace["filesystem_modified"] is False
+    assert trace["network_called"] is False
+    assert trace["artifact_contents_included"] is False
+    assert trace["permission_granting"] is False
+
+    assert missing_trace["schema_version"] == "harness.trace_export/v1"
+    assert missing_trace["ok"] is False
+    assert missing_trace["objective_id"] == "objective_missing"
+    assert missing_trace["execution_started"] is False
+    assert missing_trace["permission_granting"] is False
+    assert "Objective not found" in missing_trace["errors"][0]
+
+
+def test_local_server_run_trace_projection_is_read_only(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    run = store.create_run(goal="Server trace", task_type="phase_1a_test")
+    store.append_event(
+        run.id,
+        "info",
+        "server_trace_event",
+        "Server trace event.",
+        {"api_key": "sk-server-trace-secret-abcdefghijklmnop", "value": 1},
+    )
+    artifact_path = tmp_path / ".harness" / "runs" / run.id / "server-trace.txt"
+    artifact_path.write_text("server trace artifact body", encoding="utf-8")
+    store.register_artifact(run.id, "server_trace_artifact", artifact_path)
+    cfg = load_config(tmp_path)
+
+    trace = _route_get(
+        f"/runs/{run.id}/trace",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+    missing_trace = _route_get(
+        "/runs/run_missing/trace",
+        project_root=tmp_path,
+        store=store,
+        cfg=cfg,
+        host="127.0.0.1",
+        port=8765,
+    )
+
+    serialized = json.dumps(trace)
+    assert trace["schema_version"] == "harness.trace_export/v1"
+    assert trace["ok"] is True
+    assert trace["run_id"] == run.id
+    spans = [
+        span
+        for resource in trace["resourceSpans"]
+        for scope in resource["scopeSpans"]
+        for span in scope["spans"]
+    ]
+    span_names = {span["name"] for span in spans}
+    assert "harness.run" in span_names
+    assert "harness.event.server_trace_event" in span_names
+    assert "harness.artifact.server_trace_artifact" in span_names
+    run_span = next(span for span in spans if span["name"] == "harness.run")
+    run_attributes = {attribute["key"]: attribute["value"] for attribute in run_span["attributes"]}
+    event_span = next(span for span in spans if span["name"] == "harness.event.server_trace_event")
+    event_attributes = {attribute["key"]: attribute["value"] for attribute in event_span["attributes"]}
+    assert run_attributes["trace.producer"] == "harness.trace_export"
+    assert event_attributes["event.payload"]["value"] == 1
+    assert event_attributes["event.payload"]["[REDACTED_KEY]"] == "[REDACTED_SECRET]"
+    assert len(event_attributes["event.payload_sha256"]) == 64
+    assert event_attributes["event.payload_size_bytes"] > 0
+    assert event_attributes["event.payload_keys"] == ["[REDACTED_KEY]", "value"]
+    assert trace["execution_started"] is False
+    assert trace["adapter_started"] is False
+    assert trace["provider_execution_started"] is False
+    assert trace["filesystem_modified"] is False
+    assert trace["network_called"] is False
+    assert trace["artifact_contents_included"] is False
+    assert trace["permission_granting"] is False
+    assert "server trace artifact body" not in serialized
+    assert "api_key" not in serialized
+    assert "sk-server-trace-secret" not in serialized
+
+    assert missing_trace["schema_version"] == "harness.trace_export/v1"
+    assert missing_trace["ok"] is False
+    assert missing_trace["run_id"] == "run_missing"
+    assert missing_trace["execution_started"] is False
+    assert missing_trace["permission_granting"] is False
+    assert "Run not found" in missing_trace["errors"][0]
+
+
 def test_local_server_desktop_status_and_launch_are_safe_contracts(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
@@ -4885,6 +5263,19 @@ def test_local_server_projects_mcp_config_without_connecting(tmp_path) -> None:
     assert remote["permission_granting"] is False
     assert resources["schema_version"] == "harness.mcp_resources/v1"
     assert resources["enabled"] is True
+    mcp_path_safety = {
+        "schema_version": "harness.configured_path_safety/v1",
+        "ok": True,
+        "configured_path": "mcp-cache/guide.md",
+        "symlink_policy": "reject_configured_path_components",
+        "symlink_checked": True,
+        "symlink_safe": True,
+        "project_boundary_checked": True,
+        "relative_path": "mcp-cache/guide.md",
+        "error_type": None,
+        "message": None,
+        "blocked_reasons": [],
+    }
     assert resources["resources"] == [
         {
             "name": "guide",
@@ -4893,6 +5284,10 @@ def test_local_server_projects_mcp_config_without_connecting(tmp_path) -> None:
             "enabled": True,
             "cached": True,
             "path": "mcp-cache/guide.md",
+            "path_safety": mcp_path_safety,
+            "symlink_policy": "reject_configured_path_components",
+            "symlink_checked": True,
+            "symlink_safe": True,
             "content_type": "text/markdown",
             "description": "Cached docs guide",
             "contents_included": False,
@@ -4909,6 +5304,8 @@ def test_local_server_projects_mcp_config_without_connecting(tmp_path) -> None:
                 "tool_execution_allowed": False,
                 "session_tool_permission_required": True,
                 "contents_included": False,
+                "symlink_policy": "reject_configured_path_components",
+                "symlink_safe": True,
             },
             "blocked_reasons": ["mcp_resource_read_requires_permission", "mcp_connection_disabled"],
             "connected": False,
@@ -4918,6 +5315,7 @@ def test_local_server_projects_mcp_config_without_connecting(tmp_path) -> None:
         }
     ]
     assert resources["resource_count"] == 1
+    assert resources["unsafe_resource_count"] == 0
     assert resources["cached_only"] is True
     assert resources["contents_included"] is False
     assert resources["tool_execution_supported"] is False
@@ -4925,6 +5323,7 @@ def test_local_server_projects_mcp_config_without_connecting(tmp_path) -> None:
     assert resources["session_tool_resource_read_supported"] is True
     assert resources["policy_boundary"]["kind"] == "mcp_resources_projection"
     assert resources["policy_boundary"]["requires_permission"] is True
+    assert resources["policy_boundary"]["symlink_policy"] == "reject_configured_path_components"
     assert resources["blocked_reasons"] == ["mcp_connection_disabled", "mcp_tool_execution_disabled"]
     assert resources["connected"] is False
     assert resources["network_called"] is False
@@ -4954,6 +5353,63 @@ def test_local_server_projects_mcp_config_without_connecting(tmp_path) -> None:
         assert payload["network_called"] is False
         assert payload["filesystem_modified"] is False
         assert payload["permission_granting"] is False
+
+
+def test_local_server_mcp_resources_project_config_reports_symlink_unsafe_without_reading(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    real_cache = tmp_path / "real-mcp-cache"
+    real_cache.mkdir()
+    real_cache.joinpath("guide.md").write_text("# Guide\n\nDo not project this body.\n", encoding="utf-8")
+    (tmp_path / "mcp-cache").symlink_to(real_cache, target_is_directory=True)
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["mcp"] = {
+        "enabled": True,
+        "servers": {
+            "docs": {
+                "kind": "local",
+                "enabled": True,
+                "command": ["mcp-docs", "--stdio"],
+                "resources": {
+                    "guide": {
+                        "uri": "mcp://docs/guide",
+                        "path": "mcp-cache/guide.md",
+                        "enabled": True,
+                        "content_type": "text/markdown",
+                    }
+                },
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+
+    resources = _route_get("/mcp/resources", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    assert resources["schema_version"] == "harness.mcp_resources/v1"
+    assert resources["unsafe_resource_count"] == 1
+    resource = resources["resources"][0]
+    assert resource["uri"] == "mcp://docs/guide"
+    assert resource["contents_included"] is False
+    assert resource["session_tool_resource_read_supported"] is False
+    assert resource["symlink_policy"] == "reject_configured_path_components"
+    assert resource["symlink_checked"] is True
+    assert resource["symlink_safe"] is False
+    assert resource["path_safety"]["ok"] is False
+    assert resource["path_safety"]["error_type"] == "path_security"
+    assert resource["path_safety"]["blocked_reasons"] == ["configured_path_security_failed"]
+    assert "Path contains symlink component: mcp-cache" in resource["path_safety"]["message"]
+    assert resource["blocked_reasons"] == [
+        "configured_path_security_failed",
+        "mcp_resource_read_requires_permission",
+        "mcp_connection_disabled",
+    ]
+    assert resource["policy_boundary"]["symlink_safe"] is False
+    assert "Do not project this body" not in json.dumps(resources)
+    assert resources["process_started"] is False
+    assert resources["network_called"] is False
+    assert resources["permission_granting"] is False
 
 
 def test_local_server_projects_plugin_config_without_loading_plugins(tmp_path) -> None:
@@ -5333,6 +5789,14 @@ def test_local_server_projects_skill_config_without_loading_skills(tmp_path) -> 
     assert skill["skill_file_path"] == "skills/review/SKILL.md"
     assert skill["skill_file_exists"] is True
     assert skill["content_bytes"] == len("# Review\n\nMetadata only.\n".encode("utf-8"))
+    assert skill["path_safety"]["schema_version"] == "harness.configured_path_safety/v1"
+    assert skill["path_safety"]["ok"] is True
+    assert skill["path_safety"]["relative_path"] == "skills/review"
+    assert skill["skill_file_path_safety"]["ok"] is True
+    assert skill["skill_file_path_safety"]["relative_path"] == "skills/review/SKILL.md"
+    assert skill["symlink_policy"] == "reject_configured_path_components"
+    assert skill["symlink_checked"] is True
+    assert skill["symlink_safe"] is True
     assert skill["runtime_loaded"] is False
     assert skill["skill_body_loaded"] is False
     assert skill["tool_registered"] is False
@@ -5342,6 +5806,56 @@ def test_local_server_projects_skill_config_without_loading_skills(tmp_path) -> 
     assert skill["network_called"] is False
     assert skill["permission_granting"] is False
     assert "Metadata only" not in json.dumps(skills)
+
+
+def test_local_server_projects_skill_config_reports_symlink_unsafe_without_loading_body(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    real_skill_dir = tmp_path / "real-skills" / "review"
+    real_skill_dir.mkdir(parents=True)
+    real_skill_dir.joinpath("SKILL.md").write_text("# Review\n\nDo not load from projection.\n", encoding="utf-8")
+    (tmp_path / "skills-link").symlink_to(tmp_path / "real-skills", target_is_directory=True)
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {
+            "review": {
+                "enabled": True,
+                "path": "skills-link/review",
+                "spec": "./skills-link/review",
+                "version": "0.1.0",
+                "description": "Review skill",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    cfg = load_config(tmp_path)
+    store = SQLiteStore(tmp_path)
+
+    skills = _route_get("/skills", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+    status = _route_get("/extensions/status", project_root=tmp_path, store=store, cfg=cfg, host="127.0.0.1", port=8765)
+
+    assert skills["schema_version"] == "harness.skills/v1"
+    assert skills["unsafe_skill_count"] == 1
+    skill = [item for item in skills["skills"] if item["scope"] == "project"][0]
+    assert skill["name"] == "review"
+    assert skill["path"] == "skills-link/review"
+    assert skill["session_tool_load_supported"] is False
+    assert skill["symlink_policy"] == "reject_configured_path_components"
+    assert skill["symlink_checked"] is True
+    assert skill["symlink_safe"] is False
+    assert skill["path_safety"]["ok"] is False
+    assert skill["path_safety"]["error_type"] == "path_security"
+    assert skill["path_safety"]["blocked_reasons"] == ["configured_path_security_failed"]
+    assert "Path contains symlink component: skills-link" in skill["path_safety"]["message"]
+    assert "configured_path_security_failed" in skill["blocked_reasons"]
+    assert skill["skill_file_path"] is None
+    assert skill["skill_file_exists"] is False
+    assert "Do not load from projection" not in json.dumps(skills)
+    assert status["skills"]["unsafe_skill_count"] == 1
+    assert status["policy"]["runtime_loaded"] is False
+    assert status["policy"]["network_called"] is False
+    assert status["policy"]["filesystem_modified"] is False
 
 
 def test_local_server_extensibility_status_summarizes_policy_without_side_effects(tmp_path) -> None:
@@ -5392,6 +5906,7 @@ def test_local_server_extensibility_status_summarizes_policy_without_side_effect
     assert status["mcp"]["enabled"] is True
     assert status["mcp"]["server_count"] == 1
     assert status["mcp"]["resource_count"] == 1
+    assert status["mcp"]["unsafe_resource_count"] == 0
     assert status["mcp"]["connected"] is False
     assert status["mcp"]["process_started"] is False
     assert status["plugins"]["plugin_count"] >= 1
@@ -5401,6 +5916,7 @@ def test_local_server_extensibility_status_summarizes_policy_without_side_effect
     assert status["plugins"]["install_supported"] is False
     assert status["skills"]["skill_count"] >= 1
     assert status["skills"]["project_skill_count"] == 1
+    assert status["skills"]["unsafe_skill_count"] == 0
     assert status["skills"]["skill_body_loaded"] is False
     assert status["skills"]["load_supported"] is False
     assert status["skills"]["session_tool_load_supported"] is True

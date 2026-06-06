@@ -1970,8 +1970,26 @@ class HarnessCoreService:
         store = SQLiteStore(root)
         store.initialize()
         task_record = store.get_task(task_id)
-        selection = store.select_next_task_for_lease(owner=CORE_OWNER, objective_id=task_record.objective_id)
-        if selection is None or selection["task"].id != task_id:
+        selection, pause_reasons = store.select_guarded_task_for_lease(
+            task_id,
+            owner=CORE_OWNER,
+            objective_id=task_record.objective_id,
+        )
+        if pause_reasons:
+            eligibility = pause_reasons[0]
+            decision = "approval_required" if eligibility["decision"] == "waiting_approval" else eligibility["decision"]
+            return self._closed_result(
+                mode=normalized_mode,
+                project_root=root,
+                decision=decision,
+                session_id=session_id or task_record.session_id,
+                objective_id=objective_id or task_record.objective_id,
+                task_id=task_id,
+                adapter_id=str(task_record.metadata.get("execution_adapter") or ""),
+                task=task,
+                errors=[self._task_eligibility_error(eligibility)],
+            )
+        if selection is None:
             return self._closed_result(
                 mode=normalized_mode,
                 project_root=root,
@@ -2173,6 +2191,39 @@ class HarnessCoreService:
             summary=summary,
             task=task,
         )
+
+    def _task_eligibility_error(self, eligibility: dict[str, Any]) -> str:
+        reason = str(sanitize_for_logging(str(eligibility.get("reason") or "Task is not eligible for core execution.")))
+        details: list[str] = []
+        decision = eligibility.get("decision")
+        if decision in {"breaker_open", "control_disabled", "waiting_approval"}:
+            details.append(f"decision={decision}")
+        adapter_id = eligibility.get("adapter_id")
+        if isinstance(adapter_id, str) and adapter_id:
+            details.append(f"adapter={adapter_id}")
+        task_type = eligibility.get("task_type")
+        if isinstance(task_type, str) and task_type:
+            details.append(f"task_type={task_type}")
+        for key in (
+            "missing_approvals",
+            "required_approvals",
+            "forbidden_policy_keys",
+            "blocked_dependency_ids",
+        ):
+            values = eligibility.get(key)
+            if isinstance(values, list) and values:
+                details.append(f"{key}={','.join(str(sanitize_for_logging(str(item))) for item in values)}")
+        target_kind = eligibility.get("target_kind")
+        target_id = eligibility.get("target_id")
+        if isinstance(target_kind, str) and isinstance(target_id, str):
+            details.append(f"control={target_kind}:{target_id}")
+        failure_count = eligibility.get("failure_count")
+        threshold = eligibility.get("threshold")
+        if isinstance(failure_count, int) and isinstance(threshold, int):
+            details.append(f"breaker_failures={failure_count}/{threshold}")
+        if details:
+            return f"{reason} ({'; '.join(details)})"
+        return reason
 
     def _next_commands(self, project_root: Path, run_id: str | None, task_id: str | None, lease_id: str | None) -> list[str]:
         project = str(project_root)

@@ -139,6 +139,7 @@ class AutonomyEvaluationInput(BaseModel):
     would_mutate_active_repo: bool = False
     requires_network: bool = False
     requires_paid_or_hosted_boundary: bool = False
+    allow_internal_hosted_provider_authority: bool = False
     requires_sandbox: bool = False
     sandbox_enforced: bool = False
     idempotency_key: str | None = None
@@ -196,11 +197,12 @@ class AutonomyViolation(BaseModel):
 
 
 def builtin_autonomy_policies() -> dict[str, AutonomyPolicy]:
+    review_gate_task_types = ["implementation_review", "security_review", "factuality_review"]
     safe_local = AutonomyPolicy(
         id="safe-local",
         allowed_tools=SAFE_LOCAL_TOOLS,
-        allowed_adapters=["dry_run"],
-        allowed_task_types=["phase_1a_test"],
+        allowed_adapters=["dry_run", "review_gate"],
+        allowed_task_types=["phase_1a_test", *review_gate_task_types],
         allowed_boundaries=["local_read", "local_control_plane", "local_artifact", "sandboxed_execution"],
         auto_confirm_risks=["read", "control_plane_write", "sandboxed_execution"],
         pause_on_risks=[],
@@ -238,8 +240,14 @@ def builtin_autonomy_policies() -> dict[str, AutonomyPolicy]:
             id="supervised-codex",
             budget=AutonomyBudget(max_adapter_dispatches=10, max_side_effect_actions=10, max_runtime_seconds=900),
             allowed_tools=SUPERVISED_CODEX_TOOLS,
-            allowed_adapters=["dry_run", "read_only_summary", "repo_planning", "codex_isolated_edit"],
-            allowed_task_types=["phase_1a_test", "read_only_repo_summary", "repo_planning", "codex_code_edit"],
+            allowed_adapters=["dry_run", "review_gate", "read_only_summary", "repo_planning", "codex_isolated_edit"],
+            allowed_task_types=[
+                "phase_1a_test",
+                *review_gate_task_types,
+                "read_only_repo_summary",
+                "repo_planning",
+                "codex_code_edit",
+            ],
             allowed_boundaries=[
                 "local_read",
                 "local_control_plane",
@@ -367,6 +375,7 @@ def evaluate_autonomy(policy: AutonomyPolicy, request: AutonomyEvaluationInput) 
     if request.requires_paid_or_hosted_boundary and not request.has_scoped_approval:
         if (
             policy.allow_hosted_provider_autonomy
+            and request.allow_internal_hosted_provider_authority
             and request.boundary == "hosted_provider_codex"
             and request.tool_name == "edit_isolated"
         ):

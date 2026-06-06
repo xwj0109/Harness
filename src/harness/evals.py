@@ -7,7 +7,7 @@ from typing import Any
 
 from harness.approvals import ApprovalStore
 from harness.capabilities import build_capability_catalog
-from harness.config import HarnessConfig
+from harness.config import HARNESS_DIR, HarnessConfig
 from harness.execution import list_execution_adapter_descriptors
 from harness.integrity import run_integrity_check
 from harness.memory.sqlite_store import SQLiteStore
@@ -24,10 +24,12 @@ from harness.models import (
     SecurityLayerAuditResult,
     TaskStatus,
 )
+from harness.objective_evidence import verify_objective_evidence
 from harness.operator_context import build_operator_context
 from harness.policy import resolve_backend_effective_policy
 from harness.sandbox_profiles import get_sandbox_profile
 from harness.security import sanitize_for_logging, scan_text_for_secrets
+from harness.traces import export_objective_trace, export_run_trace
 
 
 def run_safety_smoke(project_root: Path, config: HarnessConfig, store: SQLiteStore) -> SafetySmokeResult:
@@ -92,15 +94,23 @@ def run_security_layer_audit(project_root: Path) -> SecurityLayerAuditResult:
                     "Project runtime state is not initialized; security detections were not inspected.",
                     {"initialized": False},
                 ),
+                _audit_check(
+                    "run_trace_payload_metadata",
+                    "skipped",
+                    "Project runtime state is not initialized; run trace payload metadata was not inspected.",
+                    {"initialized": False},
+                ),
             ]
         )
     else:
         store = SQLiteStore(project_root)
         checks.append(_runtime_controls_audit_check(store))
         checks.append(_runtime_manifest_audit_check(store))
+        checks.append(_run_trace_payload_metadata_audit_check(project_root, store))
         checks.append(_security_detection_audit_check(project_root, store))
         checks.append(_memory_boundary_audit_check(store))
         checks.append(_progress_blocked_state_audit_check(project_root, store))
+        checks.append(_objective_evidence_audit_check(project_root, store))
     checks.sort(key=lambda item: item.id)
     summary = {
         "total": len(checks),
@@ -196,12 +206,19 @@ def _runtime_manifest_audit_check(store: SQLiteStore) -> SecurityLayerAuditCheck
     for run in store.list_runs():
         manifest = store.build_run_manifest(run.id)
         adapter_id = _adapter_id_for_run(store, run.task_id)
+        delegate_budget = manifest.delegate_budget or {}
+        delegate_budget_payload = delegate_budget.get("budget") if isinstance(delegate_budget, dict) else None
         item = {
             "run_id": run.id,
             "adapter_id": adapter_id,
             "effective_policy_sha256": manifest.effective_policy_sha256,
             "backend_descriptor_sha256": manifest.backend_descriptor_sha256,
             "sandbox_profile_id": manifest.sandbox_profile.get("id") if manifest.sandbox_profile else None,
+            "delegate_budget_schema_version": delegate_budget_payload.get("schema_version")
+            if isinstance(delegate_budget_payload, dict)
+            else None,
+            "delegate_budget_limited": delegate_budget.get("budget_limited") if isinstance(delegate_budget, dict) else None,
+            "delegate_budget_gap_count": len(delegate_budget.get("gaps") or []) if isinstance(delegate_budget, dict) else None,
             "artifacts": len(manifest.artifacts),
             "context_provenance": len(manifest.context_provenance),
         }
@@ -211,6 +228,12 @@ def _runtime_manifest_audit_check(store: SQLiteStore) -> SecurityLayerAuditCheck
                 failures.append(f"{run.id}: missing policy hash")
             if manifest.sandbox_profile is None:
                 failures.append(f"{run.id}: missing sandbox profile evidence")
+            if not isinstance(delegate_budget_payload, dict):
+                failures.append(f"{run.id}: missing delegate budget evidence")
+            elif delegate_budget_payload.get("schema_version") != "harness.delegate_budget/v1":
+                failures.append(f"{run.id}: delegate budget evidence is not v1")
+            if isinstance(delegate_budget, dict) and delegate_budget.get("gaps"):
+                failures.append(f"{run.id}: delegate budget evidence has validation gaps")
             if not manifest.context_provenance:
                 failures.append(f"{run.id}: missing context provenance")
             for artifact in manifest.artifacts:
@@ -222,6 +245,109 @@ def _runtime_manifest_audit_check(store: SQLiteStore) -> SecurityLayerAuditCheck
         "runtime_manifest_evidence",
         "pass" if not failures else "fail",
         "Run manifests expose security-layer evidence." if not failures else "; ".join(failures),
+        {"runs": evidence},
+    )
+
+
+def _run_trace_payload_metadata_audit_check(project_root: Path, store: SQLiteStore) -> SecurityLayerAuditCheck:
+    runs = store.list_runs()
+    if not runs:
+        return _audit_check(
+            "run_trace_payload_metadata",
+            "skipped",
+            "No runtime runs are present for trace payload metadata inspection.",
+            {"runs": 0},
+        )
+
+    failures: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    for run in runs:
+        run_events = store.list_events(run.id)
+        adapter_id = _adapter_id_for_run(store, run.task_id)
+        lease_trace_required = _run_has_linked_lease_attempt(store, run)
+        try:
+            export = export_run_trace(project_root, store, run.id)
+        except Exception as exc:
+            failures.append(f"{run.id}: run_trace_export")
+            evidence.append(
+                {
+                    "run_id": run.id,
+                    "adapter_id": adapter_id,
+                    "ok": False,
+                    "event_count": len(run_events),
+                    "trace_export": {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"},
+                }
+            )
+            continue
+
+        root_attributes = export.spans[0].attributes if export.spans else {}
+        run_event_payload_metadata = _trace_payload_metadata_audit(
+            export.spans,
+            span_name_prefix="harness.event.",
+            payload_prefix="event.payload",
+            require_spans=bool(run_events),
+        )
+        delegate_budget_attributes = _trace_span_attributes(export.spans, "harness.delegate_budget")
+        lease_attributes = _trace_span_attributes(export.spans, "harness.lease")
+        queue_attributes = _trace_span_attributes(export.spans, "harness.queue")
+        trace_export_ok = export.ok and bool(export.spans)
+        trace_export_evidence = {
+            "ok": trace_export_ok,
+            "trace_id": export.trace_id,
+            "span_count": len(export.spans),
+            "trace_provenance_id": root_attributes.get("trace.provenance_id"),
+            "trace_output_sha256": root_attributes.get("trace.output_sha256"),
+            "trace_producer": root_attributes.get("trace.producer"),
+            "run_event_payload_metadata_ok": run_event_payload_metadata["ok"],
+            "run_event_payload_metadata": run_event_payload_metadata,
+            "delegate_budget_span_present": delegate_budget_attributes is not None,
+            "delegate_budget_schema_version": delegate_budget_attributes.get("delegate_budget.schema_version")
+            if delegate_budget_attributes
+            else None,
+            "delegate_budget_limited": delegate_budget_attributes.get("delegate_budget.limited")
+            if delegate_budget_attributes
+            else None,
+            "delegate_budget_gap_count": delegate_budget_attributes.get("delegate_budget.gap_count")
+            if delegate_budget_attributes
+            else None,
+            "lease_span_required": lease_trace_required,
+            "lease_span_present": lease_attributes is not None,
+            "queue_span_present": queue_attributes is not None,
+        }
+        evidence.append(
+            {
+                "run_id": run.id,
+                "adapter_id": adapter_id,
+                "ok": trace_export_ok and run_event_payload_metadata["ok"],
+                "event_count": len(run_events),
+                "trace_export": trace_export_evidence,
+            }
+        )
+        if not trace_export_ok:
+            failures.append(f"{run.id}: run_trace_export")
+        if not run_event_payload_metadata["ok"]:
+            failures.append(f"{run.id}: run_trace_payload_metadata")
+        if adapter_id:
+            if delegate_budget_attributes is None:
+                failures.append(f"{run.id}: trace_delegate_budget")
+            elif delegate_budget_attributes.get("delegate_budget.schema_version") != "harness.delegate_budget/v1":
+                failures.append(f"{run.id}: trace_delegate_budget_schema")
+            elif delegate_budget_attributes.get("delegate_budget.limited") is not True:
+                failures.append(f"{run.id}: trace_delegate_budget_unlimited")
+            elif delegate_budget_attributes.get("delegate_budget.gap_count") != 0:
+                failures.append(f"{run.id}: trace_delegate_budget_gaps")
+        if lease_trace_required:
+            if lease_attributes is None:
+                failures.append(f"{run.id}: trace_lease")
+            if queue_attributes is None:
+                failures.append(f"{run.id}: trace_queue")
+
+    return _audit_check(
+        "run_trace_payload_metadata",
+        "pass" if not failures else "fail",
+        "Run traces expose payload metadata, delegate budgets, and lease timing without sensitive key leaks."
+        if not failures
+        else "; ".join(failures),
         {"runs": evidence},
     )
 
@@ -270,6 +396,179 @@ def _progress_blocked_state_audit_check(project_root: Path, store: SQLiteStore) 
         "pass" if not failures else "fail",
         "Progress blocked states expose structured explanations." if not failures else "; ".join(failures),
         {"progress_tasks": inspected},
+    )
+
+
+def _objective_evidence_audit_check(project_root: Path, store: SQLiteStore) -> SecurityLayerAuditCheck:
+    evidence_dir = project_root / HARNESS_DIR / "autonomy" / "objectives"
+    objective_ids = {objective.id for objective in store.list_objectives()}
+    if evidence_dir.exists():
+        objective_ids.update(path.stem for path in evidence_dir.glob("*.jsonl"))
+    objective_ids = {
+        objective_id
+        for objective_id in objective_ids
+        if (evidence_dir / f"{objective_id}.jsonl").exists()
+    }
+    if not objective_ids:
+        return _audit_check(
+            "objective_evidence_verifiable",
+            "skipped",
+            "No autonomous objective JSONL evidence is present.",
+            {"objective_evidence_files": 0},
+        )
+
+    failures: list[str] = []
+    evidence: list[dict[str, Any]] = []
+    for objective_id in sorted(objective_ids):
+        verification = verify_objective_evidence(project_root, objective_id)
+        failed_checks = [check for check in verification.checks if check.status == "fail"]
+        trace_export_evidence = _objective_trace_export_audit_evidence(project_root, store, objective_id)
+        evidence.append(
+            {
+                "objective_id": objective_id,
+                "ok": verification.ok,
+                "evidence_path": str(verification.evidence_path),
+                "summary": verification.summary,
+                "trace_export": trace_export_evidence,
+                "failed_checks": [
+                    {
+                        "id": check.id,
+                        "message": check.message,
+                        "evidence": check.evidence,
+                    }
+                    for check in failed_checks
+                ],
+            }
+        )
+        if failed_checks:
+            failures.append(f"{objective_id}: {', '.join(check.id for check in failed_checks)}")
+        if not trace_export_evidence.get("ok"):
+            failures.append(f"{objective_id}: objective_trace_export")
+        if not trace_export_evidence.get("objective_event_payload_metadata_ok"):
+            failures.append(f"{objective_id}: objective_trace_payload_metadata")
+    return _audit_check(
+        "objective_evidence_verifiable",
+        "pass" if not failures else "fail",
+        "Autonomous objective evidence verifies and exports as trace evidence."
+        if not failures
+        else "Autonomous objective evidence verification or trace export failed.",
+        {"objectives": evidence},
+    )
+
+
+def _objective_trace_export_audit_evidence(project_root: Path, store: SQLiteStore, objective_id: str) -> dict[str, Any]:
+    try:
+        export = export_objective_trace(project_root, store, objective_id)
+    except Exception as exc:
+        return {"ok": False, "error": f"{exc.__class__.__name__}: {exc}"}
+    root_attributes = export.spans[0].attributes if export.spans else {}
+    objective_event_payload_metadata = _trace_payload_metadata_audit(
+        export.spans,
+        span_name_prefix="harness.objective_event.",
+        payload_prefix="objective_event.payload",
+    )
+    return {
+        "ok": export.ok and bool(export.spans),
+        "trace_id": export.trace_id,
+        "objective_run_ids": export.objective_run_ids,
+        "span_count": len(export.spans),
+        "objective_evidence_event_count": root_attributes.get("objective.evidence_event_count"),
+        "objective_evidence_hash_chain_ok": root_attributes.get("objective.evidence_hash_chain_ok"),
+        "objective_evidence_head_sha256": root_attributes.get("objective.evidence_head_sha256"),
+        "trace_provenance_id": root_attributes.get("trace.provenance_id"),
+        "trace_output_sha256": root_attributes.get("trace.output_sha256"),
+        "trace_producer": root_attributes.get("trace.producer"),
+        "objective_event_payload_metadata_ok": objective_event_payload_metadata["ok"],
+        "objective_event_payload_metadata": objective_event_payload_metadata,
+    }
+
+
+def _trace_payload_metadata_audit(
+    spans: list[Any],
+    *,
+    span_name_prefix: str,
+    payload_prefix: str,
+    require_spans: bool = True,
+) -> dict[str, Any]:
+    span_count = 0
+    missing_payload_metadata: list[dict[str, Any]] = []
+    sensitive_key_leaks: list[dict[str, Any]] = []
+    hash_key = f"{payload_prefix}_sha256"
+    size_key = f"{payload_prefix}_size_bytes"
+    keys_key = f"{payload_prefix}_keys"
+    for span in spans:
+        if not str(getattr(span, "name", "")).startswith(span_name_prefix):
+            continue
+        span_count += 1
+        attributes = getattr(span, "attributes", {}) or {}
+        payload_hash = attributes.get(hash_key)
+        payload_size = attributes.get(size_key)
+        payload_keys = attributes.get(keys_key)
+        reasons = []
+        if not isinstance(payload_hash, str) or len(payload_hash) != 64:
+            reasons.append(hash_key)
+        if not isinstance(payload_size, int) or payload_size < 0:
+            reasons.append(size_key)
+        if not isinstance(payload_keys, list):
+            reasons.append(keys_key)
+        if reasons:
+            missing_payload_metadata.append(
+                {
+                    "span_id": getattr(span, "span_id", None),
+                    "span_name": getattr(span, "name", None),
+                    "missing": reasons,
+                }
+            )
+            continue
+        for key in payload_keys:
+            if _sensitive_trace_key(str(key)):
+                sensitive_key_leaks.append(
+                    {
+                        "span_id": getattr(span, "span_id", None),
+                        "span_name": getattr(span, "name", None),
+                        "key": str(key),
+                    }
+                )
+    return {
+        "ok": (span_count > 0 or not require_spans) and not missing_payload_metadata and not sensitive_key_leaks,
+        "span_count": span_count,
+        "required": require_spans,
+        "missing_payload_metadata": missing_payload_metadata,
+        "sensitive_key_leaks": sensitive_key_leaks,
+    }
+
+
+def _trace_span_attributes(spans: list[Any], span_name: str) -> dict[str, Any] | None:
+    for span in spans:
+        if getattr(span, "name", None) == span_name:
+            attributes = getattr(span, "attributes", {}) or {}
+            return attributes if isinstance(attributes, dict) else {}
+    return None
+
+
+def _run_has_linked_lease_attempt(store: SQLiteStore, run) -> bool:
+    if not run.task_id:
+        return False
+    for attempt in store.list_task_attempts(run.task_id):
+        if attempt.run_id == run.id and attempt.lease_id:
+            return True
+    return False
+
+
+def _sensitive_trace_key(key: str) -> bool:
+    lowered = key.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "api_key",
+            "apikey",
+            "authorization",
+            "credential",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+        )
     )
 
 

@@ -2,12 +2,38 @@ import json
 
 from typer.testing import CliRunner
 
+import harness.execution as execution_module
 from harness.cli.main import app
-from harness.execution import list_execution_adapter_descriptors
+from harness.execution import execute_lease, list_execution_adapter_descriptors, validate_execution_task_payload
+from harness.memory.sqlite_store import SQLiteStore
+from harness.models import SandboxNetworkPolicy
 from harness.sandbox_profiles import get_sandbox_profile, list_sandbox_profiles
 
 
 runner = CliRunner()
+
+
+def _patch_dry_run_network_allowed_budget(monkeypatch):
+    adapters = execution_module.builtin_execution_adapters()
+    dry_run = adapters["dry_run"]
+    bad_budget = dry_run.descriptor.delegate_budget.model_copy(update={"network_policy": SandboxNetworkPolicy.ALLOWED})
+    bad_descriptor = dry_run.descriptor.model_copy(update={"delegate_budget": bad_budget})
+
+    class BadBudgetAdapter:
+        id = dry_run.id
+        descriptor = bad_descriptor
+
+        def inspect_eligibility(self, project_root, lease, task, attempt):
+            return execution_module._base_adapter_eligibility(self.descriptor, lease, task, attempt)
+
+        def execute(self, project_root, lease_id, owner="local_daemon"):
+            raise AssertionError("invalid delegate budget descriptor must fail before adapter execution")
+
+    monkeypatch.setattr(
+        execution_module,
+        "builtin_execution_adapters",
+        lambda: {**adapters, "dry_run": BadBudgetAdapter()},
+    )
 
 
 def test_builtin_sandbox_profiles_are_stable_and_unique() -> None:
@@ -29,6 +55,131 @@ def test_registered_adapters_have_valid_sandbox_profiles() -> None:
     assert by_id["read_only_summary"].sandbox_profile_id == "read_only_codex"
     assert by_id["repo_planning"].sandbox_profile_id == "read_only_codex"
     assert by_id["codex_isolated_edit"].sandbox_profile_id == "isolated_workspace_codex"
+
+
+def test_registered_adapter_run_manifest_uses_descriptor_sandbox_profile(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective("Manifest profile objective")
+    upstream = store.create_task(
+        title="Upstream evidence",
+        objective_id=objective.id,
+        metadata={
+            "execution_adapter": "dry_run",
+            "task_type": "phase_1a_test",
+            "workflow_stage": "test_sandbox",
+        },
+    )
+    review = store.create_task(
+        title="Implementation review",
+        objective_id=objective.id,
+        agent_id="implementation_reviewer",
+        depends_on=[upstream.id],
+        metadata={
+            "execution_adapter": "review_gate",
+            "task_type": "implementation_review",
+            "workflow_stage": "implementation_review",
+            "review_role": "implementation_reviewer",
+            "review_gate": True,
+            "completion_gate": True,
+            "review_target_stage": "test_sandbox",
+        },
+    )
+
+    run = store.create_run(
+        goal="Review manifest profile",
+        task_type="implementation_review",
+        task_id=review.id,
+        objective_id=objective.id,
+    )
+    manifest = store.build_run_manifest(run.id)
+
+    assert manifest.sandbox_profile is not None
+    assert manifest.sandbox_profile["schema_version"] == "harness.sandbox_profile/v1"
+    assert manifest.sandbox_profile["id"] == "none"
+    assert manifest.delegate_budget is not None
+    assert manifest.delegate_budget["adapter_id"] == "review_gate"
+    assert manifest.delegate_budget["budget"]["schema_version"] == "harness.delegate_budget/v1"
+    assert manifest.delegate_budget["budget"]["network_policy"] == "forbidden"
+    assert manifest.delegate_budget["budget_limited"] is True
+    assert manifest.delegate_budget["gaps"] == []
+
+
+def test_registered_adapter_execution_denies_unresolvable_sandbox_profile(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(
+        title="Sandbox profile guard",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    def missing_profile(profile_id: str):
+        raise KeyError(f"Sandbox profile not found: {profile_id}")
+
+    monkeypatch.setattr("harness.execution.get_sandbox_profile", missing_profile)
+
+    result = execute_lease(tmp_path, leased.lease.id, owner=leased.lease.owner)
+
+    assert result.ok is False
+    assert result.security_decision is not None
+    assert result.security_decision.decision.value == "deny"
+    assert result.security_decision.reason_code == "sandbox_profile_mismatch"
+    assert result.security_decision.sandbox_profile_id == "none"
+    assert result.blocked_state_explanations[0].code.value == "sandbox_profile_mismatch"
+    assert "unknown sandbox_profile_id=none" in result.security_decision.reasons[0]
+
+
+def test_registered_task_creation_denies_invalid_delegate_budget_descriptor(tmp_path, monkeypatch) -> None:
+    _patch_dry_run_network_allowed_budget(monkeypatch)
+
+    reasons = validate_execution_task_payload(
+        execution_adapter="dry_run",
+        task_type="phase_1a_test",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+
+    assert any("delegate_budget network_policy=allowed" in reason for reason in reasons)
+
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    try:
+        store.create_task(
+            title="Invalid descriptor task",
+            metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+        )
+    except ValueError as exc:
+        assert "delegate_budget network_policy=allowed" in str(exc)
+    else:
+        raise AssertionError("invalid delegate budget descriptor must fail before task creation")
+
+    assert store.list_tasks() == []
+
+
+def test_registered_adapter_execution_denies_invalid_delegate_budget_descriptor(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    store.create_task(
+        title="Delegate budget descriptor guard",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+
+    _patch_dry_run_network_allowed_budget(monkeypatch)
+
+    result = execute_lease(tmp_path, leased.lease.id, owner=leased.lease.owner)
+
+    assert result.ok is False
+    assert result.run is None
+    assert result.manifest is None
+    assert result.security_decision is not None
+    assert result.security_decision.decision.value == "deny"
+    assert result.security_decision.reason_code == "delegate_budget_mismatch"
+    assert result.security_decision.sandbox_profile_id == "none"
+    assert result.blocked_state_explanations[0].code.value == "unsafe_metadata"
+    assert any("delegate_budget network_policy=allowed" in reason for reason in result.security_decision.reasons)
 
 
 def test_sandbox_profile_cli_is_read_only_without_init(tmp_path, monkeypatch) -> None:

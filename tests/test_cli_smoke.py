@@ -15,8 +15,10 @@ from harness.chat import ChatSessionState, handle_chat_input, route_chat_intent
 from harness.config import default_config
 from harness.models import BackendStatus, BillingMode, DataBoundary, EventStreamType, ExecutionLocation, SessionStatus
 from harness.cli.main import SUPPORTED_EXECUTION_TASK_METADATA, app
+from harness.execution import list_execution_adapter_descriptors
 from harness.memory.sqlite_store import SQLiteStore
 from harness.operator_context import build_session_pane_projection
+from harness.session_events import SessionEventKind, append_session_event
 from harness.tui import (
     THEME_DIALOG_ENTRIES,
     activate_command_palette_entry,
@@ -873,7 +875,7 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["initialized"] is True
     assert dashboard["summary"]["imported_agents"] == 1
     assert dashboard["summary"]["tasks_total"] == 1
-    assert dashboard["summary"]["active_leases"] == 1
+    assert dashboard["summary"]["active_leases"] == 0
     assert dashboard["summary"]["recent_runs"] == 1
     assert dashboard["summary"]["recent_sessions"] == 1
     assert dashboard["agents"][0]["agent_id"] == "tui_agent"
@@ -883,10 +885,10 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert dashboard["tasks"][0]["workbench_id"] == "quant"
     assert dashboard["tasks"][0]["execution_adapter"] == "read_only_summary"
     assert dashboard["tasks"][0]["task_type"] == "read_only_repo_summary"
-    assert dashboard["active_leases"][0]["task_id"] == dashboard["tasks"][0]["id"]
-    assert dashboard["active_leases"][0]["status"] == "active"
+    assert dashboard["active_leases"] == []
+    assert dashboard["daemon"]["paused_tasks"] == 1
     assert dashboard["daemon"]["latest_events"]
-    assert dashboard["task_status_counts"]["leased"] == 1
+    assert dashboard["task_status_counts"]["ready"] == 1
     assert dashboard["recent_runs"][0]["task_type"] == "phase_1a_test"
     assert dashboard["recent_sessions"][0]["id"] == session.id
     assert dashboard["recent_sessions"][0]["title"] == "TUI session"
@@ -949,13 +951,13 @@ def test_tui_dashboard_reports_initialized_project_state(tmp_path) -> None:
     assert "UI flags: command=False process=False filesystem=False permission=False authority=False" in sessions_text
     assert any("tui_agent" in line for line in panes[1]["lines"])
     assert any("tui task" in line for line in panes[2]["lines"])
-    assert any(dashboard["active_leases"][0]["id"] in line for line in panes[3]["lines"])
+    assert panes[3]["lines"] == ["none"]
     assert "tui_agent workbench=quant" in rendered
     assert "tui task" in rendered
     assert "Active Leases" in rendered
     assert "Daemon" in rendered
     assert "Tasks: 1" in rendered
-    assert "Active leases: 1" in rendered
+    assert "Active leases: 0" in rendered
     assert "Recent Runs" in rendered
     assert "Recent Sessions" in rendered
     assert "TUI session" in rendered
@@ -1043,9 +1045,9 @@ def test_tui_model_picker_persists_session_model_without_provider_execution(tmp_
             assert "Model codex_cli/gpt-5.5" in str(composer_status.content)
             assert "Agent plan" in str(composer_status.content)
             assert f"Session: {session.id}" not in str(composer_status.content)
-            assert "Enter send · Shift+Enter newline · Ctrl+X M models · / commands · ? shortcuts" in str(
-                composer_footer.content
-            )
+            footer_text = str(composer_footer.content)
+            assert "Enter send · Shift+Enter newline · Shift+Tab plan" in footer_text
+            assert "Ctrl+X M models · / commands · ? shortcuts" in footer_text
 
             await pilot.press("ctrl+p")
             for char in "qwen":
@@ -1559,7 +1561,7 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     unfiltered = filter_tui_panes(panes, "")
     agent_filtered = filter_tui_panes(panes, "SEARCH_AGENT")
     task_filtered = filter_tui_panes(panes, "searchable task")
-    lease_filtered = filter_tui_panes(panes, json.loads(tick.output)["lease"]["id"])
+    paused_filtered = filter_tui_panes(panes, "Paused tasks: 1")
     run_filtered = filter_tui_panes(panes, "phase_1a_test")
     daemon_filtered = filter_tui_panes(panes, "daemon")
     command_filtered = filter_tui_panes(panes, "tasks list")
@@ -1571,7 +1573,7 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     assert [pane["id"] for pane in agent_filtered["panes"]] == ["agents"]
     assert agent_filtered["panes"][0]["match_count"] == 1
     assert [pane["id"] for pane in task_filtered["panes"]] == ["tasks"]
-    assert [pane["id"] for pane in lease_filtered["panes"]] == ["leases", "guidance"]
+    assert [pane["id"] for pane in paused_filtered["panes"]] == ["daemon"]
     assert [pane["id"] for pane in run_filtered["panes"]] == ["runs"]
     assert "daemon" in [pane["id"] for pane in daemon_filtered["panes"]]
     assert [pane["id"] for pane in command_filtered["panes"]] == ["commands"]
@@ -1620,11 +1622,11 @@ def test_tui_filter_model_searches_sanitized_panes(tmp_path) -> None:
     assert render_filter_status(missing_filtered) == "Search: does-not-exist | Matches: 0 | Panes: 0"
     serialized = json.dumps(
         {
-            "panes": panes,
-            "agent_filtered": agent_filtered,
-            "task_filtered": task_filtered,
-            "lease_filtered": lease_filtered,
-            "run_filtered": run_filtered,
+                "panes": panes,
+                "agent_filtered": agent_filtered,
+                "task_filtered": task_filtered,
+                "paused_filtered": paused_filtered,
+                "run_filtered": run_filtered,
             "daemon_filtered": daemon_filtered,
             "command_filtered": command_filtered,
             "settings": settings,
@@ -1665,6 +1667,12 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert next(entry for entry in palette["entries"] if entry["id"] == "ui_controls.expand_all")["activation"]["kind"] == "ui_action"
     assert next(entry for entry in palette["entries"] if entry["id"] == "ui_controls.settings")["activation"]["kind"] == "ui_action"
     assert next(entry for entry in palette["entries"] if entry["id"] == "sessions.continue_last")["activation"]["kind"] == "manual_command"
+    assert next(entry for entry in palette["entries"] if entry["id"] == "runtime_evidence.orchestration_workflows")[
+        "activation"
+    ]["kind"] == "manual_command"
+    assert next(entry for entry in palette["entries"] if entry["id"] == "runtime_evidence.orchestration_scenarios")[
+        "activation"
+    ]["kind"] == "manual_command"
     safe_activation = next(entry for entry in palette["entries"] if entry["id"] == "sessions.list")["activation"]
     manual_activation = next(entry for entry in palette["entries"] if entry["id"] == "sessions.continue_last")["activation"]
     assert safe_activation["evidence_status"] == "ui_only_in_memory"
@@ -1701,6 +1709,8 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     research_entries = filter_command_palette(palette, "deep research")
     browse_entries = filter_command_palette(palette, "browse url")
     adapter_entries = filter_command_palette(palette, "adapter")
+    workflow_entries = filter_command_palette(palette, "workflow coordination")
+    scenario_entries = filter_command_palette(palette, "scenario coverage")
     packaging_entries = filter_command_palette(palette, "wheel")
     missing_entries = filter_command_palette(palette, "does-not-exist")
 
@@ -1714,6 +1724,8 @@ def test_tui_command_palette_is_grouped_searchable_and_non_executing() -> None:
     assert [entry["id"] for entry in research_entries["entries"]] == ["planning_research.deep_research"]
     assert [entry["id"] for entry in browse_entries["entries"]] == ["planning_research.browse_url"]
     assert any(entry["id"] == "registered_adapters.execute" for entry in adapter_entries["entries"])
+    assert [entry["id"] for entry in workflow_entries["entries"]] == ["runtime_evidence.orchestration_workflows"]
+    assert [entry["id"] for entry in scenario_entries["entries"]] == ["runtime_evidence.orchestration_scenarios"]
     assert [entry["id"] for entry in packaging_entries["entries"]] == ["packaging_smoke.wheel"]
     assert missing_entries["entries"] == []
     assert missing_entries["groups"] == []
@@ -2409,11 +2421,12 @@ def test_tui_right_panel_blocked_progress_shows_stable_code_and_inspect_command(
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
     objective = store.create_objective("Blocked objective")
-    task = store.create_task(
-        title="Bad adapter",
-        objective_id=objective.id,
-        metadata={"execution_adapter": "missing_adapter", "task_type": "unknown"},
-    )
+    task = store.create_task(title="Bad adapter", objective_id=objective.id)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ? WHERE id = ?",
+            (json.dumps({"execution_adapter": "missing_adapter", "task_type": "unknown"}, sort_keys=True), task.id),
+        )
 
     dashboard = build_tui_dashboard(tmp_path)
     model = build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard")
@@ -2641,7 +2654,10 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
 
             await pilot.press("shift+tab")
             await pilot.pause()
-            assert app._section_cursor_index == 1
+            assert app._section_cursor_index == 2
+            assert app._latest_palette_activation["activation_kind"] == "plan_mode_shortcut"
+            assert app._latest_palette_activation["ok"] is False
+            assert app._latest_palette_activation["model_request_started"] is False
 
             assert app._focus_mode == "dashboard"
             await pilot.press("ctrl+p")
@@ -2715,14 +2731,23 @@ def test_tui_prompt_keeps_slash_typable_and_handles_navigation_keys(tmp_path) ->
 
 def test_tui_tab_switches_right_panel_sections_with_graph_nodes(tmp_path) -> None:
     pytest.importorskip("textual")
+    from textual.widgets import Static
 
-    store = SQLiteStore.open_initialized(tmp_path)
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
     objective = store.create_objective("Section navigation")
     store.create_task("Plan section switch", objective_id=objective.id, agent_id="Planner")
+    planning_session_id = None
 
     async def run_pilot() -> None:
+        nonlocal planning_session_id
         app = create_harness_app(tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:
+            chat = app.query_one("#chat")
+            chat_content = app.query_one("#chat-content", Static)
+            composer_status = app.query_one("#composer-status", Static)
+            assert getattr(chat, "border_title", "") == "Chat - Normal mode"
+            assert chat.has_class("normal-mode")
             assert app._active_section_id == "active_work"
             assert app._section_cursor_index == 1
 
@@ -2735,10 +2760,41 @@ def test_tui_tab_switches_right_panel_sections_with_graph_nodes(tmp_path) -> Non
             await pilot.press("shift+tab")
             await pilot.pause()
 
-            assert app._active_section_id == "active_work"
-            assert app._section_cursor_index == 1
+            assert app._active_section_id == "graph"
+            assert app._section_cursor_index == 2
+            assert app._latest_palette_activation["activation_kind"] == "plan_mode_shortcut"
+            assert app._latest_palette_activation["planning_mode_after"] is True
+            assert app._latest_palette_activation["model_request_started"] is False
+            assert "Plan mode" not in str(composer_status.content)
+            assert getattr(chat, "border_title", "") == "Chat - Plan mode"
+            assert chat.has_class("plan-mode")
+            assert "Tool plan-enter" not in str(chat_content.content)
+            assert "Planning mode entered" not in str(chat_content.content)
+            planning_session_id = app._chat_state.session_id
+            assert planning_session_id is not None
+
+            await pilot.press("shift+tab")
+            await pilot.pause()
+
+            assert app._latest_palette_activation["planning_mode_before"] is True
+            assert app._latest_palette_activation["planning_mode_after"] is False
+            assert "Plan mode" not in str(composer_status.content)
+            assert getattr(chat, "border_title", "") == "Chat - Normal mode"
+            assert chat.has_class("normal-mode")
+            assert "Tool plan-exit" not in str(chat_content.content)
+            assert "Planning mode exited" not in str(chat_content.content)
 
     asyncio.run(run_pilot())
+
+    session = SQLiteStore(tmp_path).get_session(planning_session_id)
+    assert session.metadata["planning_mode"]["active"] is False
+    assert session.metadata["planning_mode"]["summary"] == (
+        "TUI shortcut exited planning mode without an additional written summary"
+    )
+    assert "session.planning_mode.entered" in [
+        event.kind for event in SQLiteStore(tmp_path).list_session_store_events(planning_session_id)
+    ]
+
 
 
 def test_tui_palette_enter_activates_safe_actions_without_chat_or_process(tmp_path) -> None:
@@ -2877,7 +2933,7 @@ def test_tui_phase2_multiline_composer_session_rail_and_history(tmp_path, monkey
             assert "Models: /models or ctrl+x m" not in str(composer_status.content)
             assert "Select: /model <number|name>" not in str(composer_status.content)
             assert f"Session: {session.id}" not in str(composer_status.content)
-            assert "Enter send · Shift+Enter newline · Ctrl+X M models · / commands · ? shortcuts" in str(
+            assert "Enter send · Shift+Enter newline · Shift+Tab plan · Ctrl+X M models · / commands · ? shortcuts" in str(
                 composer_footer.content
             )
             assert "Composer session" in str(session_detail.content)
@@ -4056,10 +4112,12 @@ def test_cli_home_reports_initialized_project_dashboard_without_sensitive_output
     assert payload["ok"] is True
     assert payload["initialized"] is True
     assert payload["summary"]["tasks_total"] == 1
-    assert payload["summary"]["active_leases"] == 1
+    assert payload["summary"]["active_leases"] == 0
     assert payload["summary"]["active_daemons"] == 1
     assert payload["summary"]["recent_runs"] == 1
-    assert payload["task_status_counts"]["leased"] == 1
+    assert payload["task_status_counts"]["ready"] == 1
+    assert payload["daemon"]["paused_tasks"][0]["decision"] == "waiting_approval"
+    assert payload["daemon"]["paused_tasks"][0]["adapter_id"] == "read_only_summary"
     assert payload["daemon"]["active_daemons"]
     assert payload["recent_runs"][0]["task_type"] == "phase_1a_test"
     serialized = json.dumps(payload)
@@ -4473,6 +4531,17 @@ def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, mo
     store = SQLiteStore(tmp_path)
     run = store.create_run(goal="trace cli", task_type="phase_1a_test")
     store.append_event(run.id, "info", "cli_trace_event", "Trace event.", {"payload": "safe"})
+    objective = store.create_objective("Trace objective")
+    store.create_task(
+        title="Trace objective task",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    objective_run = runner.invoke(
+        app,
+        ["objectives", "run", objective.id, "--project", str(tmp_path), "--autonomy", "safe-local", "--output", "json"],
+    )
+    assert objective_run.exit_code == 0, objective_run.output
 
     monkeypatch.setattr(
         "harness.cli.main.CodexCliBackend",
@@ -4499,7 +4568,12 @@ def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, mo
         app,
         ["traces", "export", run.id, "--format", "otel-json", "--project", str(tmp_path), "--output", "json"],
     )
+    objective_trace = runner.invoke(
+        app,
+        ["traces", "export-objective", objective.id, "--format", "otel-json", "--project", str(tmp_path), "--output", "json"],
+    )
     trace_text = runner.invoke(app, ["traces", "export", run.id, "--project", str(tmp_path)])
+    objective_trace_text = runner.invoke(app, ["traces", "export-objective", objective.id, "--project", str(tmp_path)])
 
     assert evals.exit_code == 0, evals.output
     eval_payload = json.loads(evals.output)
@@ -4524,11 +4598,29 @@ def test_cli_evals_safety_smoke_and_traces_export_are_evidence_only(tmp_path, mo
     spans = trace_payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
     assert {span["name"] for span in spans} >= {"harness.run", "harness.policy", "harness.event.cli_trace_event"}
 
+    assert objective_trace.exit_code == 0, objective_trace.output
+    objective_trace_payload = json.loads(objective_trace.output)
+    assert objective_trace_payload["schema_version"] == "harness.trace_export/v1"
+    assert objective_trace_payload["ok"] is True
+    assert objective_trace_payload["format"] == "otel-json"
+    assert objective_trace_payload["objective_id"] == objective.id
+    objective_spans = objective_trace_payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    assert {span["name"] for span in objective_spans} >= {
+        "harness.objective",
+        "harness.objective_run",
+        "harness.objective_event.adapter_dispatched",
+    }
+
     assert trace_text.exit_code == 0
     assert "Trace:" in trace_text.output
     assert "Spans:" in trace_text.output
+    assert objective_trace_text.exit_code == 0
+    assert "Objective:" in objective_trace_text.output
+    assert "Objective runs:" in objective_trace_text.output
+    assert "Evidence verification: pass" in objective_trace_text.output
+    assert "Evidence hash chain: pass" in objective_trace_text.output
 
-    serialized = json.dumps(eval_payload) + json.dumps(trace_payload) + json.dumps(security_layer_payload)
+    serialized = json.dumps(eval_payload) + json.dumps(trace_payload) + json.dumps(objective_trace_payload) + json.dumps(security_layer_payload)
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
     assert "base_url" not in serialized
@@ -4548,9 +4640,17 @@ def test_cli_evals_and_traces_errors_are_stable_json(tmp_path) -> None:
         app,
         ["traces", "export", run.id, "--format", "zipkin", "--project", str(tmp_path), "--output", "json"],
     )
+    bad_objective_format = runner.invoke(
+        app,
+        ["traces", "export-objective", "obj_missing", "--format", "zipkin", "--project", str(tmp_path), "--output", "json"],
+    )
     missing_run = runner.invoke(
         app,
         ["traces", "export", "run_missing", "--project", str(tmp_path), "--output", "json"],
+    )
+    missing_objective = runner.invoke(
+        app,
+        ["traces", "export-objective", "obj_missing", "--project", str(tmp_path), "--output", "json"],
     )
 
     assert bad_suite.exit_code == 1
@@ -4565,11 +4665,23 @@ def test_cli_evals_and_traces_errors_are_stable_json(tmp_path) -> None:
         "ok": False,
         "errors": ["Unsupported trace format: zipkin"],
     }
+    assert bad_objective_format.exit_code == 1
+    assert json.loads(bad_objective_format.output) == {
+        "schema_version": "harness.trace_export/v1",
+        "ok": False,
+        "errors": ["Unsupported trace format: zipkin"],
+    }
     assert missing_run.exit_code == 1
     assert json.loads(missing_run.output) == {
         "schema_version": "harness.trace_export/v1",
         "ok": False,
         "errors": ["Run not found: run_missing"],
+    }
+    assert missing_objective.exit_code == 1
+    assert json.loads(missing_objective.output) == {
+        "schema_version": "harness.trace_export/v1",
+        "ok": False,
+        "errors": ["Objective not found: obj_missing"],
     }
 
 
@@ -4697,6 +4809,19 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
     assert resources.exit_code == 0, resources.output
     resources_payload = json.loads(resources.output)
     assert resources_payload["schema_version"] == "harness.mcp_resources/v1"
+    mcp_path_safety = {
+        "schema_version": "harness.configured_path_safety/v1",
+        "ok": True,
+        "configured_path": "mcp-cache/guide.md",
+        "symlink_policy": "reject_configured_path_components",
+        "symlink_checked": True,
+        "symlink_safe": True,
+        "project_boundary_checked": True,
+        "relative_path": "mcp-cache/guide.md",
+        "error_type": None,
+        "message": None,
+        "blocked_reasons": [],
+    }
     assert resources_payload["resources"] == [
         {
             "name": "guide",
@@ -4705,6 +4830,10 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
             "enabled": True,
             "cached": True,
             "path": "mcp-cache/guide.md",
+            "path_safety": mcp_path_safety,
+            "symlink_policy": "reject_configured_path_components",
+            "symlink_checked": True,
+            "symlink_safe": True,
             "content_type": "text/markdown",
             "description": "Cached docs guide",
             "contents_included": False,
@@ -4721,6 +4850,8 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
                 "tool_execution_allowed": False,
                 "session_tool_permission_required": True,
                 "contents_included": False,
+                "symlink_policy": "reject_configured_path_components",
+                "symlink_safe": True,
             },
             "blocked_reasons": ["mcp_resource_read_requires_permission", "mcp_connection_disabled"],
             "connected": False,
@@ -4730,9 +4861,11 @@ def test_cli_mcp_list_resources_and_lifecycle_fail_closed(tmp_path) -> None:
         }
     ]
     assert resources_payload["resource_count"] == 1
+    assert resources_payload["unsafe_resource_count"] == 0
     assert resources_payload["cached_only"] is True
     assert resources_payload["contents_included"] is False
     assert resources_payload["policy_boundary"]["kind"] == "mcp_resources_projection"
+    assert resources_payload["policy_boundary"]["symlink_policy"] == "reject_configured_path_components"
     assert resources_payload["network_called"] is False
     assert resources_payload["process_started"] is False
     assert resources_text.exit_code == 0, resources_text.output
@@ -4862,6 +4995,11 @@ def test_cli_plugins_and_skills_are_metadata_only_and_fail_closed(tmp_path) -> N
     assert project_skills[0]["version"] == "0.1.0"
     assert project_skills[0]["skill_file_path"] == "skills/review/SKILL.md"
     assert project_skills[0]["skill_file_exists"] is True
+    assert project_skills[0]["path_safety"]["ok"] is True
+    assert project_skills[0]["skill_file_path_safety"]["ok"] is True
+    assert project_skills[0]["symlink_policy"] == "reject_configured_path_components"
+    assert project_skills[0]["symlink_checked"] is True
+    assert project_skills[0]["symlink_safe"] is True
     assert project_skills[0]["skill_body_loaded"] is False
     assert "Do not load this body" not in skills.output
     assert skills_text.exit_code == 0, skills_text.output
@@ -6011,6 +6149,10 @@ def test_cli_session_status_and_inspect_surface_latest_ui_activation_and_model_v
     assert inspected_payload["latest_ui_activation"]["filesystem_modified"] is False
     assert inspected_payload["latest_ui_activation"]["permission_granting"] is False
     assert inspected_payload["latest_ui_activation"]["authority_granting"] is False
+    assert inspected_payload["transcript_health"]["schema_version"] == "harness.session_events_read/v1"
+    assert inspected_payload["transcript_health"]["ok"] is True
+    assert inspected_payload["transcript_health"]["contents_included"] is False
+    assert inspected_payload["transcript_health"]["permission_granting"] is False
 
     assert status.exit_code == 0, status.output
     status_payload = json.loads(status.output)
@@ -6032,6 +6174,52 @@ def test_cli_session_status_and_inspect_surface_latest_ui_activation_and_model_v
     assert "No hidden fallback: True" in text.output
     assert "Latest UI action: ui_controls.settings action=focus_section source=slash" in text.output
     assert "UI action flags: command=False process=False filesystem=False permission=False authority=False" in text.output
+
+
+def test_cli_session_inspect_and_resume_report_malformed_transcript_without_traceback(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Malformed transcript")
+    append_session_event(
+        tmp_path,
+        session_id=session.id,
+        event_type=SessionEventKind.SESSION_STARTED,
+        message="Started",
+    )
+    transcript_path = tmp_path / ".harness" / "sessions" / session.id / "transcript.jsonl"
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("not json with secret sk-abcdefghijklmnopqrstuvwxyz\n")
+
+    inspected = runner.invoke(app, ["session", "inspect", session.id, "--project", str(tmp_path), "--output", "json"])
+    resumed = runner.invoke(app, ["resume", session.id, "--project", str(tmp_path), "--output", "json"])
+    resumed_text = runner.invoke(app, ["resume", session.id, "--project", str(tmp_path)])
+
+    assert inspected.exit_code == 0, inspected.output
+    inspected_payload = json.loads(inspected.output)
+    assert inspected_payload["event_count"] == 1
+    assert inspected_payload["transcript_health"]["ok"] is False
+    assert inspected_payload["transcript_health"]["parse_error_count"] == 1
+    assert inspected_payload["transcript_health"]["validation_error_count"] == 0
+    assert inspected_payload["transcript_health"]["contents_included"] is False
+    assert inspected_payload["transcript_health"]["permission_granting"] is False
+    assert "not json" not in inspected.output
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in inspected.output
+    assert "Traceback" not in inspected.output
+
+    assert resumed.exit_code == 0, resumed.output
+    resumed_payload = json.loads(resumed.output)
+    assert resumed_payload["transcript_health"]["ok"] is False
+    assert resumed_payload["transcript_health"]["parse_error_count"] == 1
+    assert "not json" not in resumed.output
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in resumed.output
+    assert "Traceback" not in resumed.output
+
+    assert resumed_text.exit_code == 0, resumed_text.output
+    assert "Transcript health: malformed" in resumed_text.output
+    assert "Started" in resumed_text.output
+    assert "not json" not in resumed_text.output
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in resumed_text.output
+    assert "Traceback" not in resumed_text.output
 
 
 def test_cli_server_lifecycle_mdns_and_dispose_are_safe_contracts(tmp_path) -> None:
@@ -6822,6 +7010,85 @@ def test_cli_tasks_cancel_and_retry_reject_invalid_states(tmp_path) -> None:
     ]
 
 
+def test_cli_tasks_retry_requires_fresh_adapter_approval(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    task_result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Retry hosted planning",
+            "--execution-adapter",
+            "repo_planning",
+            "--task-type",
+            "repo_planning",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+    assert task_result.exit_code == 0, task_result.output
+    task = json.loads(task_result.output)["task"]
+    assert runner.invoke(
+        app,
+        ["tasks", "status", task["id"], "running", "--project", str(tmp_path), "--output", "json"],
+    ).exit_code == 0
+    assert runner.invoke(
+        app,
+        ["tasks", "status", task["id"], "failed", "--project", str(tmp_path), "--output", "json"],
+    ).exit_code == 0
+
+    rejected = runner.invoke(
+        app,
+        ["tasks", "retry", task["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert rejected.exit_code == 1
+    assert json.loads(rejected.output)["errors"] == [
+        "Task retry requires fresh approval for repo_planning: hosted_provider_codex"
+    ]
+    assert SQLiteStore(tmp_path).get_task(task["id"]).status.value == "failed"
+
+    ApprovalStore(tmp_path).add(
+        "codex_cli",
+        "hosted_provider",
+        ["repo_planning"],
+        duration_hours=1,
+        allowed_adapters=["repo_planning"],
+    )
+    retried = runner.invoke(
+        app,
+        ["tasks", "retry", task["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert retried.exit_code == 0, retried.output
+    retried_task = json.loads(retried.output)["task"]
+    assert retried_task["status"] == "ready"
+    assert retried_task["idempotency_key"] == task["idempotency_key"]
+    inspected = runner.invoke(
+        app,
+        ["tasks", "inspect", task["id"], "--project", str(tmp_path), "--output", "json"],
+    )
+    assert inspected.exit_code == 0, inspected.output
+    replay_receipts = json.loads(inspected.output)["replay_receipts"]
+    assert replay_receipts["schema_version"] == "harness.task_replay_receipts_projection/v1"
+    assert replay_receipts["ok"] is True
+    assert replay_receipts["task_replay_receipt_schema_version"] == "harness.task_replay_receipt/v1"
+    assert replay_receipts["retry_transition_receipt_count"] == 1
+    assert replay_receipts["gaps"] == []
+    retry_receipt = replay_receipts["transition_receipts"][0]["receipt"]
+    assert retry_receipt["schema_version"] == "harness.task_replay_receipt/v1"
+    assert retry_receipt["receipt_kind"] == "retry_authorization"
+    assert retry_receipt["task_id"] == task["id"]
+    assert retry_receipt["task_idempotency_key"] == task["idempotency_key"]
+    assert retry_receipt["previous_status"] == "failed"
+    assert retry_receipt["next_status"] == "ready"
+    assert retry_receipt["replay_policy"] == "requires_fresh_approval"
+    assert retry_receipt["retry_gate"] == "fresh_approval_revalidated"
+
+
 def test_cli_tasks_cancel_retry_require_initialized_project(tmp_path) -> None:
     for command in ["cancel", "retry"]:
         result = runner.invoke(
@@ -6872,6 +7139,8 @@ def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.task_run_next/v1"
     assert payload["ok"] is True
+    assert payload["decision"] == "leased_task"
+    assert payload["pause_reasons"] == []
     assert payload["selected_task"]["id"] == high.id
     assert payload["selected_task"]["status"] == "leased"
     assert payload["attempt"]["task_id"] == high.id
@@ -6883,6 +7152,21 @@ def test_cli_tasks_run_next_selects_task_without_creating_run_artifacts(tmp_path
     assert store.get_task(low.id).status.value == "ready"
     assert store.list_runs() == []
     assert not any((tmp_path / ".harness" / "runs").iterdir())
+    inspected = runner.invoke(app, ["tasks", "inspect", high.id, "--project", str(tmp_path), "--output", "json"])
+    assert inspected.exit_code == 0, inspected.output
+    replay_receipts = json.loads(inspected.output)["replay_receipts"]
+    assert replay_receipts["schema_version"] == "harness.task_replay_receipts_projection/v1"
+    assert replay_receipts["ok"] is True
+    assert replay_receipts["attempt_count"] == 1
+    assert replay_receipts["attempt_receipt_count"] == 1
+    assert replay_receipts["legacy_missing_receipt_count"] == 0
+    assert replay_receipts["gaps"] == []
+    attempt_receipt = replay_receipts["attempt_receipts"][0]["receipt"]
+    assert attempt_receipt["schema_version"] == "harness.task_replay_receipt/v1"
+    assert attempt_receipt["receipt_kind"] == "attempt_replay_guard"
+    assert attempt_receipt["task_id"] == high.id
+    assert attempt_receipt["attempt_number"] == 1
+    assert attempt_receipt["prior_attempt_count"] == 0
 
     text_result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path)])
     assert text_result.exit_code == 0
@@ -6915,9 +7199,45 @@ def test_cli_tasks_run_next_returns_null_without_runnable_task(tmp_path) -> None
     payload = json.loads(result.output)
     assert payload["schema_version"] == "harness.task_run_next/v1"
     assert payload["ok"] is True
+    assert payload["decision"] == "no_eligible_task"
     assert payload["selected_task"] is None
     assert payload["attempt"] is None
     assert payload["lease"] is None
+    assert payload["pause_reasons"] == []
+
+
+def test_cli_tasks_run_next_pauses_descriptor_approval_required_adapter_before_lease(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Repo planning",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+
+    result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path), "--output", "json"])
+    text_result = runner.invoke(app, ["tasks", "run-next", "--project", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["schema_version"] == "harness.task_run_next/v1"
+    assert payload["ok"] is True
+    assert payload["decision"] == "paused"
+    assert payload["selected_task"] is None
+    assert payload["attempt"] is None
+    assert payload["lease"] is None
+    assert payload["pause_reasons"][0]["task_id"] == task.id
+    assert payload["pause_reasons"][0]["decision"] == "waiting_approval"
+    assert payload["pause_reasons"][0]["adapter_id"] == "repo_planning"
+    assert payload["pause_reasons"][0]["task_type"] == "repo_planning"
+    assert payload["pause_reasons"][0]["approval_source"] == "execution_adapter_descriptor"
+    assert payload["pause_reasons"][0]["missing_approvals"] == ["hosted_provider_codex"]
+    assert store.get_task(task.id).status.value == "ready"
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+    assert text_result.exit_code == 0, text_result.output
+    assert text_result.output.startswith("No task leased: waiting_approval")
 
 
 def test_cli_daemon_run_once_status_and_stop_are_non_executing(tmp_path, monkeypatch) -> None:
@@ -7087,6 +7407,74 @@ def test_cli_daemon_run_once_pauses_approval_required_tasks(tmp_path, monkeypatc
     assert "environment" not in serialized
 
 
+def test_cli_daemon_run_once_pauses_descriptor_approval_required_adapter_before_lease(
+    tmp_path, monkeypatch
+) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Repo planning",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.CodexCliBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon must not preflight Codex")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.LocalOpenAICompatibleBackend",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon must not preflight local backend")),
+    )
+    monkeypatch.setattr(
+        "harness.cli.main.DockerImageManager",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("daemon must not touch Docker")),
+    )
+
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+    status = runner.invoke(app, ["daemon", "status", "--project", str(tmp_path), "--output", "json"])
+
+    assert tick.exit_code == 0, tick.output
+    tick_payload = json.loads(tick.output)
+    assert tick_payload["schema_version"] == "harness.daemon_tick/v1"
+    assert tick_payload["decision"] == "paused"
+    assert tick_payload["selected_task"] is None
+    assert tick_payload["attempt"] is None
+    assert tick_payload["lease"] is None
+    assert tick_payload["pause_reasons"][0]["task_id"] == task.id
+    assert tick_payload["pause_reasons"][0]["decision"] == "waiting_approval"
+    assert tick_payload["pause_reasons"][0]["adapter_id"] == "repo_planning"
+    assert tick_payload["pause_reasons"][0]["approval_source"] == "execution_adapter_descriptor"
+    assert tick_payload["pause_reasons"][0]["required_approvals"] == ["hosted_provider_codex"]
+    assert tick_payload["pause_reasons"][0]["missing_approvals"] == ["hosted_provider_codex"]
+
+    assert status.exit_code == 0, status.output
+    status_payload = json.loads(status.output)
+    assert status_payload["schema_version"] == "harness.daemon_status/v1"
+    assert status_payload["paused_tasks"][0]["task_id"] == task.id
+    assert status_payload["paused_tasks"][0]["decision"] == "waiting_approval"
+    assert store.get_task(task.id).status.value == "ready"
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_runs() == []
+
+    ApprovalStore(tmp_path).add(
+        "codex_cli",
+        "hosted_provider",
+        ["repo_planning"],
+        duration_hours=1,
+        allowed_adapters=["repo_planning"],
+    )
+
+    leased = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
+
+    assert leased.exit_code == 0, leased.output
+    leased_payload = json.loads(leased.output)
+    assert leased_payload["decision"] == "leased_task"
+    assert leased_payload["selected_task"]["id"] == task.id
+    assert leased_payload["attempt"]["task_id"] == task.id
+    assert leased_payload["lease"]["task_id"] == task.id
+    assert store.get_task(task.id).status.value == "leased"
+    assert store.list_runs() == []
+
+
 def test_cli_daemon_execute_dry_run_links_run_without_backends_or_docker(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     monkeypatch.setattr(
@@ -7237,7 +7625,7 @@ def test_cli_daemon_execute_dispatches_dry_run_through_registered_adapter(tmp_pa
     assert payload["adapter_result"]["schema_version"] == "harness.daemon_execute_dry_run/v1"
 
 
-def test_cli_controls_disable_adapter_blocks_generic_execute_without_run(tmp_path) -> None:
+def test_cli_controls_disable_adapter_pauses_daemon_before_lease(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     disabled = runner.invoke(
         app,
@@ -7266,32 +7654,23 @@ def test_cli_controls_disable_adapter_blocks_generic_execute_without_run(tmp_pat
         title="Generic dry run",
         metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
     )
-    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
-    assert leased.lease is not None
+    tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
 
-    inspected = runner.invoke(
-        app,
-        ["daemon", "inspect-lease", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
-    )
-    result = runner.invoke(
-        app,
-        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
-    )
-
-    assert inspected.exit_code == 0, inspected.output
-    inspected_payload = json.loads(inspected.output)
-    assert inspected_payload["security_decision"]["decision"] == "deny"
-    assert inspected_payload["security_decision"]["reason_code"] == "control_disabled"
-
-    assert result.exit_code == 1
-    payload = json.loads(result.output)
-    assert payload["ok"] is False
-    assert payload["run"] is None
-    assert payload["security_decision"]["decision"] == "deny"
-    assert payload["security_decision"]["reason_code"] == "control_disabled"
-    assert "OPENAI_API_KEY=secret" not in result.output
+    assert tick.exit_code == 0, tick.output
+    payload = json.loads(tick.output)
+    assert payload["decision"] == "paused"
+    assert payload["selected_task"] is None
+    assert payload["attempt"] is None
+    assert payload["lease"] is None
+    assert payload["pause_reasons"][0]["decision"] == "control_disabled"
+    assert payload["pause_reasons"][0]["adapter_id"] == "dry_run"
+    assert payload["pause_reasons"][0]["target_kind"] == "adapter"
+    assert payload["pause_reasons"][0]["target_id"] == "dry_run"
+    assert "OPENAI_API_KEY=secret" not in tick.output
     assert store.list_runs() == []
-    assert store.list_daemon_events()[0].metadata["reason_code"] == "control_disabled"
+    assert store.list_task_attempts() == []
+    assert store.list_task_leases() == []
+    assert store.list_daemon_events()[0].metadata["decision"] == "paused"
 
 
 def test_cli_controls_task_type_backend_and_breaker_are_json_inspectable(tmp_path) -> None:
@@ -7392,17 +7771,16 @@ def test_cli_controls_breaker_opens_and_reset_closes_for_adapter(tmp_path) -> No
         title="Generic dry run",
         metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
     )
-    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
-    assert leased.lease is not None
-    rejected = runner.invoke(
-        app,
-        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
-    )
-    assert rejected.exit_code == 1
-    rejected_payload = json.loads(rejected.output)
-    assert rejected_payload["security_decision"]["reason_code"] == "breaker_open"
-    assert rejected_payload["blocked_state_explanations"][0]["code"] == "breaker_open"
+    paused = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert paused.decision == "paused"
+    assert paused.lease is None
+    assert paused.attempt is None
+    assert paused.selected_task is None
+    assert paused.pause_reasons[0]["decision"] == "breaker_open"
+    assert paused.pause_reasons[0]["adapter_id"] == "dry_run"
     assert store.list_runs() == []
+    assert store.list_task_attempts() == []
+    assert store.list_task_leases() == []
 
     reset = runner.invoke(
         app,
@@ -7421,17 +7799,30 @@ def test_cli_controls_breaker_opens_and_reset_closes_for_adapter(tmp_path) -> No
     assert reset.exit_code == 0, reset.output
     reset_payload = json.loads(reset.output)
     assert reset_payload["breaker"]["status"] == "closed"
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.decision == "leased_task"
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    assert leased.selected_task is not None
 
 
 def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
-    store.create_task(
+    task = store.create_task(
         title="Unknown adapter",
-        metadata={"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"},
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
     )
     leased = store.daemon_run_once("local_daemon:test:123", pid=123)
     assert leased.lease is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ? WHERE id = ?",
+            (
+                json.dumps({"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"}, sort_keys=True),
+                task.id,
+            ),
+        )
 
     result = runner.invoke(
         app,
@@ -7450,9 +7841,15 @@ def test_cli_daemon_execute_rejects_unknown_adapter_without_run(tmp_path) -> Non
     assert payload["run"] is None
     assert payload["rejection_reasons"] == ["Unknown execution adapter: unknown_adapter."]
     assert store.list_runs() == []
+    assert store.get_task_lease(leased.lease.id).status.value == "released"
+    assert store.get_task_attempt(leased.attempt.id).status.value == "failed"
+    assert store.get_task(task.id).status.value == "failed"
     event = store.list_daemon_events()[0]
     assert event.event_type == "execution_adapter_rejected"
     assert event.metadata["reason_code"] == "unknown_adapter"
+    assert event.metadata["lease_status"] == "released"
+    assert event.metadata["attempt_status"] == "failed"
+    assert event.metadata["task_status"] == "failed"
 
 
 def test_cli_daemon_execute_rejects_unsafe_metadata_with_security_decision(tmp_path) -> None:
@@ -7496,6 +7893,63 @@ def test_cli_daemon_execute_rejects_unsafe_metadata_with_security_decision(tmp_p
         "Execution rejected by task metadata: requires_external_network."
     ]
     assert store.list_runs() == []
+    assert store.get_task_lease(leased.lease.id).status.value == "released"
+    assert store.get_task_attempt(leased.attempt.id).status.value == "failed"
+    assert store.get_task(task.id).status.value == "failed"
+
+
+def test_cli_daemon_execute_rejects_invalid_delegate_budget_metadata_with_security_decision(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = store.create_task(
+        title="Invalid budget dispatch",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "execution_adapter": "dry_run",
+                        "task_type": "phase_1a_test",
+                        "max_model_calls": -1,
+                        "max_parallel_branches": 0,
+                        "max_cost_usd": -1,
+                        "cpu_seconds": 1,
+                        "memory_mb": 1,
+                    },
+                    sort_keys=True,
+                ),
+                task.id,
+            ),
+        )
+
+    result = runner.invoke(
+        app,
+        ["daemon", "execute", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["run"] is None
+    assert payload["security_decision"]["decision"] == "deny"
+    assert payload["security_decision"]["reason_code"] == "unsafe_metadata"
+    assert payload["blocked_state_explanations"][0]["code"] == "unsafe_metadata"
+    assert payload["security_decision"]["reasons"] == [
+        "Task metadata max_model_calls=-1 must be at least 0.",
+        "Task metadata max_parallel_branches=0 must be at least 1.",
+        "Task metadata max_cost_usd=-1 must be at least 0.",
+        "Task metadata cpu_seconds=1 exceeds dry_run delegate budget max_cpu_seconds=0.",
+        "Task metadata memory_mb=1 exceeds dry_run delegate budget max_memory_mb=0.",
+    ]
+    assert store.list_runs() == []
+    assert store.get_task_lease(leased.lease.id).status.value == "released"
+    assert store.get_task_attempt(leased.attempt.id).status.value == "failed"
+    assert store.get_task(task.id).status.value == "failed"
 
 
 def test_cli_daemon_execute_reports_approval_required_security_decision(tmp_path) -> None:
@@ -7536,6 +7990,9 @@ def test_cli_daemon_execute_reports_approval_required_security_decision(tmp_path
     assert payload["security_decision"]["missing_approvals"] == ["human_operator"]
     assert payload["blocked_state_explanations"][0]["code"] == "missing_approval"
     assert store.list_runs() == []
+    assert store.get_task_lease(leased.lease.id).status.value == "released"
+    assert store.get_task_attempt(leased.attempt.id).status.value == "waiting_approval"
+    assert store.get_task(task.id).status.value == "waiting_approval"
 
 
 def test_cli_tasks_add_accepts_repo_planning_execution_metadata(tmp_path) -> None:
@@ -7670,12 +8127,14 @@ def test_chat_task_draft_confirm_and_decline_flows(tmp_path) -> None:
         "repo_planning",
         "codex_isolated_edit",
         "dry_run",
-        "dry_run",
-        "dry_run",
+        "review_gate",
+        "review_gate",
         "dry_run",
     ]
     assert codex_draft["draft"]["tasks"][3]["agent_id"] == "implementation_reviewer"
     assert codex_draft["draft"]["tasks"][4]["agent_id"] == "security_reviewer"
+    assert codex_draft["draft"]["checkpoints"][0]["label"] == "Supervisor approval for reviewed coding workflow"
+    assert codex_draft["draft"]["checkpoints"][0]["required"] is True
     assert "Apply-back is not automatic and remains denied by default." in codex_draft["draft"]["safety_notes"]
 
 
@@ -7784,7 +8243,15 @@ def test_chat_codex_like_read_only_confirmation_prepares_scoped_approval(tmp_pat
 def test_chat_unknown_adapter_fail_closed_without_run(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     store = SQLiteStore(tmp_path)
-    store.create_task(title="Unknown", metadata={"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"})
+    task = store.create_task(title="Unknown")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ? WHERE id = ?",
+            (
+                json.dumps({"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"}, sort_keys=True),
+                task.id,
+            ),
+        )
     leased = store.select_next_task_for_lease(owner="chat-test")
     assert leased is not None
     state = ChatSessionState(latest_lease_id=leased["lease"].id)
@@ -7881,8 +8348,8 @@ def test_chat_codex_confirm_prepares_scoped_hosted_approval_before_run(tmp_path,
         "repo_planning",
         "codex_isolated_edit",
         "dry_run",
-        "dry_run",
-        "dry_run",
+        "review_gate",
+        "review_gate",
         "dry_run",
     ]
     assert draft["draft"]["tasks"][3]["agent_id"] == "implementation_reviewer"
@@ -8079,7 +8546,7 @@ def test_cli_daemon_execute_read_only_links_run_and_releases_lease(tmp_path, mon
     assert "http://localhost:11434" not in serialized
 
 
-def test_cli_daemon_execute_read_only_preflight_failure_leaves_lease_unchanged(tmp_path, monkeypatch) -> None:
+def test_cli_daemon_execute_read_only_preflight_failure_finalizes_without_run(tmp_path, monkeypatch) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     ApprovalStore(tmp_path).add("codex_cli", "hosted_provider", ["read_only_repo_summary"], 1)
 
@@ -8131,10 +8598,18 @@ def test_cli_daemon_execute_read_only_preflight_failure_leaves_lease_unchanged(t
     assert payload["errors"] == ["codex backend unavailable for test"]
     store = SQLiteStore(tmp_path)
     assert store.list_runs() == []
-    assert store.get_task(task_id).status.value == "leased"
-    assert store.get_task_attempt(attempt_id).status.value == "leased"
-    assert store.get_task_attempt(attempt_id).run_id is None
-    assert store.get_task_lease(lease_id).status.value == "active"
+    assert store.get_task(task_id).status.value == "failed"
+    attempt = store.get_task_attempt(attempt_id)
+    assert attempt.status.value == "failed"
+    assert attempt.run_id is None
+    assert attempt.failure_code == "backend_unavailable"
+    lease = store.get_task_lease(lease_id)
+    assert lease.status.value == "released"
+    assert lease.metadata["reason_code"] == "backend_unavailable"
+    event = [event for event in store.list_daemon_events() if event.event_type == "execution_adapter_rejected"][-1]
+    assert event.metadata["lease_status"] == "released"
+    assert event.metadata["attempt_status"] == "failed"
+    assert event.metadata["task_status"] == "failed"
 
 
 def test_cli_daemon_execute_read_only_missing_hosted_approval_leaves_no_run(tmp_path, monkeypatch) -> None:
@@ -8161,9 +8636,17 @@ def test_cli_daemon_execute_read_only_missing_hosted_approval_leaves_no_run(tmp_
         ],
     )
     task_id = json.loads(task_result.output)["task"]["id"]
+    approval = ApprovalStore(tmp_path).add(
+        "codex_cli",
+        "hosted_provider",
+        ["read_only_repo_summary"],
+        duration_hours=1,
+        allowed_adapters=["read_only_summary"],
+    )
     tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
     lease_id = json.loads(tick.output)["lease"]["id"]
     attempt_id = json.loads(tick.output)["attempt"]["id"]
+    assert ApprovalStore(tmp_path).revoke(approval.id) is True
 
     executed = runner.invoke(
         app,
@@ -8176,10 +8659,18 @@ def test_cli_daemon_execute_read_only_missing_hosted_approval_leaves_no_run(tmp_
     assert payload["errors"] == ["Missing valid hosted-provider Codex approval for read_only_repo_summary."]
     store = SQLiteStore(tmp_path)
     assert store.list_runs() == []
-    assert store.get_task(task_id).status.value == "leased"
-    assert store.get_task_attempt(attempt_id).status.value == "leased"
-    assert store.get_task_attempt(attempt_id).run_id is None
-    assert store.get_task_lease(lease_id).status.value == "active"
+    assert store.get_task(task_id).status.value == "waiting_approval"
+    attempt = store.get_task_attempt(attempt_id)
+    assert attempt.status.value == "waiting_approval"
+    assert attempt.run_id is None
+    assert attempt.failure_code == "missing_hosted_approval"
+    lease = store.get_task_lease(lease_id)
+    assert lease.status.value == "released"
+    assert lease.metadata["reason_code"] == "missing_hosted_approval"
+    event = [event for event in store.list_daemon_events() if event.event_type == "execution_adapter_rejected"][-1]
+    assert event.metadata["lease_status"] == "released"
+    assert event.metadata["attempt_status"] == "waiting_approval"
+    assert event.metadata["task_status"] == "waiting_approval"
 
 
 def test_cli_daemon_execute_read_only_runner_failure_marks_terminal_without_duplicate_run(
@@ -8281,8 +8772,10 @@ def test_cli_daemon_execute_read_only_rejects_unsafe_backend_descriptor(tmp_path
             "json",
         ],
     )
+    task_id = json.loads(task_result.output)["task"]["id"]
     tick = runner.invoke(app, ["daemon", "run-once", "--project", str(tmp_path), "--output", "json"])
     lease_id = json.loads(tick.output)["lease"]["id"]
+    attempt_id = json.loads(tick.output)["attempt"]["id"]
 
     executed = runner.invoke(
         app,
@@ -8293,7 +8786,16 @@ def test_cli_daemon_execute_read_only_rejects_unsafe_backend_descriptor(tmp_path
     assert executed.exit_code == 1
     payload = json.loads(executed.output)
     assert payload["errors"] == ["Read-only execution requires subscription codex_cli backend"]
-    assert SQLiteStore(tmp_path).list_runs() == []
+    store = SQLiteStore(tmp_path)
+    assert store.list_runs() == []
+    assert store.get_task(task_id).status.value == "failed"
+    attempt = store.get_task_attempt(attempt_id)
+    assert attempt.status.value == "failed"
+    assert attempt.run_id is None
+    assert attempt.failure_code == "unsafe_backend"
+    lease = store.get_task_lease(lease_id)
+    assert lease.status.value == "released"
+    assert lease.metadata["reason_code"] == "unsafe_backend"
 
 
 def test_cli_daemon_inspect_lease_before_and_after_dry_run_is_read_only(tmp_path, monkeypatch) -> None:
@@ -8438,11 +8940,48 @@ def test_cli_tasks_add_rejects_unsupported_execution_adapter_metadata(tmp_path) 
     assert payload["ok"] is False
     assert payload["errors"] == [
         "Unsupported execution metadata: supported pairs are "
-        "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
-        "codex_isolated_edit/codex_code_edit, repo_planning/repo_planning, "
-        "session_read_tools/session_plan, session_read_tools/session_read_only_research, "
-        "and session_read_tools/session_operator"
-    ]
+            "dry_run/phase_1a_test, read_only_summary/read_only_repo_summary, "
+            "session_read_tools/session_operator, session_read_tools/session_plan, "
+            "session_read_tools/session_read_only_research, session_child_task/session_delegate, "
+            "codex_isolated_edit/codex_code_edit, repo_planning/repo_planning, review_gate/factuality_review, "
+            "review_gate/implementation_review, and review_gate/security_review"
+        ]
+
+
+def test_cli_supported_execution_metadata_matches_registered_adapters() -> None:
+    expected = tuple(
+        (descriptor.id, task_type)
+        for descriptor in list_execution_adapter_descriptors()
+        for task_type in descriptor.supported_task_types
+    )
+    assert SUPPORTED_EXECUTION_TASK_METADATA == expected
+
+
+def test_cli_tasks_add_review_gate_requires_target_stage(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    result = runner.invoke(
+        app,
+        [
+            "tasks",
+            "add",
+            "--title",
+            "Implementation review",
+            "--execution-adapter",
+            "review_gate",
+            "--task-type",
+            "implementation_review",
+            "--project",
+            str(tmp_path),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["errors"] == ["Review gate metadata requires --review-target-stage."]
 
 
 @pytest.mark.parametrize(("execution_adapter", "task_type"), SUPPORTED_EXECUTION_TASK_METADATA)
@@ -8452,6 +8991,17 @@ def test_cli_tasks_add_accepts_supported_execution_adapter_metadata(
     task_type: str,
 ) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    extra_args: list[str] = []
+    if execution_adapter == "review_gate":
+        upstream = SQLiteStore(tmp_path).create_task(
+            title="Upstream evidence",
+            metadata={
+                "execution_adapter": "dry_run",
+                "task_type": "phase_1a_test",
+                "workflow_stage": "test_sandbox",
+            },
+        )
+        extra_args.extend(["--depends-on", upstream.id, "--review-target-stage", "test_sandbox"])
 
     result = runner.invoke(
         app,
@@ -8468,6 +9018,7 @@ def test_cli_tasks_add_accepts_supported_execution_adapter_metadata(
             str(tmp_path),
             "--output",
             "json",
+            *extra_args,
         ],
     )
 
@@ -8476,6 +9027,20 @@ def test_cli_tasks_add_accepts_supported_execution_adapter_metadata(
     assert payload["ok"] is True
     assert payload["task"]["metadata"]["execution_adapter"] == execution_adapter
     assert payload["task"]["metadata"]["task_type"] == task_type
+    if execution_adapter == "review_gate":
+        role_by_task_type = {
+            "implementation_review": "implementation_reviewer",
+            "security_review": "security_reviewer",
+            "factuality_review": "factuality_reviewer",
+        }
+        assert payload["task"]["agent_id"] == role_by_task_type[task_type]
+        assert payload["task"]["metadata"]["review_gate"] is True
+        assert payload["task"]["metadata"]["completion_gate"] is True
+        assert payload["task"]["metadata"]["review_role"] == role_by_task_type[task_type]
+        assert payload["task"]["metadata"]["workflow_stage"] == task_type
+        assert payload["task"]["metadata"]["review_target_stage"] == "test_sandbox"
+        if task_type == "security_review":
+            assert payload["task"]["metadata"]["blocks_apply_back"] is True
 
 
 def test_cli_tasks_reject_invalid_builtin_registry_refs(tmp_path) -> None:
@@ -8750,9 +9315,101 @@ def test_cli_doctor_release_reports_no_preflight_operator_checklist(tmp_path, mo
         "openai_codex_responses",
         "openai_responses",
     }
+    extension_paths = checks["extension_config_path_safety"]
+    assert extension_paths["status"] == "pass"
+    assert extension_paths["details"]["schema_version"] == "harness.extension_config_path_safety/v1"
+    assert extension_paths["details"]["symlink_policy"] == "reject_configured_path_components"
+    assert extension_paths["details"]["unsafe_resource_count"] == 0
+    assert extension_paths["details"]["unsafe_skill_count"] == 0
+    assert extension_paths["details"]["contents_included"] is False
+    assert extension_paths["details"]["skill_body_loaded"] is False
+    assert extension_paths["details"]["mcp_resource_body_loaded"] is False
+    assert extension_paths["details"]["process_started"] is False
+    assert extension_paths["details"]["network_called"] is False
+    assert extension_paths["details"]["filesystem_modified"] is False
+    assert extension_paths["details"]["permission_granting"] is False
     runtime = checks["release_runtime_state"]["details"]
     assert runtime["blocked_or_waiting_tasks"][0]["title"] == "Waiting"
     assert runtime["latest_failed_run"]["status"] == "failed"
+    orchestration = checks["orchestration_readiness_release_gates"]["details"]
+    assert checks["orchestration_readiness_release_gates"]["status"] == "pass"
+    assert orchestration["schema_version"] == "harness.orchestration_readiness_audit/v1"
+    assert orchestration["summary"]["fail"] == 0
+    assert "agentic_security_controls" in orchestration["check_ids"]
+    assert "agent_discovery_and_allocation" in orchestration["check_ids"]
+    assert "pending_chat_action_recovery" in orchestration["check_ids"]
+    assert "workflow_coordination_contracts" in orchestration["check_ids"]
+    assert "orchestration_scenario_conformance" in orchestration["check_ids"]
+    assert orchestration["reference_metadata_included"] is False
+    assert orchestration["reference_code_imported"] is False
+    assert orchestration["reference_contents_included"] is False
+    assert orchestration["provider_called"] is False
+    assert orchestration["network_called"] is False
+    assert orchestration["adapter_execution_started"] is False
+    assert orchestration["filesystem_modified"] is False
+    assert orchestration["permission_granting"] is False
+    efficiency = checks["orchestration_efficiency_release_gates"]["details"]
+    assert checks["orchestration_efficiency_release_gates"]["status"] == "pass"
+    assert efficiency["schema_version"] == "harness.orchestration_efficiency/v1"
+    assert efficiency["summary"]["fail"] == 0
+    assert "adapter_security_complexity_tradeoff" in efficiency["check_ids"]
+    assert "bounded_critical_path_scheduler" in efficiency["check_ids"]
+    assert "live_benchmark_permits" in efficiency["check_ids"]
+    assert "microbenchmark_contracts" in efficiency["check_ids"]
+    assert "replay_retry_idempotency" in efficiency["check_ids"]
+    assert efficiency["reference_metadata_included"] is False
+    assert efficiency["reference_code_imported"] is False
+    assert efficiency["reference_contents_included"] is False
+    assert efficiency["provider_called"] is False
+    assert efficiency["network_called"] is False
+    assert efficiency["adapter_execution_started"] is False
+    assert efficiency["filesystem_modified"] is False
+    assert efficiency["permission_granting"] is False
+    assert efficiency["artifact_bodies_read"] is False
+    synthesis = checks["orchestration_synthesis_release_gates"]["details"]
+    assert checks["orchestration_synthesis_release_gates"]["status"] == "pass"
+    assert synthesis["schema_version"] == "harness.orchestration_synthesis/v1"
+    assert synthesis["summary"]["status"] == "pass"
+    assert synthesis["summary"]["reference_status"] == "disabled"
+    assert synthesis["source_report_statuses"]["readiness"] == "pass"
+    assert synthesis["source_report_statuses"]["efficiency"] == "pass"
+    assert synthesis["source_report_statuses"]["microbenchmarks"] == "pass"
+    assert set(synthesis["adopted_reference_pattern_ids"]) >= {
+        "agent_runtime_and_tool_contracts",
+        "external_protocol_interoperability",
+        "durable_workflow_and_state_graph",
+        "observability_and_progress",
+        "policy_boundary_and_applyback",
+        "sandbox_and_low_level_isolation",
+    }
+    assert set(synthesis["deliberate_non_adoption_ids"]) >= {
+        "no_reference_source_import",
+        "no_ambient_tool_or_provider_execution",
+        "no_fail_open_remote_protocol_execution",
+        "no_hidden_applyback",
+        "no_release_blocking_live_benchmarks",
+    }
+    assert synthesis["security_complexity_posture"]["posture"] == "balanced"
+    assert synthesis["security_complexity_posture"]["live_benchmarks_release_blocking"] is False
+    assert synthesis["reference_metadata_included"] is False
+    assert synthesis["reference_code_imported"] is False
+    assert synthesis["reference_contents_included"] is False
+    assert synthesis["provider_called"] is False
+    assert synthesis["network_called"] is False
+    assert synthesis["adapter_execution_started"] is False
+    assert synthesis["filesystem_modified"] is False
+    assert synthesis["permission_granting"] is False
+    assert synthesis["artifact_bodies_read"] is False
+    assert synthesis["live_benchmark_execution_allowed"] is False
+    assert synthesis["mutation_allowed"] is False
+    assert synthesis["model_context_allowed"] is False
+    transcript_health = checks["session_transcript_health"]
+    assert transcript_health["status"] == "pass"
+    assert transcript_health["details"]["schema_version"] == "harness.session_transcript_health/v1"
+    assert transcript_health["details"]["malformed_session_count"] == 0
+    assert transcript_health["details"]["contents_included"] is False
+    assert transcript_health["details"]["filesystem_modified"] is False
+    assert transcript_health["details"]["permission_granting"] is False
     serialized = json.dumps(payload)
     assert "api_key" not in serialized
     assert "OPENAI_API_KEY" not in serialized
@@ -8771,7 +9428,293 @@ def test_cli_doctor_release_uninitialized_is_non_mutating_warning(tmp_path, monk
     assert checks["initialized"]["status"] == "warn"
     assert checks["config_loadable"]["status"] == "warn"
     assert checks["release_runtime_state"]["details"]["initialized"] is False
+    orchestration = checks["orchestration_readiness_release_gates"]["details"]
+    assert checks["orchestration_readiness_release_gates"]["status"] == "pass"
+    assert orchestration["initialized"] is False
+    assert "agentic_security_controls" in orchestration["check_ids"]
+    assert "agent_discovery_and_allocation" in orchestration["check_ids"]
+    assert "workflow_coordination_contracts" in orchestration["check_ids"]
+    assert "orchestration_scenario_conformance" in orchestration["check_ids"]
+    assert orchestration["reference_metadata_included"] is False
+    assert orchestration["provider_called"] is False
+    assert orchestration["filesystem_modified"] is False
+    assert orchestration["permission_granting"] is False
+    efficiency = checks["orchestration_efficiency_release_gates"]["details"]
+    assert checks["orchestration_efficiency_release_gates"]["status"] == "pass"
+    assert efficiency["schema_version"] == "harness.orchestration_efficiency/v1"
+    assert efficiency["summary"]["fail"] == 0
+    assert "evidence_trace_projection_cost" in efficiency["skipped_check_ids"]
+    assert efficiency["reference_metadata_included"] is False
+    assert efficiency["provider_called"] is False
+    assert efficiency["network_called"] is False
+    assert efficiency["adapter_execution_started"] is False
+    assert efficiency["filesystem_modified"] is False
+    assert efficiency["permission_granting"] is False
+    assert efficiency["artifact_bodies_read"] is False
+    synthesis = checks["orchestration_synthesis_release_gates"]["details"]
+    assert checks["orchestration_synthesis_release_gates"]["status"] == "pass"
+    assert synthesis["schema_version"] == "harness.orchestration_synthesis/v1"
+    assert synthesis["summary"]["reference_status"] == "disabled"
+    assert synthesis["reference_metadata_included"] is False
+    assert synthesis["provider_called"] is False
+    assert synthesis["network_called"] is False
+    assert synthesis["adapter_execution_started"] is False
+    assert synthesis["filesystem_modified"] is False
+    assert synthesis["permission_granting"] is False
+    assert synthesis["artifact_bodies_read"] is False
+    assert synthesis["mutation_allowed"] is False
+    assert synthesis["model_context_allowed"] is False
+    assert checks["session_transcript_health"]["status"] == "warn"
+    assert checks["session_transcript_health"]["details"]["schema_version"] == "harness.session_transcript_health/v1"
+    assert checks["session_transcript_health"]["details"]["initialized"] is False
+    assert checks["session_transcript_health"]["details"]["contents_included"] is False
+    assert checks["session_transcript_health"]["details"]["filesystem_modified"] is False
+    assert checks["session_transcript_health"]["details"]["permission_granting"] is False
     assert not (tmp_path / ".harness").exists()
+
+
+def test_cli_doctor_release_fails_on_malformed_session_transcript_without_exposing_body(
+    tmp_path, monkeypatch
+) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Malformed transcript")
+    append_session_event(
+        tmp_path,
+        session_id=session.id,
+        event_type=SessionEventKind.SESSION_STARTED,
+        message="Started",
+    )
+    transcript_path = tmp_path / ".harness" / "sessions" / session.id / "transcript.jsonl"
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("not json with secret sk-abcdefghijklmnopqrstuvwxyz\n")
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    result = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    checks = {check["id"]: check for check in payload["checks"]}
+    check = checks["session_transcript_health"]
+    assert check["status"] == "fail"
+    assert check["details"]["malformed_session_count"] == 1
+    malformed = check["details"]["malformed_sessions"][0]
+    assert malformed["session_id"] == session.id
+    assert malformed["parse_error_count"] == 1
+    assert malformed["validation_error_count"] == 0
+    assert check["details"]["contents_included"] is False
+    assert check["details"]["filesystem_modified"] is False
+    assert check["details"]["permission_granting"] is False
+    assert "not json" not in result.output
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in result.output
+    assert "Traceback" not in result.output
+
+
+def test_cli_doctor_release_fails_on_unsafe_extension_config_paths_without_loading_bodies(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    real_cache = tmp_path / "real-mcp-cache"
+    real_cache.mkdir()
+    real_cache.joinpath("guide.md").write_text("# Guide\n\nDo not read this MCP body.\n", encoding="utf-8")
+    (tmp_path / "mcp-cache").symlink_to(real_cache, target_is_directory=True)
+    real_skill = tmp_path / "real-skills" / "review"
+    real_skill.mkdir(parents=True)
+    real_skill.joinpath("SKILL.md").write_text("# Review\n\nDo not read this skill body.\n", encoding="utf-8")
+    (tmp_path / "skills-link").symlink_to(tmp_path / "real-skills", target_is_directory=True)
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["mcp"] = {
+        "enabled": True,
+        "servers": {
+            "docs": {
+                "kind": "local",
+                "enabled": True,
+                "command": ["mcp-docs", "--stdio"],
+                "resources": {
+                    "guide": {
+                        "uri": "mcp://docs/guide",
+                        "path": "mcp-cache/guide.md",
+                        "enabled": True,
+                    }
+                },
+            }
+        },
+    }
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {
+            "review": {
+                "enabled": True,
+                "path": "skills-link/review",
+                "spec": "./skills-link/review",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+
+    result = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    checks = {check["id"]: check for check in payload["checks"]}
+    extension_paths = checks["extension_config_path_safety"]
+    assert extension_paths["status"] == "fail"
+    assert extension_paths["message"] == "One or more configured extension paths contain unsafe symlink components."
+    details = extension_paths["details"]
+    assert details["schema_version"] == "harness.extension_config_path_safety/v1"
+    assert details["symlink_policy"] == "reject_configured_path_components"
+    assert details["unsafe_resource_count"] == 1
+    assert details["unsafe_skill_count"] == 1
+    assert details["unsafe_resources"][0]["server"] == "docs"
+    assert details["unsafe_resources"][0]["uri"] == "mcp://docs/guide"
+    assert details["unsafe_resources"][0]["path"] == "mcp-cache/guide.md"
+    assert details["unsafe_resources"][0]["path_safety"]["error_type"] == "path_security"
+    assert "Path contains symlink component: mcp-cache" in details["unsafe_resources"][0]["path_safety"]["message"]
+    assert details["unsafe_skills"][0]["name"] == "review"
+    assert details["unsafe_skills"][0]["path"] == "skills-link/review"
+    assert details["unsafe_skills"][0]["path_safety"]["error_type"] == "path_security"
+    assert "Path contains symlink component: skills-link" in details["unsafe_skills"][0]["path_safety"]["message"]
+    assert details["contents_included"] is False
+    assert details["skill_body_loaded"] is False
+    assert details["mcp_resource_body_loaded"] is False
+    assert details["runtime_loaded"] is False
+    assert details["process_started"] is False
+    assert details["network_called"] is False
+    assert details["filesystem_modified"] is False
+    assert details["permission_granting"] is False
+    serialized = json.dumps(payload)
+    assert "Do not read this MCP body" not in serialized
+    assert "Do not read this skill body" not in serialized
+
+
+def test_cli_doctor_release_warns_on_invalid_pending_action_without_clearing_it(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(
+        title="Invalid pending action",
+        metadata={
+            "pending_chat_action": {
+                "schema_version": "harness.pending_chat_action/v1",
+                "kind": "task_draft",
+            }
+        },
+    )
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+
+    result = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    checks = {check["id"]: check for check in payload["checks"]}
+    orchestration = checks["orchestration_readiness_release_gates"]
+    assert orchestration["status"] == "warn"
+    assert "agentic_security_controls" in orchestration["details"]["check_ids"]
+    assert "agent_discovery_and_allocation" in orchestration["details"]["check_ids"]
+    assert "workflow_coordination_contracts" in orchestration["details"]["check_ids"]
+    assert "orchestration_scenario_conformance" in orchestration["details"]["check_ids"]
+    assert orchestration["details"]["warning_check_ids"] == ["pending_chat_action_recovery"]
+    assert orchestration["details"]["summary"]["warning"] == 1
+    assert orchestration["details"]["provider_called"] is False
+    assert orchestration["details"]["network_called"] is False
+    assert orchestration["details"]["filesystem_modified"] is False
+    assert orchestration["details"]["permission_granting"] is False
+    synthesis = checks["orchestration_synthesis_release_gates"]
+    assert synthesis["status"] == "warn"
+    assert synthesis["details"]["source_report_statuses"]["readiness"] == "warning"
+    assert synthesis["details"]["warning_source_report_ids"] == ["readiness"]
+    assert synthesis["details"]["provider_called"] is False
+    assert synthesis["details"]["network_called"] is False
+    assert synthesis["details"]["filesystem_modified"] is False
+    assert synthesis["details"]["permission_granting"] is False
+    assert "pending_chat_action" in SQLiteStore(tmp_path).get_session(session.id).metadata
+    assert not SQLiteStore(tmp_path).list_tasks()
+
+
+def test_cli_doctor_release_warns_on_run_linked_objective_missing_jsonl_evidence(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    objective = store.create_objective("Run-linked objective")
+    run = store.create_run("Existing run evidence", "phase_1a_test", status="succeeded", objective_id=objective.id)
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+
+    result = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    checks = {check["id"]: check for check in payload["checks"]}
+    orchestration = checks["orchestration_readiness_release_gates"]
+    assert orchestration["status"] == "warn"
+    assert "agentic_security_controls" in orchestration["details"]["check_ids"]
+    assert "agent_discovery_and_allocation" in orchestration["details"]["check_ids"]
+    assert "workflow_coordination_contracts" in orchestration["details"]["check_ids"]
+    assert "orchestration_scenario_conformance" in orchestration["details"]["check_ids"]
+    assert orchestration["details"]["warning_check_ids"] == ["append_only_objective_evidence"]
+    assert orchestration["details"]["summary"]["warning"] == 1
+    assert orchestration["details"]["provider_called"] is False
+    assert orchestration["details"]["network_called"] is False
+    assert orchestration["details"]["filesystem_modified"] is False
+    assert orchestration["details"]["permission_granting"] is False
+    synthesis = checks["orchestration_synthesis_release_gates"]
+    assert synthesis["status"] == "warn"
+    assert synthesis["details"]["source_report_statuses"]["readiness"] == "warning"
+    assert synthesis["details"]["warning_source_report_ids"] == ["readiness"]
+    assert synthesis["details"]["provider_called"] is False
+    assert synthesis["details"]["network_called"] is False
+    assert synthesis["details"]["filesystem_modified"] is False
+    assert synthesis["details"]["permission_granting"] is False
+    assert store.get_run(run.id).objective_id == objective.id
+    assert not (tmp_path / ".harness" / "autonomy" / "objectives" / f"{objective.id}.jsonl").exists()
+
+
+def test_cli_doctor_repair_clears_only_stale_session_active_run_pointer(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Stale active run")
+    missing_run_id = "run_missing_for_repair"
+    with store.connect() as conn:
+        conn.execute("UPDATE sessions SET active_run_id = ? WHERE id = ?", (missing_run_id, session.id))
+    monkeypatch.setattr("harness.cli.main.shutil.which", lambda name: None)
+
+    before = runner.invoke(app, ["doctor", "--release", "--project", str(tmp_path), "--output", "json"])
+    assert before.exit_code == 0, before.output
+    before_checks = {check["id"]: check for check in json.loads(before.output)["checks"]}
+    before_projection = before_checks["session_status_projection"]
+    assert before_projection["status"] == "warn"
+    assert before_projection["details"]["stale_active_run_session_ids"] == [session.id]
+    assert before_projection["details"]["repair_attempted"] is False
+    assert SQLiteStore(tmp_path).get_session(session.id).active_run_id == missing_run_id
+
+    repaired = runner.invoke(app, ["doctor", "--release", "--repair", "--project", str(tmp_path), "--output", "json"])
+
+    assert repaired.exit_code == 0, repaired.output
+    payload = json.loads(repaired.output)
+    checks = {check["id"]: check for check in payload["checks"]}
+    projection = checks["session_status_projection"]
+    assert projection["status"] == "pass"
+    assert projection["details"]["repair_attempted"] is True
+    assert projection["details"]["repaired_session_ids"] == [session.id]
+    assert projection["details"]["stale_active_run_refs_before"] == [
+        {"session_id": session.id, "missing_run_id": missing_run_id}
+    ]
+    assert projection["details"]["stale_active_run_refs_after"] == []
+    assert projection["details"]["mutation_scope"] == "session_active_run_pointer_only"
+    assert projection["details"]["runs_deleted"] is False
+    assert projection["details"]["tasks_mutated"] is False
+    assert projection["details"]["artifacts_deleted"] is False
+    assert projection["details"]["messages_mutated"] is False
+    assert projection["details"]["events_deleted"] is False
+    assert projection["details"]["process_started"] is False
+    assert projection["details"]["provider_called"] is False
+    assert projection["details"]["network_called"] is False
+    assert projection["details"]["filesystem_modified"] is False
+    assert projection["details"]["permission_granting"] is False
+    repaired_store = SQLiteStore(tmp_path)
+    assert repaired_store.get_session(session.id).active_run_id is None
+    assert not repaired_store.list_runs()
+    assert not repaired_store.list_tasks()
+    events = repaired_store.list_session_store_events(session.id)
+    assert any(event.kind == "session.active_run_repaired" for event in events)
 
 
 def test_cli_policy_explain_supports_runtime_subjects_without_preflight_or_settings(tmp_path, monkeypatch) -> None:

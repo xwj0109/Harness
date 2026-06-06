@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -608,8 +609,8 @@ def test_chat_orchestrated_codex_flow_uses_registered_adapter_with_denied_apply_
         "repo_planning_completed",
         "codex_isolated_edit_completed_denied",
         "dry_run_no_tool_execution",
-        "dry_run_no_tool_execution",
-        "dry_run_no_tool_execution",
+        "review_gate_passed",
+        "review_gate_passed",
         "dry_run_no_tool_execution",
     ]
     assert (tmp_path / "app.py").read_bytes() == before
@@ -659,14 +660,28 @@ def test_codex_isolated_adapter_rejects_requires_hosted_boundary_metadata(tmp_pa
         task_types=["codex_code_edit"],
         duration_days=1,
     )
-    store.create_task(
+    task = store.create_task(
         title="Codex edit",
         metadata={
             "execution_adapter": "codex_isolated_edit",
             "task_type": "codex_code_edit",
-            "requires_hosted_boundary": True,
         },
     )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET metadata_json = ? WHERE id = ?",
+            (
+                json.dumps(
+                    {
+                        "execution_adapter": "codex_isolated_edit",
+                        "task_type": "codex_code_edit",
+                        "requires_hosted_boundary": True,
+                    },
+                    sort_keys=True,
+                ),
+                task.id,
+            ),
+        )
     leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
     assert leased is not None
 

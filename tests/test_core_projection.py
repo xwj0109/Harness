@@ -76,7 +76,7 @@ def test_core_blocked_repo_planning_projection_has_reasons_and_no_run_id(tmp_pat
     assert projection.lease_id == result.lease_id
     assert projection.adapter_id == "repo_planning"
     assert projection.task_type == "repo_planning"
-    assert projection.decision == "execution_adapter_rejected"
+    assert projection.decision == "approval_required"
     assert projection.policy_sha256
     assert any("hosted_provider_codex" in reason for reason in projection.blocked_reasons)
     assert any(command.startswith("harness core inspect-evidence --task ") for command in projection.next_commands)
@@ -100,11 +100,11 @@ def test_core_inspect_task_cli_inspects_blocked_repo_planning(tmp_path) -> None:
     assert payload["lease_id"] == result.lease_id
     assert payload["adapter_id"] == "repo_planning"
     assert payload["task_type"] == "repo_planning"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["policy_sha256"]
     assert any("hosted_provider_codex" in reason for reason in payload["blocked_reasons"])
     assert any(command.startswith("harness core inspect-task ") for command in payload["next_commands"])
-    assert any(command.startswith("harness daemon inspect-lease ") for command in payload["next_commands"])
+    assert not any(command.startswith("harness daemon inspect-lease ") for command in payload["next_commands"])
 
 
 def test_core_inspect_task_cli_inspects_blocked_codex_isolated_edit(tmp_path) -> None:
@@ -124,7 +124,7 @@ def test_core_inspect_task_cli_inspects_blocked_codex_isolated_edit(tmp_path) ->
     assert payload["lease_id"] == result.lease_id
     assert payload["adapter_id"] == "codex_isolated_edit"
     assert payload["task_type"] == "codex_code_edit"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert any("hosted_provider_codex" in reason for reason in payload["blocked_reasons"])
 
 
@@ -523,7 +523,7 @@ def test_core_evidence_bundle_blocked_repo_planning_by_task_id(tmp_path) -> None
     assert payload["run_id"] is None
     assert payload["task_id"] == result.task_id
     assert payload["mode"] == "repo_planning"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["run"] is None
     assert payload["task"]["task_id"] == result.task_id
     assert payload["blocked_state"]["task_id"] == result.task_id
@@ -548,7 +548,7 @@ def test_core_evidence_bundle_blocked_codex_isolated_edit_by_task_id(tmp_path) -
     assert payload["run_id"] is None
     assert payload["task_id"] == result.task_id
     assert payload["mode"] == "codex_isolated_edit"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["blocked_state"]["adapter_id"] == "codex_isolated_edit"
     assert any("hosted_provider_codex" in reason for reason in payload["blocked_state"]["blocked_reasons"])
 
@@ -918,7 +918,7 @@ def test_legacy_tasks_inspect_json_wraps_blocked_foreground_plan_task(tmp_path) 
     assert payload["task_id"] == routed_payload["task_id"]
     assert payload["run_id"] is None
     assert payload["mode"] == "repo_planning"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["task"]["id"] == routed_payload["task_id"]
     assert payload["core_evidence"]["schema_version"] == "harness.core_evidence_bundle_projection/v1"
     assert payload["core_evidence"]["task_id"] == routed_payload["task_id"]
@@ -946,7 +946,7 @@ def test_legacy_tasks_inspect_json_wraps_blocked_foreground_build_task(tmp_path)
     assert payload["task_id"] == routed_payload["task_id"]
     assert payload["run_id"] is None
     assert payload["mode"] == "codex_isolated_edit"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["core_evidence"]["blocked_state"]["adapter_id"] == "codex_isolated_edit"
     assert any("hosted_provider_codex" in reason for reason in payload["core_evidence"]["blocked_state"]["blocked_reasons"])
 

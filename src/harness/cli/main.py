@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -26,6 +26,13 @@ from typer.core import TyperGroup
 from harness.action_executors import execute_managed_action
 from harness.action_policy import decide_managed_action
 from harness.action_router import ManagedActionDecisionStatus, route_managed_action
+from harness.agent_contracts import build_agent_contract
+from harness.agent_discovery import (
+    build_agent_discovery_catalog,
+    evaluate_delegate_allocation,
+    summarize_agent_discovery,
+)
+from harness.agent_handoff import AGENT_HANDOFF_ENVELOPE_SCHEMA_VERSION, get_task_handoff_envelope
 from harness.agent_authoring import (
     AgentBundleError,
     load_agent_bundle,
@@ -84,7 +91,14 @@ from harness.codex_runner import (
 from harness.codex_direct_runner import CodexDirectAgentRunner, DirtyWorkspaceError
 from harness.codex_edit_runner import ActiveProjectModifiedError, ApplyBackDecision, CodexCodeEditRunner
 from harness.daemon_adapters import execute_read_only_summary_lease
-from harness.execution import execute_lease, list_execution_adapter_descriptors
+from harness.execution import (
+    REVIEW_GATE_EXECUTION_ADAPTER,
+    REVIEW_ROLE_BY_TASK_TYPE,
+    SECURITY_REVIEW_TASK_TYPE,
+    execute_lease,
+    list_execution_adapter_descriptors,
+)
+from harness.external_protocols import build_external_protocol_catalog, get_external_protocol_descriptor
 from harness.edit_runner import NativeEditRunner, PatchApprovalDecision
 from harness.evals import run_safety_smoke, run_security_check, run_security_layer_audit
 from harness.governance.applyback import load_applyback_request, write_applyback_evidence
@@ -100,6 +114,7 @@ from harness.governance.network import (
     write_network_policy_check,
     write_network_request_log,
 )
+from harness.governance.reference_repositories import build_reference_repositories_audit
 from harness.governance.tasks import (
     close_governance_task,
     create_governance_task,
@@ -153,6 +168,7 @@ from harness.memory.sqlite_store import (
     SCHEMA_MIGRATIONS,
     SESSION_SCHEMA_REPAIR_MESSAGE,
     SQLiteStore,
+    TASK_REPLAY_RECEIPT_SCHEMA_VERSION,
     is_missing_session_schema_error,
 )
 from harness.model_catalog import catalog_projection_evidence, list_model_catalog, list_provider_catalog, validate_model_selection
@@ -164,6 +180,7 @@ from harness.models import (
     KillSwitchTargetKind,
     MemoryScopeType,
     MemorySourceKind,
+    ObjectiveStatus,
     RedactionState,
     RunEventType,
     SessionPermissionBoundaryKind,
@@ -176,8 +193,32 @@ from harness.models import (
     SessionStatus,
     TaskStatus,
 )
-from harness.objective_runner import run_next_active_objective_autonomously, run_objective_autonomously
+from harness.objective_runner import (
+    run_next_active_objective_autonomously,
+    run_objective_autonomously,
+    run_objective_parallel,
+)
+from harness.objective_checkpoints import (
+    create_objective_checkpoint,
+    evaluate_objective_checkpoint_gate,
+    list_objective_checkpoints,
+    resolve_objective_checkpoint,
+    verify_objective_checkpoint_evidence,
+)
+from harness.objective_evidence import verify_objective_evidence
+from harness.objective_evidence_reconciliation import reconcile_objective_evidence
+from harness.orchestration_efficiency import run_orchestration_efficiency_audit, run_orchestration_microbenchmarks
+from harness.orchestration_readiness import run_orchestration_readiness_audit, summarize_orchestration_readiness
+from harness.orchestration_replay import run_orchestration_replay_audit
+from harness.orchestration_scenarios import build_orchestration_scenario_catalog, summarize_orchestration_scenarios
+from harness.orchestration_synthesis import run_orchestration_synthesis
+from harness.orchestration_workflows import build_workflow_coordination_catalog, summarize_workflow_coordination
 from harness.paths import resolve_project_root
+from harness.pending_chat_actions import (
+    PENDING_CHAT_ACTION_METADATA_KEY,
+    clear_pending_chat_action_metadata,
+    pending_chat_action_audit,
+)
 from harness.policy import (
     backend_descriptor_sha256,
     effective_policy_sha256,
@@ -188,6 +229,7 @@ from harness.policy import (
 )
 from harness.procedure_renderer import render_procedure_event
 from harness.progress import build_orchestration_progress
+from harness.schema_contracts import build_schema_contract_catalog, get_schema_contract_descriptor
 from harness.registry import builtin_spec_registry
 from harness.sandbox import CommandValidationError, DockerImageManager
 from harness.sandbox_profiles import build_sandbox_profile_catalog, get_sandbox_profile
@@ -197,7 +239,9 @@ from harness.session_events import (
     SessionEventKind,
     append_session_event,
     read_session_events,
+    read_session_events_with_diagnostics,
     render_session_event,
+    session_events_read_health_payload,
     session_transcript_path,
 )
 from harness.session_timeline import (
@@ -229,7 +273,7 @@ from harness.spec_loader import (
 )
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tool_capabilities import get_tool_capability, list_tool_capabilities
-from harness.traces import export_run_trace, to_otel_json
+from harness.traces import export_objective_trace, export_run_trace, to_otel_json
 from harness.tui_assets import TUI_HOME_IMAGE_SCHEMA_VERSION, TuiHomeImageError, set_tui_home_image
 from harness.tui import build_tui_settings_catalog, normalize_tui_preferences
 from harness.workspace_catalog import build_workspace_catalog, build_workspace_clients_projection, workspace_action_unsupported
@@ -283,6 +327,9 @@ actions_app = typer.Typer(help="Self-managed local action routing and execution.
 runs_app = typer.Typer(help="Run listing and live event tailing.", invoke_without_command=True)
 tools_app = typer.Typer(help="Harness tool capability descriptors.")
 capabilities_app = typer.Typer(help="Read-only Harness capability catalog.")
+protocols_app = typer.Typer(help="Read-only external protocol compatibility catalog.")
+schemas_app = typer.Typer(help="Read-only orchestration schema compatibility catalog.")
+handoffs_app = typer.Typer(help="Read-only typed agent handoff envelopes.")
 sandbox_app = typer.Typer(help="Read-only sandbox profile descriptors.")
 controls_app = typer.Typer(help="Local runtime execution controls.")
 core_app = typer.Typer(help="Minimal headless core loop.")
@@ -292,6 +339,7 @@ evals_app = typer.Typer(help="Local evidence-only eval suites.")
 security_app = typer.Typer(help="Local metadata-only security detections.")
 integrity_app = typer.Typer(help="Local package and evidence integrity checks.")
 traces_app = typer.Typer(help="Local run trace export.")
+orchestration_app = typer.Typer(help="Read-only orchestration readiness and state diagnostics.")
 governance_app = typer.Typer(help="Governance authority, gates, and evidence.")
 governance_tasks_app = typer.Typer(help="Governed task branch and worktree records.")
 governance_context_app = typer.Typer(help="Governance context pack evidence.")
@@ -302,6 +350,7 @@ autonomy_app = typer.Typer(help="Autonomy policy profiles and decisions.")
 autonomy_policy_app = typer.Typer(help="Autonomy policy profile inspection.")
 daemon_app = typer.Typer(help="Local daemon control-plane scheduler.")
 objectives_app = typer.Typer(help="Manual persistent objective records.")
+objective_checkpoints_app = typer.Typer(help="Objective supervision checkpoints.")
 tasks_app = typer.Typer(help="Manual persistent task queue.")
 agents_app = typer.Typer(help="Declarative custom agent authoring.")
 quickstart_app = typer.Typer(help="Guided command composition without hidden execution.")
@@ -337,6 +386,9 @@ app.add_typer(actions_app, name="actions")
 app.add_typer(runs_app, name="runs")
 app.add_typer(tools_app, name="tools")
 app.add_typer(capabilities_app, name="capabilities")
+app.add_typer(protocols_app, name="protocols")
+app.add_typer(schemas_app, name="schemas")
+app.add_typer(handoffs_app, name="handoffs")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(controls_app, name="controls")
 app.add_typer(core_app, name="core")
@@ -346,10 +398,12 @@ app.add_typer(evals_app, name="evals")
 app.add_typer(security_app, name="security")
 app.add_typer(integrity_app, name="integrity")
 app.add_typer(traces_app, name="traces")
+app.add_typer(orchestration_app, name="orchestration")
 app.add_typer(governance_app, name="governance")
 app.add_typer(autonomy_app, name="autonomy")
 app.add_typer(daemon_app, name="daemon")
 app.add_typer(objectives_app, name="objectives")
+objectives_app.add_typer(objective_checkpoints_app, name="checkpoints")
 app.add_typer(tasks_app, name="tasks")
 app.add_typer(agents_app, name="agents")
 app.add_typer(quickstart_app, name="quickstart")
@@ -1285,6 +1339,7 @@ def objectives_add(
     description: Annotated[str, typer.Option("--description", help="Objective description.")] = "",
     workbench: Annotated[str | None, typer.Option("--workbench", help="Built-in workbench id.")] = None,
     priority: Annotated[int, typer.Option("--priority", help="Higher priority objectives list first.")] = 0,
+    draft: Annotated[bool, typer.Option("--draft", help="Create objective in created/draft state; start before dispatch.")] = False,
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
@@ -1298,6 +1353,7 @@ def objectives_add(
             priority=priority,
             workbench_id=workbench,
             metadata={},
+            status=ObjectiveStatus.CREATED if draft else ObjectiveStatus.ACTIVE,
         )
     except (KeyError, ValueError) as exc:
         _emit_objective_error("harness.objective/v1", str(exc).strip("'"), output)
@@ -1360,23 +1416,260 @@ def objectives_inspect(
     _print_objective(objective)
 
 
+@objectives_app.command("start")
+def objectives_start(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Start rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        objective = store.get_objective(objective_id)
+        if objective.status != ObjectiveStatus.CREATED:
+            raise ValueError(f"Objective start requires created status: {objective.status.value}")
+        objective = store.update_objective_status(
+            objective_id,
+            ObjectiveStatus.ACTIVE,
+            reason=reason,
+            actor=actor,
+            metadata={"source": "cli"},
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective_lifecycle/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.objective_lifecycle/v1",
+        "ok": True,
+        "objective": objective.model_dump(mode="json"),
+        "operator_authority": {
+            "filesystem_modified": False,
+            "execution_allowed": False,
+            "provider_called": False,
+            "network_called": False,
+            "permission_granting": False,
+            "future_authority_granted": False,
+        },
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Started objective {objective.id}: {objective.status.value}")
+    _print_kv("Reason", reason or "none")
+    _print_kv("Actor", actor)
+
+
+@objectives_app.command("complete")
+def objectives_complete(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Completion rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _objective_lifecycle_cli(
+        objective_id,
+        status=ObjectiveStatus.COMPLETED,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objectives_app.command("cancel")
+def objectives_cancel(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Cancellation rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _objective_lifecycle_cli(
+        objective_id,
+        status=ObjectiveStatus.CANCELLED,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objectives_app.command("suspend")
+def objectives_suspend(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Suspension rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _objective_lifecycle_cli(
+        objective_id,
+        status=ObjectiveStatus.SUSPENDED,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objectives_app.command("resume")
+def objectives_resume(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Resume rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _objective_lifecycle_cli(
+        objective_id,
+        status=ObjectiveStatus.ACTIVE,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objectives_app.command("timeout")
+def objectives_timeout(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Timeout rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _objective_lifecycle_cli(
+        objective_id,
+        status=ObjectiveStatus.TIMED_OUT,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objectives_app.command("retry")
+def objectives_retry(
+    objective_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Retry rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Lifecycle actor identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        objective, retried_tasks = SQLiteStore(project_root).retry_objective(
+            objective_id,
+            reason=reason,
+            actor=actor,
+            metadata={"source": "cli"},
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective_retry/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.objective_retry/v1",
+        "ok": True,
+        "objective": objective.model_dump(mode="json"),
+        "retried_tasks": [task.model_dump(mode="json") for task in retried_tasks],
+        "retried_task_ids": [task.id for task in retried_tasks],
+        "retried_task_count": len(retried_tasks),
+        "operator_authority": {
+            "filesystem_modified": False,
+            "execution_allowed": False,
+            "provider_called": False,
+            "network_called": False,
+            "permission_granting": False,
+            "future_authority_granted": False,
+        },
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Retried objective {objective.id}: {objective.status.value}")
+    _print_kv("Retried tasks", str(len(retried_tasks)))
+    _print_kv("Reason", reason or "none")
+    _print_kv("Actor", actor)
+
+
+def _objective_lifecycle_cli(
+    objective_id: str,
+    *,
+    status: ObjectiveStatus,
+    reason: str,
+    actor: str,
+    project: Path,
+    output: OutputFormat,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        objective = SQLiteStore(project_root).update_objective_status(
+            objective_id,
+            status,
+            reason=reason,
+            actor=actor,
+            metadata={"source": "cli"},
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective_lifecycle/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.objective_lifecycle/v1",
+        "ok": True,
+        "objective": objective.model_dump(mode="json"),
+        "operator_authority": {
+            "filesystem_modified": False,
+            "execution_allowed": False,
+            "provider_called": False,
+            "network_called": False,
+            "permission_granting": False,
+            "future_authority_granted": False,
+        },
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Updated objective {objective.id}: {objective.status.value}")
+    _print_kv("Reason", reason or "none")
+    _print_kv("Actor", actor)
+
+
 @objectives_app.command("run")
 def objectives_run(
     objective_id: str,
     project: ProjectOption = Path("."),
     autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id.")] = "safe-local",
     max_steps: Annotated[int | None, typer.Option("--max-steps", help="Maximum adapter dispatches for this run.")] = None,
+    max_parallel: Annotated[int, typer.Option("--max-parallel", help="Maximum ready tasks to dispatch concurrently.")] = 1,
+    timeout_seconds: Annotated[int | None, typer.Option("--timeout-seconds", help="Maximum wall-clock seconds before the objective run times out.")] = None,
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     try:
-        result = run_objective_autonomously(
-            project_root,
-            objective_id,
-            autonomy_profile_id=autonomy,
-            max_steps=max_steps,
-        )
+        if max_parallel > 1:
+            result = run_objective_parallel(
+                project_root,
+                objective_id,
+                autonomy_profile_id=autonomy,
+                max_steps=max_steps,
+                max_parallel=max_parallel,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            result = run_objective_autonomously(
+                project_root,
+                objective_id,
+                autonomy_profile_id=autonomy,
+                max_steps=max_steps,
+                timeout_seconds=timeout_seconds,
+            )
     except (KeyError, ValueError) as exc:
         _emit_objective_error("harness.autonomous_objective_run/v1", str(exc).strip("'"), output)
         raise typer.Exit(code=1) from exc
@@ -1387,6 +1680,9 @@ def objectives_run(
     _print_kv("Objective", result.objective_id)
     _print_kv("Profile", result.autonomy_profile_id)
     _print_kv("Stop reason", result.stop_reason)
+    _print_kv("Scheduler", result.scheduler_mode)
+    _print_kv("Batches", result.batches)
+    _print_kv("Max parallel", result.max_parallel)
     _print_kv("Adapter dispatches", result.adapter_dispatches)
     _print_kv("Evidence", str(result.evidence_path))
     for step in result.step_results:
@@ -1394,6 +1690,277 @@ def objectives_run(
             f"Step {step.step}: task={step.task_id or 'none'} "
             f"adapter={step.adapter_id or 'none'} decision={step.decision_status or step.execution_decision or 'none'}"
         )
+
+
+@objectives_app.command("verify-evidence")
+def objectives_verify_evidence(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    result = verify_objective_evidence(project_root, objective_id)
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+    else:
+        typer.echo("Objective Evidence Verification")
+        _print_kv("Objective", result.objective_id)
+        _print_kv("Overall", "pass" if result.ok else "fail")
+        _print_kv("Evidence", str(result.evidence_path))
+        checks_by_id = {check.id: check for check in result.checks}
+        event_hash_chain = checks_by_id.get("event_hash_chain")
+        if event_hash_chain is not None:
+            _print_kv("Events", event_hash_chain.evidence.get("event_count", "unknown"))
+            _print_kv("Evidence head sha256", event_hash_chain.evidence.get("head_sha256") or "none")
+        for label, check_id in (
+            ("Event payload schema", "event_payload_schema"),
+            ("Event identity", "event_identity"),
+            ("Event hash chain", "event_hash_chain"),
+            ("Event timestamps", "event_timestamps"),
+        ):
+            check = checks_by_id.get(check_id)
+            if check is not None:
+                _print_kv(label, "pass" if check.status == "pass" else "fail")
+        for check in result.checks:
+            typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@objectives_app.command("reconcile-evidence")
+def objectives_reconcile_evidence(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    dry_run: Annotated[bool, typer.Option("--dry-run", help="Preview reconciliation without writing objective evidence.")] = False,
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        result = reconcile_objective_evidence(project_root, objective_id, actor="cli", dry_run=dry_run)
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective_evidence_reconciliation/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+    else:
+        typer.echo("Objective Evidence Reconciliation")
+        _print_kv("Objective", result.objective_id)
+        _print_kv("Status", result.status)
+        _print_kv("Evidence", str(result.evidence_path))
+        _print_kv("Runs", len(result.run_ids))
+        _print_kv("Events", result.events_written)
+        _print_kv("Filesystem modified", result.filesystem_modified)
+        if result.verification_ok is not None:
+            _print_kv("Verification", "pass" if result.verification_ok else "fail")
+        _print_kv("Message", result.message)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@objective_checkpoints_app.command("create")
+def objectives_checkpoints_create(
+    objective_id: str,
+    label: Annotated[str, typer.Option("--label", help="Checkpoint label.")],
+    reason: Annotated[str, typer.Option("--reason", help="Why the checkpoint is required.")] = "",
+    optional: Annotated[bool, typer.Option("--optional", help="Do not block objective dispatch while pending.")] = False,
+    actor: Annotated[str, typer.Option("--actor", help="Checkpoint creator identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        checkpoint = create_objective_checkpoint(
+            project_root,
+            objective_id,
+            label=label,
+            reason=reason,
+            required=not optional,
+            actor=actor,
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective_checkpoint_result/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.objective_checkpoint_result/v1",
+        "ok": True,
+        "checkpoint": checkpoint.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Created objective checkpoint {checkpoint.checkpoint_id}")
+    _print_kv("Objective", checkpoint.objective_id)
+    _print_kv("Label", checkpoint.label)
+    _print_kv("Required", checkpoint.required)
+    _print_kv("Status", checkpoint.status)
+
+
+@objective_checkpoints_app.command("list")
+def objectives_checkpoints_list(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        projection = list_objective_checkpoints(project_root, objective_id)
+    except KeyError as exc:
+        _emit_objective_error("harness.objective_checkpoints/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(projection.model_dump(mode="json"))
+        return
+    typer.echo("Objective Checkpoints")
+    _print_kv("Objective", projection.objective_id)
+    _print_kv("Checkpoints", len(projection.checkpoints))
+    if not projection.checkpoints:
+        return
+    _print_tsv(["checkpoint_id", "status", "required", "label"])
+    for checkpoint in projection.checkpoints:
+        _print_tsv_row([checkpoint.checkpoint_id, checkpoint.status, checkpoint.required, checkpoint.label])
+
+
+@objective_checkpoints_app.command("verify")
+def objectives_checkpoints_verify(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        verification = verify_objective_checkpoint_evidence(project_root, objective_id)
+    except KeyError as exc:
+        _emit_objective_error("harness.objective_checkpoint_evidence_verification/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(verification.model_dump(mode="json"))
+    else:
+        typer.echo("Objective Checkpoint Evidence")
+        _print_kv("Objective", verification.objective_id)
+        _print_kv("Status", "pass" if verification.ok else "fail")
+        _print_kv("Evidence", str(verification.evidence_path))
+        _print_kv("Checks", f"{verification.summary.get('pass', 0)} passed, {verification.summary.get('fail', 0)} failed")
+        _print_tsv(["check_id", "status", "message"])
+        for check in verification.checks:
+            _print_tsv_row([check.id, check.status, check.message])
+    if not verification.ok:
+        raise typer.Exit(code=1)
+
+
+@objective_checkpoints_app.command("approve")
+def objectives_checkpoints_approve(
+    objective_id: str,
+    checkpoint_id: str,
+    approval_id: Annotated[str, typer.Option("--approval-id", help="Approval evidence id.")],
+    reason: Annotated[str, typer.Option("--reason", help="Approval rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Resolver identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _resolve_objective_checkpoint_cli(
+        objective_id,
+        checkpoint_id,
+        verdict="approved",
+        approval_id=approval_id,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objective_checkpoints_app.command("reject")
+def objectives_checkpoints_reject(
+    objective_id: str,
+    checkpoint_id: str,
+    reason: Annotated[str, typer.Option("--reason", help="Rejection rationale.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Resolver identity.")] = "operator",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    _resolve_objective_checkpoint_cli(
+        objective_id,
+        checkpoint_id,
+        verdict="rejected",
+        approval_id=None,
+        reason=reason,
+        actor=actor,
+        project=project,
+        output=output,
+    )
+
+
+@objective_checkpoints_app.command("gate")
+def objectives_checkpoints_gate(
+    objective_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        gate = evaluate_objective_checkpoint_gate(project_root, objective_id)
+    except KeyError as exc:
+        _emit_objective_error("harness.objective_checkpoint_gate/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(gate.model_dump(mode="json"))
+    else:
+        typer.echo("Objective Checkpoint Gate")
+        _print_kv("Objective", gate.objective_id)
+        _print_kv("Status", gate.status)
+        _print_kv("Required checkpoints", gate.required_checkpoint_count)
+        _print_kv("Pending", ", ".join(gate.pending_checkpoint_ids) if gate.pending_checkpoint_ids else "none")
+        _print_kv("Rejected", ", ".join(gate.rejected_checkpoint_ids) if gate.rejected_checkpoint_ids else "none")
+        if gate.reasons:
+            _print_kv("Reasons", "; ".join(gate.reasons))
+    if not gate.ok:
+        raise typer.Exit(code=1)
+
+
+def _resolve_objective_checkpoint_cli(
+    objective_id: str,
+    checkpoint_id: str,
+    *,
+    verdict: Literal["approved", "rejected"],
+    approval_id: str | None,
+    reason: str,
+    actor: str,
+    project: Path,
+    output: OutputFormat,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    try:
+        checkpoint = resolve_objective_checkpoint(
+            project_root,
+            objective_id,
+            checkpoint_id,
+            verdict=verdict,
+            approval_id=approval_id,
+            reason=reason,
+            actor=actor,
+        )
+    except (KeyError, ValueError) as exc:
+        _emit_objective_error("harness.objective_checkpoint_result/v1", str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    payload = {
+        "schema_version": "harness.objective_checkpoint_result/v1",
+        "ok": True,
+        "checkpoint": checkpoint.model_dump(mode="json"),
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    typer.echo(f"Resolved objective checkpoint {checkpoint.checkpoint_id}")
+    _print_kv("Objective", checkpoint.objective_id)
+    _print_kv("Status", checkpoint.status)
+    _print_kv("Approval", checkpoint.approval_id or "none")
 
 
 @tasks_app.command("add")
@@ -1419,6 +1986,19 @@ def tasks_add(
         str | None,
         typer.Option("--task-type", help="Execution task type metadata."),
     ] = None,
+    workflow_stage: Annotated[str | None, typer.Option("--workflow-stage", help="Workflow stage metadata.")] = None,
+    review_role: Annotated[
+        str | None,
+        typer.Option("--review-role", help="Review-gate reviewer role metadata; defaults from --task-type."),
+    ] = None,
+    review_target_stage: Annotated[
+        str | None,
+        typer.Option("--review-target-stage", help="Workflow stage being reviewed by a review_gate task."),
+    ] = None,
+    blocks_apply_back: Annotated[
+        bool,
+        typer.Option("--blocks-apply-back", help="Mark a review_gate task as blocking apply-back."),
+    ] = False,
     priority: Annotated[int, typer.Option("--priority", help="Higher priority tasks run first.")] = 0,
     project: ProjectOption = Path("."),
     output: OutputOption = OutputFormat.TEXT,
@@ -1426,15 +2006,23 @@ def tasks_add(
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     try:
-        spec_source_kind, spec_source_path = _validate_task_spec_refs(project_root, workbench, agent)
-        metadata = _execution_task_metadata(execution_adapter, task_type)
+        metadata = _execution_task_metadata(
+            execution_adapter,
+            task_type,
+            workflow_stage=workflow_stage,
+            review_role=review_role,
+            review_target_stage=review_target_stage,
+            blocks_apply_back=blocks_apply_back,
+        )
+        agent_id = agent or _default_agent_for_execution_metadata(metadata)
+        spec_source_kind, spec_source_path = _validate_task_spec_refs(project_root, workbench, agent_id)
         task = SQLiteStore(project_root).create_task(
             title=title,
             description=description,
             priority=priority,
             objective_id=objective,
             workbench_id=workbench,
-            agent_id=agent,
+            agent_id=agent_id,
             spec_source_kind=spec_source_kind,
             spec_source_path=spec_source_path,
             depends_on=depends_on,
@@ -1512,8 +2100,10 @@ def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: Outp
     project_root = resolve_project_root(project)
     if output == OutputFormat.JSON:
         try:
+            store = SQLiteStore(project_root)
             projection = build_core_evidence_bundle(project_root, task_id=task_id)
-            task = SQLiteStore(project_root).get_task(task_id)
+            task = store.get_task(task_id)
+            replay_receipts = _task_replay_receipt_projection(store, task.id)
             payload = {
                 "schema_version": "harness.tasks_inspect/v2",
                 "ok": projection.ok,
@@ -1527,6 +2117,7 @@ def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: Outp
                 "errors": projection.errors,
                 "next_commands": projection.next_commands,
                 "task": sanitize_for_logging(task.model_dump(mode="json")),
+                "replay_receipts": replay_receipts,
                 "core_evidence": projection.model_dump(mode="json"),
             }
             _emit_json(payload)
@@ -1534,7 +2125,8 @@ def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: Outp
         except ValueError as exc:
             message = str(exc).strip("'")
             try:
-                task = SQLiteStore(project_root).get_task(task_id)
+                store = SQLiteStore(project_root)
+                task = store.get_task(task_id)
             except KeyError as task_exc:
                 message = str(task_exc).strip("'")
                 _emit_json(
@@ -1562,6 +2154,7 @@ def tasks_inspect(task_id: str, project: ProjectOption = Path("."), output: Outp
                     "errors": [],
                     "next_commands": [],
                     "task": sanitize_for_logging(task.model_dump(mode="json")),
+                    "replay_receipts": _task_replay_receipt_projection(store, task.id),
                     "core_evidence": None,
                     "core_evidence_error": message,
                 }
@@ -1716,23 +2309,30 @@ def tasks_retry(task_id: str, project: ProjectOption = Path("."), output: Output
 def tasks_run_next(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    selection = SQLiteStore(project_root).select_next_task_for_lease()
+    selection, pause_reasons = SQLiteStore(project_root).select_next_guarded_task_for_lease()
     task = selection["task"] if selection is not None else None
     attempt = selection["attempt"] if selection is not None else None
     lease = selection["lease"] if selection is not None else None
+    decision = "leased_task" if selection is not None else "paused" if pause_reasons else "no_eligible_task"
     if output == OutputFormat.JSON:
         _emit_json(
             {
                 "schema_version": "harness.task_run_next/v1",
                 "ok": True,
+                "decision": decision,
                 "selected_task": task.model_dump(mode="json") if task is not None else None,
                 "attempt": attempt.model_dump(mode="json") if attempt is not None else None,
                 "lease": lease.model_dump(mode="json") if lease is not None else None,
+                "pause_reasons": pause_reasons,
             }
         )
         return
     if task is None:
-        typer.echo("No runnable ready task.")
+        if pause_reasons:
+            reason = pause_reasons[0]
+            typer.echo(f"No task leased: {reason.get('decision', 'paused')} ({reason.get('reason', 'paused')})")
+        else:
+            typer.echo("No runnable ready task.")
     else:
         typer.echo(f"Leased task {task.id}")
 
@@ -2237,6 +2837,121 @@ def agents_inspect(
     _print_kv("Content SHA256", record.content_sha256)
 
 
+@agents_app.command("contract")
+def agents_contract(
+    agent_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    contract = build_agent_contract(project_root, agent_id)
+    if output == OutputFormat.JSON:
+        _emit_json(contract.model_dump(mode="json"))
+    else:
+        _print_agent_contract(contract)
+    if not contract.ok:
+        raise typer.Exit(code=1)
+
+
+@agents_app.command("discover")
+def agents_discover(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    workbench: Annotated[str | None, typer.Option("--workbench", help="Optional workbench id filter.")] = None,
+) -> None:
+    project_root = resolve_project_root(project)
+    catalog = build_agent_discovery_catalog(project_root, workbench_id=workbench)
+    if output == OutputFormat.JSON:
+        _emit_json(catalog.model_dump(mode="json"))
+    else:
+        summary = summarize_agent_discovery(catalog)
+        typer.echo("Harness agent discovery catalog: read-only")
+        typer.echo(f"Overall: {'pass' if catalog.ok else 'fail'}")
+        _print_kv("Status", summary["status"])
+        _print_kv("Workbench", workbench or "all")
+        _print_kv("Initialized", catalog.initialized)
+        _print_kv("Agent execution started", catalog.safety.get("agent_execution_started"))
+        _print_kv("Provider called", catalog.safety.get("provider_called"))
+        _print_kv("Permission granting", catalog.safety.get("permission_granting"))
+        for card in catalog.cards:
+            typer.echo(f"{card.status}\t{card.agent_id}\t{card.kind or 'unknown'}\t{','.join(card.workbench_ids)}")
+    if not catalog.ok:
+        raise typer.Exit(code=1)
+
+
+@agents_app.command("allocate")
+def agents_allocate(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    workbench: Annotated[str | None, typer.Option("--workbench", help="Optional workbench id filter.")] = None,
+    task_type: Annotated[str | None, typer.Option("--task-type", help="Optional task type hint.")] = None,
+    required_kind: Annotated[
+        str | None,
+        typer.Option("--required-kind", help="Required agent kind: orchestrator, group, specialist, or reviewer."),
+    ] = None,
+    required_tool_policy: Annotated[
+        str | None,
+        typer.Option("--required-tool-policy", help="Required tool policy id."),
+    ] = None,
+    required_output: Annotated[
+        list[str] | None,
+        typer.Option("--required-output", help="Required output contract or artifact label."),
+    ] = None,
+    required_tag: Annotated[list[str] | None, typer.Option("--required-tag", help="Required agent tag.")] = None,
+    required_knowledge: Annotated[
+        list[str] | None,
+        typer.Option("--required-knowledge", help="Required knowledge-domain label."),
+    ] = None,
+    required_review: Annotated[
+        list[str] | None,
+        typer.Option("--required-review", help="Required review-responsibility label."),
+    ] = None,
+    required_forbidden_action: Annotated[
+        list[str] | None,
+        typer.Option("--required-forbidden-action", help="Forbidden action the agent profile must explicitly preserve."),
+    ] = None,
+    exclude_agent: Annotated[list[str] | None, typer.Option("--exclude-agent", help="Agent id to exclude.")] = None,
+    max_candidates: Annotated[int, typer.Option("--max-candidates", help="Maximum selected candidates.")] = 3,
+) -> None:
+    project_root = resolve_project_root(project)
+    if required_kind not in {None, "orchestrator", "group", "specialist", "reviewer"}:
+        _emit_agent_authoring_error(
+            "harness.delegate_allocation/v1",
+            f"Unsupported required kind: {required_kind}",
+            output,
+        )
+        raise typer.Exit(code=1)
+    allocation = evaluate_delegate_allocation(
+        project_root,
+        workbench_id=workbench,
+        task_type=task_type,
+        required_kind=required_kind,  # type: ignore[arg-type]
+        required_tool_policy_id=required_tool_policy,
+        required_outputs=required_output,
+        required_tags=required_tag,
+        required_knowledge_domains=required_knowledge,
+        required_review_responsibilities=required_review,
+        required_forbidden_actions=required_forbidden_action,
+        excluded_agent_ids=exclude_agent,
+        max_candidates=max_candidates,
+    )
+    if output == OutputFormat.JSON:
+        _emit_json(allocation.model_dump(mode="json"))
+    else:
+        typer.echo("Harness delegate allocation: read-only")
+        typer.echo(f"Overall: {'pass' if allocation.ok else 'fail'}")
+        _print_kv("Announcement", allocation.announcement.announcement_id)
+        _print_kv("Selected", ", ".join(allocation.selected_agent_ids) if allocation.selected_agent_ids else "none")
+        _print_kv("Agent execution started", allocation.safety.get("agent_execution_started"))
+        _print_kv("Provider called", allocation.safety.get("provider_called"))
+        _print_kv("Permission granting", allocation.safety.get("permission_granting"))
+        for bid in allocation.bids:
+            reason = ",".join(bid.rejected_reasons) if bid.rejected_reasons else "eligible"
+            typer.echo(f"{bid.status}\t{bid.agent_id}\tscore={bid.score}\t{reason}")
+    if not allocation.ok:
+        raise typer.Exit(code=1)
+
+
 @agents_app.command("preview-imported")
 def agents_preview_imported(
     agent_id: str,
@@ -2582,6 +3297,48 @@ def governance_data_audit(
     typer.echo(f"Mutation allowed: {proposal['mutation_allowed']}")
 
 
+@governance_app.command("references-audit")
+def governance_references_audit(
+    root: Annotated[
+        Path | None,
+        typer.Option(
+            "--root",
+            help="Reference repository root. Defaults to a sibling <project>-references directory.",
+        ),
+    ] = None,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    audit = build_reference_repositories_audit(project_root, reference_root=root)
+    payload = audit.to_dict()
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    summary = payload["summary"]
+    authority = payload["authority"]
+    typer.echo("Harness reference repositories audit: read-only")
+    typer.echo(f"Schema: {payload['schema_version']}")
+    typer.echo(f"Reference root: {payload['reference_root']}")
+    typer.echo(f"Repositories: {summary['repository_count']}")
+    typer.echo(f"Expected curated repositories: {summary['expected_repository_count']}")
+    typer.echo(f"Missing expected repositories: {summary['missing_expected_repository_count']}")
+    typer.echo(f"Required reference patterns: {summary['required_reference_pattern_count']}")
+    typer.echo(f"Covered reference patterns: {summary['covered_reference_pattern_count']}")
+    typer.echo(f"Missing required patterns: {summary['missing_required_reference_pattern_count']}")
+    typer.echo(f"Dirty repositories: {summary['dirty_repository_count']}")
+    typer.echo(f"LFS repositories: {summary['lfs_repository_count']}")
+    typer.echo(f"LFS materialized files: {summary['lfs_materialized_file_count']}")
+    typer.echo(f"LFS unmaterialized files: {summary['lfs_unmaterialized_file_count']}")
+    typer.echo(f"Missing .git directories: {summary['missing_git_count']}")
+    typer.echo(f"Contents included: {authority['contents_included']}")
+    typer.echo(f"Model context allowed: {authority['model_context_allowed']}")
+    typer.echo(f"Execution allowed: {authority['execution_allowed']}")
+    typer.echo(f"Mutation allowed: {authority['mutation_allowed']}")
+    if payload["warnings"]:
+        typer.echo(f"Warnings: {', '.join(payload['warnings'])}")
+
+
 @governance_applyback_app.command("validate")
 def governance_applyback_validate(
     input_path: Annotated[Path, typer.Option("--input", help="Path to an apply-back request JSON object.")],
@@ -2840,6 +3597,10 @@ def sessions_list(
         )
 
 
+def _session_transcript_health_payload(result) -> dict:
+    return session_events_read_health_payload(result)
+
+
 @sessions_app.command("inspect")
 def sessions_inspect(
     session_id: str,
@@ -2855,7 +3616,8 @@ def sessions_inspect(
         _emit_session_error(str(exc).strip("'"), output)
         raise typer.Exit(code=1) from exc
     transcript = session_transcript_path(project_root, session.id)
-    events = read_session_events(project_root, session.id)
+    transcript_read = read_session_events_with_diagnostics(project_root, session.id)
+    events = transcript_read.events
     latest_ui_activation = _latest_session_ui_activation(store, session.id)
     model_validation = _session_model_validation(load_config(project_root), session)
     payload = {
@@ -2864,6 +3626,7 @@ def sessions_inspect(
         "session": session.model_dump(mode="json"),
         "transcript_path": str(transcript),
         "event_count": len(events),
+        "transcript_health": _session_transcript_health_payload(transcript_read),
         "latest_ui_activation": latest_ui_activation,
         "model_validation": model_validation,
         "next_actions": _session_next_actions(session),
@@ -2879,6 +3642,12 @@ def sessions_inspect(
     _print_kv("Task", session.active_task_id or "none")
     _print_kv("Run", session.active_run_id or "none")
     _print_kv("Transcript", transcript)
+    if not transcript_read.ok:
+        _print_kv(
+            "Transcript health",
+            f"malformed ({len(transcript_read.parse_errors)} parse errors, "
+            f"{len(transcript_read.validation_errors)} validation errors)",
+        )
     if model_validation:
         _print_kv("Model", model_validation["raw_model_ref"] or "default")
         _print_kv("Model executable", model_validation["executable"])
@@ -2933,6 +3702,7 @@ def sessions_status(
     children = store.list_child_sessions(session.id)
     latest_ui_activation = _latest_session_ui_activation(store, session.id)
     model_validation = _session_model_validation(load_config(project_root), session)
+    pending_action_audit = _session_pending_action_audit(store, session)
     payload = {
         "schema_version": "harness.session_status/v1",
         "ok": True,
@@ -2953,6 +3723,7 @@ def sessions_status(
         "event_count": len(events),
         "latest_ui_activation": latest_ui_activation,
         "model_validation": model_validation,
+        "pending_action_audit": pending_action_audit,
         "child_session_ids": [child.id for child in children],
         "terminal": session.status
         in {SessionStatus.COMPLETED, SessionStatus.FAILED, SessionStatus.CANCELLED, SessionStatus.ARCHIVED},
@@ -2988,7 +3759,93 @@ def sessions_status(
                 f"authority={latest_ui_activation['authority_granting']}"
             ),
         )
+    if pending_action_audit["present"]:
+        _print_kv("Pending action metadata", pending_action_audit["status"])
+        if pending_action_audit.get("cleanup_command"):
+            _print_kv("Pending action cleanup", pending_action_audit["cleanup_command"])
     _print_kv("Children", ",".join(payload["child_session_ids"]) if payload["child_session_ids"] else "none")
+
+
+@sessions_app.command("pending-action")
+def sessions_pending_action(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        session = store.get_session(session_id)
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    audit = _session_pending_action_audit(store, session)
+    payload = {
+        "schema_version": "harness.session_pending_action/v1",
+        "ok": True,
+        "session_id": session.id,
+        "pending_action_audit": audit,
+        "execution_started": False,
+        "permission_granting": False,
+    }
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    _print_kv("Session id", session.id)
+    _print_kv("Pending action metadata", audit["status"])
+    if audit.get("pending_action"):
+        _print_kv("Pending action", audit["pending_action"]["label"])
+        _print_kv("Next", " or ".join(audit["pending_action"]["next_commands"]))
+    for issue in audit.get("issues") or []:
+        _print_kv("Issue", f"{issue.get('code')}: {issue.get('message')}")
+    if audit.get("cleanup_command"):
+        _print_kv("Cleanup", audit["cleanup_command"])
+
+
+@sessions_app.command("clear-pending-action")
+def sessions_clear_pending_action(
+    session_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    store = SQLiteStore(project_root)
+    try:
+        payload = clear_pending_chat_action_metadata(store, session_id, actor="cli")
+    except KeyError as exc:
+        _emit_session_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    status_before = payload["audit_before"]["status"]
+    if payload["cleared"]:
+        typer.echo(f"Cleared pending chat action metadata for {session_id} (was {status_before}).")
+    else:
+        typer.echo(f"No pending chat action metadata found for {session_id}.")
+
+
+def _session_pending_action_audit(store: SQLiteStore, session) -> dict:
+    return pending_chat_action_audit(
+        session.metadata,
+        session_id=session.id,
+        lease_status=_session_pending_action_lease_status(store, session.metadata),
+    )
+
+
+def _session_pending_action_lease_status(store: SQLiteStore, metadata: dict | None) -> str | None:
+    raw = (metadata or {}).get(PENDING_CHAT_ACTION_METADATA_KEY)
+    if not isinstance(raw, dict) or raw.get("kind") != "execute_lease":
+        return None
+    lease_id = raw.get("lease_id")
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        return None
+    try:
+        return store.get_task_lease(lease_id).status.value
+    except KeyError:
+        return "missing"
 
 
 @sessions_app.command("model")
@@ -4063,18 +4920,25 @@ def resume(session_id: str, project: ProjectOption = Path("."), output: OutputOp
     except KeyError as exc:
         _emit_session_error(str(exc).strip("'"), output)
         raise typer.Exit(code=1) from exc
-    events = read_session_events(project_root, session.id)
+    transcript_read = read_session_events_with_diagnostics(project_root, session.id)
+    events = transcript_read.events
     payload = {
         "schema_version": "harness.session_resume/v1",
         "ok": True,
         "session": session.model_dump(mode="json"),
         "events": [event.model_dump(mode="json") for event in events],
+        "transcript_health": _session_transcript_health_payload(transcript_read),
         "next_actions": _session_next_actions(session),
     }
     if output == OutputFormat.JSON:
         _emit_json(payload)
         return
     typer.echo(f"Resumed session {session.id}")
+    if not transcript_read.ok:
+        typer.echo(
+            "Transcript health: malformed "
+            f"({len(transcript_read.parse_errors)} parse errors, {len(transcript_read.validation_errors)} validation errors)"
+        )
     for event in events[-20:]:
         typer.echo(render_session_event(event))
     typer.echo("Next:")
@@ -4533,6 +5397,224 @@ def capabilities_inspect(
     _print_section("Equivalent Commands")
     for command in capability.equivalent_commands:
         typer.echo(command)
+
+
+@protocols_app.command("list")
+def protocols_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    catalog = build_external_protocol_catalog(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(catalog.model_dump(mode="json"))
+        return
+    _print_tsv(["protocol_id", "protocol", "status", "runtime", "default_visible"])
+    for protocol in catalog.protocols:
+        _print_tsv_row(
+            [
+                protocol.id,
+                protocol.protocol,
+                protocol.status,
+                str(protocol.runtime_enabled),
+                str(protocol.default_model_visible),
+            ]
+        )
+
+
+@protocols_app.command("inspect")
+def protocols_inspect(
+    protocol_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        protocol = get_external_protocol_descriptor(project_root, protocol_id)
+    except KeyError as exc:
+        payload = {
+            "schema_version": "harness.external_protocol_catalog/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "errors": [str(exc).strip("'")],
+            "safety": {
+                "read_only": True,
+                "process_started": False,
+                "network_called": False,
+                "tool_execution_started": False,
+                "agent_execution_started": False,
+                "filesystem_modified": False,
+                "credential_accessed": False,
+                "permission_granting": False,
+                "model_context_allowed": False,
+            },
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(payload["errors"][0])
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = protocol.model_dump(mode="json")
+        payload.update({"ok": True, "project_root": str(project_root)})
+        _emit_json(payload)
+        return
+    _print_section("External Protocol")
+    _print_kv("Protocol id", protocol.id)
+    _print_kv("Protocol", protocol.protocol)
+    _print_kv("Status", protocol.status)
+    _print_kv("Boundary", protocol.boundary_kind)
+    _print_kv("Runtime enabled", str(protocol.runtime_enabled))
+    _print_kv("Default model visible", str(protocol.default_model_visible))
+    _print_section("Authority")
+    for key, value in protocol.authority.model_dump(mode="json").items():
+        if key != "schema_version":
+            _print_kv(key, str(value))
+    if protocol.blocked_reasons:
+        _print_section("Blocked")
+        for reason in protocol.blocked_reasons:
+            typer.echo(f"- {reason}")
+    if protocol.next_actions:
+        _print_section("Next Actions")
+        for action in protocol.next_actions:
+            typer.echo(action)
+
+
+@schemas_app.command("list")
+def schemas_list(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    catalog = build_schema_contract_catalog(project_root)
+    if output == OutputFormat.JSON:
+        _emit_json(catalog.model_dump(mode="json"))
+        return
+    _print_tsv(["schema_id", "surface", "stability", "policy", "version"])
+    for schema in catalog.schemas:
+        _print_tsv_row(
+            [
+                schema.id,
+                schema.surface,
+                schema.stability,
+                schema.compatibility_policy,
+                schema.current_schema_version,
+            ]
+        )
+
+
+@schemas_app.command("inspect")
+def schemas_inspect(
+    schema_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        schema = get_schema_contract_descriptor(project_root, schema_id)
+    except KeyError as exc:
+        payload = {
+            "schema_version": "harness.schema_contract_catalog/v1",
+            "ok": False,
+            "project_root": str(project_root),
+            "errors": [str(exc).strip("'")],
+            "safety": {
+                "read_only": True,
+                "schema_validation_only": True,
+                "process_started": False,
+                "network_called": False,
+                "tool_execution_started": False,
+                "agent_execution_started": False,
+                "filesystem_modified": False,
+                "credential_accessed": False,
+                "permission_granting": False,
+                "model_context_allowed": False,
+                "artifact_bodies_read": False,
+            },
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(payload["errors"][0])
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        payload = schema.model_dump(mode="json")
+        payload.update({"ok": True, "project_root": str(project_root)})
+        _emit_json(payload)
+        return
+    _print_section("Schema Contract")
+    _print_kv("Schema id", schema.id)
+    _print_kv("Version", schema.current_schema_version)
+    _print_kv("Surface", schema.surface)
+    _print_kv("Stability", schema.stability)
+    _print_kv("Compatibility", schema.compatibility_policy)
+    _print_kv("Owner", schema.owner)
+    _print_section("Authority")
+    for key, value in schema.authority.model_dump(mode="json").items():
+        if key != "schema_version":
+            _print_kv(key, str(value))
+    if schema.validation_surfaces:
+        _print_section("Validation")
+        for surface in schema.validation_surfaces:
+            typer.echo(f"- {surface}")
+    if schema.upgrade_notes:
+        _print_section("Upgrade Notes")
+        for note in schema.upgrade_notes:
+            typer.echo(f"- {note}")
+
+
+@handoffs_app.command("inspect-task")
+def handoffs_inspect_task(
+    task_id: str,
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    try:
+        envelope = get_task_handoff_envelope(project_root, task_id)
+    except (KeyError, sqlite3.Error) as exc:
+        payload = {
+            "schema_version": AGENT_HANDOFF_ENVELOPE_SCHEMA_VERSION,
+            "ok": False,
+            "project_root": str(project_root),
+            "task_id": task_id,
+            "errors": [str(exc).strip("'")],
+            "safety": {
+                "read_only": True,
+                "adapter_execution_started": False,
+                "process_started": False,
+                "network_called": False,
+                "tool_execution_started": False,
+                "agent_execution_started": False,
+                "filesystem_modified": False,
+                "credential_accessed": False,
+                "permission_granting": False,
+                "model_context_allowed": False,
+                "artifact_bodies_read": False,
+            },
+        }
+        if output == OutputFormat.JSON:
+            _emit_json(payload)
+        else:
+            typer.echo(payload["errors"][0])
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(envelope.model_dump(mode="json"))
+        return
+    _print_section("Agent Handoff")
+    _print_kv("Envelope id", envelope.envelope_id)
+    _print_kv("Task id", envelope.task_id)
+    _print_kv("Status", "ok" if envelope.ok else "invalid")
+    _print_kv("Adapter", envelope.execution_adapter or "none")
+    _print_kv("Task type", envelope.task_type or "none")
+    _print_kv("Agent", envelope.agent_id or "none")
+    _print_kv("Agent contract", envelope.agent_contract.contract_id)
+    _print_kv("Agent contract OK", envelope.agent_contract.ok)
+    _print_kv("Agent contract SHA256", envelope.agent_contract.contract_sha256)
+    _print_kv("Traceparent", envelope.trace_context.traceparent)
+    _print_kv("Payload sha256", envelope.integrity.payload_sha256)
+    _print_section("Authority")
+    for key, value in envelope.authority.model_dump(mode="json").items():
+        if key != "schema_version":
+            _print_kv(key, str(value))
+    if envelope.validation_errors:
+        _print_section("Validation")
+        for error in envelope.validation_errors:
+            typer.echo(f"- {error}")
 
 
 @controls_app.command("list")
@@ -5090,12 +6172,42 @@ def progress(
         _print_kv("Blocked reasons", "; ".join(payload.blocked_reasons))
     if payload.untrusted_context_warnings:
         _print_kv("Context warnings", ", ".join(payload.untrusted_context_warnings))
+    if payload.checkpoints:
+        checkpoints = payload.checkpoints
+        _print_kv("Checkpoint gate", checkpoints.get("status") or "unknown")
+        _print_kv("Required checkpoints", checkpoints.get("required_checkpoint_count", 0))
+        pending = checkpoints.get("pending_checkpoint_ids") or []
+        rejected = checkpoints.get("rejected_checkpoint_ids") or []
+        if pending:
+            _print_kv("Pending checkpoints", ", ".join(pending))
+        if rejected:
+            _print_kv("Rejected checkpoints", ", ".join(rejected))
+    if payload.objective_evidence:
+        evidence = payload.objective_evidence
+        _print_kv("Objective evidence", "pass" if evidence.get("ok") else "fail")
+        if evidence.get("event_count") is not None:
+            _print_kv("Evidence events", evidence.get("event_count"))
+        event_type_counts = evidence.get("event_type_counts") or {}
+        if isinstance(event_type_counts, dict) and event_type_counts:
+            rendered_counts = ", ".join(f"{key}={value}" for key, value in sorted(event_type_counts.items()))
+            _print_kv("Evidence event types", rendered_counts)
+        lease_guard_stop = evidence.get("last_lease_guard_stop") or {}
+        if isinstance(lease_guard_stop, dict) and lease_guard_stop:
+            stop_reason = lease_guard_stop.get("stop_reason") or "unknown"
+            adapter_id = lease_guard_stop.get("adapter_id") or "unknown"
+            _print_kv("Lease guard stop", f"{stop_reason} | adapter={adapter_id}")
+        if evidence.get("head_sha256"):
+            _print_kv("Evidence head sha256", evidence.get("head_sha256"))
     _print_section("Tasks")
     if not payload.tasks:
         typer.echo("No tasks for this objective.")
         return
     _print_tsv(["task_id", "status", "title", "adapter", "lease", "run", "blocked", "next"])
     for task in payload.tasks:
+        blocked = "; ".join(task.blocked_reasons)
+        if task.blocked_state_explanations:
+            code = task.blocked_state_explanations[0].code.value
+            blocked = f"{code}: {blocked}" if blocked else code
         _print_tsv_row(
             [
                 task.task_id,
@@ -5104,7 +6216,7 @@ def progress(
                 task.execution_adapter or "",
                 task.lease_id or "",
                 task.run_id or "",
-                "; ".join(task.blocked_reasons),
+                blocked,
                 task.next_action or "",
             ]
         )
@@ -5226,6 +6338,48 @@ def evals_run(
         if not result.ok:
             raise typer.Exit(code=1)
         return
+    if suite == "orchestration-readiness":
+        result = run_orchestration_readiness_audit(project_root)
+        _emit_orchestration_readiness_audit_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "orchestration-efficiency":
+        result = run_orchestration_efficiency_audit(project_root)
+        _emit_orchestration_efficiency_audit_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "orchestration-microbenchmarks":
+        result = run_orchestration_microbenchmarks(project_root)
+        _emit_orchestration_microbenchmark_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "orchestration-replay":
+        result = run_orchestration_replay_audit(project_root)
+        _emit_orchestration_replay_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "orchestration-workflows":
+        result = build_workflow_coordination_catalog(project_root)
+        _emit_workflow_coordination_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "orchestration-scenarios":
+        result = build_orchestration_scenario_catalog(project_root)
+        _emit_orchestration_scenario_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
+    if suite == "orchestration-synthesis":
+        result = run_orchestration_synthesis(project_root)
+        _emit_orchestration_synthesis_result(result, output)
+        if not result.ok:
+            raise typer.Exit(code=1)
+        return
     _require_initialized(project_root)
     if suite == "safety-smoke":
         result = run_safety_smoke(project_root, load_config(project_root), SQLiteStore(project_root))
@@ -5291,6 +6445,222 @@ def _emit_security_layer_audit_result(result, output: OutputFormat) -> None:
         typer.echo(f"{check.status}\t{check.id}\t{check.message}")
 
 
+@orchestration_app.command("audit")
+def orchestration_audit(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    reference_root: Annotated[
+        Path | None,
+        typer.Option("--reference-root", help="Reference repository root. Defaults to sibling <project>-references."),
+    ] = None,
+    include_references: Annotated[
+        bool,
+        typer.Option(
+            "--include-references/--no-references",
+            help="Inspect local reference repository metadata without reading source bodies.",
+        ),
+    ] = True,
+) -> None:
+    project_root = resolve_project_root(project)
+    result = run_orchestration_readiness_audit(
+        project_root,
+        reference_root=reference_root,
+        include_references=include_references,
+    )
+    _emit_orchestration_readiness_audit_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@orchestration_app.command("replay")
+def orchestration_replay(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = run_orchestration_replay_audit(project_root)
+    _emit_orchestration_replay_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@orchestration_app.command("workflows")
+def orchestration_workflows(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = build_workflow_coordination_catalog(project_root)
+    _emit_workflow_coordination_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+@orchestration_app.command("scenarios")
+def orchestration_scenarios(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
+    project_root = resolve_project_root(project)
+    result = build_orchestration_scenario_catalog(project_root)
+    _emit_orchestration_scenario_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _emit_orchestration_readiness_audit_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Harness orchestration readiness audit: read-only")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Initialized", result.initialized)
+    _print_kv("Reference root", result.reference_root or "none")
+    _print_kv("Reference contents included", result.safety.get("reference_contents_included"))
+    _print_kv("Reference code imported", result.safety.get("reference_code_imported"))
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    for check in result.checks:
+        typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+
+
+def _emit_orchestration_replay_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Harness orchestration replay audit: read-only")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Initialized", result.initialized)
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Artifact bodies read", result.safety.get("artifact_bodies_read"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    for case in result.cases:
+        issue_codes = ",".join(case.detected_issue_codes) if case.detected_issue_codes else "none"
+        typer.echo(f"{case.status}\t{case.id}\tevents={case.event_count}\tissues={issue_codes}")
+
+
+def _emit_workflow_coordination_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    summary = summarize_workflow_coordination(result)
+    typer.echo("Harness workflow coordination catalog: read-only")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Status", summary["status"])
+    _print_kv("Initialized", result.initialized)
+    _print_kv("Reference code imported", result.safety.get("reference_code_imported"))
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    for pattern in result.patterns:
+        typer.echo(f"{pattern.status}\t{pattern.id}\t{pattern.execution_mode}")
+
+
+def _emit_orchestration_scenario_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    summary = summarize_orchestration_scenarios(result)
+    typer.echo("Harness orchestration scenario catalog: read-only")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Status", summary["status"])
+    _print_kv("Initialized", result.initialized)
+    _print_kv("Reference code imported", result.safety.get("reference_code_imported"))
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    _print_kv("Live benchmark execution allowed", result.safety.get("live_benchmark_execution_allowed"))
+    for case in result.cases:
+        signals = ",".join(case.detected_signals) if case.detected_signals else "none"
+        typer.echo(f"{case.status}\t{case.id}\t{case.layer}\tsignals={signals}")
+
+
+@orchestration_app.command("synthesis")
+def orchestration_synthesis(
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+    reference_root: Annotated[
+        Path | None,
+        typer.Option("--reference-root", help="Reference repository root. Defaults to sibling <project>-references."),
+    ] = None,
+    include_references: Annotated[
+        bool,
+        typer.Option(
+            "--include-references/--no-references",
+            help="Include local reference repository metadata without reading source bodies.",
+        ),
+    ] = True,
+) -> None:
+    project_root = resolve_project_root(project)
+    result = run_orchestration_synthesis(
+        project_root,
+        reference_root=reference_root,
+        include_references=include_references,
+    )
+    _emit_orchestration_synthesis_result(result, output)
+    if not result.ok:
+        raise typer.Exit(code=1)
+
+
+def _emit_orchestration_synthesis_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    summary = result.summary
+    posture = result.security_complexity_posture
+    typer.echo("Harness orchestration synthesis: read-only")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Posture", posture.get("posture"))
+    _print_kv("Readiness", summary.get("readiness_status"))
+    _print_kv("Efficiency", summary.get("efficiency_status"))
+    _print_kv("Microbenchmarks", summary.get("microbenchmark_status"))
+    _print_kv("References", summary.get("reference_status"))
+    _print_kv("Reference root", result.reference_root or "none")
+    _print_kv("Reference code imported", result.safety.get("reference_code_imported"))
+    _print_kv("Reference contents included", result.safety.get("reference_contents_included"))
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    for row in result.adopted_reference_patterns:
+        typer.echo(f"{row.get('status')}\t{row.get('pattern')}\t{row.get('decision')}")
+
+
+def _emit_orchestration_efficiency_audit_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Suite: orchestration-efficiency")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    for check in result.checks:
+        typer.echo(f"{check.status}\t{check.id}\t{check.message}")
+
+
+def _emit_orchestration_microbenchmark_result(result, output: OutputFormat) -> None:
+    if output == OutputFormat.JSON:
+        _emit_json(result.model_dump(mode="json"))
+        return
+    typer.echo("Suite: orchestration-microbenchmarks")
+    typer.echo(f"Overall: {'pass' if result.ok else 'fail'}")
+    _print_kv("Provider called", result.safety.get("provider_called"))
+    _print_kv("Network called", result.safety.get("network_called"))
+    _print_kv("Adapter execution started", result.safety.get("adapter_execution_started"))
+    _print_kv("Filesystem modified", result.safety.get("filesystem_modified"))
+    _print_kv("Permission granting", result.safety.get("permission_granting"))
+    _print_kv("Artifact bodies read", result.safety.get("artifact_bodies_read"))
+    for benchmark in result.benchmarks:
+        mean_ns = benchmark.measurements.get("mean_duration_ns")
+        suffix = f"\tmean_ns={mean_ns}" if mean_ns is not None else ""
+        typer.echo(f"{benchmark.status}\t{benchmark.id}\t{benchmark.message}{suffix}")
+
+
 @integrity_app.command("check")
 def integrity_check(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
@@ -5337,6 +6707,60 @@ def traces_export(
     typer.echo(f"Spans: {span_count}")
 
 
+@traces_app.command("export-objective")
+def traces_export_objective(
+    objective_id: str,
+    format: TraceFormatOption = "otel-json",
+    project: ProjectOption = Path("."),
+    output: OutputOption = OutputFormat.TEXT,
+) -> None:
+    project_root = resolve_project_root(project)
+    _require_initialized(project_root)
+    if format != "otel-json":
+        _emit_trace_error(f"Unsupported trace format: {format}", output)
+        raise typer.Exit(code=1)
+    try:
+        payload = to_otel_json(export_objective_trace(project_root, SQLiteStore(project_root), objective_id))
+    except (KeyError, ValueError) as exc:
+        _emit_trace_error(str(exc).strip("'"), output)
+        raise typer.Exit(code=1) from exc
+    if output == OutputFormat.JSON:
+        _emit_json(payload)
+        return
+    span_count = sum(len(scope["spans"]) for resource in payload["resourceSpans"] for scope in resource["scopeSpans"])
+    typer.echo(f"Trace: {payload['trace_id']}")
+    typer.echo(f"Objective: {payload['objective_id']}")
+    typer.echo(f"Objective runs: {len(payload.get('objective_run_ids', []))}")
+    root_attributes = _trace_span_attributes(payload, "harness.objective")
+    if root_attributes:
+        evidence_ok = root_attributes.get("objective.evidence_verification_ok")
+        hash_chain_ok = root_attributes.get("objective.evidence_hash_chain_ok")
+        typer.echo(f"Evidence verification: {_pass_fail_label(evidence_ok)}")
+        typer.echo(f"Evidence hash chain: {_pass_fail_label(hash_chain_ok)}")
+        head_sha256 = root_attributes.get("objective.evidence_head_sha256")
+        if head_sha256:
+            typer.echo(f"Evidence head sha256: {head_sha256}")
+    typer.echo(f"Format: {payload['format']}")
+    typer.echo(f"Spans: {span_count}")
+
+
+def _trace_span_attributes(payload: dict, span_name: str) -> dict[str, object]:
+    for resource in payload.get("resourceSpans", []):
+        for scope in resource.get("scopeSpans", []):
+            for span in scope.get("spans", []):
+                if span.get("name") == span_name:
+                    return {
+                        attribute.get("key"): attribute.get("value")
+                        for attribute in span.get("attributes", [])
+                        if isinstance(attribute, dict) and attribute.get("key")
+                    }
+    return {}
+
+
+def _pass_fail_label(value: object) -> str:
+    return "pass" if value is True else "fail"
+
+
 @daemon_app.command("run-once")
 def daemon_run_once(project: ProjectOption = Path("."), output: OutputOption = OutputFormat.TEXT) -> None:
     project_root = resolve_project_root(project)
@@ -5363,6 +6787,8 @@ def daemon_run_autonomous(
     project: ProjectOption = Path("."),
     autonomy: Annotated[str, typer.Option("--autonomy", help="Autonomy profile id.")] = "daemon-safe",
     max_steps: Annotated[int | None, typer.Option("--max-steps", help="Maximum adapter dispatches for this run.")] = None,
+    max_parallel: Annotated[int, typer.Option("--max-parallel", help="Maximum ready tasks to dispatch concurrently.")] = 1,
+    timeout_seconds: Annotated[int | None, typer.Option("--timeout-seconds", help="Maximum wall-clock seconds before the objective run times out.")] = None,
     output: OutputOption = OutputFormat.TEXT,
 ) -> None:
     project_root = resolve_project_root(project)
@@ -5372,6 +6798,8 @@ def daemon_run_autonomous(
             project_root,
             autonomy_profile_id=autonomy,
             max_steps=max_steps,
+            max_parallel=max_parallel,
+            timeout_seconds=timeout_seconds,
             owner=_daemon_owner(),
         )
     except (KeyError, ValueError) as exc:
@@ -5398,6 +6826,9 @@ def daemon_run_autonomous(
     _print_kv("Objective", result.objective_id)
     _print_kv("Profile", result.autonomy_profile_id)
     _print_kv("Stop reason", result.stop_reason)
+    _print_kv("Scheduler", result.scheduler_mode)
+    _print_kv("Batches", result.batches)
+    _print_kv("Max parallel", result.max_parallel)
     _print_kv("Adapter dispatches", result.adapter_dispatches)
     _print_kv("Evidence", str(result.evidence_path))
 
@@ -5516,8 +6947,8 @@ def daemon_execute(
 ) -> None:
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
-    owner = _daemon_owner()
     try:
+        owner = SQLiteStore(project_root).get_task_lease(lease_id).owner
         result = execute_lease(project_root, lease_id, owner=owner)
     except (KeyError, ValueError) as exc:
         _emit_daemon_error("harness.daemon_execute/v1", str(exc).strip("'"), output)
@@ -6449,7 +7880,7 @@ def mcp_resources(project: ProjectOption = Path("."), output: OutputOption = Out
     project_root = resolve_project_root(project)
     _require_initialized(project_root)
     cfg = load_config(project_root)
-    payload = _mcp_resources_projection(cfg)
+    payload = _mcp_resources_projection(project_root, cfg)
     if output == OutputFormat.JSON:
         _emit_json(payload)
         return
@@ -9362,6 +10793,47 @@ def _print_agent_spec(agent) -> None:
     typer.echo(f"Tags: {', '.join(agent.tags) if agent.tags else 'none'}")
 
 
+def _print_agent_contract(contract) -> None:
+    _print_section("Agent Contract")
+    _print_kv("Schema", contract.schema_version)
+    _print_kv("OK", contract.ok)
+    _print_kv("Contract id", contract.contract_id)
+    _print_kv("Contract SHA256", contract.contract_sha256)
+    _print_kv("Agent", contract.agent_id)
+    _print_kv("Source", contract.source_kind)
+    _print_kv("Workbench", contract.workbench_id or "none")
+    _print_kv("Kind", contract.kind or "unknown")
+    _print_kv("Role", contract.role or "unknown")
+    _print_kv("Parent chain", ", ".join(contract.parent_chain) if contract.parent_chain else "none")
+    _print_section("Policy")
+    _print_kv("Model profile", contract.model_profile or "unknown")
+    _print_kv("Model profile kind", contract.model_profile_kind or "unknown")
+    _print_kv("Backend", contract.backend_id or "unknown")
+    _print_kv("Tool policy", contract.tool_policy_id or "unknown")
+    _print_kv("Allowed tools", ", ".join(contract.tool_policy.allowed_tool_ids) if contract.tool_policy.allowed_tool_ids else "none")
+    _print_kv(
+        "Approval tools",
+        ", ".join(contract.tool_policy.approval_required_tool_ids) if contract.tool_policy.approval_required_tool_ids else "none",
+    )
+    _print_kv("Network", contract.tool_policy.network or "unknown")
+    _print_kv("Active repo write", contract.tool_policy.active_repo_write or "unknown")
+    _print_kv("Hosted boundary", contract.tool_policy.hosted_boundary or "unknown")
+    _print_kv("Memory scope", contract.memory_scope or "unknown")
+    _print_section("Contracts")
+    _print_kv("Inputs", ", ".join(contract.input_contracts) if contract.input_contracts else "none")
+    _print_kv("Outputs", ", ".join(contract.output_contracts) if contract.output_contracts else "none")
+    _print_kv("Trace required", contract.trace_policy.trace_required)
+    _print_kv("Budget source", contract.budget_policy.budget_source)
+    _print_section("Authority")
+    _print_kv("Execution allowed", contract.authority.agent_execution_allowed)
+    _print_kv("Tool execution allowed", contract.authority.tool_execution_allowed)
+    _print_kv("Permission granting", contract.authority.permission_granting)
+    if contract.validation_errors:
+        _print_section("Errors")
+        for error in contract.validation_errors:
+            typer.echo(f"- {error}")
+
+
 def _print_workbench_spec(workbench) -> None:
     typer.echo(f"Workbench: {workbench.id}")
     typer.echo(f"Description: {workbench.description}")
@@ -9372,6 +10844,127 @@ def _print_workbench_spec(workbench) -> None:
         f"{', '.join(f'{key}={value.value}' for key, value in workbench.approval_policy.items()) if workbench.approval_policy else 'none'}"
     )
     typer.echo(f"Forbidden actions: {', '.join(workbench.forbidden_actions) if workbench.forbidden_actions else 'none'}")
+
+
+def _task_replay_receipt_projection(store: SQLiteStore, task_id: str) -> dict[str, Any]:
+    attempts = store.list_task_attempts(task_id)
+    transitions = store.list_task_transitions(task_id)
+    attempt_receipts: list[dict[str, Any]] = []
+    transition_receipts: list[dict[str, Any]] = []
+    gaps: list[str] = []
+    legacy_missing_receipt_count = 0
+
+    for attempt in attempts:
+        receipt = attempt.metadata.get("replay_receipt") if isinstance(attempt.metadata, dict) else None
+        if not isinstance(receipt, dict):
+            legacy_missing_receipt_count += 1
+            continue
+        receipt_gaps = _task_replay_receipt_gaps(
+            receipt,
+            task_id=task_id,
+            receipt_kind="attempt_replay_guard",
+            attempt_number=attempt.attempt_number,
+            attempt_idempotency_key=attempt.metadata.get("attempt_idempotency_key"),
+        )
+        gaps.extend(f"attempt:{attempt.id}:{gap}" for gap in receipt_gaps)
+        attempt_receipts.append(
+            {
+                "attempt_id": attempt.id,
+                "attempt_number": attempt.attempt_number,
+                "attempt_status": attempt.status.value,
+                "receipt_valid": not receipt_gaps,
+                "receipt": sanitize_for_logging(receipt),
+            }
+        )
+
+    for transition in transitions:
+        receipt = transition.metadata.get("replay_receipt") if isinstance(transition.metadata, dict) else None
+        if not isinstance(receipt, dict):
+            continue
+        receipt_gaps = _task_replay_receipt_gaps(
+            receipt,
+            task_id=task_id,
+            receipt_kind="retry_authorization",
+            from_status=transition.from_status.value if transition.from_status is not None else None,
+            to_status=transition.to_status.value,
+        )
+        gaps.extend(f"transition:{transition.id}:{gap}" for gap in receipt_gaps)
+        transition_receipts.append(
+            {
+                "transition_id": transition.id,
+                "reason": transition.reason,
+                "from_status": transition.from_status.value if transition.from_status is not None else None,
+                "to_status": transition.to_status.value,
+                "receipt_valid": not receipt_gaps,
+                "receipt": sanitize_for_logging(receipt),
+            }
+        )
+
+    return {
+        "schema_version": "harness.task_replay_receipts_projection/v1",
+        "ok": not gaps,
+        "task_replay_receipt_schema_version": TASK_REPLAY_RECEIPT_SCHEMA_VERSION,
+        "task_id": task_id,
+        "attempt_count": len(attempts),
+        "attempt_receipt_count": len(attempt_receipts),
+        "retry_transition_receipt_count": len(transition_receipts),
+        "legacy_missing_receipt_count": legacy_missing_receipt_count,
+        "attempt_receipts": attempt_receipts,
+        "transition_receipts": transition_receipts,
+        "gaps": gaps,
+        "safety": {
+            "read_only": True,
+            "metadata_only": True,
+            "adapter_execution_started": False,
+            "process_started": False,
+            "network_called": False,
+            "provider_called": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+            "artifact_bodies_read": False,
+        },
+    }
+
+
+def _task_replay_receipt_gaps(
+    receipt: dict[str, Any],
+    *,
+    task_id: str,
+    receipt_kind: str,
+    attempt_number: int | None = None,
+    attempt_idempotency_key: str | None = None,
+    from_status: str | None = None,
+    to_status: str | None = None,
+) -> list[str]:
+    gaps: list[str] = []
+    if receipt.get("schema_version") != TASK_REPLAY_RECEIPT_SCHEMA_VERSION:
+        gaps.append("schema_version")
+    if receipt.get("receipt_kind") != receipt_kind:
+        gaps.append("receipt_kind")
+    if receipt.get("task_id") != task_id:
+        gaps.append("task_id")
+    if receipt_kind == "attempt_replay_guard":
+        if receipt.get("attempt_number") != attempt_number:
+            gaps.append("attempt_number")
+        if receipt.get("attempt_idempotency_key") != attempt_idempotency_key:
+            gaps.append("attempt_idempotency_key")
+    if receipt_kind == "retry_authorization":
+        if from_status is not None and receipt.get("previous_status") != from_status:
+            gaps.append("previous_status")
+        if to_status is not None and receipt.get("next_status") != to_status:
+            gaps.append("next_status")
+    if receipt.get("active_lease_duplicate_guard") != "active_lease_exclusion_before_attempt_insert":
+        gaps.append("active_lease_duplicate_guard")
+    replay_policy = receipt.get("replay_policy")
+    retry_gate = receipt.get("retry_gate")
+    if replay_policy is None:
+        if retry_gate != "legacy_unregistered_task":
+            gaps.append("replay_policy")
+    elif not isinstance(replay_policy, str) or not replay_policy:
+        gaps.append("replay_policy")
+    if not isinstance(retry_gate, str) or not retry_gate:
+        gaps.append("retry_gate")
+    return gaps
 
 
 def _print_task(task) -> None:
@@ -9464,15 +11057,15 @@ def _resolve_memory_scope_id(
     raise ValueError(f"Unsupported memory scope: {scope.value}")
 
 
-SUPPORTED_EXECUTION_TASK_METADATA: tuple[tuple[str, str], ...] = (
-    ("dry_run", "phase_1a_test"),
-    ("read_only_summary", "read_only_repo_summary"),
-    ("codex_isolated_edit", "codex_code_edit"),
-    ("repo_planning", "repo_planning"),
-    ("session_read_tools", "session_plan"),
-    ("session_read_tools", "session_read_only_research"),
-    ("session_read_tools", "session_operator"),
-)
+def _registered_execution_task_metadata_pairs() -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (descriptor.id, task_type)
+        for descriptor in list_execution_adapter_descriptors()
+        for task_type in descriptor.supported_task_types
+    )
+
+
+SUPPORTED_EXECUTION_TASK_METADATA: tuple[tuple[str, str], ...] = _registered_execution_task_metadata_pairs()
 
 
 def _supported_execution_task_metadata_message() -> str:
@@ -9482,15 +11075,56 @@ def _supported_execution_task_metadata_message() -> str:
     return f"{', '.join(pairs[:-1])}, and {pairs[-1]}"
 
 
-def _execution_task_metadata(execution_adapter: str | None, task_type: str | None) -> dict[str, str]:
+def _execution_task_metadata(
+    execution_adapter: str | None,
+    task_type: str | None,
+    *,
+    workflow_stage: str | None = None,
+    review_role: str | None = None,
+    review_target_stage: str | None = None,
+    blocks_apply_back: bool = False,
+) -> dict[str, object]:
     if execution_adapter is None and task_type is None:
-        return {}
+        if review_role or review_target_stage or blocks_apply_back:
+            raise ValueError("Review metadata requires --execution-adapter review_gate and --task-type.")
+        return {"workflow_stage": workflow_stage} if workflow_stage else {}
     if (execution_adapter, task_type) not in SUPPORTED_EXECUTION_TASK_METADATA:
         raise ValueError(
             "Unsupported execution metadata: supported pairs are "
             f"{_supported_execution_task_metadata_message()}"
         )
-    return {"execution_adapter": execution_adapter or "", "task_type": task_type or ""}
+    metadata: dict[str, object] = {"execution_adapter": execution_adapter or "", "task_type": task_type or ""}
+    if workflow_stage:
+        metadata["workflow_stage"] = workflow_stage
+    if execution_adapter != REVIEW_GATE_EXECUTION_ADAPTER:
+        if review_role or review_target_stage or blocks_apply_back:
+            raise ValueError("Review metadata is only supported for execution_adapter=review_gate.")
+        return metadata
+
+    expected_role = REVIEW_ROLE_BY_TASK_TYPE.get(str(task_type))
+    if expected_role is None:
+        raise ValueError(f"Unsupported review_gate task type: {task_type}")
+    if not review_target_stage:
+        raise ValueError("Review gate metadata requires --review-target-stage.")
+    metadata.update(
+        {
+            "workflow_stage": workflow_stage or task_type or "",
+            "review_role": review_role or expected_role,
+            "review_gate": True,
+            "completion_gate": True,
+            "review_target_stage": review_target_stage,
+        }
+    )
+    if task_type == SECURITY_REVIEW_TASK_TYPE or blocks_apply_back:
+        metadata["blocks_apply_back"] = True
+    return metadata
+
+
+def _default_agent_for_execution_metadata(metadata: dict[str, object]) -> str | None:
+    if metadata.get("execution_adapter") != REVIEW_GATE_EXECUTION_ADAPTER:
+        return None
+    task_type = metadata.get("task_type")
+    return REVIEW_ROLE_BY_TASK_TYPE.get(str(task_type))
 
 
 def _emit_objective_error(schema_version: str, message: str, output: OutputFormat) -> None:
@@ -10126,6 +11760,7 @@ def _doctor_result(project_root: Path, *, release: bool = False, repair: bool = 
     _doctor_shell_config(checks)
     _doctor_session_permission_tables(checks, project_root)
     _doctor_session_status_projection(checks, project_root, repair=repair)
+    _doctor_session_transcript_health(checks, project_root, release=release)
 
     try:
         config = load_config(project_root)
@@ -10165,9 +11800,13 @@ def _doctor_result(project_root: Path, *, release: bool = False, repair: bool = 
         if config is not None:
             _doctor_backend_descriptors(checks, config)
             _doctor_sandbox_safety(checks, config)
+            _doctor_extension_config_path_safety(checks, project_root, config)
             _doctor_release_model_provider_gates(checks, config)
         _doctor_release_cli_metadata(checks)
         _doctor_release_runtime_state(checks, project_root)
+        _doctor_release_orchestration_readiness(checks, project_root)
+        _doctor_release_orchestration_efficiency(checks, project_root)
+        _doctor_release_orchestration_synthesis(checks, project_root)
     elif config is not None:
         _doctor_backend_descriptors(checks, config)
         if not release:
@@ -10711,13 +12350,160 @@ def _doctor_session_status_projection(checks: list[dict], project_root: Path, *,
             {"error": SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)},
         )
         return
-    stale = [session.id for session in sessions if session.active_run_id and session.active_run_id not in runs]
+    stale_before = [
+        {"session_id": session.id, "missing_run_id": session.active_run_id}
+        for session in sessions
+        if session.active_run_id and session.active_run_id not in runs
+    ]
+    repaired: list[dict[str, Any]] = []
+    repair_errors: list[dict[str, str]] = []
+    if repair and stale_before:
+        for item in stale_before:
+            session_id = str(item["session_id"])
+            missing_run_id = str(item["missing_run_id"])
+            try:
+                event = store.clear_stale_session_active_run(
+                    session_id,
+                    missing_run_id=missing_run_id,
+                    actor="doctor",
+                )
+            except Exception as exc:
+                repair_errors.append(
+                    {
+                        "session_id": session_id,
+                        "missing_run_id": missing_run_id,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    }
+                )
+            else:
+                repaired.append(
+                    {
+                        "session_id": session_id,
+                        "missing_run_id": missing_run_id,
+                        "event_id": event.id,
+                    }
+                )
+        try:
+            sessions = store.list_sessions()
+            runs = {run.id for run in store.list_runs()}
+        except sqlite3.Error as exc:
+            _add_check(
+                checks,
+                "session_status_projection",
+                "fail",
+                "Session status projection repair ran but follow-up inspection failed.",
+                {"error": SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)},
+            )
+            return
+    stale_after = [
+        {"session_id": session.id, "missing_run_id": session.active_run_id}
+        for session in sessions
+        if session.active_run_id and session.active_run_id not in runs
+    ]
+    status = "pass" if not stale_after else "warn"
+    if repair_errors:
+        status = "fail"
     _add_check(
         checks,
         "session_status_projection",
-        "pass" if not stale else "warn",
-        "Session status projection is derived on read; no rebuild required." if not stale else "Some sessions reference missing active runs; derived status remains available.",
-        {"materialized": False, "stale_active_run_session_ids": stale, "repair_attempted": repair, "manual_action_required": bool(stale)},
+        status,
+        "Session status projection is derived on read; no rebuild required."
+        if not stale_after
+        else "Some sessions reference missing active runs; derived status remains available.",
+        {
+            "materialized": False,
+            "stale_active_run_session_ids": [item["session_id"] for item in stale_after],
+            "stale_active_run_refs_before": stale_before,
+            "stale_active_run_refs_after": stale_after,
+            "repair_attempted": repair,
+            "repairable": bool(stale_before),
+            "repaired_session_ids": [item["session_id"] for item in repaired],
+            "repair_events": repaired,
+            "repair_errors": repair_errors,
+            "mutation_scope": "session_active_run_pointer_only",
+            "runs_deleted": False,
+            "tasks_mutated": False,
+            "artifacts_deleted": False,
+            "messages_mutated": False,
+            "events_deleted": False,
+            "process_started": False,
+            "provider_called": False,
+            "network_called": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+            "manual_action_required": bool(stale_after),
+        },
+    )
+
+
+def _doctor_session_transcript_health(checks: list[dict], project_root: Path, *, release: bool) -> None:
+    store = SQLiteStore(project_root)
+    schema = store.inspect_required_session_schema()
+    if not schema.get("db_exists") or "sessions" in schema.get("missing_tables", []):
+        _add_check(
+            checks,
+            "session_transcript_health",
+            "warn",
+            "Session transcript health check skipped until the sessions table exists.",
+            {
+                "schema_version": "harness.session_transcript_health/v1",
+                "initialized": False,
+                "contents_included": False,
+                "filesystem_modified": False,
+                "process_started": False,
+                "provider_called": False,
+                "network_called": False,
+                "permission_granting": False,
+            },
+        )
+        return
+    try:
+        sessions = store.list_sessions()
+    except sqlite3.Error as exc:
+        _add_check(
+            checks,
+            "session_transcript_health",
+            "fail",
+            "Session transcript health could not list sessions.",
+            {
+                "schema_version": "harness.session_transcript_health/v1",
+                "error": SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc),
+            },
+        )
+        return
+    health = [read_session_events_with_diagnostics(project_root, session.id) for session in sessions]
+    malformed = [item for item in health if not item.ok]
+    status = "pass" if not malformed else "fail" if release else "warn"
+    _add_check(
+        checks,
+        "session_transcript_health",
+        status,
+        "Session transcripts are parseable."
+        if not malformed
+        else "One or more session transcripts are malformed; inspect before relying on resume history.",
+        {
+            "schema_version": "harness.session_transcript_health/v1",
+            "session_count": len(sessions),
+            "transcript_count": sum(1 for item in health if item.transcript_exists),
+            "malformed_session_count": len(malformed),
+            "malformed_sessions": [
+                {
+                    "session_id": item.session_id,
+                    "transcript_path": str(item.transcript_path),
+                    "parse_error_count": len(item.parse_errors),
+                    "validation_error_count": len(item.validation_errors),
+                    "parse_errors": list(item.parse_errors),
+                    "validation_errors": list(item.validation_errors),
+                }
+                for item in malformed
+            ],
+            "contents_included": False,
+            "filesystem_modified": False,
+            "process_started": False,
+            "provider_called": False,
+            "network_called": False,
+            "permission_granting": False,
+        },
     )
 
 
@@ -10888,6 +12674,80 @@ def _doctor_release_model_provider_gates(checks: list[dict], config) -> None:
     )
 
 
+def _doctor_extension_config_path_safety(checks: list[dict], project_root: Path, config) -> None:
+    try:
+        mcp_resources = _mcp_resources_projection(project_root, config)
+        skills = _skill_catalog(project_root, config)
+    except Exception as exc:
+        _add_check(
+            checks,
+            "extension_config_path_safety",
+            "fail",
+            "Extension configured path safety could not be inspected.",
+            {
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "contents_included": False,
+                "skill_body_loaded": False,
+                "mcp_resource_body_loaded": False,
+                "runtime_loaded": False,
+                "process_started": False,
+                "network_called": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+            },
+        )
+        return
+    unsafe_resources = [
+        {
+            "server": resource.get("server"),
+            "uri": resource.get("uri"),
+            "path": resource.get("path"),
+            "path_safety": resource.get("path_safety"),
+            "blocked_reasons": resource.get("blocked_reasons", []),
+        }
+        for resource in mcp_resources.get("resources", [])
+        if resource.get("symlink_checked") and not resource.get("symlink_safe", True)
+    ]
+    unsafe_skills = [
+        {
+            "name": skill.get("name"),
+            "scope": skill.get("scope"),
+            "path": skill.get("path"),
+            "skill_file_path": skill.get("skill_file_path"),
+            "path_safety": skill.get("path_safety"),
+            "skill_file_path_safety": skill.get("skill_file_path_safety"),
+            "blocked_reasons": skill.get("blocked_reasons", []),
+        }
+        for skill in skills.get("skills", [])
+        if skill.get("symlink_checked") and not skill.get("symlink_safe", True)
+    ]
+    unsafe_count = len(unsafe_resources) + len(unsafe_skills)
+    _add_check(
+        checks,
+        "extension_config_path_safety",
+        "pass" if unsafe_count == 0 else "fail",
+        "Extension configured paths are symlink-safe."
+        if unsafe_count == 0
+        else "One or more configured extension paths contain unsafe symlink components.",
+        {
+            "schema_version": "harness.extension_config_path_safety/v1",
+            "symlink_policy": "reject_configured_path_components",
+            "unsafe_resource_count": len(unsafe_resources),
+            "unsafe_skill_count": len(unsafe_skills),
+            "unsafe_resources": unsafe_resources,
+            "unsafe_skills": unsafe_skills,
+            "contents_included": False,
+            "skill_body_loaded": False,
+            "mcp_resource_body_loaded": False,
+            "runtime_loaded": False,
+            "process_started": False,
+            "network_called": False,
+            "filesystem_modified": False,
+            "permission_granting": False,
+        },
+    )
+
+
 def _doctor_release_runtime_state(checks: list[dict], project_root: Path) -> None:
     if not (project_root / HARNESS_DIR / "harness.sqlite").exists():
         _add_check(
@@ -10926,6 +12786,205 @@ def _doctor_release_runtime_state(checks: list[dict], project_root: Path) -> Non
             "active_leases": [lease.model_dump(mode="json") for lease in active_leases[:5]],
             "blocked_or_waiting_tasks": [task.model_dump(mode="json") for task in blocked_tasks[:5]],
             "latest_failed_run": failed_runs[0].model_dump(mode="json") if failed_runs else None,
+        },
+    )
+
+
+def _doctor_release_orchestration_readiness(checks: list[dict], project_root: Path) -> None:
+    try:
+        audit = run_orchestration_readiness_audit(project_root, include_references=False)
+        summary_projection = summarize_orchestration_readiness(audit)
+    except Exception as exc:
+        _add_check(
+            checks,
+            "orchestration_readiness_release_gates",
+            "fail",
+            "Orchestration readiness audit could not run.",
+            {
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "execution_started": False,
+                "provider_called": False,
+                "network_called": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+                "reference_metadata_included": False,
+            },
+        )
+        return
+    failing = [check.id for check in audit.checks if check.status == "fail"]
+    warnings = [check.id for check in audit.checks if check.status == "warning"]
+    status = "fail" if failing else "warn" if warnings else "pass"
+    _add_check(
+        checks,
+        "orchestration_readiness_release_gates",
+        status,
+        "Orchestration readiness release gates passed."
+        if status == "pass"
+        else "Orchestration readiness release gates need operator review.",
+        {
+            "schema_version": audit.schema_version,
+            "summary": dict(audit.summary),
+            "status": summary_projection["status"],
+            "initialized": audit.initialized,
+            "failing_check_ids": failing,
+            "warning_check_ids": warnings,
+            "skipped_check_ids": [check.id for check in audit.checks if check.status == "skipped"],
+            "check_ids": [check.id for check in audit.checks],
+            "reference_metadata_included": False,
+            "reference_root": None,
+            "read_only": audit.safety.get("read_only") is True,
+            "reference_code_imported": audit.safety.get("reference_code_imported") is True,
+            "reference_contents_included": audit.safety.get("reference_contents_included") is True,
+            "provider_called": audit.safety.get("provider_called") is True,
+            "network_called": audit.safety.get("network_called") is True,
+            "adapter_execution_started": audit.safety.get("adapter_execution_started") is True,
+            "filesystem_modified": audit.safety.get("filesystem_modified") is True,
+            "permission_granting": audit.safety.get("permission_granting") is True,
+            "command": f"harness orchestration audit --project {project_root} --no-references --output json",
+        },
+    )
+
+
+def _doctor_release_orchestration_efficiency(checks: list[dict], project_root: Path) -> None:
+    try:
+        audit = run_orchestration_efficiency_audit(project_root)
+    except Exception as exc:
+        _add_check(
+            checks,
+            "orchestration_efficiency_release_gates",
+            "fail",
+            "Orchestration efficiency audit could not run.",
+            {
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "schema_version": "harness.orchestration_efficiency/v1",
+                "execution_started": False,
+                "provider_called": False,
+                "network_called": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+                "artifact_bodies_read": False,
+                "reference_metadata_included": False,
+                "reference_contents_included": False,
+            },
+        )
+        return
+    failing = [check.id for check in audit.checks if check.status == "fail"]
+    warnings = [check.id for check in audit.checks if check.status == "warning"]
+    skipped = [check.id for check in audit.checks if check.status == "skipped"]
+    status = "fail" if failing else "warn" if warnings else "pass"
+    _add_check(
+        checks,
+        "orchestration_efficiency_release_gates",
+        status,
+        "Orchestration efficiency release gates passed."
+        if status == "pass"
+        else "Orchestration efficiency release gates need operator review.",
+        {
+            "schema_version": audit.schema_version,
+            "summary": dict(audit.summary),
+            "status": "fail" if failing else "warning" if warnings else "pass",
+            "failing_check_ids": failing,
+            "warning_check_ids": warnings,
+            "skipped_check_ids": skipped,
+            "check_ids": [check.id for check in audit.checks],
+            "reference_metadata_included": False,
+            "read_only": audit.safety.get("read_only") is True,
+            "synthetic_probe_only": audit.safety.get("synthetic_probe_only") is True,
+            "reference_code_imported": audit.safety.get("reference_code_imported") is True,
+            "reference_contents_included": audit.safety.get("reference_contents_included") is True,
+            "provider_called": audit.safety.get("provider_called") is True,
+            "network_called": audit.safety.get("network_called") is True,
+            "adapter_execution_started": audit.safety.get("adapter_execution_started") is True,
+            "filesystem_modified": audit.safety.get("filesystem_modified") is True,
+            "permission_granting": audit.safety.get("permission_granting") is True,
+            "artifact_bodies_read": audit.safety.get("artifact_bodies_read") is True,
+            "command": f"harness evals run --suite orchestration-efficiency --project {project_root} --output json",
+        },
+    )
+
+
+def _doctor_release_orchestration_synthesis(checks: list[dict], project_root: Path) -> None:
+    try:
+        report = run_orchestration_synthesis(project_root, include_references=False)
+    except Exception as exc:
+        _add_check(
+            checks,
+            "orchestration_synthesis_release_gates",
+            "fail",
+            "Orchestration synthesis report could not run.",
+            {
+                "error": f"{exc.__class__.__name__}: {exc}",
+                "schema_version": "harness.orchestration_synthesis/v1",
+                "execution_started": False,
+                "provider_called": False,
+                "network_called": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+                "artifact_bodies_read": False,
+                "reference_metadata_included": False,
+                "reference_contents_included": False,
+                "model_context_allowed": False,
+                "mutation_allowed": False,
+            },
+        )
+        return
+    posture = report.security_complexity_posture
+    source_reports = report.source_reports
+    failing_sources = [
+        source_id
+        for source_id, source in source_reports.items()
+        if isinstance(source, dict) and source.get("status") == "fail"
+    ]
+    source_warnings = [
+        source_id
+        for source_id, source in source_reports.items()
+        if isinstance(source, dict) and source.get("status") == "warning"
+    ]
+    status = "fail" if not report.ok or failing_sources else "warn" if source_warnings else "pass"
+    safety = report.safety
+    _add_check(
+        checks,
+        "orchestration_synthesis_release_gates",
+        status,
+        "Orchestration synthesis release gates passed."
+        if status == "pass"
+        else "Orchestration synthesis release gates need operator review.",
+        {
+            "schema_version": report.schema_version,
+            "summary": dict(report.summary),
+            "status": report.summary.get("status"),
+            "source_report_statuses": {
+                source_id: source.get("status")
+                for source_id, source in source_reports.items()
+                if isinstance(source, dict) and source.get("status") is not None
+            },
+            "failing_source_report_ids": failing_sources,
+            "warning_source_report_ids": source_warnings,
+            "adopted_reference_pattern_ids": [
+                str(item.get("pattern")) for item in report.adopted_reference_patterns if item.get("pattern")
+            ],
+            "adopted_reference_pattern_count": len(report.adopted_reference_patterns),
+            "deliberate_non_adoption_ids": [
+                str(item.get("id")) for item in report.deliberate_non_adoptions if item.get("id")
+            ],
+            "deliberate_non_adoption_count": len(report.deliberate_non_adoptions),
+            "security_complexity_posture": posture,
+            "reference_metadata_included": safety.get("reference_metadata_included") is True,
+            "reference_root": None,
+            "read_only": safety.get("read_only") is True,
+            "synthetic_probe_only": True,
+            "reference_code_imported": safety.get("reference_code_imported") is True,
+            "reference_contents_included": safety.get("reference_contents_included") is True,
+            "provider_called": safety.get("provider_called") is True,
+            "network_called": safety.get("network_called") is True,
+            "adapter_execution_started": safety.get("adapter_execution_started") is True,
+            "filesystem_modified": safety.get("filesystem_modified") is True,
+            "permission_granting": safety.get("permission_granting") is True,
+            "artifact_bodies_read": safety.get("artifact_bodies_read") is True,
+            "live_benchmark_execution_allowed": safety.get("live_benchmark_execution_allowed") is True,
+            "mutation_allowed": safety.get("mutation_allowed") is True,
+            "model_context_allowed": safety.get("model_context_allowed") is True,
+            "command": f"harness evals run --suite orchestration-synthesis --project {project_root} --output json",
         },
     )
 

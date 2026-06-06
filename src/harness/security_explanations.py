@@ -85,7 +85,7 @@ def _code_for_reason(reason_code: str, details: list[str]) -> BlockedStateCode:
         return BlockedStateCode.DISABLED_ADAPTER
     if reason_code == "breaker_open" or "breaker_open" in joined:
         return BlockedStateCode.BREAKER_OPEN
-    if reason_code == "unsafe_metadata" or "unsafe metadata" in joined:
+    if reason_code in {"unsafe_metadata", "delegate_budget_mismatch"} or "unsafe metadata" in joined:
         return BlockedStateCode.UNSAFE_METADATA
     if reason_code == "unknown_adapter" or "unknown execution adapter" in joined:
         return BlockedStateCode.UNKNOWN_ADAPTER

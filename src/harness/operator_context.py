@@ -19,10 +19,25 @@ from harness.model_registry import resolve_model_for_session
 from harness.model_discovery import list_cached_discovered_models
 from harness.models import EventStreamType, SessionPartKind, SessionPermissionStatus, SessionStatus, TaskStatus
 from harness.operator_loop import session_operator_status_projection
+from harness.orchestration_efficiency import (
+    run_orchestration_efficiency_audit,
+    run_orchestration_microbenchmarks,
+    summarize_orchestration_efficiency,
+    summarize_orchestration_microbenchmarks,
+)
+from harness.orchestration_synthesis import summarize_orchestration_synthesis_sources
 from harness.paths import resolve_project_root
+from harness.pending_chat_actions import (
+    PENDING_CHAT_ACTION_METADATA_KEY,
+    pending_chat_action_audit,
+    pending_chat_action_projection,
+    pending_chat_action_search_text,
+)
 from harness.progress import build_orchestration_progress
 from harness.security import sanitize_for_logging
 from harness.session_cwd import session_cwd_payload
+from harness.session_events import read_session_events_with_diagnostics, session_events_read_health_payload
+from harness.session_health import active_run_reference_counts, session_active_run_reference_projection
 from harness.session_timeline import (
     list_session_timeline,
     list_session_transcript,
@@ -41,6 +56,17 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
     provider_catalog = list_provider_catalog(catalog_config)
     model_catalog = list_model_catalog(catalog_config)
     capability_catalog = build_capability_catalog(project_root).model_dump(mode="json")
+    orchestration_readiness = _orchestration_readiness_dashboard_summary(project_root)
+    orchestration_efficiency = _orchestration_efficiency_dashboard_summary(project_root)
+    orchestration_microbenchmarks = _orchestration_microbenchmarks_dashboard_summary(project_root)
+    orchestration_synthesis = summarize_orchestration_synthesis_sources(
+        project_root,
+        readiness_summary=orchestration_readiness,
+        efficiency_summary=orchestration_efficiency,
+        microbenchmark_summary=orchestration_microbenchmarks,
+        include_references=False,
+    )
+    orchestration_synthesis["source"] = "operator_context_no_reference_synthesis"
     dashboard = {
         "schema_version": OPERATOR_CONTEXT_SCHEMA_VERSION,
         "ok": True,
@@ -56,6 +82,12 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             "active_daemons": 0,
             "recent_runs": 0,
             "recent_sessions": 0,
+            "pending_chat_actions": 0,
+            "invalid_pending_chat_actions": 0,
+            "stale_pending_chat_actions": 0,
+            "active_run_refs": 0,
+            "valid_active_run_refs": 0,
+            "stale_active_run_refs": 0,
         },
         "task_status_counts": {status.value: 0 for status in TaskStatus},
         "agents": [],
@@ -74,7 +106,20 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             "selected_session_id": None,
             "filter": "open",
             "query": "",
-            "counts": {"total": 0, "open": 0, "running": 0, "waiting_approval": 0, "archived": 0, "filtered": 0},
+            "counts": {
+                "total": 0,
+                "open": 0,
+                "running": 0,
+                "waiting_approval": 0,
+                "pending_chat_actions": 0,
+                "invalid_pending_chat_actions": 0,
+                "stale_pending_chat_actions": 0,
+                "active_run_refs": 0,
+                "valid_active_run_refs": 0,
+                "stale_active_run_refs": 0,
+                "archived": 0,
+                "filtered": 0,
+            },
         },
         "active_session": None,
         "live_activity": _empty_live_activity("setup_needed" if not initialized else "idle"),
@@ -94,6 +139,10 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             "recent": [],
         },
         "session_tools": _session_tools_summary(project_root, active_session=None),
+        "orchestration_readiness": orchestration_readiness,
+        "orchestration_efficiency": orchestration_efficiency,
+        "orchestration_microbenchmarks": orchestration_microbenchmarks,
+        "orchestration_synthesis": orchestration_synthesis,
         "progress": {
             "schema_version": "harness.orchestration_progress_summary/v1",
             "objective_id": None,
@@ -103,6 +152,7 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             "active_lease_ids": [],
             "active_run_ids": [],
             "blocked_reasons": [],
+            "objective_evidence": None,
             "tasks": [],
         },
         "terminal_tabs": {
@@ -191,7 +241,9 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
         objectives = store.list_objectives()
         tasks = store.list_tasks()
         leases = store.list_task_leases()
-        runs = store.list_runs()[:5]
+        all_runs = store.list_runs()
+        runs = all_runs[:5]
+        known_run_ids = {run.id for run in all_runs}
         all_open_sessions = [
             session
             for session in store.list_sessions()
@@ -241,6 +293,14 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
     model_sessions = list(sessions)
     if selected_session is not None:
         model_sessions = [selected_session, *[session for session in model_sessions if session.id != selected_session.id]]
+    pending_action_audits = [_pending_chat_action_audit_for_session(store, session) for session in all_open_sessions]
+    transcript_health = [_session_transcript_health_projection(store, session.id) for session in all_open_sessions]
+    run_ref_counts = active_run_reference_counts(
+        store,
+        all_open_sessions,
+        known_run_ids=known_run_ids,
+        project_root=project_root,
+    )
 
     dashboard["summary"] = {
         "imported_agents": len(agents),
@@ -250,6 +310,11 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
         "active_daemons": len(daemon_status.active_daemons),
         "recent_runs": len(runs),
         "recent_sessions": len(sessions),
+        "pending_chat_actions": sum(1 for audit in pending_action_audits if audit["recoverable"]),
+        "invalid_pending_chat_actions": sum(1 for audit in pending_action_audits if audit["status"] == "invalid"),
+        "stale_pending_chat_actions": sum(1 for audit in pending_action_audits if audit["status"] == "stale"),
+        "malformed_session_transcripts": sum(1 for health in transcript_health if not health["ok"]),
+        **run_ref_counts,
     }
     dashboard["runtime_controls"] = {
         "schema_version": "harness.execution_controls_summary/v1",
@@ -314,6 +379,9 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
             "active_run_id": session.active_run_id,
             "active_task_id": session.active_task_id,
             "cwd": sanitize_for_logging(session.metadata.get("cwd", ".")),
+            "pending_action": _pending_chat_action_projection_for_session(store, session),
+            "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
+            "transcript_health": _session_transcript_health_projection(store, session.id),
             "ui_preferences": sanitize_for_logging(session.ui_preferences),
             "updated_at": session.updated_at.isoformat(),
         }
@@ -371,6 +439,8 @@ def build_operator_context(project_root: Path, *, selected_session_id: str | Non
                 "active_lease_ids": progress.active_lease_ids,
                 "active_run_ids": progress.active_run_ids,
                 "blocked_reasons": progress.blocked_reasons[:5],
+                "checkpoints": progress.checkpoints,
+                "objective_evidence": progress.objective_evidence,
                 "tasks": [
                     {
                         "task_id": task.task_id,
@@ -495,6 +565,12 @@ def _empty_live_activity(active_signal: str = "idle") -> dict:
             "recent_sessions": 0,
             "recent_runs": 0,
             "recent_artifacts": 0,
+            "pending_chat_actions": 0,
+            "invalid_pending_chat_actions": 0,
+            "stale_pending_chat_actions": 0,
+            "active_run_refs": 0,
+            "valid_active_run_refs": 0,
+            "stale_active_run_refs": 0,
             "pending_permissions": 0,
             "open_todos": 0,
         },
@@ -632,6 +708,10 @@ def _live_activity_counts(
         "waiting_approval": int(task_counts.get("waiting_approval", 0) or 0),
         "done": int(task_counts.get("succeeded", 0) or 0),
         "recent_sessions": int((dashboard.get("summary") or {}).get("recent_sessions", 0) or 0),
+        "pending_chat_actions": int((dashboard.get("summary") or {}).get("pending_chat_actions", 0) or 0),
+        "invalid_pending_chat_actions": int((dashboard.get("summary") or {}).get("invalid_pending_chat_actions", 0) or 0),
+        "stale_pending_chat_actions": int((dashboard.get("summary") or {}).get("stale_pending_chat_actions", 0) or 0),
+        "stale_active_run_refs": int((dashboard.get("summary") or {}).get("stale_active_run_refs", 0) or 0),
         "recent_runs": int((dashboard.get("summary") or {}).get("recent_runs", 0) or 0),
         "recent_artifacts": len(recent_artifacts),
         "pending_permissions": len(pending_permissions),
@@ -647,6 +727,10 @@ def _live_activity_signal(dashboard: dict, counts: dict) -> str:
     progress = dashboard.get("progress") or {}
     if counts.get("pending_permissions") or counts.get("waiting_approval") or operator.get("waiting_approval_id"):
         return "approval_required"
+    if counts.get("pending_chat_actions"):
+        return "approval_required"
+    if counts.get("invalid_pending_chat_actions") or counts.get("stale_pending_chat_actions") or counts.get("stale_active_run_refs"):
+        return "blocked"
     if operator.get("phase") == "turn":
         return "responding"
     if dashboard.get("active_leases") or progress.get("active_lease_ids") or progress.get("active_run_ids") or counts.get("running"):
@@ -673,7 +757,20 @@ def build_session_pane_projection(
             "selected_session_id": None,
             "filter": status_filter if status_filter in {"open", "running", "archived", "all"} else "open",
             "query": query.strip(),
-            "counts": {"total": 0, "open": 0, "running": 0, "waiting_approval": 0, "archived": 0, "filtered": 0},
+            "counts": {
+                "total": 0,
+                "open": 0,
+                "running": 0,
+                "waiting_approval": 0,
+                "pending_chat_actions": 0,
+                "invalid_pending_chat_actions": 0,
+                "stale_pending_chat_actions": 0,
+                "active_run_refs": 0,
+                "valid_active_run_refs": 0,
+                "stale_active_run_refs": 0,
+                "archived": 0,
+                "filtered": 0,
+            },
             "ok": False,
         }
     store = SQLiteStore.open_initialized(project_root)
@@ -681,11 +778,25 @@ def build_session_pane_projection(
     normalized_filter = status_filter if status_filter in {"open", "running", "archived", "all"} else "open"
     normalized_query = query.strip().casefold()
     running_statuses = {SessionStatus.RUNNING, SessionStatus.WAITING_APPROVAL}
+    pending_action_audits = [_pending_chat_action_audit_for_session(store, session) for session in all_sessions]
+    transcript_health = [_session_transcript_health_projection(store, session.id) for session in all_sessions]
+    known_run_ids = {run.id for run in store.list_runs()}
+    run_ref_counts = active_run_reference_counts(
+        store,
+        all_sessions,
+        known_run_ids=known_run_ids,
+        project_root=project_root,
+    )
     counts = {
         "total": len(all_sessions),
         "open": sum(1 for session in all_sessions if session.status != SessionStatus.ARCHIVED),
         "running": sum(1 for session in all_sessions if session.status in running_statuses),
         "waiting_approval": sum(1 for session in all_sessions if session.status == SessionStatus.WAITING_APPROVAL),
+        "pending_chat_actions": sum(1 for audit in pending_action_audits if audit["recoverable"]),
+        "invalid_pending_chat_actions": sum(1 for audit in pending_action_audits if audit["status"] == "invalid"),
+        "stale_pending_chat_actions": sum(1 for audit in pending_action_audits if audit["status"] == "stale"),
+        "malformed_session_transcripts": sum(1 for health in transcript_health if not health["ok"]),
+        **run_ref_counts,
         "archived": sum(1 for session in all_sessions if session.status == SessionStatus.ARCHIVED),
     }
     filtered = []
@@ -700,6 +811,13 @@ def build_session_pane_projection(
         searchable = " ".join(
             str(row.get(key) or "")
             for key in ("id", "display_title", "status", "agent_id", "raw_model_ref", "cwd", "active_run_id", "active_task_id")
+        )
+        pending_audit = row.get("pending_action_audit") if (row.get("pending_action_audit") or {}).get("present") else None
+        run_ref = row.get("active_run_reference") or {}
+        searchable = (
+            f"{searchable} "
+            f"{pending_chat_action_search_text(row.get('pending_action') or pending_audit)} "
+            f"{run_ref.get('status') or ''} {run_ref.get('missing_run_id') or ''}"
         ).casefold()
         if normalized_query and normalized_query not in searchable:
             continue
@@ -742,6 +860,10 @@ def _session_pane_row(store: SQLiteStore, session) -> dict:
         "agent_id": sanitize_for_logging(session.agent_id),
         "raw_model_ref": sanitize_for_logging(session.raw_model_ref),
         "cwd": sanitize_for_logging(session.metadata.get("cwd", ".")),
+        "pending_action": _pending_chat_action_projection_for_session(store, session),
+        "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
+        "transcript_health": _session_transcript_health_projection(store, session.id),
+        "active_run_reference": session_active_run_reference_projection(store, session),
         "active_run_id": session.active_run_id,
         "active_task_id": session.active_task_id,
         "updated_at": session.updated_at.isoformat(),
@@ -771,7 +893,7 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         session_id,
         project_root=project_root,
         cwd=str(cwd.get("cwd") or "."),
-        active_tools=_operator_active_tools(),
+        active_tools=_operator_active_tools(project_root=project_root),
     )
     return {
         "schema_version": "harness.session_preview/v1",
@@ -792,6 +914,10 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         "token_cache_write": session.token_cache_write,
         "cwd": cwd,
         "planning_mode": session_planning_mode_projection(session.metadata),
+        "pending_action": _pending_chat_action_projection_for_session(store, session),
+        "pending_action_audit": _pending_chat_action_audit_for_session(store, session),
+        "transcript_health": _session_transcript_health_projection(store, session.id),
+        "active_run_reference": session_active_run_reference_projection(store, session, project_root=project_root),
         "operator": operator,
         "ui_preferences": sanitize_for_logging(session.ui_preferences),
         "latest_ui_activation": _ui_activation_preview(latest_ui_activation) if latest_ui_activation else None,
@@ -799,6 +925,39 @@ def _session_preview(store: SQLiteStore, session_id: str, project_root: Path) ->
         "timeline": [render_timeline_event(event) for event in timeline_events],
         "transcript": [render_transcript_entry(entry) for entry in transcript_entries],
     }
+
+
+def _session_transcript_health_projection(store: SQLiteStore, session_id: str) -> dict:
+    return session_events_read_health_payload(read_session_events_with_diagnostics(store.project_root, session_id))
+
+
+def _pending_chat_action_projection_for_session(store: SQLiteStore, session) -> dict | None:
+    return pending_chat_action_projection(
+        session.metadata,
+        session_id=session.id,
+        lease_status=_pending_chat_action_lease_status(store, session.metadata),
+    )
+
+
+def _pending_chat_action_audit_for_session(store: SQLiteStore, session) -> dict:
+    return pending_chat_action_audit(
+        session.metadata,
+        session_id=session.id,
+        lease_status=_pending_chat_action_lease_status(store, session.metadata),
+    )
+
+
+def _pending_chat_action_lease_status(store: SQLiteStore, metadata: dict | None) -> str | None:
+    raw = (metadata or {}).get(PENDING_CHAT_ACTION_METADATA_KEY)
+    if not isinstance(raw, dict) or raw.get("kind") != "execute_lease":
+        return None
+    lease_id = raw.get("lease_id")
+    if not isinstance(lease_id, str) or not lease_id.strip():
+        return None
+    try:
+        return store.get_task_lease(lease_id).status.value
+    except KeyError:
+        return "missing"
 
 
 def _session_display_title(store: SQLiteStore, session) -> str:
@@ -843,10 +1002,10 @@ def _compact_session_topic(text: str, *, max_chars: int = 54) -> str:
     return (clipped or cleaned[:max_chars].rstrip()) + "..."
 
 
-def _operator_active_tools() -> list[str]:
-    from harness.session_tools import default_session_tool_descriptors
+def _operator_active_tools(*, project_root: Path | None = None) -> list[str]:
+    from harness.session_tools import model_visible_session_tool_ids
 
-    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+    return model_visible_session_tool_ids(project_root=project_root)
 
 
 def _session_tools_summary(project_root: Path, *, active_session: dict | None) -> dict:
@@ -1357,6 +1516,147 @@ def build_tui_dashboard(project_root: Path, *, selected_session_id: str | None =
     return dashboard
 
 
+def _orchestration_readiness_dashboard_summary(project_root: Path) -> dict:
+    try:
+        root = resolve_project_root(project_root)
+        initialized = _is_initialized(root)
+        return {
+            "schema_version": "harness.orchestration_readiness_summary/v1",
+            "ok": True,
+            "status": "pass",
+            "initialized": initialized,
+            "summary": {
+                "total": 0,
+                "pass": 0,
+                "warning": 0,
+                "fail": 0,
+                "skipped": 0,
+                "deep_audit_required": True,
+            },
+            "failing_check_ids": [],
+            "warning_check_ids": [],
+            "skipped_check_ids": [],
+            "reference_root": None,
+            "reference_systems": [
+                "microsoft_agent_framework",
+                "langgraph",
+                "temporal",
+                "dapr",
+                "openai_agents",
+                "google_adk",
+                "opentelemetry",
+            ],
+            "safety": {
+                "read_only": True,
+                "reference_code_imported": False,
+                "reference_contents_included": False,
+                "provider_called": False,
+                "network_called": False,
+                "adapter_execution_started": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+            },
+            "next_action": f"harness orchestration audit --project {root} --no-references --output json",
+            "command": f"harness orchestration audit --project {root} --no-references --output json",
+            "source": "operator_context_bounded_passive_readiness_sample",
+        }
+    except Exception as exc:
+        return {
+            "schema_version": "harness.orchestration_readiness_summary/v1",
+            "ok": False,
+            "status": "fail",
+            "initialized": False,
+            "summary": {"total": 0, "pass": 0, "warning": 0, "fail": 1, "skipped": 0},
+            "failing_check_ids": ["orchestration_readiness_projection"],
+            "warning_check_ids": [],
+            "skipped_check_ids": [],
+            "reference_root": None,
+            "reference_systems": [],
+            "safety": {
+                "read_only": True,
+                "reference_code_imported": False,
+                "reference_contents_included": False,
+                "provider_called": False,
+                "network_called": False,
+                "adapter_execution_started": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+            },
+            "next_action": f"harness orchestration audit --project {project_root} --output json",
+            "command": f"harness orchestration audit --project {project_root} --output json",
+            "source": "operator_context_no_reference_repositories",
+            "error": str(sanitize_for_logging(f"{exc.__class__.__name__}: {exc}")),
+        }
+
+
+def _orchestration_efficiency_dashboard_summary(project_root: Path) -> dict:
+    try:
+        audit = run_orchestration_efficiency_audit(project_root)
+        summary = summarize_orchestration_efficiency(audit)
+        summary["source"] = "operator_context_metadata_only"
+        return summary
+    except Exception as exc:
+        return {
+            "schema_version": "harness.orchestration_efficiency_summary/v1",
+            "ok": False,
+            "status": "fail",
+            "summary": {"total": 0, "pass": 0, "warning": 0, "fail": 1, "skipped": 0},
+            "failing_check_ids": ["orchestration_efficiency_projection"],
+            "warning_check_ids": [],
+            "skipped_check_ids": [],
+            "check_ids": [],
+            "safety": {
+                "read_only": True,
+                "reference_code_imported": False,
+                "reference_contents_included": False,
+                "provider_called": False,
+                "network_called": False,
+                "adapter_execution_started": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+                "artifact_bodies_read": False,
+            },
+            "next_action": f"harness evals run --suite orchestration-efficiency --project {project_root} --output json",
+            "command": f"harness evals run --suite orchestration-efficiency --project {project_root} --output json",
+            "source": "operator_context_metadata_only",
+            "error": str(sanitize_for_logging(f"{exc.__class__.__name__}: {exc}")),
+        }
+
+
+def _orchestration_microbenchmarks_dashboard_summary(project_root: Path) -> dict:
+    try:
+        result = run_orchestration_microbenchmarks(project_root, samples=1)
+        summary = summarize_orchestration_microbenchmarks(result)
+        summary["source"] = "operator_context_bounded_passive_sample"
+        return summary
+    except Exception as exc:
+        return {
+            "schema_version": "harness.orchestration_microbenchmarks_summary/v1",
+            "ok": False,
+            "status": "fail",
+            "summary": {"total": 0, "pass": 0, "warning": 0, "fail": 1, "skipped": 0},
+            "failing_benchmark_ids": ["orchestration_microbenchmarks_projection"],
+            "warning_benchmark_ids": [],
+            "skipped_benchmark_ids": [],
+            "benchmark_ids": [],
+            "safety": {
+                "read_only": True,
+                "reference_code_imported": False,
+                "reference_contents_included": False,
+                "provider_called": False,
+                "network_called": False,
+                "adapter_execution_started": False,
+                "filesystem_modified": False,
+                "permission_granting": False,
+                "artifact_bodies_read": False,
+            },
+            "next_action": f"harness evals run --suite orchestration-microbenchmarks --project {project_root} --output json",
+            "command": f"harness evals run --suite orchestration-microbenchmarks --project {project_root} --output json",
+            "source": "operator_context_bounded_passive_sample",
+            "error": str(sanitize_for_logging(f"{exc.__class__.__name__}: {exc}")),
+        }
+
+
 def render_operator_context_lines(context: dict, *, active_orchestrator: str | None = None) -> list[str]:
     summary = context["summary"]
     adapters = ", ".join(adapter["id"] for adapter in context.get("registered_adapters", []))
@@ -1371,7 +1671,10 @@ def render_operator_context_lines(context: dict, *, active_orchestrator: str | N
         "Summary: "
         f"tasks={summary['tasks_total']} objectives={summary['objectives']} "
         f"active_leases={summary['active_leases']} recent_runs={summary['recent_runs']} "
-        f"recent_sessions={summary.get('recent_sessions', 0)}",
+        f"recent_sessions={summary.get('recent_sessions', 0)} "
+        f"pending_actions={summary.get('pending_chat_actions', 0)} "
+        f"invalid_pending={summary.get('invalid_pending_chat_actions', 0)} "
+        f"stale_pending={summary.get('stale_pending_chat_actions', 0)}",
         f"Adapters: {adapters or 'none'}",
         f"Capabilities: {capabilities or 'none'}",
     ]
@@ -1384,6 +1687,16 @@ def render_operator_context_lines(context: dict, *, active_orchestrator: str | N
         lines.append("Recent sessions:")
         lines.extend(
             f"- {session['id']} {session['status']} {session.get('title') or session.get('intent') or 'untitled'}"
+            + (
+                f" | pending: {session['pending_action']['label']}"
+                if session.get("pending_action")
+                else ""
+            )
+            + (
+                f" | pending metadata: {session['pending_action_audit']['status']}"
+                if (session.get("pending_action_audit") or {}).get("status") in {"invalid", "stale"}
+                else ""
+            )
             for session in context["recent_sessions"][:3]
         )
     lines.append("Safety: passive dashboard context, no backend preflight, no hidden execution.")

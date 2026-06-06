@@ -234,6 +234,7 @@ def test_golden_doctor_evidence_contract(tmp_path, monkeypatch) -> None:
     assert set(checks) == {
         "initialized",
         "session_schema",
+        "session_transcript_health",
         "config_loadable",
         "local_artifact_ignores",
         "backend_descriptors",
@@ -244,6 +245,8 @@ def test_golden_doctor_evidence_contract(tmp_path, monkeypatch) -> None:
     }
     assert checks["initialized"]["status"] == "pass"
     assert checks["session_schema"]["status"] == "pass"
+    assert checks["session_transcript_health"]["status"] == "pass"
+    assert checks["session_transcript_health"]["details"]["contents_included"] is False
     assert checks["config_loadable"]["status"] == "pass"
     assert checks["backend_preflight"]["status"] == "warn"
     assert checks["docker_binary"]["status"] == "pass"
@@ -706,8 +709,8 @@ def test_golden_act_runs_full_supervised_codex_workflow_without_apply_back(tmp_p
         "repo_planning",
         "codex_isolated_edit",
         "dry_run",
-        "dry_run",
-        "dry_run",
+        "review_gate",
+        "review_gate",
         "dry_run",
     ]
     assert all(task.status.value == "succeeded" for task in tasks)

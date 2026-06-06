@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from typer.testing import CliRunner
 
@@ -75,15 +76,13 @@ def test_managed_action_router_routes_simple_python_script_before_directory_phra
     assert route.normalized_arguments["allowed_extensions"] == [".py"]
 
 
-def test_managed_action_router_routes_black_scholes_python_script() -> None:
+def test_managed_action_router_does_not_hardcode_domain_python_scripts() -> None:
     route = route_managed_action("create a python script for the black scholes pricing")
+    decision = decide_managed_action(route, Path.cwd())
 
-    assert route.intent == "create_python_script"
-    assert route.executor == "create_file_with_content"
-    assert route.normalized_arguments["filename"] == "black_scholes_pricing.py"
-    assert "def black_scholes_price(" in route.normalized_arguments["text"]
-    assert "math.erf" in route.normalized_arguments["text"]
-    assert route.required_approvals == []
+    assert route.intent == "unsupported"
+    assert route.executor == "none"
+    assert decision.status == ManagedActionDecisionStatus.UNSUPPORTED
 
 
 def test_managed_action_router_routes_sandboxed_tests_as_approval_required(tmp_path) -> None:
@@ -278,21 +277,20 @@ def test_managed_action_executor_creates_simple_python_script(tmp_path) -> None:
     assert {artifact.kind for artifact in store.verify_artifacts(result.run_id)} >= {"created_file", "final_report"}
 
 
-def test_managed_action_executor_creates_black_scholes_python_script(tmp_path) -> None:
+def test_managed_action_executor_rejects_domain_script_without_explicit_content(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
     route = route_managed_action("create a python script for the black scholes pricing")
     decision = decide_managed_action(route, tmp_path)
 
-    result = execute_managed_action(tmp_path, route, decision, store)
-
-    script = tmp_path / "black_scholes_pricing.py"
-    assert result.ok is True
-    assert result.created_paths == [script]
-    content = script.read_text(encoding="utf-8")
-    assert "def black_scholes_price(" in content
-    assert "argparse.ArgumentParser" in content
-    assert {artifact.kind for artifact in store.verify_artifacts(result.run_id)} >= {"created_file", "final_report"}
+    assert decision.status == ManagedActionDecisionStatus.UNSUPPORTED
+    try:
+        execute_managed_action(tmp_path, route, decision, store)
+    except ValueError as exc:
+        assert "not auto-allowed" in str(exc)
+    else:
+        raise AssertionError("unsupported domain scripts must not execute as managed actions")
+    assert not (tmp_path / "black_scholes_pricing.py").exists()
 
 
 def test_managed_action_executor_preserves_relative_parent_when_avoiding_overwrite(tmp_path) -> None:

@@ -14,6 +14,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from html import escape as html_escape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from urllib.parse import urlencode, urlparse
 
 from pydantic import BaseModel, Field
 
+from harness.agent_handoff import build_agent_handoff_envelope, handoff_metadata_patch
 from harness.config import load_config
 from harness.governance.network import (
     GovernanceNetworkPolicy,
@@ -45,7 +47,13 @@ from harness.models import (
     SessionPermissionStatus,
 )
 from harness.operator_models import HarnessToolCallRecord
-from harness.paths import PathSecurityError, is_excluded_relative, relative_to_project, resolve_under_project
+from harness.paths import (
+    PathSecurityError,
+    is_excluded_relative,
+    reject_symlink_components_under_project,
+    relative_to_project,
+    resolve_under_project,
+)
 from harness.policy import (
     backend_descriptor_sha256,
     effective_policy_sha256,
@@ -106,6 +114,15 @@ class SessionToolPermissionDecisionStatus(str, Enum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
+
+
+class SessionToolExposureState(str, Enum):
+    EXPOSED = "exposed"
+    WITHHELD = "withheld"
+    APPROVAL_GATED = "approval_gated"
+    CONFIG_BLOCKED = "config_blocked"
+    CAPABILITY_BLOCKED = "capability_blocked"
+    DISABLED = "disabled"
 
 
 PLANNING_MODE_METADATA_KEY = "planning_mode"
@@ -170,6 +187,18 @@ class SessionToolPolicyProjection(BaseModel):
     policy_source: str = "session_tool_descriptor"
     maturity: list[SessionToolMaturity] = Field(default_factory=list)
     policy_reasons: list[str] = Field(default_factory=list)
+    exposure: "SessionToolExposureProjection"
+
+
+class SessionToolExposureProjection(BaseModel):
+    schema_version: str = "harness.session_tool_exposure_projection/v1"
+    tool_id: str
+    model_visible: bool
+    state: SessionToolExposureState
+    exposure_mode: str = "default"
+    progressive: bool = True
+    reason: str
+    source: str = "session_tool_policy_projection"
 
 
 class SessionToolDescriptor(BaseModel):
@@ -1220,7 +1249,7 @@ def session_tool_catalog_projection(
         "policy_projection_schema_version": "harness.session_tool_policy_projection/v1",
         "policy_source": "session_tool_descriptor",
         "tools": [
-            session_tool_descriptor_payload(descriptor, project_root=project_root)
+            session_tool_descriptor_payload(descriptor, project_root=project_root, plan_mode=plan_only)
             for descriptor in descriptors
         ],
     }
@@ -1230,9 +1259,14 @@ def session_tool_descriptor_payload(
     descriptor: SessionToolDescriptor,
     *,
     project_root: Path | None = None,
+    plan_mode: bool = False,
 ) -> dict[str, Any]:
     payload = descriptor.model_dump(mode="json")
-    payload["policy"] = build_session_tool_policy_projection(descriptor, project_root=project_root).model_dump(mode="json")
+    payload["policy"] = build_session_tool_policy_projection(
+        descriptor,
+        project_root=project_root,
+        plan_mode=plan_mode,
+    ).model_dump(mode="json")
     return payload
 
 
@@ -1240,6 +1274,7 @@ def build_session_tool_policy_projection(
     descriptor: SessionToolDescriptor,
     *,
     project_root: Path | None = None,
+    plan_mode: bool = False,
 ) -> SessionToolPolicyProjection:
     required_config = _session_tool_required_config(descriptor.id)
     missing_config = _session_tool_missing_config(descriptor.id, project_root) if project_root is not None else []
@@ -1283,6 +1318,13 @@ def build_session_tool_policy_projection(
                 descriptor,
                 supported=descriptor.execution_supported,
             )
+    exposure = build_session_tool_exposure_projection(
+        descriptor,
+        effective_enabled=effective_enabled,
+        disabled_reason=disabled_reason,
+        missing_config=missing_config,
+        plan_mode=plan_mode,
+    )
     return SessionToolPolicyProjection(
         tool_id=descriptor.id,
         enabled=effective_enabled,
@@ -1299,7 +1341,120 @@ def build_session_tool_policy_projection(
         replay_policy=descriptor.replay_policy,
         maturity=list(dict.fromkeys(maturity)),
         policy_reasons=list(dict.fromkeys(policy_reasons)),
+        exposure=exposure,
     )
+
+
+def build_session_tool_exposure_projection(
+    descriptor: SessionToolDescriptor,
+    *,
+    effective_enabled: bool | None = None,
+    disabled_reason: str | None = None,
+    missing_config: list[str] | None = None,
+    project_root: Path | None = None,
+    plan_mode: bool = False,
+) -> SessionToolExposureProjection:
+    if effective_enabled is None:
+        policy = build_session_tool_policy_projection(descriptor, project_root=project_root, plan_mode=plan_mode)
+        return policy.exposure
+    mode = "plan" if plan_mode else "default"
+    if not effective_enabled:
+        if not descriptor.enabled:
+            return SessionToolExposureProjection(
+                tool_id=descriptor.id,
+                model_visible=False,
+                state=SessionToolExposureState.DISABLED,
+                exposure_mode=mode,
+                reason=disabled_reason or "Session tool is disabled by policy.",
+            )
+        if missing_config:
+            return SessionToolExposureProjection(
+                tool_id=descriptor.id,
+                model_visible=False,
+                state=SessionToolExposureState.CONFIG_BLOCKED,
+                exposure_mode=mode,
+                reason=disabled_reason or "Required project configuration is missing.",
+            )
+        if descriptor.requires_client_capability or descriptor.requires_model_capability:
+            return SessionToolExposureProjection(
+                tool_id=descriptor.id,
+                model_visible=False,
+                state=SessionToolExposureState.CAPABILITY_BLOCKED,
+                exposure_mode=mode,
+                reason=disabled_reason or "Required client or model capability is unavailable.",
+            )
+        return SessionToolExposureProjection(
+            tool_id=descriptor.id,
+            model_visible=False,
+            state=SessionToolExposureState.WITHHELD,
+            exposure_mode=mode,
+            reason=disabled_reason or "Session tool is withheld from the default model-visible set.",
+        )
+    if descriptor.permission_required:
+        return SessionToolExposureProjection(
+            tool_id=descriptor.id,
+            model_visible=False,
+            state=SessionToolExposureState.APPROVAL_GATED,
+            exposure_mode=mode,
+            reason="Withheld from default model-visible tools because it requires an exact permission record.",
+        )
+    if plan_mode and not descriptor.allowed_in_plan_agent:
+        return SessionToolExposureProjection(
+            tool_id=descriptor.id,
+            model_visible=False,
+            state=SessionToolExposureState.WITHHELD,
+            exposure_mode=mode,
+            reason="Withheld because this tool is not allowed in read-only planning mode.",
+        )
+    if descriptor.id == "invalid":
+        return SessionToolExposureProjection(
+            tool_id=descriptor.id,
+            model_visible=False,
+            state=SessionToolExposureState.WITHHELD,
+            exposure_mode=mode,
+            progressive=True,
+            reason=(
+                "Withheld from default model-visible tools because Harness normalizes unknown or malformed calls "
+                "to this recovery result internally."
+            ),
+        )
+    if descriptor.side_effect not in {SessionToolSideEffect.NONE, SessionToolSideEffect.SESSION_LOCAL}:
+        return SessionToolExposureProjection(
+            tool_id=descriptor.id,
+            model_visible=False,
+            state=SessionToolExposureState.WITHHELD,
+            exposure_mode=mode,
+            reason="Withheld from default model-visible tools because it can cross an execution, network, or mutation boundary.",
+        )
+    if descriptor.risk != SessionToolRisk.LOW:
+        return SessionToolExposureProjection(
+            tool_id=descriptor.id,
+            model_visible=False,
+            state=SessionToolExposureState.WITHHELD,
+            exposure_mode=mode,
+            reason="Withheld from default model-visible tools because its risk is not low.",
+        )
+    return SessionToolExposureProjection(
+        tool_id=descriptor.id,
+        model_visible=True,
+        state=SessionToolExposureState.EXPOSED,
+        exposure_mode=mode,
+        progressive=True,
+        reason="Exposed by default as a low-risk read-only or session-local tool.",
+    )
+
+
+def model_visible_session_tool_ids(
+    *,
+    project_root: Path | None = None,
+    plan_mode: bool = False,
+) -> list[str]:
+    tool_ids: list[str] = []
+    for descriptor in default_session_tool_descriptors():
+        policy = build_session_tool_policy_projection(descriptor, project_root=project_root, plan_mode=plan_mode)
+        if policy.exposure.model_visible:
+            tool_ids.append(descriptor.id)
+    return sorted(tool_ids)
 
 
 def _session_tool_actionable_disabled_reason(
@@ -1484,7 +1639,7 @@ def _planned_session_tool_descriptors(
         SessionToolDescriptor(
             id="invalid",
             title="Invalid tool call",
-            description="Persist a model-visible result for an unknown or malformed tool call.",
+            description="Persist a recovery result for an unknown or malformed tool call.",
             input_schema={
                 "type": "object",
                 "additionalProperties": True,
@@ -1504,7 +1659,11 @@ def _planned_session_tool_descriptors(
             replay_policy=SessionToolReplayPolicy.EVENT_AND_PREVIEW,
             allowed_in_plan_agent=True,
             enabled=True,
-            safety_notes=notes + ["Invalid tool calls are recorded as transcript evidence so the model can recover."],
+            safety_notes=notes
+            + [
+                "Invalid tool calls are recorded as transcript evidence so the model can recover.",
+                "This recovery tool is not advertised as a default provider-native model-visible tool.",
+            ],
         ),
         SessionToolDescriptor(
             id="edit",
@@ -2018,24 +2177,29 @@ def after_tool_call(
 def validate_session_tool_arguments(descriptor: SessionToolDescriptor, arguments: dict[str, Any]) -> str | None:
     if not isinstance(arguments, dict):
         return f"Tool arguments for {descriptor.id} must be an object."
-    schema = descriptor.input_schema or {}
+    return _json_schema_object_validation_error(descriptor.id, arguments, descriptor.input_schema or {})
+
+
+def _json_schema_object_validation_error(label: str, arguments: dict[str, Any], schema: dict[str, Any]) -> str | None:
     required = schema.get("required") or []
     if isinstance(required, list):
         for key in required:
             if isinstance(key, str) and key not in arguments:
-                return f"Missing required argument for {descriptor.id}: {key}"
+                return f"Missing required argument for {label}: {key}"
     if schema.get("additionalProperties") is False:
         properties = schema.get("properties") or {}
         if isinstance(properties, dict):
             extra = sorted(key for key in arguments if key not in properties)
             if extra:
-                return f"Unexpected argument for {descriptor.id}: {extra[0]}"
+                return f"Unexpected argument for {label}: {extra[0]}"
     properties = schema.get("properties") or {}
     if isinstance(properties, dict):
         for key, value in arguments.items():
             property_schema = properties.get(key)
-            if isinstance(property_schema, dict) and not _json_schema_value_matches(value, property_schema):
-                return f"Invalid argument type for {descriptor.id}.{key}"
+            if isinstance(property_schema, dict):
+                error = _json_schema_value_error(value, property_schema, f"{label}.{key}")
+                if error is not None:
+                    return error
     return None
 
 
@@ -2169,14 +2333,58 @@ def _tool_call_status_from_result(result: SessionToolExecutionResult) -> str:
 
 
 def _json_schema_value_matches(value: Any, schema: dict[str, Any]) -> bool:
+    return _json_schema_value_error(value, schema, "value") is None
+
+
+def _json_schema_value_error(value: Any, schema: dict[str, Any], label: str) -> str | None:
     if "oneOf" in schema and isinstance(schema["oneOf"], list):
-        return any(isinstance(candidate, dict) and _json_schema_value_matches(value, candidate) for candidate in schema["oneOf"])
+        for candidate in schema["oneOf"]:
+            if isinstance(candidate, dict) and _json_schema_value_error(value, candidate, label) is None:
+                return None
+        return f"Invalid argument value for {label}: must match one allowed schema"
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and value not in enum_values:
+        allowed = ", ".join(str(item) for item in enum_values)
+        return f"Invalid argument value for {label}: must be one of {allowed}"
     expected = schema.get("type")
     if isinstance(expected, list):
-        return any(_json_type_matches(value, item) for item in expected if isinstance(item, str))
-    if isinstance(expected, str):
-        return _json_type_matches(value, expected)
-    return True
+        expected_values = [item for item in expected if isinstance(item, str)]
+        if expected_values and not any(_json_type_matches(value, item) for item in expected_values):
+            return f"Invalid argument type for {label}"
+    elif isinstance(expected, str) and not _json_type_matches(value, expected):
+        return f"Invalid argument type for {label}"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, (int, float)) and value < minimum:
+            return f"Invalid argument value for {label}: must be >= {minimum}"
+        if isinstance(maximum, (int, float)) and value > maximum:
+            return f"Invalid argument value for {label}: must be <= {maximum}"
+    if isinstance(value, str):
+        min_length = schema.get("minLength")
+        max_length = schema.get("maxLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            return f"Invalid argument value for {label}: length must be >= {min_length}"
+        if isinstance(max_length, int) and len(value) > max_length:
+            return f"Invalid argument value for {label}: length must be <= {max_length}"
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        max_items = schema.get("maxItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            return f"Invalid argument value for {label}: item count must be >= {min_items}"
+        if isinstance(max_items, int) and len(value) > max_items:
+            return f"Invalid argument value for {label}: item count must be <= {max_items}"
+        items_schema = schema.get("items")
+        if isinstance(items_schema, dict):
+            for index, item in enumerate(value):
+                error = _json_schema_value_error(item, items_schema, f"{label}[{index}]")
+                if error is not None:
+                    return error
+    if isinstance(value, dict):
+        error = _json_schema_object_validation_error(label, value, schema)
+        if error is not None:
+            return error
+    return None
 
 
 def _json_type_matches(value: Any, expected: str) -> bool:
@@ -2669,6 +2877,7 @@ def execute_session_tool(
     arguments: dict[str, Any],
     *,
     tool_call_id: str | None = None,
+    tool_call_key: str | None = None,
     turn_id: str | None = None,
     run_mode: RunMode | str = RunMode.READ_ONLY,
 ) -> SessionToolExecutionResult:
@@ -2688,6 +2897,15 @@ def execute_session_tool(
         }
         tool_id = "invalid"
         descriptor = get_session_tool_descriptor(tool_id)
+    validation_error = validate_session_tool_arguments(descriptor, arguments)
+    if validation_error is not None and tool_id != "invalid":
+        arguments = {
+            "requested_tool_id": str(sanitize_for_logging(requested_tool_id)),
+            "arguments": sanitize_for_logging(requested_arguments),
+            "reason": validation_error,
+        }
+        tool_id = "invalid"
+        descriptor = get_session_tool_descriptor(tool_id)
     if (
         descriptor.enabled
         and descriptor.side_effect not in {SessionToolSideEffect.NONE, SessionToolSideEffect.SESSION_LOCAL}
@@ -2696,6 +2914,15 @@ def execute_session_tool(
     ):
         raise ValueError(f"Session tool is not enabled for session-gateway execution: {tool_id}")
     store.get_session(session_id)
+    tool_identity = {
+        key: value
+        for key, value in {
+            "tool_call_id": tool_call_id,
+            "tool_call_key": tool_call_key,
+            "turn_id": turn_id,
+        }.items()
+        if isinstance(value, str) and value
+    }
     run = store.create_run(
         f"Session tool {tool_id}",
         "session_tool_call",
@@ -2705,7 +2932,7 @@ def execute_session_tool(
     store.append_run_event(
         run.id,
         RunEventType.TOOL_CALL_STARTED,
-        {"tool_id": tool_id, "arguments": sanitize_for_logging(arguments)},
+        {"tool_id": tool_id, "arguments": sanitize_for_logging(arguments), **tool_identity},
         message=f"Session tool {tool_id} started.",
         session_id=session_id,
     )
@@ -2713,7 +2940,7 @@ def execute_session_tool(
         EventStreamType.SESSION,
         session_id,
         "tool_call.started",
-        {"tool_id": tool_id, "arguments": sanitize_for_logging(arguments), "summary": tool_id},
+        {"tool_id": tool_id, "arguments": sanitize_for_logging(arguments), "summary": tool_id, **tool_identity},
         session_id=session_id,
         run_id=run.id,
         redaction_state=RedactionState.REDACTED,
@@ -2743,6 +2970,7 @@ def execute_session_tool(
             "boundary_kind": decision.boundary_kind.value,
             "reasons": decision.reasons,
             "summary": f"{tool_id} {decision.status.value}",
+            **tool_identity,
         },
         session_id=session_id,
         run_id=run.id,
@@ -2871,6 +3099,7 @@ def execute_session_tool(
         "error_type": error_type,
         "permission_id": permission_id,
         "summary": preview[:240],
+        **tool_identity,
     }
     payload.update(evidence)
     store.append_run_event(
@@ -2901,7 +3130,7 @@ def execute_session_tool(
     store.append_run_event(
         run.id,
         RunEventType.TOOL_CALL_FINISHED,
-        {"tool_id": tool_id, "ok": ok, "status": finish_status},
+        {"tool_id": tool_id, "ok": ok, "status": finish_status, **tool_identity},
         message=f"Session tool {tool_id} finished.",
         session_id=session_id,
     )
@@ -2909,7 +3138,7 @@ def execute_session_tool(
         EventStreamType.SESSION,
         session_id,
         "tool_call.finished",
-        {"tool_id": tool_id, "ok": ok, "status": finish_status, "summary": finish_status},
+        {"tool_id": tool_id, "ok": ok, "status": finish_status, "summary": finish_status, **tool_identity},
         session_id=session_id,
         run_id=run.id,
         redaction_state=RedactionState.NOT_REQUIRED,
@@ -3819,6 +4048,8 @@ def _skill_load_tool(
             "loaded_sections": sections,
             "runtime_loaded": False,
             "tool_registered": False,
+            "symlink_policy": skill["symlink_policy"],
+            "symlink_checked": skill["symlink_checked"],
         },
         producer="session_tool",
         redaction_state="redacted",
@@ -3844,6 +4075,8 @@ def _skill_load_tool(
         "plugin_tools_registered": False,
         "network_called": False,
         "filesystem_modified": False,
+        "symlink_policy": skill["symlink_policy"],
+        "symlink_checked": skill["symlink_checked"],
     }
     metadata_path = store.runs_dir / run_id / "session_tool_skill_load_metadata.json"
     metadata_path.write_text(json.dumps(sanitize_for_logging(metadata_payload), indent=2, sort_keys=True), encoding="utf-8")
@@ -3864,10 +4097,11 @@ def _skill_load_tool(
         redaction_state="redacted",
         session_id=session_id,
     )
+    escaped_skill_name = html_escape(str(skill["name"]), quote=True)
     return "\n".join(
         [
-            f'<skill_content name="{skill["name"]}">',
-            f'# Skill: {skill["name"]}',
+            f'<skill_content name="{escaped_skill_name}">',
+            f"# Skill: {escaped_skill_name}",
             "",
             content.strip(),
             "",
@@ -3908,7 +4142,13 @@ def _project_skill_info(project_root: Path, arguments: dict[str, Any]) -> dict[s
             target=name,
             error_type="not_found",
         )
-    path = resolve_under_project(project_root, skill.path)
+    try:
+        reject_symlink_components_under_project(project_root, skill.path)
+        path = resolve_under_project(project_root, skill.path)
+        skill_file_candidate = Path(skill.path) / "SKILL.md" if path.is_dir() else Path(skill.path)
+        reject_symlink_components_under_project(project_root, skill_file_candidate)
+    except PathSecurityError as exc:
+        raise _DeniedToolCall(str(exc), action="skill-load", target=name, error_type="path_security") from exc
     skill_file = path / "SKILL.md" if path.is_dir() else path
     if not skill_file.exists() or not skill_file.is_file():
         raise _DeniedToolCall(
@@ -3933,6 +4173,8 @@ def _project_skill_info(project_root: Path, arguments: dict[str, Any]) -> dict[s
         "skill_file": str(skill_file),
         "skill_file_path": relative_to_project(project_root, skill_file),
         "base_dir_uri": path.resolve().as_uri() if path.is_dir() else skill_file.parent.resolve().as_uri(),
+        "symlink_policy": "reject_configured_path_components",
+        "symlink_checked": True,
     }
 
 
@@ -3982,6 +4224,8 @@ def _mcp_resource_tool(
             "content_sha256": content_sha256,
             "process_started": False,
             "network_called": False,
+            "symlink_policy": info["symlink_policy"],
+            "symlink_checked": info["symlink_checked"],
         },
         producer="session_tool",
         redaction_state="redacted",
@@ -4008,6 +4252,8 @@ def _mcp_resource_tool(
         "process_started": False,
         "network_called": False,
         "resource_read": True,
+        "symlink_policy": info["symlink_policy"],
+        "symlink_checked": info["symlink_checked"],
     }
     metadata_path = store.runs_dir / run_id / "session_tool_mcp_resource_metadata.json"
     metadata_path.write_text(json.dumps(sanitize_for_logging(metadata_payload), indent=2, sort_keys=True), encoding="utf-8")
@@ -4064,7 +4310,16 @@ def _mcp_resource_info(project_root: Path, arguments: dict[str, Any]) -> dict[st
         raise ValueError(f"Cached MCP resource not found: {server_name}:{requested_uri}")
     if not resource.enabled:
         raise ValueError(f"Cached MCP resource is disabled: {server_name}:{requested_uri}")
-    path = resolve_under_project(project_root, resource.path)
+    try:
+        reject_symlink_components_under_project(project_root, resource.path)
+        path = resolve_under_project(project_root, resource.path)
+    except PathSecurityError as exc:
+        raise _DeniedToolCall(
+            str(exc),
+            action="mcp-resource",
+            target=f"{server_name}:{resource.uri}",
+            error_type="path_security",
+        ) from exc
     if not path.exists() or not path.is_file():
         raise ValueError(f"Cached MCP resource file does not exist: {server_name}:{requested_uri}")
     if is_secret_path(path):
@@ -4086,6 +4341,8 @@ def _mcp_resource_info(project_root: Path, arguments: dict[str, Any]) -> dict[st
         "server_kind": server.kind,
         "server_command_configured": bool(server.command),
         "server_url_configured": bool(server.url),
+        "symlink_policy": "reject_configured_path_components",
+        "symlink_checked": True,
     }
 
 
@@ -5085,6 +5342,24 @@ def _task_tool(store: SQLiteStore, root: Path, session_id: str, arguments: dict[
         },
         session_id=child.id,
     )
+    handoff = build_agent_handoff_envelope(root, task)
+    task = store.update_task_metadata(task.id, handoff_metadata_patch(handoff))
+    handoff = build_agent_handoff_envelope(root, task)
+    handoff_summary = {
+        "schema_version": handoff.schema_version,
+        "ok": handoff.ok,
+        "envelope_id": handoff.envelope_id,
+        "payload_sha256": handoff.integrity.payload_sha256,
+        "trace_id": handoff.trace_context.trace_id,
+        "traceparent": handoff.trace_context.traceparent,
+        "agent_contract_schema_version": handoff.agent_contract.schema_version,
+        "agent_contract_id": handoff.agent_contract.contract_id,
+        "agent_contract_sha256": handoff.agent_contract.contract_sha256,
+        "agent_contract_ok": handoff.agent_contract.ok,
+        "adapter_execution_allowed": handoff.authority.adapter_execution_allowed,
+        "permission_granting": handoff.authority.permission_granting,
+        "validation_errors": handoff.validation_errors,
+    }
     store.update_session(session_id, active_task_id=task.id)
     store.append_store_event(
         EventStreamType.SESSION,
@@ -5096,6 +5371,7 @@ def _task_tool(store: SQLiteStore, root: Path, session_id: str, arguments: dict[
             "agent_id": task.agent_id,
             "boundary": plan["boundary"],
             "allowed_tools": plan["allowed_tools"],
+            "handoff": handoff_summary,
             "execution_started": False,
             "process_started": False,
             "summary": f"Delegated task created: {task.title}",
@@ -5113,6 +5389,7 @@ def _task_tool(store: SQLiteStore, root: Path, session_id: str, arguments: dict[
             "task_id": task.id,
             "parent_session_id": session_id,
             "agent_id": task.agent_id,
+            "handoff": handoff_summary,
             "execution_started": False,
             "summary": f"Task assigned: {task.title}",
         },
@@ -5130,6 +5407,7 @@ def _task_tool(store: SQLiteStore, root: Path, session_id: str, arguments: dict[
             "parent_session_id": session_id,
             "child_session_id": child.id,
             "tool_run_id": run_id,
+            "handoff": handoff_summary,
             "execution_started": False,
             "summary": f"Task created by session tool: {task.title}",
         },
@@ -5145,6 +5423,7 @@ def _task_tool(store: SQLiteStore, root: Path, session_id: str, arguments: dict[
         "task_id": task.id,
         "parent_session_id": session_id,
         "child_session_id": child.id,
+        "handoff": handoff_summary,
         "execution_started": False,
         "process_started": False,
     }
@@ -5172,6 +5451,7 @@ def _task_tool(store: SQLiteStore, root: Path, session_id: str, arguments: dict[
                 "status": task.status.value,
                 "allowed_tools": plan["allowed_tools"],
                 "boundary": plan["boundary"],
+                "handoff": handoff_summary,
                 "plan_artifact_id": artifact.id,
                 "execution_started": False,
                 "process_started": False,
@@ -5231,6 +5511,7 @@ def _task_status_tool(store: SQLiteStore, session_id: str, arguments: dict[str, 
     leases = store.list_task_leases(task.id)
     task_events = store.list_store_events(EventStreamType.TASK, task.id)
     child_events = store.list_store_events(EventStreamType.SESSION, child_session.id) if child_session is not None else []
+    handoff = build_agent_handoff_envelope(store.project_root, task)
     artifact_ids: list[str] = []
     if task.run_id is not None:
         artifact_ids = [artifact.id for artifact in store.list_artifacts(task.run_id)]
@@ -5239,6 +5520,8 @@ def _task_status_tool(store: SQLiteStore, session_id: str, arguments: dict[str, 
         "ok": True,
         "task": task.model_dump(mode="json"),
         "child_session": child_session.model_dump(mode="json") if child_session is not None else None,
+        "handoff": _compact_handoff_projection(handoff),
+        "handoff_inspect_command": f"harness handoffs inspect-task {task.id} --project . --output json",
         "attempts": [attempt.model_dump(mode="json") for attempt in attempts],
         "leases": [lease.model_dump(mode="json") for lease in leases],
         "artifact_ids": artifact_ids,
@@ -5249,6 +5532,46 @@ def _task_status_tool(store: SQLiteStore, session_id: str, arguments: dict[str, 
         "permission_granting": False,
     }
     return json.dumps(sanitize_for_logging(payload), indent=2, sort_keys=True)
+
+
+def _compact_handoff_projection(handoff) -> dict[str, Any]:
+    agent_contract = handoff.agent_contract
+    return {
+        "schema_version": handoff.schema_version,
+        "ok": handoff.ok,
+        "envelope_id": handoff.envelope_id,
+        "task_id": handoff.task_id,
+        "task_type": handoff.task_type,
+        "execution_adapter": handoff.execution_adapter,
+        "agent_id": handoff.agent_id,
+        "parent_session_id": handoff.parent_session_id,
+        "child_session_id": handoff.child_session_id,
+        "allowed_tools": handoff.allowed_tools,
+        "boundary": handoff.boundary,
+        "output_expectation": handoff.output_expectation,
+        "delegate_budget": handoff.delegate_budget,
+        "trace_context": handoff.trace_context.model_dump(mode="json"),
+        "integrity": handoff.integrity.model_dump(mode="json"),
+        "agent_contract": {
+            "schema_version": agent_contract.schema_version,
+            "ok": agent_contract.ok,
+            "contract_id": agent_contract.contract_id,
+            "contract_sha256": agent_contract.contract_sha256,
+            "agent_id": agent_contract.agent_id,
+            "source_kind": agent_contract.source_kind,
+            "tool_policy_id": agent_contract.tool_policy_id,
+            "budget_source": agent_contract.budget_policy.budget_source,
+            "trace_required": agent_contract.trace_policy.trace_required,
+            "authority": {
+                "agent_execution_allowed": agent_contract.authority.agent_execution_allowed,
+                "tool_execution_allowed": agent_contract.authority.tool_execution_allowed,
+                "permission_granting": agent_contract.authority.permission_granting,
+            },
+            "validation_errors": agent_contract.validation_errors,
+        },
+        "authority": handoff.authority.model_dump(mode="json"),
+        "validation_errors": handoff.validation_errors,
+    }
 
 
 def _plan_enter_tool(store: SQLiteStore, session_id: str, arguments: dict[str, Any], *, run_id: str) -> str:

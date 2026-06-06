@@ -22,8 +22,15 @@ from harness.models import (
     SessionPartKind,
     SessionStatus,
 )
+from harness.operator_loop import (
+    HarnessAgentLoop,
+    HarnessAgentLoopLimits,
+    create_turn_state_from_session,
+    native_session_tool_schemas,
+)
 from harness.session_tools import pending_session_tool_call_from_permission
 from harness.session_events import SessionEventKind, append_session_event, read_session_events
+from harness.task_operator_bridge import default_session_operator_tool_ids
 
 
 runner = CliRunner()
@@ -134,6 +141,258 @@ def test_task_runs_read_only_operator_loop_and_records_linkage(tmp_path, monkeyp
     events = store.list_session_store_events(session.id)
     assert any(event.kind == "operator.turn.started" for event in events)
     assert any(event.kind == "harness.task_operator.completed" for event in events)
+
+
+def test_native_tool_schema_builder_honors_empty_and_internal_tool_filters() -> None:
+    assert native_session_tool_schemas(active_tool_ids=[]) == []
+    names = {schema.name for schema in native_session_tool_schemas(active_tool_ids=["read", "invalid"])}
+    assert names == {"read"}
+
+
+def test_native_tool_schema_builder_filters_policy_blocked_explicit_tools(tmp_path) -> None:
+    assert native_session_tool_schemas(active_tool_ids=["web-fetch"], project_root=tmp_path) == []
+    explicit_shell = {schema.name for schema in native_session_tool_schemas(active_tool_ids=["shell"], project_root=tmp_path)}
+    assert explicit_shell == {"shell"}
+    plan_shell = native_session_tool_schemas(active_tool_ids=["shell"], project_root=tmp_path, plan_mode=True)
+    assert plan_shell == []
+
+
+def test_agent_loop_replays_same_tool_guard_from_persisted_turn_events(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    (tmp_path / "README.md").write_text("restart-aware repeat guard\n", encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Restart-aware guard")
+    turn_state = create_turn_state_from_session(
+        project_root=tmp_path,
+        session=session,
+        model_profile_id="local",
+        backend_id="local",
+        agent_id="operator",
+        workbench_id=None,
+        active_tools=["read"],
+    )
+    first_model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I will read once.",
+                tool_calls=[ChatToolCall(id="call_read_1", name="read", arguments={"path": "README.md"})],
+            ),
+            ChatResponse(content="Read complete."),
+        ]
+    )
+    limits = HarnessAgentLoopLimits(max_same_tool_same_args=2)
+    first = HarnessAgentLoop(
+        store=store,
+        project_root=tmp_path,
+        session_id=session.id,
+        model=first_model,
+        chat_context=ChatContext(project_root=str(tmp_path), model_profile="local", mode="normal"),
+        messages=[],
+        turn_state=turn_state,
+        limits=limits,
+    )
+
+    first_result = first.run("Read README.")
+
+    assert first_result.ok is True
+    second_model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I will read again.",
+                tool_calls=[ChatToolCall(id="call_read_2", name="read", arguments={"path": "README.md"})],
+            )
+        ]
+    )
+    restarted = HarnessAgentLoop(
+        store=store,
+        project_root=tmp_path,
+        session_id=session.id,
+        model=second_model,
+        chat_context=ChatContext(project_root=str(tmp_path), model_profile="local", mode="normal"),
+        messages=list(first_result.messages),
+        turn_state=turn_state,
+        limits=limits,
+    )
+
+    restarted_result = restarted.run("Read README.")
+
+    assert restarted_result.status == "guard_triggered"
+    assert restarted_result.stop_reason == "same_tool_same_args_guard"
+    events = store.list_session_store_events(session.id)
+    read_outputs = [
+        event
+        for event in events
+        if event.kind == "tool_call.output" and isinstance(event.payload, dict) and event.payload.get("tool_id") == "read"
+    ]
+    assert len(read_outputs) == 1
+    guard = [event for event in events if event.kind == "harness.agent_loop_guard.triggered"][-1]
+    assert guard.payload["error_type"] == "same_tool_same_args_guard"
+    assert guard.payload["repeat_count"] == 2
+    assert guard.payload["tool_call_key"]
+
+
+def test_agent_loop_blocks_persisted_rerun_forbidden_tool_replay(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Rerun forbidden guard")
+    turn_state = create_turn_state_from_session(
+        project_root=tmp_path,
+        session=session,
+        model_profile_id="local",
+        backend_id="local",
+        agent_id="operator",
+        workbench_id=None,
+        active_tools=["shell"],
+    )
+    shell_args = {"command": "printf guarded", "timeout_seconds": 5, "shell_executable": "/bin/sh"}
+    tool_call_key = json.dumps(
+        {"tool": "shell", "arguments": shell_args},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    store.append_store_event(
+        EventStreamType.SESSION,
+        session.id,
+        "tool_call.output",
+        {
+            "turn_id": turn_state.turn_id,
+            "tool_id": "shell",
+            "tool_call_key": tool_call_key,
+            "ok": True,
+            "summary": "previous shell execution",
+        },
+        session_id=session.id,
+    )
+    model = FakeNativeToolTaskModel(
+        [
+            ChatResponse(
+                content="I will rerun shell.",
+                tool_calls=[ChatToolCall(id="call_shell_replay", name="shell", arguments=shell_args)],
+            )
+        ]
+    )
+    loop = HarnessAgentLoop(
+        store=store,
+        project_root=tmp_path,
+        session_id=session.id,
+        model=model,
+        chat_context=ChatContext(project_root=str(tmp_path), model_profile="local", mode="normal"),
+        messages=[],
+        turn_state=turn_state,
+    )
+
+    result = loop.run("Run shell again.")
+
+    assert result.status == "guard_triggered"
+    assert result.stop_reason == "rerun_forbidden_tool_replayed"
+    assert result.pending_tool_call is None
+    assert store.list_session_permissions(session.id) == []
+    shell_outputs = [
+        event
+        for event in store.list_session_store_events(session.id)
+        if event.kind == "tool_call.output" and isinstance(event.payload, dict) and event.payload.get("tool_id") == "shell"
+    ]
+    assert len(shell_outputs) == 1
+
+
+def test_task_operator_default_tools_do_not_expose_all_enabled_tools(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    assert default_session_operator_tool_ids(tmp_path) == ["artifact-read", "glob", "grep", "read"]
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        "Inspect with default session tools",
+        metadata={
+            "execution_adapter": "session_read_tools",
+            "task_type": "session_plan",
+            "required_artifact_kinds": ["final_report"],
+        },
+    )
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel([ChatResponse(content="Default tools inspected.")])
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+
+    result = execute_lease(tmp_path, selection["lease"].id)
+
+    assert result.ok is True
+    assert model.calls
+    names = {schema.name for schema in model.calls[0]["tools"]}
+    assert names == {"artifact-read", "glob", "grep", "read"}
+    assert names.isdisjoint(
+        {
+            "shell",
+            "write",
+            "patch",
+            "web-fetch",
+            "web-search",
+            "mcp-resource",
+            "plugin-tool",
+            "task",
+            "invalid",
+        }
+    )
+
+
+def test_task_operator_rejects_invalid_explicit_allowed_tools_before_run(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    task = _operator_task(store, "Reject invalid tool metadata", metadata={"allowed_tools": ["read", "not-a-tool", "invalid"]})
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel([ChatResponse(content="Should not run.")])
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+
+    result = execute_lease(tmp_path, selection["lease"].id)
+
+    assert result.ok is False
+    assert result.decision == "operator_task_blocked_policy"
+    assert result.run is None
+    assert model.calls == []
+    assert "unknown tools: not-a-tool" in result.errors[0]
+    assert "internal-only tools: invalid" in result.errors[0]
+    event = store.list_daemon_events()[0]
+    assert event.event_type == "execution_adapter_rejected"
+    assert event.metadata["reason_code"] == "unsafe_metadata"
+    assert event.metadata["rejection_reasons"] == result.errors
+
+
+def test_task_operator_rejects_malformed_allowed_tools_before_run(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    _operator_task(store, "Reject malformed tool metadata", metadata={"allowed_tools": "read"})
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+
+    result = execute_lease(tmp_path, selection["lease"].id)
+
+    assert result.ok is False
+    assert result.decision == "operator_task_blocked_policy"
+    assert result.run is None
+    assert result.errors == ["Operator task allowed_tools must be a non-empty list of known session tool ids."]
+
+
+def test_task_operator_rejects_policy_blocked_allowed_tools_before_run(tmp_path, monkeypatch) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    _operator_task(store, "Reject policy blocked tool metadata", metadata={"allowed_tools": ["web-fetch"]})
+    selection = store.select_next_task_for_lease()
+    assert selection is not None
+    model = FakeNativeToolTaskModel([ChatResponse(content="Should not run.")])
+    monkeypatch.setattr("harness.task_operator_bridge.build_default_chat_model", lambda _project_root: model)
+
+    result = execute_lease(tmp_path, selection["lease"].id)
+
+    assert result.ok is False
+    assert result.decision == "operator_task_blocked_policy"
+    assert result.run is None
+    assert model.calls == []
+    assert "policy-blocked tools: web-fetch" in result.errors[0]
+    assert "Missing project configuration: web_tools.enabled, web_tools.fetch_enabled" in result.errors[0]
+    event = store.list_daemon_events()[0]
+    assert event.event_type == "execution_adapter_rejected"
+    assert event.metadata["reason_code"] == "unsafe_metadata"
+    assert event.metadata["rejection_reasons"] == result.errors
 
 
 def test_task_operator_loop_pauses_for_shell_approval_and_resumes_once(tmp_path, monkeypatch) -> None:
@@ -1214,3 +1473,159 @@ def store_without_session_columns(tmp_path):
     import sqlite3
 
     return sqlite3.connect(tmp_path / ".harness" / "harness.sqlite")
+
+
+def test_registered_adapter_boundary_exception_before_run_releases_lease_and_counts_breaker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import harness.execution as execution_module
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    store.create_task(
+        "Adapter crashes before run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once(owner="test", pid=None)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    calls: list[str] = []
+    dry_run = execution_module.DryRunExecutionAdapter()
+
+    class FailingAdapter:
+        id = dry_run.id
+        descriptor = dry_run.descriptor
+
+        def inspect_eligibility(self, project_root, lease, task, attempt):
+            return dry_run.inspect_eligibility(project_root, lease, task, attempt)
+
+        def execute(self, project_root, lease_id, owner="test"):
+            calls.append(lease_id)
+            raise RuntimeError("simulated adapter panic")
+
+    monkeypatch.setattr(
+        execution_module,
+        "builtin_execution_adapters",
+        lambda: {"dry_run": FailingAdapter()},
+    )
+
+    result = execution_module.execute_lease(tmp_path, leased.lease.id, owner="test")
+    fresh = SQLiteStore(tmp_path)
+    attempt = fresh.get_task_attempt(leased.attempt.id)
+    lease = fresh.get_task_lease(leased.lease.id)
+    event = next(
+        event
+        for event in fresh.list_daemon_events()
+        if event.event_type == "execution_adapter_rejected"
+        and event.metadata.get("reason_code") == "adapter_execution_failed"
+    )
+    breaker = fresh.adapter_breaker_state("dry_run")
+
+    assert calls == [leased.lease.id]
+    assert result.ok is False
+    assert result.decision == "execution_adapter_rejected"
+    assert result.errors == ["simulated adapter panic"]
+    assert fresh.list_runs() == []
+    assert result.task is not None
+    assert fresh.get_task(result.task.id).status.value == "failed"
+    assert attempt.status.value == "failed"
+    assert attempt.run_id is None
+    assert attempt.failure_code == "adapter_execution_failed"
+    assert lease.status.value == "released"
+    assert event.event_type == "execution_adapter_rejected"
+    assert event.metadata["adapter_id"] == "dry_run"
+    assert event.metadata["reason_code"] == "adapter_execution_failed"
+    assert event.metadata["lease_status"] == "released"
+    assert event.metadata["attempt_status"] == "failed"
+    assert event.metadata["task_status"] == "failed"
+    assert breaker.failure_count == 1
+
+
+def test_registered_adapter_boundary_exception_after_run_marks_run_failed_and_opens_breaker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import harness.execution as execution_module
+
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    calls: list[str] = []
+    dry_run = execution_module.DryRunExecutionAdapter()
+
+    class FailingAfterRunAdapter:
+        id = dry_run.id
+        descriptor = dry_run.descriptor
+
+        def inspect_eligibility(self, project_root, lease, task, attempt):
+            return dry_run.inspect_eligibility(project_root, lease, task, attempt)
+
+        def execute(self, project_root, lease_id, owner="test"):
+            calls.append(lease_id)
+            SQLiteStore(project_root).start_attempt_run(
+                lease_id,
+                task_type="phase_1a_test",
+                backend=None,
+                approval_id=None,
+                owner=owner,
+            )
+            raise RuntimeError("simulated adapter panic after run")
+
+    monkeypatch.setattr(
+        execution_module,
+        "builtin_execution_adapters",
+        lambda: {"dry_run": FailingAfterRunAdapter()},
+    )
+
+    run_ids: list[str] = []
+    for index in range(3):
+        task = store.create_task(
+            f"Adapter crashes after run {index}",
+            metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+        )
+        leased = store.daemon_run_once(owner="test", pid=None)
+        assert leased.lease is not None
+        assert leased.attempt is not None
+
+        result = execution_module.execute_lease(tmp_path, leased.lease.id, owner="test")
+        fresh = SQLiteStore(tmp_path)
+        attempt = fresh.get_task_attempt(leased.attempt.id)
+        lease = fresh.get_task_lease(leased.lease.id)
+        assert result.ok is False
+        assert result.run is not None
+        assert result.run.status == "failed"
+        assert result.manifest is not None
+        assert fresh.get_task(task.id).status.value == "failed"
+        assert attempt.status.value == "failed"
+        assert attempt.run_id == result.run.id
+        assert attempt.failure_code == "adapter_execution_failed"
+        assert lease.status.value == "released"
+        run_ids.append(result.run.id)
+
+    fresh = SQLiteStore(tmp_path)
+    breaker = fresh.adapter_breaker_state("dry_run")
+    assert len(calls) == 3
+    assert breaker.status.value == "open"
+    assert breaker.failure_count == 3
+    assert {run.status for run in fresh.list_runs() if run.id in run_ids} == {"failed"}
+
+    store.create_task(
+        "Breaker rejection does not increment breaker",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    breaker_selection = store.select_next_task_for_lease(owner="test")
+    assert breaker_selection is not None
+    rejected = execution_module.execute_lease(tmp_path, breaker_selection["lease"].id, owner="test")
+    breaker_event = next(
+        event
+        for event in SQLiteStore(tmp_path).list_daemon_events()
+        if event.event_type == "execution_adapter_rejected"
+        and event.metadata.get("reason_code") == "breaker_open"
+    )
+
+    assert len(calls) == 3
+    assert rejected.ok is False
+    assert rejected.security_decision is not None
+    assert rejected.security_decision.reason_code == "breaker_open"
+    assert breaker_event.metadata["reason_code"] == "breaker_open"
+    assert SQLiteStore(tmp_path).adapter_breaker_state("dry_run").failure_count == 3

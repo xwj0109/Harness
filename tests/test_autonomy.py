@@ -138,6 +138,30 @@ def test_codex_adapter_auto_allowed_with_scoped_hosted_approval() -> None:
     assert decision.status == AutonomyDecisionStatus.AUTO_ALLOWED
 
 
+def test_codex_adapter_auto_allowed_with_internal_hosted_authority() -> None:
+    policy = get_builtin_autonomy_policy("supervised-codex")
+
+    decision = evaluate_autonomy(
+        policy,
+        AutonomyEvaluationInput(
+            tool_name="edit_isolated",
+            risk="repo_mutation",
+            boundary="hosted_provider_codex",
+            adapter_id="codex_isolated_edit",
+            task_type="codex_code_edit",
+            requires_paid_or_hosted_boundary=True,
+            allow_internal_hosted_provider_authority=True,
+            requires_sandbox=True,
+            sandbox_enforced=True,
+            idempotency_key="codex:edit:1",
+            evidence_contract="run_manifest",
+        ),
+    )
+
+    assert decision.status == AutonomyDecisionStatus.AUTO_ALLOWED
+    assert "hosted-provider Codex boundary is auto-authorized" in " ".join(decision.reasons)
+
+
 def test_active_repo_apply_back_not_auto_allowed() -> None:
     policy = get_builtin_autonomy_policy("supervised-codex")
 

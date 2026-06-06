@@ -201,7 +201,11 @@ def test_right_pane_idle_snapshot(tmp_path) -> None:
 def test_right_pane_running_task_snapshot(tmp_path) -> None:
     store = _store(tmp_path)
     objective = store.create_objective("Running objective")
-    task = store.create_task("Lease this", objective_id=objective.id, metadata={"execution_adapter": "repo_planning"})
+    task = store.create_task(
+        "Lease this",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
     lease = store.select_next_task_for_lease("test-owner")["lease"]
 
     dashboard = build_tui_dashboard(tmp_path)
@@ -229,7 +233,11 @@ def test_right_pane_blocked_approval_snapshot(tmp_path) -> None:
 def test_right_pane_failed_run_snapshot(tmp_path) -> None:
     store = _store(tmp_path)
     objective = store.create_objective("Failed objective")
-    task = store.create_task("Run failing tests", objective_id=objective.id, metadata={"execution_adapter": "phase_1a_test"})
+    task = store.create_task(
+        "Run failing tests",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
     store.create_run("failed", "phase_1a_test", status="failed", task_id=task.id, objective_id=objective.id)
 
     dashboard = build_tui_dashboard(tmp_path)
@@ -338,7 +346,11 @@ def test_right_pane_navigation_is_ui_only(tmp_path) -> None:
 def test_right_pane_enter_opens_details_without_dispatch(tmp_path) -> None:
     store = _store(tmp_path)
     objective = store.create_objective("Detail objective")
-    store.create_task("Detail task", objective_id=objective.id, metadata={"execution_adapter": "repo_planning"})
+    store.create_task(
+        "Detail task",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
     dashboard = build_tui_dashboard(tmp_path)
     model = build_right_panel_model(dashboard, {"palette": build_command_palette()}, "", "dashboard")
     detail = render_right_panel_detail(model)
@@ -384,7 +396,12 @@ def test_left_pane_sessions_snapshot(tmp_path) -> None:
 def test_left_pane_orchestrations_snapshot(tmp_path) -> None:
     store = _store(tmp_path)
     running = store.create_objective("Coding fix")
-    store.create_task("Plan fix", objective_id=running.id, agent_id="Planner", metadata={"execution_adapter": "repo_planning"})
+    store.create_task(
+        "Plan fix",
+        objective_id=running.id,
+        agent_id="Planner",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
     store.select_next_task_for_lease("Planner")
     ready = store.create_objective("Repo summary")
     store.create_task("Summarize repo", objective_id=ready.id, agent_id="Summary")

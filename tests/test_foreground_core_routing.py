@@ -8,7 +8,8 @@ from typer.testing import CliRunner
 
 from harness.backends.codex_cli import CodexRunResult
 from harness.cli.main import app
-from harness.core_service import CoreRunExecutionResult
+from harness.core_service import CoreRunExecutionResult, HarnessCoreService
+from harness.memory.sqlite_store import SQLiteStore
 from harness.models import BackendStatus
 
 
@@ -92,13 +93,21 @@ def test_foreground_plan_without_hosted_approval_blocks_with_core_shape(tmp_path
     _assert_core_shape(payload)
     assert payload["ok"] is False
     assert payload["mode"] == "repo_planning"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["task_id"]
-    assert payload["lease_id"]
+    assert payload["lease_id"] is None
     assert payload["run_id"] is None
     assert payload["adapter_id"] == "repo_planning"
     assert payload["manifest"] is None
     assert any("hosted_provider_codex" in error for error in payload["errors"])
+    assert all("inspect-lease" not in command for command in payload["next_commands"])
+
+    store = SQLiteStore(tmp_path)
+    task = store.get_task(payload["task_id"])
+    assert task.status.value == "ready"
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
 
 
 def test_foreground_explicit_build_json_uses_core_service(tmp_path, monkeypatch) -> None:
@@ -161,13 +170,58 @@ def test_foreground_build_without_hosted_approval_blocks_with_core_shape(tmp_pat
     _assert_core_shape(payload)
     assert payload["ok"] is False
     assert payload["mode"] == "codex_isolated_edit"
-    assert payload["decision"] == "execution_adapter_rejected"
+    assert payload["decision"] == "approval_required"
     assert payload["task_id"]
-    assert payload["lease_id"]
+    assert payload["lease_id"] is None
     assert payload["run_id"] is None
     assert payload["adapter_id"] == "codex_isolated_edit"
     assert payload["manifest"] is None
     assert any("hosted_provider_codex" in error for error in payload["errors"])
+    assert all("inspect-lease" not in command for command in payload["next_commands"])
+
+    store = SQLiteStore(tmp_path)
+    task = store.get_task(payload["task_id"])
+    assert task.status.value == "ready"
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+
+def test_core_run_task_leases_the_named_task_not_next_priority_candidate(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective("Exact task foreground execution")
+    other = store.create_task(
+        title="Higher priority unrelated task",
+        priority=100,
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    target = store.create_task(
+        title="Named target task",
+        priority=0,
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+
+    result = HarnessCoreService().run_task(
+        task_id=target.id,
+        mode="dry_run",
+        project_root=tmp_path,
+        objective_id=objective.id,
+    )
+
+    assert result.ok is True
+    assert result.decision == "dry_run_no_tool_execution"
+    assert result.task_id == target.id
+    assert result.lease_id
+    assert result.run_id
+
+    after = SQLiteStore(tmp_path)
+    assert after.get_task(target.id).status.value == "succeeded"
+    assert after.get_task(other.id).status.value == "ready"
+    assert after.list_task_attempts(other.id) == []
+    assert after.list_task_leases(other.id) == []
 
 
 def test_foreground_direct_mode_does_not_route_through_core(tmp_path, monkeypatch) -> None:

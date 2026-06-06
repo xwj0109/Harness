@@ -43,7 +43,7 @@ SESSION_DELETE_KEYS = {"ctrl+d"}
 ENTER_KEYS = {"enter", "numpad_enter", "ctrl+m"}
 PROMPT_NEWLINE_KEYS = {"shift+enter", "shift+numpad_enter", "ctrl+j"}
 SESSION_PANE_FILTERS = ("open", "running", "archived", "all")
-COMPOSER_FOOTER_HINTS = "Enter send · Shift+Enter newline · Ctrl+X M models · / commands · ? shortcuts"
+COMPOSER_FOOTER_HINTS = "Enter send · Shift+Enter newline · Shift+Tab plan · Ctrl+X M models · / commands · ? shortcuts"
 
 COMMAND_PALETTE_GROUPS = [
     {"id": "orientation", "title": "Orientation"},
@@ -442,6 +442,42 @@ COMMAND_PALETTE_ENTRIES = [
         "safety_note": "Metadata only; does not print artifact files.",
     },
     {
+        "id": "runtime_evidence.orchestration_audit",
+        "group_id": "runtime_evidence",
+        "title": "Orchestration readiness",
+        "command": "harness orchestration audit --project . --no-references --output json",
+        "description": "Inspect passive orchestration readiness gates.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only audit; no adapters, providers, reference source, or permission grants.",
+    },
+    {
+        "id": "runtime_evidence.orchestration_workflows",
+        "group_id": "runtime_evidence",
+        "title": "Workflow coordination",
+        "command": "harness orchestration workflows --project . --output json",
+        "description": "Inspect passive workflow pattern and state-class contracts.",
+        "mutates_when_run": False,
+        "safety_note": "Metadata only; does not execute orchestration or import reference runtimes.",
+    },
+    {
+        "id": "runtime_evidence.orchestration_scenarios",
+        "group_id": "runtime_evidence",
+        "title": "Orchestration scenarios",
+        "command": "harness orchestration scenarios --project . --output json",
+        "description": "Inspect passive layered failure-mode scenario coverage.",
+        "mutates_when_run": False,
+        "safety_note": "Metadata only; does not run adapters, providers, tools, live benchmarks, or reference runtimes.",
+    },
+    {
+        "id": "runtime_evidence.orchestration_synthesis",
+        "group_id": "runtime_evidence",
+        "title": "Orchestration synthesis",
+        "command": "harness orchestration synthesis --project . --no-references --output json",
+        "description": "Synthesize passive readiness, efficiency, replay, and adoption posture.",
+        "mutates_when_run": False,
+        "safety_note": "Read-only synthesis; no providers, adapters, live benchmarks, or permissions.",
+    },
+    {
         "id": "sessions.list",
         "group_id": "sessions",
         "title": "List sessions",
@@ -565,7 +601,7 @@ TUI_NAVIGATION_HINTS = [
     {"key": "/", "label": "Search"},
     {"key": "escape", "label": "Clear"},
     {"key": "tab", "label": "Next"},
-    {"key": "shift+tab", "label": "Previous"},
+    {"key": "shift+tab", "label": "Plan"},
     {"key": "ctrl+p/f2", "label": "Palette"},
     {"key": "ctrl+x m", "label": "Models"},
     {"key": "c", "label": "Collapse"},
@@ -1758,7 +1794,7 @@ def build_tui_settings_catalog(
             {"key": "ctrl+q", "action": "quit", "label": "Quit", "customizable": False},
             {"key": "escape", "action": "clear_search", "label": "Clear input", "customizable": True},
             {"key": "tab", "action": "section_next", "label": "Next section", "customizable": True},
-            {"key": "shift+tab", "action": "section_previous", "label": "Previous section", "customizable": True},
+            {"key": "shift+tab", "action": "plan_mode_shortcut", "label": "Plan mode", "customizable": True},
             {"key": "ctrl+p", "action": "toggle_palette_focus", "label": "Palette focus", "customizable": True},
             {"key": "f2", "action": "toggle_palette_focus", "label": "Palette focus", "customizable": True},
         ],
@@ -3403,6 +3439,15 @@ def _right_panel_progress_rows(dashboard: dict) -> list[str]:
         rows.append("Lease: active")
     if progress.get("active_run_ids"):
         rows.append("Run: active")
+    checkpoints = progress.get("checkpoints") or {}
+    if checkpoints.get("required_checkpoint_count") or checkpoints.get("status") == "blocked":
+        rows.append(f"Checkpoints: {_status_label(checkpoints.get('status') or 'pass')}")
+    evidence = progress.get("objective_evidence")
+    if evidence:
+        rows.append(f"Evidence: {'pass' if evidence.get('ok') else 'fail'}")
+        lease_guard = evidence.get("last_lease_guard_stop") or {}
+        if isinstance(lease_guard, dict) and lease_guard:
+            rows.append(f"Lease guard: {_status_label(lease_guard.get('stop_reason') or 'blocked')}")
     for task in progress.get("tasks", [])[:3]:
         label = f"{_status_label(task.get('status') or 'unknown')} | {task.get('title') or 'Untitled task'}"
         blocked = task.get("blocked_state_explanations") or []
@@ -4327,6 +4372,8 @@ def _persisted_transcript_entries(messages: list[dict], parts_by_message: dict) 
 
 def _persisted_message_to_tui_message(message: dict, parts: list[dict]) -> dict | None:
     role = str(message.get("role") or "assistant")
+    if role == "tool" and _parts_are_transcript_silent_mode_tools(parts):
+        return None
     lines = _lines_from_persisted_parts(parts)
     if not lines:
         preview = _tool_request_summary(message.get("content_preview")) or _safe_transcript_text(message.get("content_preview"))
@@ -4338,6 +4385,21 @@ def _persisted_message_to_tui_message(message: dict, parts: list[dict]) -> dict 
     if role == "system":
         return {"role": "assistant", "title": "System", "lines": lines}
     return {"role": "assistant", "title": "Assistant", "lines": lines}
+
+
+_TRANSCRIPT_SILENT_MODE_TOOL_IDS = {"plan-enter", "plan-exit"}
+
+
+def _parts_are_transcript_silent_mode_tools(parts: list[dict]) -> bool:
+    if not parts:
+        return False
+    tool_ids = []
+    for part in parts:
+        metadata = part.get("metadata") if isinstance(part.get("metadata"), dict) else {}
+        tool_id = str(metadata.get("tool_id") or "").strip()
+        if tool_id:
+            tool_ids.append(tool_id)
+    return bool(tool_ids) and all(tool_id in _TRANSCRIPT_SILENT_MODE_TOOL_IDS for tool_id in tool_ids)
 
 
 def _persisted_assistant_prompt_ids(messages: list[dict], parts_by_message: dict) -> set[str]:
@@ -4417,6 +4479,8 @@ def _transcript_event_entries(
     for event in events:
         kind = str(event.get("kind") or "")
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        if _transcript_should_hide_mode_event(kind, payload):
+            continue
         prompt_id = str(payload.get("prompt_id") or "")
         if prompt_id in completed_prompt_ids and kind not in {"model.failed"}:
             continue
@@ -4451,6 +4515,14 @@ def _transcript_event_entries(
             }
         )
     return rendered
+
+
+def _transcript_should_hide_mode_event(kind: str, payload: dict) -> bool:
+    if kind in {"session.planning_mode.entered", "session.planning_mode.exited", "permission.checked"}:
+        return True
+    if kind.startswith("tool_call."):
+        return _event_tool_id(payload) in _TRANSCRIPT_SILENT_MODE_TOOL_IDS
+    return False
 
 
 def _event_group_sort_key(events: list[dict]) -> tuple:
@@ -5466,7 +5538,7 @@ def create_harness_app(
             elif event.key in {"shift+tab", "backtab"}:
                 event.prevent_default()
                 event.stop()
-                self.app.action_section_previous()
+                self.app.action_plan_mode_shortcut()
             elif event.key in {"ctrl+p", "f2"}:
                 event.prevent_default()
                 event.stop()
@@ -5538,6 +5610,14 @@ def create_harness_app(
             margin: 1 0 1 1;
             padding: 1;
             background: $surface;
+        }
+
+        #chat.plan-mode {
+            border: round $warning;
+        }
+
+        #chat.normal-mode {
+            border: round $primary;
         }
 
         #session-pane {
@@ -5651,7 +5731,7 @@ def create_harness_app(
             Binding("ctrl+q", "quit", "Quit", priority=True),
             Binding("escape", "clear_search", "Clear input", priority=True),
             Binding("tab", "section_next", "Next section", priority=True),
-            Binding("shift+tab,backtab", "section_previous", "Previous section", priority=True),
+            Binding("shift+tab,backtab", "plan_mode_shortcut", "Plan mode", priority=True),
             Binding("alt+up,ctrl+left,ctrl+pageup", "session_previous", "Previous session", priority=True),
             Binding("alt+down,ctrl+right,ctrl+pagedown", "session_next", "Next session", priority=True),
             Binding("ctrl+d", "delete_selected_session", "Purge session", priority=True),
@@ -6086,6 +6166,132 @@ def create_harness_app(
             prompt.value = self._prompt_history[self._prompt_history_index]
             self._render_slash_suggestions(prompt.value)
 
+        def action_plan_mode_shortcut(self) -> None:
+            if self._request_in_flight:
+                self._latest_palette_activation = {
+                    "schema_version": "harness.tui_palette_activation/v1",
+                    "ok": False,
+                    "entry_id": "planning_research.plan_mode_shortcut",
+                    "activation_kind": "plan_mode_shortcut",
+                    "source": "shift+tab",
+                    "ui_action_applied": False,
+                    "chat_submitted": False,
+                    "model_request_started": False,
+                    "slash_suggestion_inserted": False,
+                    "evidence_status": "request_in_flight",
+                    "policy_boundary": _safe_palette_policy_boundary(),
+                    "blocked_reasons": ["request_in_flight"],
+                    **_palette_no_side_effect_flags(),
+                }
+                self._render_palette_activation_status(
+                    "Plan mode shortcut is unavailable while a request is running.",
+                    ok=False,
+                )
+                return
+            active_before = self._active_session_planning_mode()
+            request = (
+                "/plan-mode off TUI shortcut exited planning mode without an additional written summary"
+                if active_before
+                else "/plan-mode on TUI Shift+Tab shortcut"
+            )
+            try:
+                response = handle_chat_input(request, project_root, self._chat_state)
+            except Exception as exc:
+                response = {
+                    "ok": False,
+                    "kind": "plan_mode_shortcut_error",
+                    "title": "Plan Mode",
+                    "lines": [SESSION_SCHEMA_REPAIR_MESSAGE if is_missing_session_schema_error(exc) else str(exc)],
+                }
+            self._latest_response = dict(response)
+            session_id = self._chat_state.session_id
+            if session_id:
+                self._selected_session_id = session_id
+                self._left_selected_item_id = f"session:{session_id}"
+                self._sync_session_event_subscription()
+            prompt = self.query_one("#prompt", TextArea)
+            self._render_slash_suggestions(prompt.value)
+            refreshed = self._dashboard_snapshot(force=True)
+            active_after = self._active_session_planning_mode(refreshed)
+            ok = bool(response.get("ok"))
+            self._latest_palette_activation = {
+                "schema_version": "harness.tui_palette_activation/v1",
+                "ok": ok,
+                "entry_id": "planning_research.plan_mode_shortcut",
+                "activation_kind": "plan_mode_shortcut",
+                "source": "shift+tab",
+                "ui_action_applied": ok,
+                "slash": "/plan-mode",
+                "slash_consumed": False,
+                "chat_submitted": True,
+                "model_request_started": False,
+                "slash_suggestion_inserted": False,
+                "planning_mode_before": active_before,
+                "planning_mode_after": active_after,
+                "session_id": session_id,
+                "harness_state_modified": ok,
+                "session_metadata_modified": ok,
+                "session_event_persisted": ok,
+                "active_repo_modified": False,
+                "evidence_status": (
+                    "session_planning_mode_updated" if ok else str(response.get("kind") or "plan_mode_failed")
+                ),
+                "policy_boundary": {
+                    "kind": "session_local_planning_mode",
+                    "source": "tui_shift_tab",
+                    "command_execution_allowed": False,
+                    "provider_call_allowed": False,
+                    "shell_allowed": False,
+                    "adapter_dispatch_allowed": False,
+                    "child_process_allowed": False,
+                    "filesystem_mutation_allowed": True,
+                    "active_repo_write_allowed": False,
+                    "permission_grant_allowed": False,
+                    "authority_grant_allowed": False,
+                    "session_message_allowed": True,
+                },
+                "blocked_reasons": [] if ok else [str(response.get("kind") or "plan_mode_failed")],
+                **{
+                    **_palette_no_side_effect_flags(),
+                    "filesystem_modified": ok,
+                    "session_message_created": True,
+                },
+            }
+            if ok:
+                self._render_palette_activation_status(
+                    "Plan mode active." if active_after else "Plan mode inactive.",
+                    ok=True,
+                )
+            else:
+                self._render_palette_activation_status("Plan mode shortcut failed safely.", ok=False)
+            self._render_chat()
+            self._render_current_view(refreshed)
+
+        def _active_session_planning_mode(self, dashboard_snapshot: dict | None = None) -> bool:
+            selected_session_id = self._selected_session_id or self._chat_state.session_id
+            if not selected_session_id:
+                return False
+            try:
+                dashboard_view = dashboard_snapshot or self._dashboard_snapshot()
+            except Exception:
+                return False
+            active_session = (
+                dashboard_view.get("active_session")
+                if isinstance(dashboard_view.get("active_session"), dict)
+                else {}
+            )
+            if active_session.get("id") != selected_session_id:
+                active_session = next(
+                    (
+                        session
+                        for session in dashboard_view.get("recent_sessions", [])
+                        if session.get("id") == selected_session_id
+                    ),
+                    {},
+                )
+            planning = active_session.get("planning_mode") if isinstance(active_session, dict) else {}
+            return bool(isinstance(planning, dict) and planning.get("active"))
+
         def _run_chat_request(self, request: str, stream_index: int) -> None:
             def progress(update: dict) -> None:
                 self.call_from_thread(self._append_stream_update, stream_index, update)
@@ -6156,6 +6362,8 @@ def create_harness_app(
                 if not self._dashboard_snapshot().get("initialized"):
                     return False
             except Exception:
+                return False
+            if self._active_session_planning_mode():
                 return False
             if (
                 self._chat_state.pending_draft is not None
@@ -9927,10 +10135,22 @@ def create_harness_app(
                 return
             self._session_event_subscription = subscription
             self._event_stream_status = "live"
+            self._drain_session_subscription_replay(subscription)
             self.run_worker(
                 lambda subscription=subscription: self._event_subscription_loop("session", subscription),
                 thread=True,
             )
+
+        def _drain_session_subscription_replay(self, subscription) -> None:
+            drain = getattr(subscription, "drain", None)
+            if not callable(drain):
+                return
+            try:
+                events = drain(limit=80)
+            except Exception:
+                return
+            for event in events:
+                self._handle_service_event("session", event)
 
         def _event_subscription_loop(self, scope: str, subscription) -> None:
             while not getattr(subscription, "closed", False):
@@ -10040,6 +10260,16 @@ def create_harness_app(
                     and not runtime_active
                     and not self._event_refresh_dirty
                 ):
+                    return
+                if (
+                    self._focus_mode == "palette"
+                    and not self._request_in_flight
+                    and not runtime_active
+                    and not self._event_refresh_dirty
+                    and self._dashboard_cache is not None
+                ):
+                    self._render_right_pane_only()
+                    self._live_refresh_failures = 0
                     return
                 needs_full_refresh = (
                     self._request_in_flight
@@ -10255,6 +10485,7 @@ def create_harness_app(
 
         def _render_chat(self) -> None:
             working_seconds = self._prompt_elapsed_seconds(self._dashboard_cache or {})
+            self._render_chat_mode_frame(self._dashboard_cache if isinstance(self._dashboard_cache, dict) else None)
             chat_width = max(60, min(160, self.query_one("#chat", VerticalScroll).size.width - 4))
             session_id = self._visible_chat_session_id()
             transcript_model = build_tui_transcript_projection(
@@ -10270,6 +10501,22 @@ def create_harness_app(
             )
             _update_markup_static(self.query_one("#chat-content", Static), transcript)
             self.call_after_refresh(lambda: self.query_one("#chat", VerticalScroll).scroll_end(animate=False))
+
+        def _render_chat_mode_frame(self, dashboard_snapshot: dict | None = None) -> None:
+            chat = self.query_one("#chat", VerticalScroll)
+            plan_active = self._active_session_planning_mode(dashboard_snapshot)
+            if plan_active:
+                chat.add_class("plan-mode")
+                chat.remove_class("normal-mode")
+                title = "Chat - Plan mode"
+            else:
+                chat.add_class("normal-mode")
+                chat.remove_class("plan-mode")
+                title = "Chat - Normal mode"
+            try:
+                chat.border_title = title
+            except Exception:
+                return
 
         def _local_messages_for_session(self, session_id: str | None) -> list[dict]:
             visible: list[dict] = []
@@ -10292,6 +10539,7 @@ def create_harness_app(
             self.query_one("#search-status", Static).update(render_right_panel_status(view))
             self.query_one("#palette-status", Static).update(_render_navigation_hints(view))
             refreshed_dashboard = dashboard_snapshot or self._dashboard_snapshot()
+            self._render_chat_mode_frame(refreshed_dashboard)
             self._render_session_pane(refreshed_dashboard, right_view=view)
             self.query_one("#composer-status", Static).update(
                 _render_composer_status(

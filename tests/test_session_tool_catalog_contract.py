@@ -32,6 +32,7 @@ POLICY_CONTRACT_FIELDS = [
     "boundary_kind",
     "disabled_reason",
     "enabled",
+    "exposure",
     "execution_supported",
     "maturity",
     "permission_key",

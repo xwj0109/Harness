@@ -15,6 +15,12 @@ from harness.action_executors import execute_managed_action
 from harness.action_policy import decide_managed_action
 from harness.action_proposals import ActionContract, contract_from_tool_request
 from harness.action_router import ManagedActionDecisionStatus, ManagedActionResult, route_managed_action
+from harness.agent_discovery import (
+    DELEGATE_ALLOCATION_SCHEMA_VERSION,
+    AgentDiscoveryCard,
+    build_agent_discovery_catalog,
+    evaluate_delegate_allocation,
+)
 from harness.approvals import ApprovalStore
 from harness.autonomy import (
     AutonomyDecision,
@@ -29,6 +35,7 @@ from harness.capabilities import build_capability_catalog
 from harness.chat_model import ChatContext, ChatMessage, ChatModel, ChatResponse, build_default_chat_model
 from harness.chat_tools import (
     ChatToolRequest,
+    ChatToolResult,
     chat_tool_specs_payload,
     default_chat_tool_context,
     parse_tool_request,
@@ -49,6 +56,11 @@ from harness.natural_language_router import (
     NaturalLanguageRoute,
     route_natural_language,
 )
+from harness.objective_checkpoints import (
+    create_objective_checkpoint,
+    list_objective_checkpoints,
+    resolve_objective_checkpoint,
+)
 from harness.objective_runner import run_objective_autonomously
 from harness.operator_context import build_operator_context, render_operator_context_lines
 from harness.operator_loop import (
@@ -57,12 +69,14 @@ from harness.operator_loop import (
     HarnessOperatorRuntime,
     create_turn_state_from_session,
     model_supports_native_tools,
+    plan_agent_tool_ids,
     persist_save_point,
     persist_turn_aborted,
     persist_turn_finished,
     persist_turn_started,
     persist_turn_waiting_approval,
 )
+from harness.pending_chat_actions import PENDING_CHAT_ACTION_METADATA_KEY, PENDING_CHAT_ACTION_SCHEMA_VERSION
 from harness.paths import resolve_project_root
 from harness.progress import build_orchestration_progress
 from harness.registry import builtin_spec_registry
@@ -74,6 +88,7 @@ from harness.session_tools import (
     default_session_tool_descriptors,
     execute_session_tool,
     get_session_tool_descriptor,
+    model_visible_session_tool_ids,
     persist_session_tool_denial,
     session_planning_mode_projection,
     session_tool_catalog_projection,
@@ -82,13 +97,14 @@ from harness.session_tools import (
 from harness.task_operator_bridge import apply_operator_task_permission_resolution
 from harness.test_runner import DockerTestRunner, RunTestsDecision
 from harness.tools.patch import apply_planned_updates, plan_unified_diff
-from harness.workflow_templates import WorkflowTemplate, template_for_intent
+from harness.workflow_templates import WorkflowTaskTemplate, WorkflowTemplate, template_for_intent
 
 
 CHAT_SCHEMA_VERSION = "harness.chat/v1"
 CHAT_RESPONSE_SCHEMA_VERSION = "harness.chat_response/v1"
 CHAT_INTENT_SCHEMA_VERSION = "harness.chat_intent/v1"
 ORCHESTRATION_DRAFT_SCHEMA_VERSION = "harness.chat_orchestration_draft/v1"
+WORKFLOW_AGENT_SELECTION_SOURCE = "delegate_allocation"
 AUTONOMOUS_READ_LOOP_SCHEMA_VERSION = "harness.autonomous_read_loop/v1"
 
 CODEX_ORCHESTRATION_ADAPTER = "codex_isolated_edit"
@@ -326,6 +342,7 @@ class OrchestratedTaskDraft:
     depends_on_indexes: list[int] = field(default_factory=list)
     priority: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
+    agent_selection: dict[str, Any] | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -338,6 +355,26 @@ class OrchestratedTaskDraft:
             "execution_adapter": self.execution_adapter,
             "task_type": self.task_type,
             "metadata": self.metadata,
+            "agent_selection": self.agent_selection,
+        }
+
+
+@dataclass
+class OrchestratedCheckpointDraft:
+    label: str
+    reason: str = ""
+    required: bool = True
+    actor: str = "harness_chat"
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_payload(self) -> dict[str, Any]:
+        metadata = self.metadata if isinstance(self.metadata, dict) else {}
+        return {
+            "label": str(sanitize_for_logging(self.label)).strip(),
+            "reason": str(sanitize_for_logging(self.reason)).strip(),
+            "required": bool(self.required),
+            "actor": str(sanitize_for_logging(self.actor)).strip() or "harness_chat",
+            "metadata": sanitize_for_logging(dict(metadata)),
         }
 
 
@@ -348,6 +385,8 @@ class OrchestratedRunDraft:
     orchestrator_id: str
     workbench_id: str
     tasks: list[OrchestratedTaskDraft]
+    checkpoints: list[OrchestratedCheckpointDraft] = field(default_factory=list)
+    idempotency_key: str = field(default_factory=lambda: f"chat_orchestration:{uuid.uuid4().hex[:24]}")
     interpreted_intent: str = "codex_isolated_edit"
     proposed_action: str = "Create a visible objective/task graph and run it through registered adapters."
     required_approvals: list[str] = field(default_factory=lambda: ["hosted_provider_codex"])
@@ -364,7 +403,9 @@ class OrchestratedRunDraft:
             "workbench_id": self.workbench_id,
             "interpreted_intent": self.interpreted_intent,
             "proposed_action": self.proposed_action,
+            "idempotency_key": self.idempotency_key,
             "tasks": [task.to_payload() for task in self.tasks],
+            "checkpoints": [checkpoint.to_payload() for checkpoint in self.checkpoints],
             "required_approvals": self.required_approvals,
             "safety_notes": self.safety_notes,
             "equivalent_commands": self.equivalent_commands,
@@ -551,6 +592,7 @@ def _dispatch_chat_input(
     if not raw:
         return _response("empty", "No input", ["Type /help for available commands."])
     _emit_progress(progress_callback, "procedure", "Turn started")
+    _load_persisted_pending_chat_action(project_root, state)
     if raw in {"/quit", "quit", "exit"}:
         return _response("quit", "Goodbye", ["Exiting harness chat."], ok=True)
     if raw in {"/confirm", "yes", "y"}:
@@ -563,6 +605,7 @@ def _dispatch_chat_input(
         state.pending_action_contract = None
         state.pending_session_tool_call = None
         state.pending_hosted_approval = False
+        _persist_pending_chat_action(project_root, state)
         _persist_active_operator_turn_aborted(project_root, state, reason="declined")
         state.operator_runtime.abort()
         return _response(
@@ -577,6 +620,7 @@ def _dispatch_chat_input(
         denial = _deny_pending_session_tool_permission(project_root, state, feedback=feedback)
         state.pending_session_tool_call = None
         state.pending_hosted_approval = False
+        _persist_pending_chat_action(project_root, state)
         _persist_active_operator_turn_aborted(project_root, state, reason="declined")
         state.operator_runtime.abort()
         return _response(
@@ -910,6 +954,7 @@ def _handle_slash(
         state.pending_action_contract = None
         state.pending_session_tool_call = None
         state.pending_hosted_approval = False
+        _persist_pending_chat_action(project_root, state)
         _persist_active_operator_turn_aborted(project_root, state, reason="declined")
         state.operator_runtime.abort()
         return _response(
@@ -1051,6 +1096,7 @@ def _handle_slash(
     if command == "progress":
         return _orchestration_progress_response(project_root, arg or state.latest_objective_id, state)
     if command == "reset":
+        _clear_persisted_pending_chat_action(project_root, state)
         state.reset()
         return _response("reset", "Session Reset", ["Session-local references were cleared."], ok=True)
     return _response("unknown", "Unknown Command", [f"No chat command matched {raw}.", "Type /help."])
@@ -1093,6 +1139,18 @@ def _handle_intent_routed(
     chat_model: ChatModel | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    intent = route_chat_intent(raw)["intent"]
+    if _active_session_planning_mode(project_root, state) and _plan_mode_should_capture_intent(intent):
+        _emit_progress(progress_callback, "procedure", "Ran plan-mode routing")
+        _emit_progress(progress_callback, "procedure", f"- intent: {intent}")
+        return _plan_mode_prompt_response(
+            project_root,
+            state,
+            raw,
+            intent,
+            chat_model=chat_model,
+            progress_callback=progress_callback,
+        )
     external_write_block = _external_filesystem_write_block_response(raw, project_root)
     if external_write_block is not None:
         return external_write_block
@@ -1111,7 +1169,8 @@ def _handle_intent_routed(
     managed_action_response = _maybe_run_managed_action(raw, project_root, state)
     if managed_action_response is not None:
         return managed_action_response
-    intent = route_chat_intent(raw)["intent"]
+    if chat_model is not None and intent in {"coding_fix", "draft_orchestration", "draft_codex"}:
+        return _model_chat_response(raw, project_root, state, chat_model=chat_model, progress_callback=progress_callback)
     _emit_progress(progress_callback, "procedure", "Ran intent routing")
     _emit_progress(progress_callback, "procedure", f"- intent: {intent}")
     if intent == "init_project":
@@ -1163,7 +1222,7 @@ def _handle_intent_routed(
         return _orchestration_draft_response(
             project_root,
             state,
-            _orchestration_from_template(template_for_intent("coding_fix", raw, project_root), state),
+            _orchestration_from_template(template_for_intent("coding_fix", raw, project_root), state, project_root),
         )
     if intent == "draft_orchestration":
         return _orchestration_draft_response(project_root, state, _draft_orchestration(project_root, state, raw))
@@ -1209,7 +1268,7 @@ def _begin_operator_turn(raw: str, project_root: Path, state: ChatSessionState) 
             cfg = load_config(project_root)
         except FileNotFoundError:
             cfg = default_config()
-        active_tools = _operator_active_tools()
+        active_tools = _operator_active_tools(project_root=project_root, plan_mode=_active_session_planning_mode(project_root, state))
         turn_state = create_turn_state_from_session(
             project_root=project_root,
             session=session,
@@ -1273,7 +1332,10 @@ def _persist_operator_save_point(
             backend_id=turn_state.backend_id,
             agent_id=session.agent_id or turn_state.agent_id,
             workbench_id=session.workbench_id or turn_state.workbench_id,
-            active_tools=_operator_active_tools(),
+            active_tools=_operator_active_tools(
+                project_root=Path(turn_state.project_root),
+                plan_mode=_active_session_planning_mode(Path(turn_state.project_root), state),
+            ),
             run_mode=turn_state.run_mode,
             context_pack_sha256=turn_state.context_pack_sha256,
             stream_options=dict(turn_state.stream_options),
@@ -1327,12 +1389,14 @@ def _operator_status_payload(project_root: Path, state: ChatSessionState) -> dic
     return state.operator_runtime.status(
         project_root=resolve_project_root(state.active_project_root or project_root),
         cwd=_chat_session_cwd(project_root, state),
-        active_tools=_operator_active_tools(),
+        active_tools=_operator_active_tools(project_root=project_root, plan_mode=_active_session_planning_mode(project_root, state)),
     ).model_dump(mode="json")
 
 
-def _operator_active_tools() -> list[str]:
-    return sorted(descriptor.id for descriptor in default_session_tool_descriptors() if descriptor.enabled)
+def _operator_active_tools(*, project_root: Path | None = None, plan_mode: bool = False) -> list[str]:
+    if plan_mode:
+        return plan_agent_tool_ids(project_root=project_root)
+    return model_visible_session_tool_ids(project_root=project_root)
 
 
 def _natural_language_route_response(
@@ -1547,7 +1611,12 @@ def _model_chat_response(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     context_payload = chat_context(project_root)
-    mode = mode_override or ("codex-like" if state.codex_like_mode else "normal")
+    if mode_override:
+        mode = mode_override
+    elif _active_session_planning_mode(project_root, state):
+        mode = "plan"
+    else:
+        mode = "codex-like" if state.codex_like_mode else "normal"
     model_profile = context_payload["chat"]["default_model_profile"]
     context_manifest = pack_chat_context(
         project_root,
@@ -1567,6 +1636,7 @@ def _model_chat_response(
         context_blocks=[block.to_payload() for block in context_manifest.blocks],
         safety_boundaries=list(context_payload["safety_boundaries"]),
     )
+    plan_mode_active = chat_ctx.mode == "plan"
     messages = _model_messages(raw, state, chat_ctx)
     tool_results: list[dict[str, Any]] = []
     try:
@@ -1594,6 +1664,27 @@ def _model_chat_response(
                 normalized_request = _normalize_session_tool_request(tool_request, user_prompt=raw)
             _emit_progress(progress_callback, "reasoning", f"Reasoning: requesting {normalized_request.tool}.")
             _emit_progress(progress_callback, "procedure", f"Ran {normalized_request.tool}")
+            if plan_mode_active and not _plan_mode_tool_request_allowed(normalized_request):
+                boundary_result = _plan_mode_tool_boundary_result(normalized_request)
+                tool_results.append(
+                    {
+                        "tool": boundary_result.tool,
+                        "ok": boundary_result.ok,
+                        "error_type": boundary_result.error_type,
+                    }
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "kind": "procedure",
+                            "content": f"- {boundary_result.tool}: {boundary_result.error_type}",
+                        }
+                    )
+                messages.append(ChatMessage(role="assistant", content=model_response.content))
+                messages.append(ChatMessage(role="user", content=f"Harness plan-mode boundary:\n{boundary_result.to_message()}"))
+                _emit_progress(progress_callback, "procedure", "Ran model turn")
+                model_response = _complete_model_turn(model, messages, chat_ctx, progress_callback)
+                continue
             try:
                 session_tool_result = _try_execute_model_session_tool(project_root, state, normalized_request)
             except ValueError as exc:
@@ -1679,10 +1770,31 @@ def _model_chat_response(
     except LocalEndpointUnavailable as exc:
         return _local_model_unavailable_response(project_root, exc)
     content = str(sanitize_for_logging(model_response.content)).strip()
+    if plan_mode_active and parse_tool_request(content) is not None:
+        return _response(
+            "plan_mode_tool_request_blocked",
+            "Plan",
+            [
+                "The model kept requesting a Harness tool instead of returning a plan.",
+                "Plan mode did not create an approval, task, lease, adapter dispatch, provider run, or active-repo mutation.",
+                "Retry with a more explicit planning request, or exit plan mode before asking for execution.",
+            ],
+            ok=False,
+            extra={
+                "model_profile": chat_ctx.model_profile,
+                "mode": chat_ctx.mode,
+                "hosted_fallback": False,
+                "context_manifest": _context_manifest_response_payload(context_manifest),
+                "tool_results": tool_results,
+                "action_proposals": model_response.action_proposals,
+                "permission_granting": False,
+                "creates_pending_action": False,
+            },
+        )
     if not content:
         content = "The local chat model returned an empty response."
     fallback_request = _fallback_action_request_for_user_intent(raw)
-    if fallback_request is not None and _model_missed_side_effect_request(content):
+    if not plan_mode_active and fallback_request is not None and _model_missed_side_effect_request(content):
         return _action_contract_response(project_root, state, fallback_request)
     return _response(
         "llm_chat",
@@ -1723,7 +1835,7 @@ def _native_agent_loop_response(
             backend_id=cfg.chat.default_model_profile,
             agent_id=session.agent_id or state.selected_orchestrator_id or "operator",
             workbench_id=session.workbench_id,
-            active_tools=_operator_active_tools(),
+            active_tools=_operator_active_tools(project_root=project_root, plan_mode=chat_ctx.mode == "plan"),
             run_mode=RunMode.READ_ONLY,
             stream_options={"stream": cfg.chat.stream},
         )
@@ -1736,7 +1848,7 @@ def _native_agent_loop_response(
         session_id=session_id,
         model=model,
         chat_context=chat_ctx,
-        messages=_native_agent_loop_messages(messages),
+        messages=_native_agent_loop_messages(messages, mode=chat_ctx.mode),
         turn_state=turn_state,
         progress_callback=progress_callback,
         queue_drain_callback=state.operator_runtime.drain_save_point_queues,
@@ -1749,6 +1861,29 @@ def _native_agent_loop_response(
             state.latest_run_id = last_run_id
     tool_result_payloads = [item.to_payload() for item in loop_result.tool_results]
     if loop_result.status == "approval_required":
+        if chat_ctx.mode == "plan":
+            state.pending_session_tool_call = None
+            return _response(
+                "plan_mode_tool_request_blocked",
+                "Plan",
+                [
+                    "The model requested a permission-gated tool while plan mode was active.",
+                    "Plan mode did not create a pending approval, task, lease, adapter dispatch, provider run, or active-repo mutation.",
+                    "Ask for a revised plan, or exit plan mode before requesting execution.",
+                ],
+                ok=False,
+                extra={
+                    "model_profile": chat_ctx.model_profile,
+                    "mode": chat_ctx.mode,
+                    "hosted_fallback": False,
+                    "native_tool_loop": True,
+                    "context_manifest": _context_manifest_response_payload(context_manifest),
+                    "tool_results": tool_result_payloads,
+                    "action_proposals": [],
+                    "permission_granting": False,
+                    "creates_pending_action": False,
+                },
+            )
         if loop_result.pending_tool_call is not None:
             state.pending_session_tool_call = loop_result.pending_tool_call
         permission_result = loop_result.permission_result
@@ -1800,7 +1935,20 @@ def _native_agent_loop_response(
     )
 
 
-def _native_agent_loop_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+def _native_agent_loop_messages(messages: list[ChatMessage], *, mode: str = "normal") -> list[ChatMessage]:
+    if mode == "plan":
+        native_instruction = ChatMessage(
+            role="system",
+            content=(
+                "This backend supports provider-native Harness session tools. Plan mode is active: use only the "
+                "supplied read-only or session-local tools, and do not call tools for approval, execution, network, "
+                "provider dispatch, active-repository mutation, or apply-back. If a side-effecting tool would be "
+                "needed later, describe that as a future governed step and return the plan."
+            ),
+        )
+        if not messages:
+            return [native_instruction]
+        return [*messages[:-1], native_instruction, messages[-1]]
     native_instruction = ChatMessage(
         role="system",
         content=(
@@ -1969,9 +2117,12 @@ def _model_messages(raw: str, state: ChatSessionState, context: ChatContext) -> 
             ChatMessage(
                 role="system",
                 content=(
-                    "Plan mode is enabled. Produce a concrete implementation plan grounded in Harness context. "
-                    "If the plan should become work, emit a gated Harness action request rather than relying on "
-                    "deterministic intent routing."
+                    "Plan mode is enabled. Produce a concrete, prompt-specific implementation plan grounded in "
+                    "the user's request and Harness context. Do not return a generic template. Do not emit tool "
+                    "requests that create approvals, tasks, leases, adapter dispatch, provider execution, shell, "
+                    "network access, active-repository mutation, or apply-back. You may request only read-only "
+                    "or session-local tools that are available in plan mode. If execution would be needed later, "
+                    "describe it as a future governed step inside the plan."
                 ),
             )
         )
@@ -2274,6 +2425,229 @@ def _ensure_chat_session(project_root: Path, state: ChatSessionState) -> tuple[S
     return store, session.id
 
 
+def _has_in_memory_pending_chat_action(state: ChatSessionState) -> bool:
+    return bool(
+        state.pending_draft
+        or state.pending_orchestration
+        or state.pending_execute_lease_id
+        or state.pending_action_contract
+        or state.pending_hosted_approval
+    )
+
+
+def _pending_chat_action_payload(state: ChatSessionState) -> dict[str, Any] | None:
+    base = {
+        "schema_version": PENDING_CHAT_ACTION_SCHEMA_VERSION,
+        "codex_like_mode": state.codex_like_mode,
+        "latest_objective_id": state.latest_objective_id,
+        "latest_task_id": state.latest_task_id,
+        "latest_lease_id": state.latest_lease_id,
+        "latest_run_id": state.latest_run_id,
+    }
+    if state.pending_action_contract is not None:
+        return {**base, "kind": "action_contract", "contract": state.pending_action_contract.to_payload()}
+    if state.pending_orchestration is not None:
+        return {**base, "kind": "orchestration_draft", "draft": state.pending_orchestration.to_payload()}
+    if state.pending_draft is not None:
+        return {**base, "kind": "task_draft", "draft": state.pending_draft.to_payload()}
+    if state.pending_execute_lease_id is not None:
+        return {**base, "kind": "execute_lease", "lease_id": state.pending_execute_lease_id}
+    if state.pending_hosted_approval:
+        return {**base, "kind": "hosted_approval"}
+    return None
+
+
+def _persist_pending_chat_action(project_root: Path, state: ChatSessionState) -> None:
+    if not _is_initialized(project_root):
+        return
+    payload = _pending_chat_action_payload(state)
+    if payload is None and not state.session_id:
+        return
+    try:
+        store, session_id = _ensure_chat_session(project_root, state)
+        session = store.get_session(session_id)
+    except Exception:
+        return
+    metadata = dict(session.metadata or {})
+    if payload is None:
+        metadata.pop(PENDING_CHAT_ACTION_METADATA_KEY, None)
+    else:
+        metadata[PENDING_CHAT_ACTION_METADATA_KEY] = sanitize_for_logging(payload)
+    store.update_session(session_id, metadata=metadata)
+
+
+def _clear_persisted_pending_chat_action(project_root: Path, state: ChatSessionState) -> None:
+    if not state.session_id or not _is_initialized(project_root):
+        return
+    try:
+        store = _require_store(project_root)
+        session = store.get_session(state.session_id)
+    except Exception:
+        return
+    metadata = dict(session.metadata or {})
+    if PENDING_CHAT_ACTION_METADATA_KEY not in metadata:
+        return
+    metadata.pop(PENDING_CHAT_ACTION_METADATA_KEY, None)
+    store.update_session(state.session_id, metadata=metadata)
+
+
+def _load_persisted_pending_chat_action(project_root: Path, state: ChatSessionState) -> bool:
+    if _has_in_memory_pending_chat_action(state) or not state.session_id or not _is_initialized(project_root):
+        return False
+    try:
+        store = _require_store(project_root)
+        session = store.get_session(state.session_id)
+    except Exception:
+        return False
+    payload = session.metadata.get(PENDING_CHAT_ACTION_METADATA_KEY)
+    if not isinstance(payload, dict):
+        return False
+    try:
+        _restore_pending_chat_action_payload(payload, state)
+    except Exception:
+        _clear_persisted_pending_chat_action(project_root, state)
+        return False
+    state.progress.append(f"pending chat action restored: {payload.get('kind')}")
+    return True
+
+
+def _restore_pending_chat_action_payload(payload: dict[str, Any], state: ChatSessionState) -> None:
+    if payload.get("schema_version") != PENDING_CHAT_ACTION_SCHEMA_VERSION:
+        raise ValueError("unsupported pending chat action schema")
+    state.codex_like_mode = bool(payload.get("codex_like_mode", state.codex_like_mode))
+    state.latest_objective_id = _optional_payload_string(payload, "latest_objective_id") or state.latest_objective_id
+    state.latest_task_id = _optional_payload_string(payload, "latest_task_id") or state.latest_task_id
+    state.latest_lease_id = _optional_payload_string(payload, "latest_lease_id") or state.latest_lease_id
+    state.latest_run_id = _optional_payload_string(payload, "latest_run_id") or state.latest_run_id
+    kind = str(payload.get("kind") or "")
+    if kind == "action_contract":
+        contract_payload = payload.get("contract")
+        if not isinstance(contract_payload, dict):
+            raise ValueError("missing action contract payload")
+        state.pending_action_contract = _action_contract_from_payload(contract_payload)
+        return
+    if kind == "orchestration_draft":
+        draft_payload = payload.get("draft")
+        if not isinstance(draft_payload, dict):
+            raise ValueError("missing orchestration draft payload")
+        state.pending_orchestration = _orchestration_draft_from_payload(draft_payload)
+        return
+    if kind == "task_draft":
+        draft_payload = payload.get("draft")
+        if not isinstance(draft_payload, dict):
+            raise ValueError("missing task draft payload")
+        state.pending_draft = _task_draft_from_payload(draft_payload)
+        return
+    if kind == "execute_lease":
+        lease_id = _optional_payload_string(payload, "lease_id")
+        if not lease_id:
+            raise ValueError("missing lease id")
+        state.pending_execute_lease_id = lease_id
+        return
+    if kind == "hosted_approval":
+        state.pending_hosted_approval = True
+        return
+    raise ValueError(f"unknown pending chat action kind: {kind}")
+
+
+def _action_contract_from_payload(payload: dict[str, Any]) -> ActionContract:
+    return ActionContract(
+        id=str(payload["id"]),
+        tool=str(payload["tool"]),
+        risk=str(payload["risk"]),  # type: ignore[arg-type]
+        summary=str(payload.get("summary") or ""),
+        normalized_arguments=dict(payload.get("normalized_arguments") or {}),
+        required_confirmations=[str(item) for item in payload.get("required_confirmations") or []],
+        required_approvals=[str(item) for item in payload.get("required_approvals") or []],
+        execution_plan=[dict(item) for item in payload.get("execution_plan") or [] if isinstance(item, dict)],
+        evidence_plan=[str(item) for item in payload.get("evidence_plan") or []],
+        allowed_next_commands=[str(item) for item in payload.get("allowed_next_commands") or []],
+        requires_confirmation=bool(payload.get("requires_confirmation", True)),
+        schema_version=str(payload.get("schema_version") or ACTION_CONTRACT_SCHEMA_VERSION),
+    )
+
+
+def _task_draft_from_payload(payload: dict[str, Any]) -> ChatDraftTask:
+    return ChatDraftTask(
+        title=str(payload.get("title") or "Recovered task draft"),
+        description=str(payload.get("description") or ""),
+        execution_adapter=str(payload.get("execution_adapter") or "dry_run"),
+        task_type=str(payload.get("task_type") or "phase_1a_test"),
+        interpreted_intent=str(payload.get("interpreted_intent") or "task"),
+        proposed_action=str(payload.get("proposed_action") or "Create one Harness task from this draft."),
+        agent_id=_optional_payload_string(payload, "agent_id"),
+        workbench_id=_optional_payload_string(payload, "workbench_id"),
+        required_approvals=[str(item) for item in payload.get("required_approvals") or []],
+        safety_notes=[str(item) for item in payload.get("safety_notes") or []],
+        equivalent_command=str(payload.get("equivalent_command") or ""),
+        mutates_when_confirmed=bool(payload.get("mutates_when_confirmed", True)),
+    )
+
+
+def _orchestration_draft_from_payload(payload: dict[str, Any]) -> OrchestratedRunDraft:
+    raw_tasks = payload.get("tasks") if isinstance(payload.get("tasks"), list) else []
+    raw_checkpoints = payload.get("checkpoints") if isinstance(payload.get("checkpoints"), list) else []
+    return OrchestratedRunDraft(
+        objective_title=str(payload.get("objective_title") or "Recovered orchestration"),
+        objective_description=str(payload.get("objective_description") or ""),
+        orchestrator_id=str(payload.get("orchestrator_id") or DEFAULT_ORCHESTRATOR_ID),
+        workbench_id=str(payload.get("workbench_id") or "coding"),
+        tasks=[_orchestration_task_from_payload(item) for item in raw_tasks if isinstance(item, dict)],
+        checkpoints=[
+            _orchestration_checkpoint_from_payload(item) for item in raw_checkpoints if isinstance(item, dict)
+        ],
+        idempotency_key=str(payload.get("idempotency_key") or f"chat_orchestration:{uuid.uuid4().hex[:24]}"),
+        interpreted_intent=str(payload.get("interpreted_intent") or "codex_isolated_edit"),
+        proposed_action=str(
+            payload.get("proposed_action")
+            or "Create a visible objective/task graph and run it through registered adapters."
+        ),
+        required_approvals=[str(item) for item in payload.get("required_approvals") or []],
+        safety_notes=[str(item) for item in payload.get("safety_notes") or []],
+        equivalent_commands=[str(item) for item in payload.get("equivalent_commands") or []],
+        confirm_prompt=str(
+            payload.get("confirm_prompt")
+            or "Type yes, /confirm, or /run to create the objective and run this graph in the foreground."
+        ),
+    )
+
+
+def _orchestration_task_from_payload(payload: dict[str, Any]) -> OrchestratedTaskDraft:
+    return OrchestratedTaskDraft(
+        title=str(payload.get("title") or "Recovered task"),
+        description=str(payload.get("description") or ""),
+        agent_id=str(payload.get("agent_id") or "repo_inspector"),
+        workbench_id=str(payload.get("workbench_id") or "coding"),
+        execution_adapter=str(payload.get("execution_adapter") or CODEX_ORCHESTRATION_ADAPTER),
+        task_type=str(payload.get("task_type") or CODEX_ORCHESTRATION_TASK_TYPE),
+        depends_on_indexes=[
+            int(item)
+            for item in payload.get("depends_on_indexes") or []
+            if isinstance(item, int) and not isinstance(item, bool)
+        ],
+        priority=int(payload.get("priority") or 0),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def _orchestration_checkpoint_from_payload(payload: dict[str, Any]) -> OrchestratedCheckpointDraft:
+    return OrchestratedCheckpointDraft(
+        label=str(payload.get("label") or "Recovered supervisor checkpoint"),
+        reason=str(payload.get("reason") or ""),
+        required=bool(payload.get("required", True)),
+        actor=str(payload.get("actor") or "harness_chat"),
+        metadata=dict(payload.get("metadata") or {}),
+    )
+
+
+def _optional_payload_string(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _session_tools_response(project_root: Path) -> dict[str, Any]:
     payload = session_tool_catalog_projection(project_root=project_root)
     descriptors = payload["tools"]
@@ -2398,6 +2772,108 @@ def _plan_mode_status_response(project_root: Path, state: ChatSessionState) -> d
         lines,
         ok=True,
         extra={"planning_mode": planning_mode, "session_id": session_id, "permission_granting": False},
+    )
+
+
+def _active_session_planning_mode(project_root: Path, state: ChatSessionState) -> bool:
+    if not state.session_id or not _is_initialized(project_root):
+        return False
+    try:
+        store = _require_store(project_root)
+        return bool(session_planning_mode_projection(store.get_session(state.session_id).metadata).get("active"))
+    except Exception:
+        return False
+
+
+_PLAN_MODE_PASSTHROUGH_INTENTS = {
+    "plan_mode_status",
+    "plan_mode_enter",
+    "plan_mode_exit",
+}
+
+
+def _plan_mode_should_capture_intent(intent: str) -> bool:
+    return intent not in _PLAN_MODE_PASSTHROUGH_INTENTS
+
+
+def _plan_mode_prompt_response(
+    project_root: Path,
+    state: ChatSessionState,
+    raw: str,
+    intent: str,
+    *,
+    chat_model: ChatModel | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    state.pending_draft = None
+    state.pending_orchestration = None
+    state.pending_execute_lease_id = None
+    state.pending_action_contract = None
+    state.pending_hosted_approval = False
+    state.pending_session_tool_call = None
+    _persist_pending_chat_action(project_root, state)
+    response = _model_chat_response(
+        raw,
+        project_root,
+        state,
+        chat_model=chat_model,
+        mode_override="plan",
+        progress_callback=progress_callback,
+    )
+    if response.get("kind") == "llm_chat":
+        response["kind"] = "plan_mode_plan"
+        response["title"] = "Plan"
+    response.update(
+        sanitize_for_logging(
+            {
+                "planning_mode": {"active": True},
+                "captured_intent": intent,
+                "creates_pending_action": False,
+                "permission_granting": False,
+                "provider_execution_started": False,
+                "adapter_dispatch_started": False,
+            }
+        )
+    )
+    state.pending_draft = None
+    state.pending_orchestration = None
+    state.pending_execute_lease_id = None
+    state.pending_action_contract = None
+    state.pending_hosted_approval = False
+    if response.get("kind") != "session_tool_permission_required":
+        state.pending_session_tool_call = None
+    _persist_pending_chat_action(project_root, state)
+    return response
+
+
+def _plan_mode_tool_request_allowed(request: ChatToolRequest) -> bool:
+    try:
+        descriptor = get_session_tool_descriptor(request.tool)
+    except KeyError:
+        return False
+    return bool(descriptor.enabled and descriptor.allowed_in_plan_agent and not descriptor.permission_required)
+
+
+def _plan_mode_tool_boundary_result(request: ChatToolRequest) -> ChatToolResult:
+    return ChatToolResult(
+        tool=request.tool,
+        ok=False,
+        content=(
+            "Plan mode does not create approvals, run execution, call providers, use network, "
+            "or mutate the active repository. Treat the requested tool as a future governed step and return "
+            "a concrete plan for the user's prompt."
+        ),
+        data={
+            "schema_version": "harness.plan_mode_tool_boundary/v1",
+            "tool": request.tool,
+            "arguments": sanitize_for_logging(request.arguments),
+            "permission_granting": False,
+            "approval_created": False,
+            "execution_started": False,
+            "provider_call_started": False,
+            "active_repo_modified": False,
+        },
+        error_type="plan_mode_boundary",
     )
 
 
@@ -2839,6 +3315,7 @@ def _action_contract_response(project_root: Path, state: ChatSessionState, tool_
                 },
             )
     state.pending_action_contract = contract
+    _persist_pending_chat_action(project_root, state)
     lines = [
         "Ready to manage this through Harness.",
         "Next: type yes or /confirm to approve this contract, or no to cancel.",
@@ -3223,6 +3700,11 @@ def _autonomy_input_from_contract(
         would_mutate_active_repo=contract.tool == "apply_back",
         requires_network=False,
         requires_paid_or_hosted_boundary=boundary in {"hosted_provider", "hosted_provider_codex"},
+        allow_internal_hosted_provider_authority=(
+            contract.tool == "edit_isolated"
+            and boundary == "hosted_provider_codex"
+            and adapter_id == "codex_isolated_edit"
+        ),
         requires_sandbox=contract.tool in {"dispatch_registered_adapter", "edit_isolated", "run_tests"},
         sandbox_enforced=contract.tool in {"dispatch_registered_adapter", "edit_isolated"},
         adapter_breaker_open=_adapter_breaker_open(project_root, adapter_id),
@@ -3300,6 +3782,76 @@ def _contract_idempotency_key(contract: ActionContract) -> str:
         default=str,
     )
     return f"chat_contract:{hashlib.sha256(stable.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _stable_idempotency_key(prefix: str, payload: dict[str, Any]) -> str:
+    stable = json.dumps(
+        sanitize_for_logging(payload),
+        sort_keys=True,
+        default=str,
+        separators=(",", ":"),
+    )
+    return f"{prefix}:{hashlib.sha256(stable.encode('utf-8')).hexdigest()[:24]}"
+
+
+def _orchestration_objective_idempotency_key(source_key: str) -> str:
+    return _stable_idempotency_key("orchestration_objective", {"source_key": source_key})
+
+
+def _orchestration_task_idempotency_key(source_key: str, index: int, task_payload: dict[str, Any]) -> str:
+    return _stable_idempotency_key(
+        "orchestration_task",
+        {"source_key": source_key, "task_index": index, "task": task_payload},
+    )
+
+
+def _orchestration_checkpoint_idempotency_key(
+    source_key: str,
+    objective_id: str,
+    index: int,
+    checkpoint_payload: dict[str, Any],
+) -> str:
+    return _stable_idempotency_key(
+        "orchestration_checkpoint",
+        {
+            "source_key": source_key,
+            "objective_id": objective_id,
+            "checkpoint_index": index,
+            "checkpoint": checkpoint_payload,
+        },
+    )
+
+
+def _find_objective_by_orchestration_key(store: SQLiteStore, idempotency_key: str) -> Any | None:
+    for objective in store.list_objectives():
+        if objective.metadata.get("orchestration_idempotency_key") == idempotency_key:
+            return objective
+    return None
+
+
+def _create_or_reuse_orchestration_objective(
+    store: SQLiteStore,
+    *,
+    title: str,
+    description: str,
+    priority: int,
+    workbench_id: str | None,
+    metadata: dict[str, Any],
+    idempotency_key: str,
+) -> tuple[Any, bool]:
+    existing = _find_objective_by_orchestration_key(store, idempotency_key)
+    if existing is not None:
+        return existing, True
+    return (
+        store.create_objective(
+            title=title,
+            description=description,
+            priority=priority,
+            workbench_id=workbench_id,
+            metadata={**metadata, "orchestration_idempotency_key": idempotency_key},
+        ),
+        False,
+    )
 
 
 def _task_for_latest_lease(project_root: Path, state: ChatSessionState) -> TaskRecord | None:
@@ -3540,14 +4092,146 @@ def _confirm_create_task_contract(project_root: Path, state: ChatSessionState, c
     )
 
 
+def _checkpoint_drafts_from_payloads(raw_checkpoints: Any) -> list[OrchestratedCheckpointDraft]:
+    if raw_checkpoints in (None, ""):
+        return []
+    if not isinstance(raw_checkpoints, list):
+        raise ValueError("checkpoint payloads must be a list")
+    drafts: list[OrchestratedCheckpointDraft] = []
+    for index, raw_checkpoint in enumerate(raw_checkpoints):
+        if not isinstance(raw_checkpoint, dict):
+            raise ValueError(f"checkpoint[{index}] must be an object")
+        label = str(sanitize_for_logging(raw_checkpoint.get("label") or "")).strip()
+        if not label:
+            raise ValueError(f"checkpoint[{index}] label is required")
+        required = raw_checkpoint.get("required", True)
+        if not isinstance(required, bool):
+            raise ValueError(f"checkpoint[{index}] required must be a boolean")
+        metadata = raw_checkpoint.get("metadata") if isinstance(raw_checkpoint.get("metadata"), dict) else {}
+        drafts.append(
+            OrchestratedCheckpointDraft(
+                label=label,
+                reason=str(sanitize_for_logging(raw_checkpoint.get("reason") or "")).strip(),
+                required=required,
+                actor=str(sanitize_for_logging(raw_checkpoint.get("actor") or "harness_chat")).strip()
+                or "harness_chat",
+                metadata=dict(metadata),
+            )
+        )
+    return drafts
+
+
+def _create_and_approve_orchestration_checkpoints(
+    project_root: Path,
+    objective_id: str,
+    checkpoints: list[OrchestratedCheckpointDraft],
+    *,
+    idempotency_key: str,
+    approval_id: str,
+    actor: str,
+    verdict_reason: str,
+    metadata: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not checkpoints:
+        return records
+    for index, checkpoint in enumerate(checkpoints):
+        payload = checkpoint.to_payload()
+        checkpoint_idempotency_key = _orchestration_checkpoint_idempotency_key(
+            idempotency_key,
+            objective_id,
+            index,
+            payload,
+        )
+        existing = _find_orchestration_checkpoint(project_root, objective_id, checkpoint_idempotency_key)
+        if existing is not None:
+            if existing.status == "pending":
+                existing = resolve_objective_checkpoint(
+                    project_root,
+                    objective_id,
+                    existing.checkpoint_id,
+                    verdict="approved",
+                    reason=verdict_reason,
+                    approval_id=approval_id,
+                    actor=actor,
+                )
+            records.append(existing.model_dump(mode="json"))
+            continue
+        checkpoint_metadata = {
+            **dict(payload.get("metadata") or {}),
+            **dict(metadata or {}),
+            "checkpoint_idempotency_key": checkpoint_idempotency_key,
+            "checkpoint_template_index": index,
+            "approval_source": actor,
+        }
+        created = create_objective_checkpoint(
+            project_root,
+            objective_id,
+            label=str(payload["label"]),
+            reason=str(payload.get("reason") or ""),
+            required=bool(payload.get("required", True)),
+            actor=str(payload.get("actor") or actor),
+            metadata=checkpoint_metadata,
+        )
+        resolved = resolve_objective_checkpoint(
+            project_root,
+            objective_id,
+            created.checkpoint_id,
+            verdict="approved",
+            reason=verdict_reason,
+            approval_id=approval_id,
+            actor=actor,
+        )
+        records.append(resolved.model_dump(mode="json"))
+    return records
+
+
+def _find_orchestration_checkpoint(
+    project_root: Path,
+    objective_id: str,
+    checkpoint_idempotency_key: str,
+) -> Any | None:
+    try:
+        projection = list_objective_checkpoints(project_root, objective_id)
+    except KeyError:
+        return None
+    for checkpoint in projection.checkpoints:
+        if checkpoint.metadata.get("checkpoint_idempotency_key") == checkpoint_idempotency_key:
+            return checkpoint
+    return None
+
+
+def _checkpoint_evidence_lines(records: list[dict[str, Any]]) -> list[str]:
+    if not records:
+        return []
+    return [
+        f"Approved supervisor checkpoints: {len(records)}",
+        *[
+            f"- {record.get('checkpoint_id')}: {record.get('label')} [{record.get('status')}]"
+            for record in records
+        ],
+    ]
+
+
 def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
     store = _require_store(project_root)
     args = contract.normalized_arguments
-    objective = store.create_objective(
+    checkpoint_drafts = _checkpoint_drafts_from_payloads(args.get("checkpoints") or [])
+    contract_idempotency_key = _contract_idempotency_key(contract)
+    objective_idempotency_key = _orchestration_objective_idempotency_key(contract_idempotency_key)
+    objective, objective_reused = _create_or_reuse_orchestration_objective(
+        store,
         title=str(args["goal"]),
         description=str(args["goal"]),
+        priority=0,
         workbench_id=args.get("workbench_id"),
-        metadata={"created_from": "chat_action_contract", "contract_id": contract.id, "tool": contract.tool},
+        metadata={
+            "created_from": "chat_action_contract",
+            "contract_id": contract.id,
+            "tool": contract.tool,
+            "contract_idempotency_key": contract_idempotency_key,
+        },
+        idempotency_key=objective_idempotency_key,
     )
     created_tasks = []
     raw_tasks = [task for task in args.get("tasks") or [] if isinstance(task, dict)]
@@ -3562,7 +4246,7 @@ def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionSt
             ChatToolRequest(
                 type="harness.tool_request/v1",
                 tool="create_task",
-                arguments={**raw_task, "objective_id": objective.id},
+                arguments={**raw_task, "objective_id": objective.id, "depends_on": depends_on},
             ),
             project_root=project_root,
         )
@@ -3576,7 +4260,7 @@ def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionSt
                 workbench_id=task_args.get("workbench_id"),
                 agent_id=task_args.get("agent_id"),
                 priority=int(raw_task.get("priority") or 0),
-                depends_on=depends_on,
+                depends_on=list(task_args.get("depends_on") or depends_on),
                 idempotency_key=task_idempotency_key,
                 metadata={
                     **dict(task_args.get("metadata") or {}),
@@ -3591,12 +4275,54 @@ def _confirm_create_task_graph_contract(project_root: Path, state: ChatSessionSt
     state.latest_objective_id = objective.id
     if created_tasks:
         state.latest_task_id = created_tasks[-1].id
+    checkpoint_records = _create_and_approve_orchestration_checkpoints(
+        project_root,
+        objective.id,
+        checkpoint_drafts,
+        idempotency_key=objective_idempotency_key,
+        approval_id=_stable_idempotency_key(
+            "action_contract_confirm",
+            {"source_key": objective_idempotency_key, "objective_id": objective.id},
+        ),
+        actor="harness_chat",
+        verdict_reason="Confirmed chat action contract before task graph creation.",
+        metadata={
+            "created_from": "chat_action_contract",
+            "contract_id": contract.id,
+            "tool": contract.tool,
+            "template_id": args.get("template_id"),
+            "task_count": len(created_tasks),
+        },
+    )
+    state.latest_orchestration = {
+        "contract": contract.to_payload(),
+        "objective": objective.model_dump(mode="json"),
+        "tasks": [task.model_dump(mode="json") for task in created_tasks],
+        "checkpoints": checkpoint_records,
+    }
+    lines = [
+        f"Objective: {objective.id}",
+        *(
+            ["Idempotency: reused existing objective graph for this confirmation."]
+            if objective_reused
+            else []
+        ),
+        f"Tasks: {len(created_tasks)}",
+        *_checkpoint_evidence_lines(checkpoint_records),
+        "Next: ask me to inspect progress or continue execution.",
+    ]
     return _response(
         "action_contract_executed",
         "Task Graph Created",
-        [f"Objective: {objective.id}", f"Tasks: {len(created_tasks)}", "Next: ask me to inspect progress or continue execution."],
+        lines,
         ok=True,
-        extra={"contract": contract.to_payload(), "objective": objective.model_dump(mode="json"), "tasks": [task.model_dump(mode="json") for task in created_tasks]},
+        extra={
+            "contract": contract.to_payload(),
+            "objective": objective.model_dump(mode="json"),
+            "tasks": [task.model_dump(mode="json") for task in created_tasks],
+            "checkpoints": checkpoint_records,
+            "orchestration": state.latest_orchestration,
+        },
     )
 
 
@@ -3612,9 +4338,10 @@ def _confirm_remember_contract(project_root: Path, contract: ActionContract) -> 
 def _confirm_edit_isolated_contract(project_root: Path, state: ChatSessionState, contract: ActionContract) -> dict[str, Any]:
     goal = str(contract.normalized_arguments.get("goal") or contract.normalized_arguments.get("summary") or contract.summary)
     template = template_for_intent("coding_fix", goal, project_root)
-    draft = _orchestration_from_template(template, state)
+    draft = _orchestration_from_template(template, state, project_root)
     draft.objective_title = str(contract.normalized_arguments.get("title") or draft.objective_title)
     draft.objective_description = goal
+    draft.idempotency_key = _contract_idempotency_key(contract)
     response = _create_and_run_orchestration(project_root, state, draft)
     response["contract"] = contract.to_payload()
     return response
@@ -3836,7 +4563,9 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
             return _uninitialized_response(project_root)
         contract = state.pending_action_contract
         state.pending_action_contract = None
-        return _execute_action_contract(project_root, state, contract)
+        response = _execute_action_contract(project_root, state, contract)
+        _persist_pending_chat_action(project_root, state)
+        return response
     if state.pending_hosted_approval:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
@@ -3862,7 +4591,9 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
         ]
         if state.latest_lease_id:
             lines.append("Type /run to continue the latest active lease.")
-        return _response("hosted_approval_created", "Hosted Approval Created", lines, ok=True)
+        response = _response("hosted_approval_created", "Hosted Approval Created", lines, ok=True)
+        _persist_pending_chat_action(project_root, state)
+        return response
     if state.pending_draft is not None:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
@@ -3873,13 +4604,16 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
             response = _run_single_task_response(project_root, state, task)
         else:
             response = _task_created_response(task, draft)
+        _persist_pending_chat_action(project_root, state)
         return response
     if state.pending_orchestration is not None:
         if not _is_initialized(project_root):
             return _uninitialized_response(project_root)
         draft = state.pending_orchestration
         state.pending_orchestration = None
-        return _create_and_run_orchestration(project_root, state, draft)
+        response = _create_and_run_orchestration(project_root, state, draft)
+        _persist_pending_chat_action(project_root, state)
+        return response
     if state.pending_execute_lease_id is not None:
         lease_id = state.pending_execute_lease_id
         state.pending_execute_lease_id = None
@@ -3897,6 +4631,7 @@ def _confirm_pending(project_root: Path, state: ChatSessionState) -> dict[str, A
             except KeyError:
                 approval_lines = []
         response = _execute_response(project_root, lease_id, state)
+        _persist_pending_chat_action(project_root, state)
         if approval_lines:
             response["lines"] = [*approval_lines, *response.get("lines", [])]
             response["auto_approvals"] = approval_lines
@@ -3937,8 +4672,13 @@ def _task_created_response(task: TaskRecord, draft: ChatDraftTask) -> dict[str, 
 
 def _run_single_task_response(project_root: Path, state: ChatSessionState, task: TaskRecord) -> dict[str, Any]:
     store = _require_store(project_root)
+    approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
+        project_root,
+        [task],
+        reason=f"Created from confirmed foreground chat task {task.id} before leasing.",
+    )
     tick = store.daemon_run_once(owner=ORCHESTRATION_OWNER, pid=None)
-    lines = [f"Task created: {task.id}"]
+    lines = [f"Task created: {task.id}", *approval_lines]
     if tick.lease is None:
         lines.extend([f"Lease decision: {tick.decision}", f"Pause reasons: {tick.pause_reasons}"])
         return _response(
@@ -3968,12 +4708,12 @@ def _run_single_task_response(project_root: Path, state: ChatSessionState, task:
         state.latest_task_id = tick.selected_task.id
     state.progress.append(f"lease acquired: {tick.lease.id}")
     lines.extend([f"Lease acquired: {tick.lease.id}", "Dispatching registered adapter."])
-    approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
+    lease_approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
         project_root,
         [tick.selected_task or task],
         reason=f"Created from confirmed foreground chat task {task.id} after lease {tick.lease.id}.",
     )
-    lines.extend(approval_lines)
+    lines.extend(lease_approval_lines)
     result_response = _execute_response(project_root, tick.lease.id, state)
     result_lines = result_response.get("lines", [])
     response = _response(
@@ -3987,13 +4727,15 @@ def _run_single_task_response(project_root: Path, state: ChatSessionState, task:
             "execution": result_response.get("result"),
         },
     )
-    if approval_lines:
-        response["auto_approvals"] = approval_lines
+    all_approval_lines = [*approval_lines, *lease_approval_lines]
+    if all_approval_lines:
+        response["auto_approvals"] = all_approval_lines
     return response
 
 
 def _draft_response(project_root: Path, state: ChatSessionState, draft: ChatDraftTask) -> dict[str, Any]:
     state.pending_draft = draft
+    _persist_pending_chat_action(project_root, state)
     confirmation_line = (
         "Type yes or /confirm to create this task and run it in the foreground. Type no to cancel."
         if state.codex_like_mode
@@ -4028,11 +4770,16 @@ def _orchestration_draft_response(
     draft: OrchestratedRunDraft,
 ) -> dict[str, Any]:
     state.pending_orchestration = draft
+    _persist_pending_chat_action(project_root, state)
     task_lines = [
         f"{idx + 1}. {task.agent_id}: {task.title}"
         + f" adapter={task.execution_adapter} task_type={task.task_type}"
         + (f" depends_on={','.join(str(i + 1) for i in task.depends_on_indexes)}" if task.depends_on_indexes else "")
         for idx, task in enumerate(draft.tasks)
+    ]
+    checkpoint_lines = [
+        f"{idx + 1}. {'required' if checkpoint.required else 'optional'}: {checkpoint.label}"
+        for idx, checkpoint in enumerate(draft.checkpoints)
     ]
     return _response(
         "orchestration_draft",
@@ -4045,6 +4792,15 @@ def _orchestration_draft_response(
             f"Workbench: {draft.workbench_id}",
             "Tasks:",
             *task_lines,
+            *(
+                [
+                    "Supervisor checkpoints:",
+                    *checkpoint_lines,
+                    "On confirmation, Harness records and approves these checkpoints as objective evidence.",
+                ]
+                if checkpoint_lines
+                else []
+            ),
             f"Required approvals: {draft.required_approvals}",
             "Safety boundary:",
             *[f"- {note}" for note in draft.safety_notes],
@@ -4170,21 +4926,51 @@ def _draft_from_template(template: WorkflowTemplate) -> ChatDraftTask:
     )
 
 
-def _orchestration_from_template(template: WorkflowTemplate, state: ChatSessionState) -> OrchestratedRunDraft:
-    tasks = [
-        OrchestratedTaskDraft(
-            title=task.title,
-            description=task.description,
-            agent_id=task.agent_id or "repo_inspector",
-            workbench_id=task.workbench_id or "coding",
-            execution_adapter=task.execution_adapter,
-            task_type=task.task_type,
-            depends_on_indexes=list(task.depends_on_indexes),
-            priority=task.priority,
-            metadata=task.metadata(),
+def _orchestration_from_template(
+    template: WorkflowTemplate,
+    state: ChatSessionState,
+    project_root: Path,
+) -> OrchestratedRunDraft:
+    tasks = []
+    discovery_cards_by_workbench: dict[str, list[AgentDiscoveryCard]] = {}
+    for task in template.tasks:
+        workbench_id = task.workbench_id or "coding"
+        if workbench_id not in discovery_cards_by_workbench:
+            catalog = build_agent_discovery_catalog(
+                project_root,
+                workbench_id=workbench_id,
+                include_sample_allocation=False,
+            )
+            if not catalog.ok:
+                raise ValueError(
+                    "Workflow agent discovery failed: "
+                    f"workbench={workbench_id} errors={catalog.validation_errors} summary={catalog.summary}"
+                )
+            discovery_cards_by_workbench[workbench_id] = catalog.cards
+        selected_agent_id, allocation_receipt = _allocate_workflow_task_agent(
+            project_root,
+            task,
+            cards=discovery_cards_by_workbench[workbench_id],
         )
-        for task in template.tasks
-    ]
+        tasks.append(
+            OrchestratedTaskDraft(
+                title=task.title,
+                description=task.description,
+                agent_id=selected_agent_id,
+                workbench_id=workbench_id,
+                execution_adapter=task.execution_adapter,
+                task_type=task.task_type,
+                depends_on_indexes=list(task.depends_on_indexes),
+                priority=task.priority,
+                metadata={
+                    **task.metadata(),
+                    "agent_selection_source": WORKFLOW_AGENT_SELECTION_SOURCE,
+                    "delegate_allocation_schema_version": DELEGATE_ALLOCATION_SCHEMA_VERSION,
+                    "delegate_allocation": allocation_receipt,
+                },
+                agent_selection=None if task.agent_selection is None else task.agent_selection.to_payload(),
+            )
+        )
     orchestrator_id = _active_orchestrator_id(state)
     workbench_id = tasks[0].workbench_id if tasks else _workbench_for_orchestrator(orchestrator_id)
     return OrchestratedRunDraft(
@@ -4193,6 +4979,16 @@ def _orchestration_from_template(template: WorkflowTemplate, state: ChatSessionS
         orchestrator_id=orchestrator_id,
         workbench_id=workbench_id,
         tasks=tasks,
+        checkpoints=[
+            OrchestratedCheckpointDraft(
+                label=checkpoint.label,
+                reason=checkpoint.reason,
+                required=checkpoint.required,
+                actor="harness_chat",
+                metadata=checkpoint.metadata,
+            )
+            for checkpoint in template.checkpoints
+        ],
         interpreted_intent=template.interpreted_intent,
         proposed_action=template.proposed_action,
         required_approvals=template.required_approvals,
@@ -4200,6 +4996,129 @@ def _orchestration_from_template(template: WorkflowTemplate, state: ChatSessionS
         equivalent_commands=template.equivalent_commands,
         confirm_prompt=template.confirm_prompt,
     )
+
+
+def _allocate_workflow_task_agent(
+    project_root: Path,
+    task: WorkflowTaskTemplate,
+    *,
+    cards: list[AgentDiscoveryCard],
+) -> tuple[str, dict[str, Any]]:
+    requirements = _workflow_task_allocation_requirements(task)
+    allocation = evaluate_delegate_allocation(
+        project_root,
+        workbench_id=task.workbench_id or "coding",
+        task_type=task.task_type,
+        required_kind=requirements["required_kind"],
+        required_tool_policy_id=requirements["required_tool_policy_id"],
+        required_outputs=requirements["required_outputs"],
+        required_tags=requirements["required_tags"],
+        max_candidates=1,
+        cards=cards,
+    )
+    if not allocation.ok or len(allocation.selected_agent_ids) != 1:
+        raise ValueError(
+            "Workflow task agent allocation failed: "
+            f"{task.title} selected={allocation.selected_agent_ids} summary={allocation.summary}"
+        )
+    selected_agent_id = allocation.selected_agent_ids[0]
+    selected_bid = next((bid for bid in allocation.bids if bid.bid_id in set(allocation.selected_bid_ids)), None)
+    if selected_bid is None:
+        raise ValueError(f"Workflow task agent allocation missing selected bid for {task.title}.")
+    receipt = {
+        "schema_version": DELEGATE_ALLOCATION_SCHEMA_VERSION,
+        "selection_source": WORKFLOW_AGENT_SELECTION_SOURCE,
+        "announcement_id": allocation.announcement.announcement_id,
+        "selected_agent_id": selected_agent_id,
+        "selected_bid_id": selected_bid.bid_id,
+        "eligible_count": allocation.summary.get("eligible_count", 0),
+        "requirements": requirements,
+        "selected_bid": {
+            "score": selected_bid.score,
+            "matched": selected_bid.matched,
+            "bid_terms": selected_bid.bid_terms,
+        },
+        "safety": {
+            "read_only": allocation.safety.get("read_only") is True,
+            "metadata_only": allocation.safety.get("metadata_only") is True,
+            "provider_called": allocation.safety.get("provider_called") is True,
+            "network_called": allocation.safety.get("network_called") is True,
+            "agent_execution_started": allocation.safety.get("agent_execution_started") is True,
+            "tool_execution_started": allocation.safety.get("tool_execution_started") is True,
+            "adapter_execution_started": allocation.safety.get("adapter_execution_started") is True,
+            "process_started": allocation.safety.get("process_started") is True,
+            "filesystem_modified": allocation.safety.get("filesystem_modified") is True,
+            "permission_granting": allocation.safety.get("permission_granting") is True,
+            "budget_granting": allocation.safety.get("budget_granting") is True,
+        },
+    }
+    return selected_agent_id, sanitize_for_logging(receipt)
+
+
+def _workflow_task_allocation_requirements(task: WorkflowTaskTemplate) -> dict[str, Any]:
+    metadata = task.metadata()
+    workflow_stage = str(metadata.get("workflow_stage") or "")
+    if task.agent_selection is not None:
+        selection = task.agent_selection
+        return {
+            "schema_version": selection.to_payload()["schema_version"],
+            "source": "workflow_template",
+            "workbench_id": task.workbench_id or "coding",
+            "required_kind": selection.required_kind,
+            "required_tool_policy_id": selection.required_tool_policy_id,
+            "required_outputs": list(selection.required_outputs),
+            "required_tags": list(selection.required_tags),
+            "task_type": task.task_type,
+            "workflow_stage": workflow_stage or None,
+        }
+    required_kind: str | None = None
+    required_tool_policy_id: str | None = None
+    required_outputs: list[str] = []
+    required_tags: list[str] = []
+
+    if task.execution_adapter == "review_gate":
+        required_kind = "reviewer"
+        required_tool_policy_id = "read_only"
+        required_outputs = [f"{task.task_type}.md"]
+        if task.task_type == "security_review":
+            required_tags = ["security"]
+        elif task.task_type in {"implementation_review", "factuality_review"}:
+            required_tags = ["review"]
+    elif task.execution_adapter == "codex_isolated_edit":
+        required_kind = "specialist"
+        required_tool_policy_id = "isolated_code_edit"
+        required_outputs = ["patch_summary.md"]
+    elif task.execution_adapter == "repo_planning":
+        required_kind = "specialist"
+        required_tool_policy_id = "read_only"
+        required_outputs = ["repo_summary.md"]
+    elif task.execution_adapter == "read_only_summary":
+        required_kind = "specialist"
+        required_tool_policy_id = "read_only"
+        required_outputs = ["repo_summary.md"]
+    elif task.task_type == "phase_1a_test" and workflow_stage == "test_sandbox":
+        required_kind = "specialist"
+        required_tool_policy_id = "docker_test"
+        required_outputs = ["test_report.md"]
+    elif workflow_stage in {"final_report", "research_synthesis"}:
+        required_kind = "orchestrator"
+        required_outputs = ["final_orchestrator_summary.md"]
+        required_tags = ["orchestrator"]
+    else:
+        required_kind = "specialist"
+        required_tool_policy_id = "read_only"
+        required_outputs = ["repo_summary.md"]
+
+    return {
+        "source": "compatibility_inference",
+        "workbench_id": task.workbench_id or "coding",
+        "required_kind": required_kind,
+        "required_tool_policy_id": required_tool_policy_id,
+        "required_outputs": required_outputs,
+        "required_tags": required_tags,
+        "task_type": task.task_type,
+        "workflow_stage": workflow_stage or None,
+    }
 
 
 def _orchestrators_response(state: ChatSessionState) -> dict[str, Any]:
@@ -4508,6 +5427,8 @@ def _orchestration_progress_response(
         lines.append(f"Active lease: {progress.active_lease_ids[0]}")
     if progress.active_run_ids:
         lines.append(f"Active run: {progress.active_run_ids[0]}")
+    if progress.objective_evidence:
+        lines.append(f"Objective evidence: {'pass' if progress.objective_evidence.get('ok') else 'fail'}")
     for task in progress.tasks[:6]:
         detail = f"{task.task_id}: {task.status.value} | {task.execution_adapter or 'no_adapter'}"
         if task.lease_id:
@@ -4744,6 +5665,7 @@ def _prepare_execute_response(project_root: Path, lease_id: str | None, state: C
             extra={"inspection": payload},
         )
     state.pending_execute_lease_id = lease_id
+    _persist_pending_chat_action(project_root, state)
     return _response(
         "execute_confirmation_required",
         "Confirm Registered Adapter Dispatch",
@@ -4760,7 +5682,11 @@ def _prepare_execute_response(project_root: Path, lease_id: str | None, state: C
 def _execute_response(project_root: Path, lease_id: str, state: ChatSessionState) -> dict[str, Any]:
     if not _is_initialized(project_root):
         return _uninitialized_response(project_root)
-    result = execute_lease(project_root, lease_id, owner="chat_cli")
+    try:
+        owner = _require_store(project_root).get_task_lease(lease_id).owner
+    except KeyError:
+        owner = "chat_cli"
+    result = execute_lease(project_root, lease_id, owner=owner)
     if result.task:
         state.latest_task_id = result.task.id
         if result.task.status.value == "failed":
@@ -4781,6 +5707,7 @@ def _execute_response(project_root: Path, lease_id: str, state: ChatSessionState
         and _needs_hosted_approval(result.rejection_reasons + result.errors)
     ):
         state.pending_hosted_approval = True
+        _persist_pending_chat_action(project_root, state)
     lines = [
         f"Task: {_status_label_for_result(result)}",
         f"Adapter: {result.adapter_id or 'none'}",
@@ -4944,13 +5871,21 @@ def _create_and_run_orchestration(
     draft: OrchestratedRunDraft,
 ) -> dict[str, Any]:
     store = _require_store(project_root)
+    objective_idempotency_key = _orchestration_objective_idempotency_key(draft.idempotency_key)
     # Cancel stale open objectives from the same workbench to prevent task pileup
     for existing in store.list_objectives():
-        if existing.workbench_id == draft.workbench_id and existing.status == "active" and existing.id != state.latest_objective_id:
+        same_graph = existing.metadata.get("orchestration_idempotency_key") == objective_idempotency_key
+        if (
+            existing.workbench_id == draft.workbench_id
+            and existing.status == "active"
+            and existing.id != state.latest_objective_id
+            and not same_graph
+        ):
             for task in store.list_tasks(objective_id=existing.id):
                 if task.status.value in {"ready", "leased", "blocked", "waiting_approval", "created"}:
                     store.cancel_task(task.id)
-    objective = store.create_objective(
+    objective, objective_reused = _create_or_reuse_orchestration_objective(
+        store,
         title=draft.objective_title,
         description=draft.objective_description,
         priority=1000,
@@ -4959,11 +5894,18 @@ def _create_and_run_orchestration(
             "created_by": "harness_chat",
             "orchestrator_id": draft.orchestrator_id,
             "execution_adapter": CODEX_ORCHESTRATION_ADAPTER,
+            "draft_idempotency_key": draft.idempotency_key,
         },
+        idempotency_key=objective_idempotency_key,
     )
     created_tasks: list[TaskRecord] = []
     for idx, task_draft in enumerate(draft.tasks):
         depends_on = [created_tasks[dep_idx].id for dep_idx in task_draft.depends_on_indexes]
+        task_idempotency_key = _orchestration_task_idempotency_key(
+            objective_idempotency_key,
+            idx,
+            task_draft.to_payload(),
+        )
         task = store.create_task(
             title=task_draft.title,
             description=task_draft.description,
@@ -4973,6 +5915,7 @@ def _create_and_run_orchestration(
             agent_id=task_draft.agent_id,
             spec_source_kind="builtin",
             depends_on=depends_on,
+            idempotency_key=task_idempotency_key,
             metadata={
                 **dict(task_draft.metadata),
                 "execution_adapter": task_draft.execution_adapter,
@@ -4980,23 +5923,58 @@ def _create_and_run_orchestration(
                 "chat_orchestrated": True,
                 "orchestrator_id": draft.orchestrator_id,
                 "workflow_intent": draft.interpreted_intent,
+                "idempotency_key": task_idempotency_key,
             },
         )
         created_tasks.append(task)
     state.latest_objective_id = objective.id
     state.latest_task_id = created_tasks[0].id if created_tasks else None
+    checkpoint_records = _create_and_approve_orchestration_checkpoints(
+        project_root,
+        objective.id,
+        draft.checkpoints,
+        idempotency_key=objective_idempotency_key,
+        approval_id=_stable_idempotency_key(
+            "chat_orchestration_confirm",
+            {"source_key": objective_idempotency_key, "objective_id": objective.id},
+        ),
+        actor="harness_chat",
+        verdict_reason="Operator confirmed the orchestration draft before foreground run.",
+        metadata={
+            "created_from": "chat_orchestration_draft",
+            "orchestrator_id": draft.orchestrator_id,
+            "workflow_intent": draft.interpreted_intent,
+            "task_count": len(created_tasks),
+        },
+    )
     state.latest_orchestration = {
         "draft": draft.to_payload(),
         "objective": objective.model_dump(mode="json"),
         "tasks": [task.model_dump(mode="json") for task in created_tasks],
+        "checkpoints": checkpoint_records,
     }
     approval_lines = _ensure_scoped_hosted_codex_approval_for_tasks(
         project_root,
         created_tasks,
         reason=f"Created from confirmed chat orchestration for objective {objective.id}.",
     )
-    state.progress.append(f"orchestration objective created: {objective.id}")
+    state.progress.append(
+        f"orchestration objective {'reused' if objective_reused else 'created'}: {objective.id}"
+    )
     response = _run_orchestration_loop(project_root, state, objective.id)
+    if objective_reused:
+        response["lines"] = [
+            "Idempotency: reused existing objective graph for this confirmation.",
+            *response.get("lines", []),
+        ]
+        response["idempotency"] = {
+            "objective_reused": True,
+            "orchestration_idempotency_key": objective_idempotency_key,
+        }
+    checkpoint_lines = _checkpoint_evidence_lines(checkpoint_records)
+    if checkpoint_lines:
+        response["lines"] = [*checkpoint_lines, *response.get("lines", [])]
+        response["checkpoint_evidence"] = checkpoint_records
     if approval_lines:
         response["lines"] = [*approval_lines, *response.get("lines", [])]
         response["auto_approvals"] = approval_lines
@@ -5069,6 +6047,7 @@ def _run_orchestration_loop(project_root: Path, state: ChatSessionState, objecti
         lines.extend(_summary_lines_from_result(project_root, result.adapter_result))
         if _needs_hosted_approval(result.rejection_reasons + result.errors):
             state.pending_hosted_approval = True
+            _persist_pending_chat_action(project_root, state)
             lines.extend(
                 [
                     "Hosted-boundary approval is required before Codex run creation.",

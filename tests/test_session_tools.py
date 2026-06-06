@@ -22,7 +22,9 @@ from harness.session_tools import (
     default_session_tool_descriptors,
     execute_session_tool,
     get_session_tool_descriptor,
+    model_visible_session_tool_ids,
     session_tool_catalog_projection,
+    validate_session_tool_arguments,
 )
 
 
@@ -359,14 +361,28 @@ def test_session_tool_policy_projection_covers_representative_classes(tmp_path) 
         "policy_source": "session_tool_descriptor",
         "maturity": ["implemented"],
         "policy_reasons": [],
+        "exposure": {
+            "schema_version": "harness.session_tool_exposure_projection/v1",
+            "tool_id": "read",
+            "model_visible": True,
+            "state": "exposed",
+            "exposure_mode": "default",
+            "progressive": True,
+            "reason": "Exposed by default as a low-risk read-only or session-local tool.",
+            "source": "session_tool_policy_projection",
+        },
     }
     assert plan["boundary_kind"] == "local_only"
     assert plan["permission_required"] is False
     assert write["boundary_kind"] == "active_repo_write"
     assert write["permission_required"] is True
     assert write["risk"] == "high"
+    assert write["exposure"]["model_visible"] is False
+    assert write["exposure"]["state"] == "approval_gated"
     assert shell["boundary_kind"] == "shell"
     assert shell["replay_policy"] == "rerun_forbidden"
+    assert shell["exposure"]["model_visible"] is False
+    assert shell["exposure"]["state"] == "approval_gated"
     assert web_search["required_config"] == [
         "web_tools.enabled",
         "web_tools.search_enabled",
@@ -374,17 +390,47 @@ def test_session_tool_policy_projection_covers_representative_classes(tmp_path) 
     ]
     assert "config_missing" in web_search["maturity"]
     assert web_search["enabled"] is False
+    assert web_search["exposure"]["state"] == "config_blocked"
     assert mcp_resource["boundary_kind"] == "mcp"
     assert "config_missing" in mcp_resource["maturity"]
+    assert mcp_resource["exposure"]["model_visible"] is False
     assert plugin_tool["enabled"] is False
     assert "disabled_by_default" in plugin_tool["maturity"]
     assert plugin_tool["disabled_reason"]
     assert "adapter" in plugin_tool["disabled_reason"]
+    assert plugin_tool["exposure"]["state"] == "disabled"
     assert task["permission_required"] is True
     assert task["required_client_capability"] == "background_tasks"
     assert task["required_model_capability"] == "tool_delegation"
     assert "client_unsupported" in task["maturity"]
     assert "model_unsupported" in task["maturity"]
+    assert task["exposure"]["model_visible"] is False
+
+
+def test_model_visible_session_tool_ids_progressively_withhold_gated_boundaries(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+
+    visible = set(model_visible_session_tool_ids(project_root=tmp_path))
+    plan_visible = set(model_visible_session_tool_ids(project_root=tmp_path, plan_mode=True))
+    descriptors = {descriptor.id: descriptor for descriptor in default_session_tool_descriptors()}
+
+    assert {"pwd", "read", "grep", "git-diff", "repo-overview", "todo", "question"} <= visible
+    assert visible == plan_visible
+    assert "invalid" not in visible
+    assert "shell" not in visible
+    assert "write" not in visible
+    assert "patch" not in visible
+    assert "web-fetch" not in visible
+    assert "web-search" not in visible
+    assert "mcp-resource" not in visible
+    assert "plugin-tool" not in visible
+    assert "task" not in visible
+    assert [
+        tool_id
+        for tool_id in sorted(visible)
+        if descriptors[tool_id].input_schema.get("type") == "object"
+        and descriptors[tool_id].input_schema.get("additionalProperties") is not False
+    ] == []
 
 
 def test_session_tools_cli_lists_descriptor_metadata_without_grants(tmp_path) -> None:
@@ -467,6 +513,49 @@ def test_unknown_session_tool_call_persists_invalid_tool_result(tmp_path) -> Non
     assert output.payload["tool_id"] == "invalid"
     assert output.payload["error_type"] == "invalid_tool_call"
     assert output.payload["ok"] is False
+
+
+def test_session_tool_argument_validation_enforces_schema_constraints() -> None:
+    ls = get_session_tool_descriptor("ls")
+    todo = get_session_tool_descriptor("todo")
+    web_search = get_session_tool_descriptor("web-search")
+
+    assert validate_session_tool_arguments(ls, {"limit": 0}) == "Invalid argument value for ls.limit: must be >= 1"
+    assert validate_session_tool_arguments(ls, {"limit": 1001}) == "Invalid argument value for ls.limit: must be <= 1000"
+    assert (
+        validate_session_tool_arguments(web_search, {"query": "agents", "search_type": "unsafe"})
+        == "Invalid argument value for web-search.search_type: must be one of auto, fast, deep"
+    )
+    assert (
+        validate_session_tool_arguments(todo, {"items": [{"title": "ship", "status": "blocked"}]})
+        == "Invalid argument value for todo.items[0].status: must be one of pending, in_progress, done"
+    )
+    assert validate_session_tool_arguments(todo, {"items": [{"title": "ship", "status": "done"}]}) is None
+
+
+def test_malformed_session_tool_arguments_persist_invalid_tool_result_without_permission(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Malformed tool args")
+
+    result = execute_session_tool(store, tmp_path, session.id, "ls", {"limit": 0})
+
+    assert result.ok is False
+    assert result.tool_id == "invalid"
+    assert result.error_type == "invalid_tool_call"
+    assert "Requested tool: ls" in result.preview
+    assert "Invalid argument value for ls.limit: must be >= 1" in result.preview
+    assert store.list_session_permissions(session.id) == []
+    run = store.get_run(result.run_id)
+    assert run.status == "failed"
+    events = store.list_session_store_events(session.id)
+    output = [event for event in events if event.kind == "tool_call.output"][-1]
+    before = [event for event in events if event.kind == "harness.tool_call.before"][-1]
+    assert output.payload["tool_id"] == "invalid"
+    assert output.payload["error_type"] == "invalid_tool_call"
+    assert output.payload["permission_granting"] is False
+    assert before.payload["record"]["normalized_args"]["arguments"]["requested_tool_id"] == "ls"
+    assert before.payload["decision"]["status"] == "allow"
 
 
 def test_ls_tool_lists_directory_with_cwd_filters_and_truncation(tmp_path) -> None:
@@ -1368,6 +1457,12 @@ def test_task_tool_requires_permission_then_persists_child_task_linkage(tmp_path
     assert result["created"] is True
     assert result["execution_started"] is False
     assert result["process_started"] is False
+    assert result["handoff"]["schema_version"] == "harness.agent_handoff_envelope/v1"
+    assert result["handoff"]["ok"] is True
+    assert result["handoff"]["agent_contract_schema_version"] == "harness.agent_contract/v1"
+    assert result["handoff"]["agent_contract_ok"] is True
+    assert result["handoff"]["adapter_execution_allowed"] is False
+    assert result["handoff"]["permission_granting"] is False
     task = SQLiteStore(tmp_path).get_task(result["task_id"])
     child = SQLiteStore(tmp_path).get_session(result["child_session_id"])
     parent = SQLiteStore(tmp_path).get_session(session.id)
@@ -1379,6 +1474,12 @@ def test_task_tool_requires_permission_then_persists_child_task_linkage(tmp_path
     assert task.metadata["child_session_id"] == child.id
     assert task.metadata["allowed_tools"] == ["read", "glob", "grep"]
     assert task.metadata["execution_started"] is False
+    assert task.metadata["handoff_schema_version"] == "harness.agent_handoff_envelope/v1"
+    assert task.metadata["handoff_envelope_id"] == result["handoff"]["envelope_id"]
+    assert task.metadata["handoff_payload_sha256"] == result["handoff"]["payload_sha256"]
+    assert task.metadata["handoff_agent_contract_schema_version"] == "harness.agent_contract/v1"
+    assert task.metadata["handoff_agent_contract_id"] == result["handoff"]["agent_contract_id"]
+    assert task.metadata["handoff_agent_contract_sha256"] == result["handoff"]["agent_contract_sha256"]
     events = SQLiteStore(tmp_path).list_session_store_events(session.id)
     assert "session.task.created" in [event.kind for event in events]
     task_events = SQLiteStore(tmp_path).list_store_events("task", task.id)
@@ -1717,6 +1818,142 @@ def test_skill_load_tool_requires_permission_then_loads_configured_project_skill
     assert metadata["plugin_tools_registered"] is False
     assert metadata["network_called"] is False
     assert metadata["filesystem_modified"] is False
+    assert metadata["symlink_policy"] == "reject_configured_path_components"
+    assert metadata["symlink_checked"] is True
+
+
+def test_skill_load_denies_configured_symlink_path_before_permission_prompt(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    real_skill_dir = tmp_path / "real-skills" / "reviewer"
+    real_skill_dir.mkdir(parents=True)
+    real_skill_dir.joinpath("SKILL.md").write_text("# Reviewer\n\nDo not reach through a symlink.\n", encoding="utf-8")
+    (tmp_path / "skills-link").symlink_to(tmp_path / "real-skills", target_is_directory=True)
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {
+            "reviewer": {
+                "path": "skills-link/reviewer",
+                "spec": "./skills-link/reviewer",
+                "version": "0.1.0",
+                "enabled": True,
+                "description": "Symlinked skill",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Skill symlink")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "skill-load",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"skill": "reviewer"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "Path contains symlink component: skills-link" in payload["preview"]
+    assert "Do not reach through a symlink" not in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.tool_id == "skill-load"
+    assert permission.normalized_target_pattern == "reviewer"
+
+
+def test_skill_load_escapes_configured_skill_name_in_prompt_wrapper(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    unsafe_name = 'review"><bad attr="1'
+    skill_dir = tmp_path / "skills" / "reviewer"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text("# Reviewer\n\nLoaded body.\n", encoding="utf-8")
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["skills"] = {
+        "enabled": True,
+        "project": {
+            unsafe_name: {
+                "path": "skills/reviewer",
+                "spec": "./skills/reviewer",
+                "version": "0.1.0",
+                "enabled": True,
+                "description": "Escaping check",
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    store = SQLiteStore(tmp_path)
+    session = store.create_session(title="Skill escape")
+
+    first = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "skill-load",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"skill": unsafe_name}),
+            "--output",
+            "json",
+        ],
+    )
+    assert first.exit_code == 0, first.output
+    first_payload = json.loads(first.output)["result"]
+    assert first_payload["error_type"] == "permission_required"
+    allowed = runner.invoke(
+        app,
+        [
+            "session",
+            "permission",
+            session.id,
+            "--project",
+            str(tmp_path),
+            "--resolve",
+            first_payload["permission_id"],
+            "--decision",
+            "allowed",
+            "--output",
+            "json",
+        ],
+    )
+    second = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "skill-load",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"skill": unsafe_name}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert allowed.exit_code == 0, allowed.output
+    assert second.exit_code == 0, second.output
+    preview = json.loads(second.output)["result"]["preview"]
+    assert '<skill_content name="review&quot;&gt;&lt;bad attr=&quot;1">' in preview
+    assert "# Skill: review&quot;&gt;&lt;bad attr=&quot;1" in preview
+    assert '<skill_content name="review"><bad' not in preview
 
 
 def test_web_fetch_tool_requires_permission_then_fetches_and_persists_response_artifacts(tmp_path) -> None:
@@ -2009,6 +2246,8 @@ def test_mcp_resource_tool_requires_permission_then_reads_cached_resource_withou
     assert metadata["content_sha256"]
     assert metadata["process_started"] is False
     assert metadata["network_called"] is False
+    assert metadata["symlink_policy"] == "reject_configured_path_components"
+    assert metadata["symlink_checked"] is True
 
 
 def test_mcp_resource_tool_denies_unconfigured_resource_without_process_or_network(tmp_path) -> None:
@@ -2039,6 +2278,63 @@ def test_mcp_resource_tool_denies_unconfigured_resource_without_process_or_netwo
     permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
     assert permission.status == SessionPermissionStatus.DENIED
     assert permission.tool_id == "mcp-resource"
+
+
+def test_mcp_resource_tool_denies_configured_symlink_cache_path_without_reading(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    real_cache = tmp_path / "mcp-real"
+    real_cache.mkdir()
+    real_cache.joinpath("guide.md").write_text("# Symlinked Guide\n", encoding="utf-8")
+    (tmp_path / "mcp-cache").symlink_to(real_cache, target_is_directory=True)
+    config_path = tmp_path / ".harness" / "config.yaml"
+    config_data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config_data["mcp"] = {
+        "enabled": True,
+        "servers": {
+            "docs": {
+                "kind": "local",
+                "enabled": True,
+                "command": ["mcp-docs", "--stdio"],
+                "resources": {
+                    "guide": {
+                        "uri": "mcp://docs/guide",
+                        "path": "mcp-cache/guide.md",
+                        "enabled": True,
+                        "content_type": "text/markdown",
+                    }
+                },
+            }
+        },
+    }
+    config_path.write_text(yaml.safe_dump(config_data, sort_keys=False), encoding="utf-8")
+    session = SQLiteStore(tmp_path).create_session(title="MCP resource symlink")
+
+    result = runner.invoke(
+        app,
+        [
+            "session",
+            "tool",
+            session.id,
+            "mcp-resource",
+            "--project",
+            str(tmp_path),
+            "--input-json",
+            json.dumps({"server": "docs", "uri": "mcp://docs/guide"}),
+            "--output",
+            "json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)["result"]
+    assert payload["ok"] is False
+    assert payload["error_type"] == "permission_denied"
+    assert "Path contains symlink component: mcp-cache" in payload["preview"]
+    assert "Symlinked Guide" not in payload["preview"]
+    permission = SQLiteStore(tmp_path).get_session_permission(payload["permission_id"])
+    assert permission.status == SessionPermissionStatus.DENIED
+    assert permission.tool_id == "mcp-resource"
+    assert permission.normalized_target_pattern == "docs:mcp://docs/guide"
 
 
 def test_web_search_tool_requires_permission_then_executes_configured_endpoint_and_persists_artifacts(tmp_path) -> None:

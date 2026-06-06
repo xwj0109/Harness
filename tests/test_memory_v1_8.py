@@ -4,6 +4,7 @@ from typer.testing import CliRunner
 
 from harness.chat import ChatSessionState, handle_chat_input
 from harness.cli.main import app
+from harness.context_policy import decide_context_transmission
 from harness.memory.sqlite_store import SQLiteStore
 from harness.operator_context import build_operator_context
 
@@ -399,17 +400,22 @@ def test_malicious_memory_cannot_authorize_hosted_execution(tmp_path) -> None:
         metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
     )
     leased = store.daemon_run_once("local_daemon:test:123", pid=123)
-    assert leased.lease is not None
+    assert leased.decision == "paused"
+    assert leased.lease is None
+    assert leased.pause_reasons
+    assert leased.pause_reasons[0]["decision"] == "waiting_approval"
+    assert leased.pause_reasons[0]["missing_approvals"] == ["hosted_provider_codex"]
 
-    inspected = runner.invoke(
-        app,
-        ["daemon", "inspect-lease", leased.lease.id, "--project", str(tmp_path), "--output", "json"],
+    context_decision = decide_context_transmission(
+        "hosted_model",
+        source_kind="memory_record",
+        trust_level="memory",
     )
 
-    assert inspected.exit_code == 0, inspected.output
-    payload = json.loads(inspected.output)
-    assert payload["security_decision"]["decision"] == "approval_required"
-    assert payload["security_decision"]["missing_approvals"] == ["hosted_provider_codex"]
-    assert payload["context_provenance"]
-    assert "memory_not_authority" in payload["untrusted_context_warnings"]
+    assert context_decision.allowed is False
+    assert context_decision.code == "context_hosted_transmission_denied"
+    assert "memory_not_authority" in context_decision.warnings
+    assert context_decision.permission_granting is False
+    assert context_decision.approval_authority is False
+    assert context_decision.provider_call_allowed is False
     assert memory.lineage["authority_claims_stripped"]

@@ -14,6 +14,7 @@ from harness.local_server import _route_get, create_local_http_server
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import (
     EventStreamType,
+    KillSwitchTargetKind,
     RedactionState,
     SessionMessageRole,
     SessionPermissionBoundaryKind,
@@ -1241,16 +1242,19 @@ def test_core_service_repo_planning_without_hosted_approval_is_blocked(tmp_path)
 
     assert result.ok is False
     assert result.mode == "repo_planning"
-    assert result.decision == "execution_adapter_rejected"
+    assert result.decision == "approval_required"
     assert result.task_id
-    assert result.lease_id
+    assert result.lease_id is None
     assert result.run_id is None
     assert result.manifest is None
     assert result.adapter_id == "repo_planning"
     assert any("hosted_provider_codex" in error for error in result.errors)
     assert any(command.startswith("harness core inspect-task ") for command in result.next_commands)
-    assert any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
-    assert SQLiteStore(tmp_path).list_runs() == []
+    assert not any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
+    store = SQLiteStore(tmp_path)
+    assert store.list_task_attempts(result.task_id) == []
+    assert store.list_task_leases(result.task_id) == []
+    assert store.list_runs() == []
 
 
 def test_core_service_isolated_edit_without_hosted_approval_is_blocked(tmp_path) -> None:
@@ -1262,16 +1266,99 @@ def test_core_service_isolated_edit_without_hosted_approval_is_blocked(tmp_path)
 
     assert result.ok is False
     assert result.mode == "codex_isolated_edit"
-    assert result.decision == "execution_adapter_rejected"
+    assert result.decision == "approval_required"
     assert result.task_id
-    assert result.lease_id
+    assert result.lease_id is None
     assert result.run_id is None
     assert result.manifest is None
     assert result.adapter_id == "codex_isolated_edit"
     assert any("hosted_provider_codex" in error for error in result.errors)
     assert any(command.startswith("harness core inspect-task ") for command in result.next_commands)
-    assert any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
-    assert SQLiteStore(tmp_path).list_runs() == []
+    assert not any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
+    store = SQLiteStore(tmp_path)
+    assert store.list_task_attempts(result.task_id) == []
+    assert store.list_task_leases(result.task_id) == []
+    assert store.list_runs() == []
+
+
+def test_core_service_disabled_adapter_pauses_before_lease(tmp_path) -> None:
+    service = HarnessCoreService()
+    task = service.create_task_for_goal(
+        goal="dry run while paused",
+        mode="dry_run",
+        project_root=tmp_path,
+    )
+    store = SQLiteStore(tmp_path)
+    store.disable_execution_control(
+        KillSwitchTargetKind.ADAPTER,
+        "dry_run",
+        reason="operator pause",
+        actor="tester",
+    )
+
+    result = service.run_task(
+        task_id=task.task_id,
+        mode="dry_run",
+        project_root=tmp_path,
+        task=task,
+    )
+
+    assert result.ok is False
+    assert result.decision == "control_disabled"
+    assert result.task_id == task.task_id
+    assert result.lease_id is None
+    assert result.run_id is None
+    assert result.manifest is None
+    assert any("control=adapter:dry_run" in error for error in result.errors)
+    assert not any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
+    fresh = SQLiteStore(tmp_path)
+    assert fresh.get_task(task.task_id).status.value == "ready"
+    assert fresh.list_task_attempts(task.task_id) == []
+    assert fresh.list_task_leases(task.task_id) == []
+    assert fresh.list_runs() == []
+
+
+def test_core_service_open_breaker_pauses_before_lease(tmp_path) -> None:
+    service = HarnessCoreService()
+    task = service.create_task_for_goal(
+        goal="dry run while breaker open",
+        mode="dry_run",
+        project_root=tmp_path,
+    )
+    store = SQLiteStore(tmp_path)
+    daemon = store.ensure_daemon(owner="tester")
+    for index in range(3):
+        store.record_daemon_event(
+            daemon.id,
+            event_type="execution_adapter_rejected",
+            message="Adapter execution failed.",
+            metadata={
+                "adapter_id": "dry_run",
+                "reason_code": "adapter_execution_failed",
+                "error": f"failure {index}",
+            },
+        )
+
+    result = service.run_task(
+        task_id=task.task_id,
+        mode="dry_run",
+        project_root=tmp_path,
+        task=task,
+    )
+
+    assert result.ok is False
+    assert result.decision == "breaker_open"
+    assert result.task_id == task.task_id
+    assert result.lease_id is None
+    assert result.run_id is None
+    assert result.manifest is None
+    assert any("breaker_failures=3/3" in error for error in result.errors)
+    assert not any(command.startswith("harness daemon inspect-lease ") for command in result.next_commands)
+    fresh = SQLiteStore(tmp_path)
+    assert fresh.get_task(task.task_id).status.value == "ready"
+    assert fresh.list_task_attempts(task.task_id) == []
+    assert fresh.list_task_leases(task.task_id) == []
+    assert fresh.list_runs() == []
 
 
 def test_core_service_final_summary_references_core_identifiers_and_errors(tmp_path) -> None:
@@ -1300,7 +1387,8 @@ def test_core_service_final_summary_references_core_identifiers_and_errors(tmp_p
     assert blocked.summary is not None
     blocked_text = blocked.summary.summary_text
     assert blocked.task_id in blocked_text
-    assert blocked.lease_id in blocked_text
+    assert blocked.lease_id is None
+    assert "lease_id=none" in blocked_text
     assert "run_id=none" in blocked_text
     assert "adapter_id=repo_planning" in blocked_text
     assert "hosted_provider_codex" in blocked_text

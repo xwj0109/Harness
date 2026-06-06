@@ -138,17 +138,27 @@ def build_default_chat_model(project_root: Path) -> ChatModel:
 def _codex_chat_prompt(messages: list[ChatMessage], context: ChatContext) -> str:
     transcript = "\n\n".join(f"{message.role.upper()}:\n{message.content}" for message in messages)
     boundaries = "\n".join(f"- {item}" for item in context.safety_boundaries)
+    if context.mode == "plan":
+        mode_guidance = (
+            "Plan mode is active. Produce a concrete, prompt-specific plan. Do not emit tool requests for "
+            "approvals, task creation, leases, adapter dispatch, provider execution, shell, network, "
+            "active-repository mutation, or apply-back. Read-only inspection requests are allowed when useful; "
+            "side effects should be described only as future governed steps."
+        )
+    else:
+        mode_guidance = (
+            "For read-only inspection, request a Harness read tool. For file or folder write requests, prefer the "
+            "edit_isolated Harness tool so the change runs in an isolated workspace with apply-back gates. For tests, "
+            "apply-back, task creation, approvals, security checks, or other side effects, emit exactly one "
+            "harness.tool_request/v1 JSON object for the appropriate Harness tool instead of saying you cannot do it. "
+            "Harness will validate it through deterministic policy, execute allowed actions with evidence, and fail "
+            "closed on unsafe boundaries. Do not claim a side effect is complete until Harness returns evidence."
+        )
     return (
         "You are running as the Harness chat model through Codex CLI subscription. "
         "Answer the latest user message conversationally and use the supplied Harness context. "
         "The Codex subprocess that hosts this chat is read-only, but the Harness assistant is act-capable. "
-        "For read-only inspection, request a Harness read tool. For file or folder write requests, prefer the "
-        "edit_isolated Harness tool so the change runs in an isolated workspace with apply-back gates. For tests, "
-        "apply-back, task creation, approvals, security checks, or other side effects, emit exactly one "
-        "harness.tool_request/v1 JSON object "
-        "for the appropriate Harness tool instead of saying you cannot do it. Harness will validate it through "
-        "deterministic policy, execute allowed actions with evidence, and fail closed on unsafe boundaries. Do not claim a "
-        "side effect is complete until Harness returns evidence.\n\n"
+        f"{mode_guidance}\n\n"
         f"Project root: {context.project_root}\n"
         f"Mode: {context.mode}\n"
         f"Safety boundaries:\n{boundaries}\n\n"

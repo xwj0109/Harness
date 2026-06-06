@@ -13,10 +13,11 @@ from harness.chat import ChatSessionState, handle_chat_input, render_chat_respon
 from harness.chat_model import ChatContext, ChatDelta, ChatMessage, ChatResponse
 from harness.chat_tools import ChatToolRequest
 from harness.cli.main import app
-from harness.execution import list_execution_adapter_descriptors
+from harness.execution import list_execution_adapter_descriptors, validate_execution_task_payload
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import BackendCapabilities, BackendStatus
 from harness.autonomy import AutonomyBudget, get_builtin_autonomy_policy
+from harness.objective_checkpoints import evaluate_objective_checkpoint_gate, list_objective_checkpoints
 from typer.testing import CliRunner
 
 
@@ -131,6 +132,92 @@ def test_action_proposal_cannot_broaden_permissions() -> None:
         )
 
 
+def test_action_proposal_rejects_review_gate_without_graph_contract() -> None:
+    with pytest.raises(ValueError, match="Review gate execution requires at least one upstream dependency"):
+        contract_from_tool_request(
+            ChatToolRequest(
+                "harness.tool_request/v1",
+                "create_task",
+                {
+                    "title": "Implementation review",
+                    "execution_adapter": "review_gate",
+                    "task_type": "implementation_review",
+                    "agent_id": "implementation_reviewer",
+                    "metadata": {
+                        "workflow_stage": "implementation_review",
+                        "review_role": "implementation_reviewer",
+                        "review_gate": True,
+                        "completion_gate": True,
+                        "review_target_stage": "test_sandbox",
+                    },
+                },
+            )
+        )
+
+
+def test_task_graph_rejects_forward_dependency_before_records(tmp_path) -> None:
+    with pytest.raises(ValueError, match="dependencies must point to earlier tasks"):
+        contract_from_tool_request(
+            ChatToolRequest(
+                "harness.tool_request/v1",
+                "create_task_graph",
+                {
+                    "goal": "bad graph",
+                    "tasks": [
+                        {
+                            "title": "First",
+                            "execution_adapter": "dry_run",
+                            "task_type": "phase_1a_test",
+                            "depends_on_indexes": [1],
+                        },
+                        {
+                            "title": "Second",
+                            "execution_adapter": "dry_run",
+                            "task_type": "phase_1a_test",
+                        },
+                    ],
+                },
+            ),
+            project_root=tmp_path,
+        )
+
+
+def test_task_graph_rejects_malformed_review_gate_before_records(tmp_path) -> None:
+    with pytest.raises(ValueError, match="review_role=implementation_reviewer"):
+        contract_from_tool_request(
+            ChatToolRequest(
+                "harness.tool_request/v1",
+                "create_task_graph",
+                {
+                    "goal": "bad review graph",
+                    "tasks": [
+                        {
+                            "title": "Test evidence",
+                            "execution_adapter": "dry_run",
+                            "task_type": "phase_1a_test",
+                            "metadata": {"workflow_stage": "test_sandbox"},
+                        },
+                        {
+                            "title": "Implementation review",
+                            "execution_adapter": "review_gate",
+                            "task_type": "implementation_review",
+                            "agent_id": "implementation_reviewer",
+                            "depends_on_indexes": [0],
+                            "metadata": {
+                                "workflow_stage": "implementation_review",
+                                "review_role": "security_reviewer",
+                                "review_gate": True,
+                                "completion_gate": True,
+                                "review_target_stage": "test_sandbox",
+                            },
+                        },
+                    ],
+                },
+            ),
+            project_root=tmp_path,
+        )
+
+
 def test_action_contract_recomputes_required_approvals() -> None:
     contract = contract_from_tool_request(
         ChatToolRequest(
@@ -177,19 +264,21 @@ def test_confirmed_action_contract_creates_objective_record(tmp_path) -> None:
     assert [objective.title for objective in objectives] == ["Improve chat"]
 
 
-def test_empty_markdown_file_request_routes_to_isolated_edit_contract(tmp_path) -> None:
+def test_empty_markdown_file_request_routes_to_managed_local_action(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     state = ChatSessionState()
 
     response = handle_chat_input("create an empty .md file in this directory", tmp_path, state)
 
-    assert response["kind"] == "action_contract"
+    assert response["kind"] == "self_managed_local_action"
     assert response["ok"] is True
-    assert response["contract"]["tool"] == "edit_isolated"
-    assert response["contract"]["normalized_arguments"]["goal"] == "create an empty .md file in this directory"
-    assert state.pending_action_contract is not None
-    assert not (tmp_path / "scratch.md").exists()
-    assert state.latest_run_id is None
+    assert response["intent"] == "create_empty_markdown_file"
+    assert response["route"]["executor"] == "create_empty_file"
+    assert response["decision"]["status"] == "auto_allowed"
+    assert state.pending_action_contract is None
+    assert (tmp_path / "scratch.md").exists()
+    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == ""
+    assert state.latest_run_id == response["run_id"]
 
 
 def test_downloads_file_request_blocks_before_orchestration_without_prompt(tmp_path) -> None:
@@ -212,28 +301,26 @@ def test_downloads_file_request_blocks_before_orchestration_without_prompt(tmp_p
     assert "no human approval prompt" in rendered
 
 
-def test_golden_write_chat_flow_returns_isolated_edit_contract_without_mutating_workspace(tmp_path) -> None:
+def test_golden_write_chat_flow_uses_managed_local_action_with_evidence(tmp_path) -> None:
     assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
     state = ChatSessionState()
 
     response = handle_chat_input("create an empty .md file in this directory", tmp_path, state)
     rendered = render_chat_response(response)
 
-    assert response["kind"] == "action_contract"
+    assert response["kind"] == "self_managed_local_action"
     assert response["ok"] is True
-    assert response["contract"]["tool"] == "edit_isolated"
-    assert not (tmp_path / "scratch.md").exists()
-    assert state.pending_action_contract is not None
+    assert response["intent"] == "create_empty_markdown_file"
+    assert (tmp_path / "scratch.md").exists()
+    assert state.pending_action_contract is None
     assert state.pending_hosted_approval is False
     assert state.pending_draft is None
     assert state.pending_orchestration is None
     assert state.pending_execute_lease_id is None
-    assert "Action Contract" in rendered
-    assert "Tool: edit_isolated" in rendered
-    assert "Required approvals: hosted_provider_codex" in rendered
-    assert "apply_back_separate" in rendered
-    assert "type yes" in rendered.lower()
-    assert "/confirm" in rendered
+    assert state.latest_run_id == response["run_id"]
+    assert "Created: scratch.md" in rendered
+    assert "Boundary: no provider, shell, Docker, network, permission grant, or human approval prompt." in rendered
+    assert "Manifest:" in rendered
 
 
 def test_named_empty_markdown_file_request_does_not_overwrite(tmp_path) -> None:
@@ -256,12 +343,14 @@ def test_chat_write_inside_existing_markdown_updates_file_instead_of_creating_an
     response = handle_chat_input("write in side scratch.md 'hello'", tmp_path, state)
     rendered = render_chat_response(response)
 
-    assert response["kind"] == "action_contract"
-    assert response["contract"]["tool"] == "edit_isolated"
-    assert response["contract"]["normalized_arguments"]["goal"] == "write in side scratch.md 'hello'"
-    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == ""
+    assert response["kind"] == "self_managed_local_action"
+    assert response["intent"] == "write_file"
+    assert response["route"]["executor"] == "write_file"
+    assert response["route"]["normalized_arguments"]["request"] == "write in side scratch.md 'hello'"
+    assert (tmp_path / "scratch.md").read_text(encoding="utf-8") == "hello\n"
     assert not (tmp_path / "scratch-2.md").exists()
-    assert "Tool: edit_isolated" in rendered
+    assert "Changed: scratch.md" in rendered
+    assert "Boundary: no provider, shell, Docker, network, permission grant, or human approval prompt." in rendered
     assert "Created `scratch-2.md`." not in rendered
 
 
@@ -494,8 +583,8 @@ def test_confirmed_edit_isolated_contract_prepares_approval_before_orchestration
         "repo_planning",
         "codex_isolated_edit",
         "dry_run",
-        "dry_run",
-        "dry_run",
+        "review_gate",
+        "review_gate",
         "dry_run",
     ]
     assert tasks[3].agent_id == "implementation_reviewer"
@@ -535,6 +624,47 @@ def test_adapter_descriptors_expose_autonomy_metadata() -> None:
     assert descriptors["repo_planning"].required_autonomy_scopes == ["supervised-codex"]
     assert descriptors["codex_isolated_edit"].sandbox_profile_id == "isolated_workspace_codex"
     assert "diff_artifact" in descriptors["codex_isolated_edit"].terminal_evidence_required
+
+
+def test_execution_task_payload_rejects_delegate_budget_overrides() -> None:
+    reasons = validate_execution_task_payload(
+        execution_adapter="read_only_summary",
+        task_type="read_only_repo_summary",
+        metadata={
+            "timeout_seconds": 901,
+            "max_model_calls": -1,
+            "max_parallel_branches": 0,
+            "max_cost_usd": "-0.01",
+            "external_network": "allowed",
+        },
+    )
+
+    assert (
+        "Task metadata timeout_seconds=901 exceeds read_only_summary delegate budget timeout_seconds=900."
+        in reasons
+    )
+    assert "Task metadata max_model_calls=-1 must be at least 0." in reasons
+    assert "Task metadata max_parallel_branches=0 must be at least 1." in reasons
+    assert "Task metadata max_cost_usd=-0.01 must be at least 0." in reasons
+    assert (
+        "Task metadata external_network=allowed conflicts with read_only_summary delegate budget network_policy=forbidden."
+        in reasons
+    )
+
+
+def test_execution_task_creation_rejects_negative_delegate_budget_metadata(tmp_path) -> None:
+    store = SQLiteStore.open_initialized(tmp_path)
+
+    with pytest.raises(ValueError, match="Task metadata max_tool_calls=-1 must be at least 0"):
+        store.create_task(
+            title="Invalid budget",
+            metadata={
+                "execution_adapter": "dry_run",
+                "task_type": "phase_1a_test",
+                "max_tool_calls": -1,
+                "max_cost_usd": -1,
+            },
+        )
 
 
 def test_safe_local_auto_dispatches_dry_run_adapter_contract(tmp_path) -> None:
@@ -918,15 +1048,19 @@ def test_llm_can_select_known_workflow_template(tmp_path) -> None:
         "repo_planning",
         "codex_isolated_edit",
         "dry_run",
-        "dry_run",
-        "dry_run",
+        "review_gate",
+        "review_gate",
         "dry_run",
     ]
     assert contract.normalized_arguments["tasks"][3]["agent_id"] == "implementation_reviewer"
     assert contract.normalized_arguments["tasks"][3]["metadata"]["review_role"] == "implementation_reviewer"
     assert contract.normalized_arguments["tasks"][4]["agent_id"] == "security_reviewer"
     assert contract.normalized_arguments["tasks"][4]["metadata"]["blocks_apply_back"] is True
+    assert contract.normalized_arguments["checkpoints"][0]["label"] == "Supervisor approval for reviewed coding workflow"
+    assert contract.normalized_arguments["checkpoints"][0]["required"] is True
     assert contract.execution_plan[0] == {"step": "select_workflow_template", "template_id": "coding_fix"}
+    assert contract.execution_plan[1] == {"step": "create_objective"}
+    assert contract.execution_plan[2] == {"step": "approve_supervisor_checkpoints", "count": 1}
 
 
 def test_unknown_workflow_template_rejected(tmp_path) -> None:
@@ -958,11 +1092,74 @@ def test_template_output_policy_checked_before_confirm(tmp_path) -> None:
         "repo_planning",
         "codex_isolated_edit",
         "dry_run",
-        "dry_run",
-        "dry_run",
+        "review_gate",
+        "review_gate",
         "dry_run",
     ]
     assert tasks[1].depends_on == [tasks[0].id]
     assert tasks[3].metadata["review_role"] == "implementation_reviewer"
     assert tasks[4].metadata["review_role"] == "security_reviewer"
     assert tasks[5].metadata["requires_evidence_links"] == "objective,task,run,artifact,policy"
+    checkpoints = list_objective_checkpoints(tmp_path, state.latest_objective_id)
+    assert len(checkpoints.checkpoints) == 1
+    assert checkpoints.checkpoints[0].status == "approved"
+    assert checkpoints.checkpoints[0].required is True
+    gate = evaluate_objective_checkpoint_gate(tmp_path, state.latest_objective_id)
+    assert gate.ok is True
+    assert response["checkpoints"][0]["checkpoint_id"] == checkpoints.checkpoints[0].checkpoint_id
+    assert response["orchestration"]["checkpoints"][0]["status"] == "approved"
+
+
+def test_pending_action_contract_survives_session_state_restart(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    model = SideEffectRequestModel(
+        '{"type":"harness.tool_request/v1","tool":"create_task_graph","arguments":{"goal":"fix failing test","template_id":"coding_fix"}}'
+    )
+    first_state = ChatSessionState()
+
+    draft = handle_chat_input("turn this into a workflow", tmp_path, first_state, chat_model=model)
+
+    assert draft["kind"] == "action_contract"
+    assert first_state.session_id is not None
+    store = SQLiteStore(tmp_path)
+    persisted = store.get_session(first_state.session_id).metadata["pending_chat_action"]
+    assert persisted["kind"] == "action_contract"
+    assert persisted["contract"]["tool"] == "create_task_graph"
+
+    resumed_state = ChatSessionState(session_id=first_state.session_id)
+    response = handle_chat_input("/confirm", tmp_path, resumed_state)
+
+    assert response["kind"] == "action_contract_executed"
+    assert len(store.list_objectives()) == 1
+    assert len(store.list_tasks(objective_id=response["objective"]["id"])) == 6
+    assert "pending_chat_action" not in store.get_session(first_state.session_id).metadata
+    assert any("pending chat action restored: action_contract" in item for item in resumed_state.progress)
+
+
+def test_template_task_graph_confirmation_replay_does_not_duplicate_records(tmp_path) -> None:
+    assert runner.invoke(app, ["init", "--project", str(tmp_path)]).exit_code == 0
+    model = SideEffectRequestModel(
+        '{"type":"harness.tool_request/v1","tool":"create_task_graph","arguments":{"goal":"fix failing test","template_id":"coding_fix"}}'
+    )
+    first_state = ChatSessionState()
+    second_state = ChatSessionState()
+
+    first_draft = handle_chat_input("turn this into a workflow", tmp_path, first_state, chat_model=model)
+    first = handle_chat_input("yes", tmp_path, first_state)
+    second_draft = handle_chat_input("turn this into a workflow", tmp_path, second_state, chat_model=model)
+    second = handle_chat_input("yes", tmp_path, second_state)
+
+    assert first_draft["kind"] == "action_contract"
+    assert second_draft["kind"] == "action_contract"
+    assert first["objective"]["id"] == second["objective"]["id"]
+    assert "Idempotency: reused existing objective graph" in "\n".join(second["lines"])
+    store = SQLiteStore(tmp_path)
+    objectives = store.list_objectives()
+    assert len(objectives) == 1
+    tasks = store.list_tasks(objective_id=objectives[0].id)
+    assert len(tasks) == 6
+    checkpoints = list_objective_checkpoints(tmp_path, objectives[0].id)
+    assert len(checkpoints.checkpoints) == 1
+    assert checkpoints.checkpoints[0].status == "approved"
+    assert checkpoints.checkpoints[0].event_count == 2
+    assert evaluate_objective_checkpoint_gate(tmp_path, objectives[0].id).ok is True

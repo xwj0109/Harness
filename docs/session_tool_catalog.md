@@ -101,6 +101,19 @@ Each descriptor includes a `policy` object with these fields:
 - `policy_source`: currently `session_tool_descriptor`.
 - `maturity`: one or more maturity labels.
 - `policy_reasons`: extra explanatory strings supporting the projection.
+- `exposure`: model-visibility projection with schema `harness.session_tool_exposure_projection/v1`.
+
+Provider-native tool calls persist a sanitized normalized `tool_call_key` with request, error, and gateway output evidence. The foreground operator loop reconstructs current-turn repeat counts from that evidence after restart and blocks duplicate completed calls for tools whose descriptor declares `replay_policy=rerun_forbidden`. The live session runtime also fail-closes provider-emitted tool calls: without explicit prompt metadata it accepts only the current default model-visible session-tool set, and explicit requested runtime tools are rejected before stream or before gateway execution when they are unknown, disabled, config-blocked, capability-blocked, or internal-only.
+
+The nested `policy.exposure` object tells UI clients and provider adapters whether the tool should be included in the current model-visible tool schema:
+
+- `tool_id`: stable public tool id.
+- `model_visible`: whether the descriptor should be exposed to the model in this mode.
+- `state`: `exposed`, `withheld`, `approval_gated`, `config_blocked`, `capability_blocked`, or `disabled`.
+- `exposure_mode`: `default` or `plan`.
+- `progressive`: true when Harness expects the tool to be surfaced progressively instead of frontloaded blindly.
+- `reason`: operator-facing explanation for the exposure decision.
+- `source`: currently `session_tool_policy_projection`.
 
 Maturity labels:
 
@@ -114,6 +127,10 @@ Maturity labels:
 ## UI Rendering Rules
 
 Render tool availability from `policy.enabled`, not descriptor `enabled` alone. Descriptor `enabled` is the static catalog default; `policy.enabled` is the context-aware answer after config and capability checks.
+
+Render default native model tool availability from `policy.exposure.model_visible`, not descriptor `enabled` or `policy.enabled` alone. The full catalog remains available for operator inspection, but default provider-native tool schemas should expose only low-risk read-only or session-local tools with strict top-level input schemas. Permission-gated tools such as `shell`, `write`, `web-fetch`, `web-search`, `mcp-resource`, `plugin-tool`, and `task` stay visible in the catalog and approval cards, but are withheld from default model-visible schemas until an explicit governed path requests them. Explicit active tool sets still pass through the project-aware policy projection before schema advertisement, so disabled, config-blocked, capability-blocked, plan-mode-disallowed, and internal recovery tools are not advertised merely because a caller named them. The session-local `invalid` recovery tool also stays in the full catalog but is withheld from provider-native schemas because unknown and malformed calls are normalized to it internally.
+
+Advertised `input_schema` constraints are enforced before permission checks and before tool execution. The gateway validates required fields, unexpected fields, JSON value types, enum values, numeric/string/array bounds, array item schemas, and nested object schemas. Malformed model tool calls are normalized into the session-local `invalid` tool result so the model receives recoverable evidence; they must not request permission, start the requested side effect, or leave a running tool run behind. `invalid` remains an internal recovery result, not a frontloaded callable model-visible tool.
 
 When `policy.permission_required=true`, show the permission key, boundary, risk, and replay policy before the operator approves. Permission cards include `descriptor_ref` and `policy` so clients can link back to `/tools/{tool_id}` or `/sessions/{session_id}/tools/{tool_id}`.
 
@@ -140,6 +157,8 @@ Session tools are not separate from governance. Active repository write and exte
 `edit` and `write` use the same protected path matcher before any active repo mutation path can proceed. They still require the exact active-repo-write permission path when `mode=apply`; `mode=plan` records artifacts and metadata without writing.
 
 `web-fetch`, `web-search`, and `repo-clone` produce governance network policy/check/request/quarantine evidence when execution is allowed. Network policy evidence is scoped to the session task, approval id, target, allowlist, request log, and quarantine path. Downloaded or cloned artifacts remain quarantined until a later review/promotion flow approves them.
+
+`skill-load` and `mcp-resource` follow progressive disclosure: catalog and status views expose metadata only, while full skill bodies and cached MCP resource bodies require an exact session permission before text is injected into the session. Configured file paths must stay under the active project and must not contain symlink components. A symlinked configured path is denied before a pending approval can be used; passive projections expose `path_safety`, `symlink_policy`, and `symlink_safe` without reading bodies; successful load/read metadata records `symlink_policy=reject_configured_path_components`; and skill metadata inserted into the prompt wrapper is XML-escaped.
 
 ## API And CLI Surfaces
 

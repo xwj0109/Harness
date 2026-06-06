@@ -4,6 +4,7 @@ import subprocess
 from collections.abc import Iterator
 
 import harness.operator_loop as operator_loop_module
+import harness.session_tools as session_tools_module
 import yaml
 from harness.chat import ChatSessionState, handle_chat_input
 from harness.chat_model import ChatContext, ChatDelta, ChatMessage, ChatResponse, ChatToolCall, ChatToolSchema
@@ -120,6 +121,124 @@ def test_freeform_chat_uses_chat_model_without_mutation(tmp_path) -> None:
     }
     assert model.messages[-1] == ChatMessage(role="user", content="explain how this project works")
     assert not (tmp_path / ".harness").exists()
+
+
+def test_active_plan_mode_uses_model_for_prompt_specific_plan(tmp_path) -> None:
+    _init_project(tmp_path)
+    state = ChatSessionState()
+    model = FakeChatModel(
+        "\n".join(
+            [
+                "Plan:",
+                "1. Define a Markowitz portfolio script with expected returns, covariance, risk-free rate, and constraints.",
+                "2. Implement efficient frontier and max Sharpe calculations.",
+                "3. Add focused tests for weight normalization, covariance shape checks, and optimizer output.",
+            ]
+        )
+    )
+
+    entered = handle_chat_input("/plan-mode on inspect before editing", tmp_path, state)
+    response = handle_chat_input(
+        "build a plan for a script that implements markowitz portfolio theory in python",
+        tmp_path,
+        state,
+        chat_model=model,
+    )
+
+    assert entered["ok"] is True
+    assert response["kind"] == "plan_mode_plan"
+    assert response["captured_intent"] == "coding_fix"
+    assert response["creates_pending_action"] is False
+    assert response["mode"] == "plan"
+    assert model.context is not None
+    assert model.context.mode == "plan"
+    rendered = "\n".join(response["lines"])
+    assert "Markowitz portfolio script" in rendered
+    assert "efficient frontier" in rendered
+    assert "Clarify the desired outcome" not in rendered
+
+
+def test_active_plan_mode_turns_side_effect_tool_request_into_model_visible_boundary(tmp_path) -> None:
+    class ToolThenPlanModel:
+        def __init__(self) -> None:
+            self.calls: list[list[ChatMessage]] = []
+            self.contexts: list[ChatContext] = []
+
+        def stream(self, messages: list[ChatMessage], context: ChatContext) -> Iterator[ChatDelta]:
+            yield ChatDelta(content=self.complete(messages, context).content)
+
+        def complete(self, messages: list[ChatMessage], context: ChatContext) -> ChatResponse:
+            self.calls.append(list(messages))
+            self.contexts.append(context)
+            if len(self.calls) == 1:
+                return ChatResponse(
+                    content='{"type":"harness.tool_request/v1","tool":"edit_isolated","arguments":{"goal":"add importer"}}'
+                )
+            return ChatResponse(content="Plan:\n1. Inspect importer entry points.\n2. Propose an isolated edit later.")
+
+    _init_project(tmp_path)
+    state = ChatSessionState()
+    model = ToolThenPlanModel()
+
+    entered = handle_chat_input("/plan-mode on inspect before editing", tmp_path, state)
+    response = handle_chat_input("build a plan to add a command line csv importer", tmp_path, state, chat_model=model)
+    confirm = handle_chat_input("/confirm", tmp_path, state)
+
+    rendered = "\n".join(response["lines"])
+    assert entered["ok"] is True
+    assert response["kind"] == "plan_mode_plan"
+    assert response["captured_intent"] == "coding_fix"
+    assert response["creates_pending_action"] is False
+    assert response["provider_execution_started"] is False
+    assert response["adapter_dispatch_started"] is False
+    assert response["tool_results"] == [{"tool": "edit_isolated", "ok": False, "error_type": "plan_mode_boundary"}]
+    assert len(model.calls) == 2
+    assert all(context.mode == "plan" for context in model.contexts)
+    assert any("Harness plan-mode boundary" in message.content for message in model.calls[1])
+    assert "Inspect importer entry points" in rendered
+    assert "Type yes" not in rendered
+    assert "Required approvals" not in rendered
+    assert state.pending_draft is None
+    assert state.pending_orchestration is None
+    assert state.pending_execute_lease_id is None
+    assert state.pending_action_contract is None
+    assert state.pending_session_tool_call is None
+    assert state.pending_hosted_approval is False
+    assert confirm["kind"] == "nothing_to_confirm"
+
+
+def test_active_plan_mode_native_tool_loop_uses_plan_agent_tools_without_approvals(tmp_path) -> None:
+    _init_project(tmp_path)
+    state = ChatSessionState()
+    model = FakeNativeToolModel(
+        [
+            ChatResponse(
+                content="I will try to run shell.",
+                tool_calls=[
+                    ChatToolCall(
+                        id="call_shell",
+                        name="shell",
+                        arguments={"command": "python3 -m pytest", "timeout_seconds": 120},
+                    )
+                ],
+            ),
+            ChatResponse(content="Plan:\n1. Inspect tests.\n2. Treat shell execution as a later governed step."),
+        ]
+    )
+
+    entered = handle_chat_input("/plan-mode on inspect before editing", tmp_path, state)
+    response = handle_chat_input("build a plan for the test command", tmp_path, state, chat_model=model)
+
+    first_tool_names = {tool.name for tool in model.calls[0]["tools"]}
+    assert entered["ok"] is True
+    assert response["kind"] == "plan_mode_plan"
+    assert response["mode"] == "plan"
+    assert "shell" not in first_tool_names
+    assert {"read", "grep", "glob"}.issubset(first_tool_names)
+    assert response["tool_results"][0]["tool"] == "shell"
+    assert response["tool_results"][0]["error_type"] == "plan_mode_tool_not_available"
+    assert state.pending_session_tool_call is None
+    assert SQLiteStore(tmp_path).list_session_permissions(state.session_id) == []
 
 
 def test_slash_commands_do_not_call_chat_model(tmp_path) -> None:
@@ -523,6 +642,7 @@ def test_provider_native_agent_loop_refreshes_active_tools_after_save_point(tmp_
             return response
 
     monkeypatch.setattr(operator_loop_module, "default_session_tool_descriptors", descriptors_for_loop)
+    monkeypatch.setattr(session_tools_module, "default_session_tool_descriptors", descriptors_for_loop)
     model = RestrictingNativeToolModel(
         [
             ChatResponse(content="I will inspect pwd.", tool_calls=[ChatToolCall(id="call_pwd", name="pwd", arguments={})]),
@@ -641,7 +761,7 @@ def test_provider_native_agent_loop_repeat_guard_skips_guarded_call(tmp_path) ->
     assert any(event.kind == "harness.agent_loop_guard.triggered" for event in events)
 
 
-def test_provider_native_agent_loop_shell_request_pauses_for_approval(tmp_path) -> None:
+def test_provider_native_agent_loop_unexposed_shell_request_fails_closed(tmp_path) -> None:
     _init_project(tmp_path)
     model = FakeNativeToolModel(
         [
@@ -662,16 +782,19 @@ def test_provider_native_agent_loop_shell_request_pauses_for_approval(tmp_path) 
 
     response = handle_chat_input("native execution approval probe", tmp_path, state, chat_model=model)
 
-    assert response["kind"] == "session_tool_permission_required"
-    assert response["ok"] is False
-    assert response["tool_request"]["tool"] == "shell"
-    assert response["permission_id"]
-    assert state.pending_session_tool_call is not None
-    assert state.pending_session_tool_call["tool_id"] == "shell"
-    assert len(model.calls) == 1
+    assert response["kind"] == "llm_chat"
+    assert response["ok"] is True
+    assert state.pending_session_tool_call is None
+    assert response["tool_results"][0]["tool"] == "shell"
+    assert response["tool_results"][0]["ok"] is False
+    assert response["tool_results"][0]["error_type"] == "active_tool_not_available"
+    assert len(model.calls) == 2
+    assert all("shell" not in {tool.name for tool in call["tools"]} for call in model.calls)
     assert "Shell command executed." not in "\n".join(response["lines"])
-    permission = SQLiteStore(tmp_path).get_session_permission(response["permission_id"])
-    assert permission.status == SessionPermissionStatus.PENDING
+    events = SQLiteStore(tmp_path).list_session_store_events(state.session_id)
+    tool_errors = [event for event in events if event.kind == "harness.agent_loop.tool_error"]
+    assert tool_errors[-1].payload["tool_id"] == "shell"
+    assert tool_errors[-1].payload["error_type"] == "active_tool_not_available"
 
 
 def test_chat_model_unavailable_does_not_initialize_or_fallback(tmp_path, monkeypatch) -> None:

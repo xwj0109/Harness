@@ -5,10 +5,21 @@ import hashlib
 import pytest
 
 from harness.agent_authoring import load_agent_bundle
+from harness.approvals import ApprovalStore
 from harness.config import default_config
 from harness.memory.sqlite_store import SQLiteStore
 from harness.models import BreakerStatus, DaemonStatus, KillSwitchTargetKind, ObjectiveStatus, TaskLeaseStatus, TaskStatus
 from harness.security import SecretBlockedError
+
+
+def _approve_hosted_adapter(project_root, adapter_id: str, task_type: str) -> None:
+    ApprovalStore(project_root).add(
+        "codex_cli",
+        "hosted_provider",
+        [task_type],
+        duration_hours=1,
+        allowed_adapters=[adapter_id],
+    )
 
 
 def _write_project_agent_bundle(path, *, agent_id: str = "custom_quant_researcher") -> None:
@@ -438,6 +449,74 @@ def test_store_daemon_status_marks_stale_and_expires_owned_leases(tmp_path) -> N
     assert any(event.event_type == "stale_lease" for event in store.list_daemon_events(tick.daemon_id))
 
 
+def test_store_daemon_status_stale_fails_linked_nonterminal_run_for_inspection(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Linked running",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    tick = store.daemon_run_once("local_daemon:test:stale", pid=123)
+    assert tick.lease is not None
+    assert tick.attempt is not None
+    run = store.start_attempt_run(
+        tick.lease.id,
+        task_type="session_plan",
+        backend=backend,
+        approval_id=None,
+        owner="local_daemon:test:stale",
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE daemon_records SET heartbeat_at = ? WHERE id = ?",
+            ("2026-01-01T00:00:00+00:00", tick.daemon_id),
+        )
+
+    status = store.daemon_status(stale_after_seconds=1)
+
+    assert status.active_daemons[0].status == DaemonStatus.STALE
+    assert store.get_run(run.id).status == "running"
+    assert store.get_task(task.id).status == TaskStatus.FAILED
+    assert store.get_task_attempt(tick.attempt.id).failure_code == "daemon_stale"
+    assert store.get_task_lease(tick.lease.id).status == TaskLeaseStatus.EXPIRED
+    stale_event = next(event for event in store.list_daemon_events(tick.daemon_id) if event.event_type == "stale_lease")
+    assert stale_event.metadata["reason"] == "nonterminal_linked_run"
+    assert stale_event.metadata["next_status"] == "failed"
+
+
+def test_store_daemon_stop_reconciles_completed_linked_run_without_requeue(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Linked completed",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    tick = store.daemon_run_once("local_daemon:test:stop", pid=123)
+    assert tick.lease is not None
+    assert tick.attempt is not None
+    run = store.start_attempt_run(
+        tick.lease.id,
+        task_type="session_plan",
+        backend=backend,
+        approval_id=None,
+        owner="local_daemon:test:stop",
+    )
+    store.update_run_status(run.id, "completed")
+
+    stopped = store.stop_daemons(owner="local_daemon:test:stop")
+
+    assert [item.id for item in stopped] == [tick.daemon_id]
+    assert store.get_task(task.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_attempt(tick.attempt.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_lease(tick.lease.id).status == TaskLeaseStatus.RELEASED
+    assert store.get_run(run.id).status == "completed"
+    stop_event = next(event for event in store.list_daemon_events(tick.daemon_id) if event.event_type == "stop_lease")
+    assert stop_event.metadata["reason"] == "linked_run_completed"
+    assert stop_event.metadata["lease_status"] == "released"
+
+
 def test_store_daemon_run_once_leases_without_creating_runs_or_artifacts(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -470,6 +549,79 @@ def test_store_daemon_run_once_leases_without_creating_runs_or_artifacts(tmp_pat
     assert event_types.count("start") == 1
 
 
+def test_store_start_attempt_run_requires_lease_owner(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Session plan",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+
+    with pytest.raises(ValueError, match="Lease owner mismatch"):
+        store.start_attempt_run(
+            leased.lease.id,
+            task_type="session_plan",
+            backend=backend,
+            approval_id=None,
+            owner="local_daemon:test:other",
+        )
+
+    assert store.list_runs() == []
+    assert store.get_task(task.id).status == TaskStatus.LEASED
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.LEASED
+    assert attempt.run_id is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.ACTIVE
+
+
+def test_store_daemon_run_once_releases_inconsistent_active_lease_before_renewing(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    high = store.create_task(title="High", priority=10)
+    low = store.create_task(title="Low", priority=0)
+    first = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert first.lease is not None
+    assert first.attempt is not None
+    with store.connect() as conn:
+        conn.execute(
+            """
+            UPDATE task_attempts
+            SET status = ?, finished_at = ?, failure_code = ?, failure_message = ?
+            WHERE id = ?
+            """,
+            (
+                TaskStatus.FAILED.value,
+                "2026-01-01T00:00:00+00:00",
+                "test_inconsistent_attempt",
+                "Simulate an interrupted rejection finalization.",
+                first.attempt.id,
+            ),
+        )
+
+    second = store.daemon_run_once("local_daemon:test:123", pid=123)
+
+    assert second.decision == "leased_task"
+    assert second.selected_task is not None
+    assert second.selected_task.id == low.id
+    assert store.get_task(high.id).status == TaskStatus.FAILED
+    assert store.get_task_attempt(first.attempt.id).status == TaskStatus.FAILED
+    released = store.get_task_lease(first.lease.id)
+    assert released.status == TaskLeaseStatus.RELEASED
+    assert released.metadata["decision"] == "inconsistent_active_lease_released"
+    assert released.metadata["reason"] == "no_run_attempt_status_failed"
+    low_leases = store.list_task_leases(low.id)
+    assert low_leases[-1].status == TaskLeaseStatus.ACTIVE
+    events = store.list_daemon_events(first.daemon_id)
+    release_events = [event for event in events if event.event_type == "release_inconsistent_lease"]
+    assert release_events[-1].metadata["lease_id"] == first.lease.id
+    assert release_events[-1].metadata["task_status"] == "failed"
+    assert release_events[-1].metadata["attempt_status"] == "failed"
+
+
 def test_store_daemon_run_once_reports_no_eligible_task(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -486,6 +638,51 @@ def test_store_daemon_run_once_reports_no_eligible_task(tmp_path) -> None:
     assert result.pause_reasons[0]["required_approvals"] == ["hosted_provider"]
     assert status.paused_tasks[0]["decision"] == "waiting_approval"
     assert store.list_runs() == []
+
+
+def test_store_daemon_run_once_pauses_descriptor_approval_required_adapter_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Repo planning",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+
+    result = store.daemon_run_once("local_daemon:test:123", pid=123)
+    status = store.daemon_status()
+
+    assert result.decision == "paused"
+    assert result.selected_task is None
+    assert result.attempt is None
+    assert result.lease is None
+    assert result.pause_reasons[0]["task_id"] == task.id
+    assert result.pause_reasons[0]["decision"] == "waiting_approval"
+    assert result.pause_reasons[0]["adapter_id"] == "repo_planning"
+    assert result.pause_reasons[0]["task_type"] == "repo_planning"
+    assert result.pause_reasons[0]["approval_source"] == "execution_adapter_descriptor"
+    assert result.pause_reasons[0]["required_approvals"] == ["hosted_provider_codex"]
+    assert result.pause_reasons[0]["missing_approvals"] == ["hosted_provider_codex"]
+    assert status.paused_tasks[0]["task_id"] == task.id
+    assert status.paused_tasks[0]["decision"] == "waiting_approval"
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_runs() == []
+
+    ApprovalStore(tmp_path).add(
+        "codex_cli",
+        "hosted_provider",
+        ["repo_planning"],
+        duration_hours=1,
+        allowed_adapters=["repo_planning"],
+    )
+
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+
+    assert leased.decision == "leased_task"
+    assert leased.selected_task is not None
+    assert leased.selected_task.id == task.id
+    assert leased.attempt is not None
+    assert leased.lease is not None
 
 
 def test_store_daemon_policy_forbidden_task_is_paused_not_leased(tmp_path) -> None:
@@ -512,7 +709,7 @@ def test_store_daemon_policy_forbidden_task_is_paused_not_leased(tmp_path) -> No
     assert store.list_runs() == []
 
 
-def test_store_manual_run_next_is_not_blocked_by_daemon_policy_metadata(tmp_path) -> None:
+def test_store_low_level_select_next_task_for_lease_is_lease_only_and_unguarded(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
     task = store.create_task(
@@ -525,6 +722,205 @@ def test_store_manual_run_next_is_not_blocked_by_daemon_policy_metadata(tmp_path
     assert selection is not None
     assert selection["task"].id == task.id
     assert selection["task"].status == TaskStatus.LEASED
+
+
+def test_store_guarded_run_next_pauses_descriptor_approval_required_adapter_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Manual repo planning task",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+
+    selection, pause_reasons = store.select_next_guarded_task_for_lease()
+
+    assert selection is None
+    assert pause_reasons[0]["task_id"] == task.id
+    assert pause_reasons[0]["decision"] == "waiting_approval"
+    assert pause_reasons[0]["adapter_id"] == "repo_planning"
+    assert pause_reasons[0]["task_type"] == "repo_planning"
+    assert pause_reasons[0]["approval_source"] == "execution_adapter_descriptor"
+    assert pause_reasons[0]["required_approvals"] == ["hosted_provider_codex"]
+    assert pause_reasons[0]["missing_approvals"] == ["hosted_provider_codex"]
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+
+def test_store_guarded_task_for_lease_pauses_descriptor_approval_required_adapter_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Explicit repo planning task",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+
+    selection, pause_reasons = store.select_guarded_task_for_lease(task.id)
+
+    assert selection is None
+    assert pause_reasons[0]["task_id"] == task.id
+    assert pause_reasons[0]["decision"] == "waiting_approval"
+    assert pause_reasons[0]["adapter_id"] == "repo_planning"
+    assert pause_reasons[0]["required_approvals"] == ["hosted_provider_codex"]
+    assert pause_reasons[0]["missing_approvals"] == ["hosted_provider_codex"]
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+
+def test_store_guarded_run_next_pauses_disabled_adapter_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    paused = store.create_task(
+        title="Paused dry run",
+        priority=10,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    eligible = store.create_task(title="Eligible lower priority task", priority=0)
+    store.disable_execution_control(
+        KillSwitchTargetKind.ADAPTER,
+        "dry_run",
+        reason="operator pause",
+        actor="tester",
+    )
+
+    selection, pause_reasons = store.select_next_guarded_task_for_lease()
+
+    assert selection is not None
+    assert selection["task"].id == eligible.id
+    assert pause_reasons[0]["task_id"] == paused.id
+    assert pause_reasons[0]["decision"] == "control_disabled"
+    assert pause_reasons[0]["adapter_id"] == "dry_run"
+    assert pause_reasons[0]["task_type"] == "phase_1a_test"
+    assert pause_reasons[0]["target_kind"] == "adapter"
+    assert pause_reasons[0]["target_id"] == "dry_run"
+    assert store.get_task(paused.id).status == TaskStatus.READY
+    assert store.list_task_attempts(paused.id) == []
+    assert store.list_task_leases(paused.id) == []
+    assert store.list_runs() == []
+
+
+def test_store_guarded_task_for_lease_pauses_disabled_adapter_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Explicit paused dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    store.disable_execution_control(
+        KillSwitchTargetKind.ADAPTER,
+        "dry_run",
+        reason="operator pause",
+        actor="tester",
+    )
+
+    selection, pause_reasons = store.select_guarded_task_for_lease(task.id)
+
+    assert selection is None
+    assert pause_reasons[0]["task_id"] == task.id
+    assert pause_reasons[0]["decision"] == "control_disabled"
+    assert pause_reasons[0]["adapter_id"] == "dry_run"
+    assert pause_reasons[0]["target_kind"] == "adapter"
+    assert pause_reasons[0]["target_id"] == "dry_run"
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+
+def test_store_guarded_run_next_pauses_open_adapter_breaker_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Breaker dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    daemon = store.ensure_daemon(owner="test")
+    for index in range(3):
+        store.record_daemon_event(
+            daemon.id,
+            event_type="execution_adapter_rejected",
+            message="Adapter execution failed.",
+            metadata={
+                "adapter_id": "dry_run",
+                "reason_code": "adapter_execution_failed",
+                "error": f"failure {index}",
+            },
+        )
+
+    selection, pause_reasons = store.select_next_guarded_task_for_lease()
+
+    assert selection is None
+    assert pause_reasons[0]["task_id"] == task.id
+    assert pause_reasons[0]["decision"] == "breaker_open"
+    assert pause_reasons[0]["adapter_id"] == "dry_run"
+    assert pause_reasons[0]["task_type"] == "phase_1a_test"
+    assert pause_reasons[0]["failure_count"] == 3
+    assert pause_reasons[0]["threshold"] == 3
+    assert pause_reasons[0]["window_seconds"] > 0
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+
+def test_store_guarded_task_for_lease_pauses_open_adapter_breaker_before_lease(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Explicit breaker dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    daemon = store.ensure_daemon(owner="test")
+    for index in range(3):
+        store.record_daemon_event(
+            daemon.id,
+            event_type="execution_adapter_rejected",
+            message="Adapter execution failed.",
+            metadata={
+                "adapter_id": "dry_run",
+                "reason_code": "adapter_execution_failed",
+                "error": f"failure {index}",
+            },
+        )
+
+    selection, pause_reasons = store.select_guarded_task_for_lease(task.id)
+
+    assert selection is None
+    assert pause_reasons[0]["task_id"] == task.id
+    assert pause_reasons[0]["decision"] == "breaker_open"
+    assert pause_reasons[0]["adapter_id"] == "dry_run"
+    assert pause_reasons[0]["failure_count"] == 3
+    assert pause_reasons[0]["threshold"] == 3
+    assert store.get_task(task.id).status == TaskStatus.READY
+    assert store.list_task_attempts(task.id) == []
+    assert store.list_task_leases(task.id) == []
+    assert store.list_runs() == []
+
+
+def test_store_guarded_run_next_reports_pauses_and_leases_lower_eligible_task(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    forbidden = store.create_task(
+        title="Forbidden high priority task",
+        priority=10,
+        metadata={"requires_active_repo_write": True},
+    )
+    eligible = store.create_task(title="Eligible lower priority task", priority=0)
+
+    selection, pause_reasons = store.select_next_guarded_task_for_lease()
+
+    assert selection is not None
+    assert selection["task"].id == eligible.id
+    assert selection["lease"].owner == "manual_cli"
+    assert pause_reasons[0]["task_id"] == forbidden.id
+    assert pause_reasons[0]["decision"] == "policy_forbidden"
+    assert pause_reasons[0]["forbidden_policy_keys"] == ["active_repo_write"]
+    assert store.get_task(forbidden.id).status == TaskStatus.READY
+    assert store.list_task_attempts(forbidden.id) == []
+    assert store.list_task_leases(forbidden.id) == []
 
 
 def test_store_daemon_recovery_expires_leases_and_requeues_tasks(tmp_path) -> None:
@@ -653,6 +1049,116 @@ def test_store_daemon_execute_dry_run_links_lease_attempt_run_and_releases(tmp_p
     assert "OPENAI_API_KEY" not in report_text
 
 
+def test_store_finalize_rejected_task_lease_marks_approval_required_without_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Approval rejection",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+
+    lease, attempt, refreshed_task = store.finalize_rejected_task_lease(
+        leased.lease.id,
+        reason_code="missing_required_approval",
+        rejection_reasons=["Task has unresolved required approvals."],
+        decision="execution_adapter_rejected",
+        adapter_id="dry_run",
+        owner="local_daemon:test:123",
+    )
+
+    assert lease.status == TaskLeaseStatus.RELEASED
+    assert lease.released_at is not None
+    assert lease.metadata["reason_code"] == "missing_required_approval"
+    assert lease.metadata["terminal_task_status"] == "waiting_approval"
+    assert attempt is not None
+    assert attempt.status == TaskStatus.WAITING_APPROVAL
+    assert attempt.run_id is None
+    assert attempt.finished_at is not None
+    assert attempt.failure_code == "missing_required_approval"
+    assert refreshed_task is not None
+    assert refreshed_task.id == task.id
+    assert refreshed_task.status == TaskStatus.WAITING_APPROVAL
+    transition = store.list_task_transitions(task.id)[-1]
+    assert transition.reason == "adapter_rejection_waiting_approval"
+    assert transition.to_status == TaskStatus.WAITING_APPROVAL
+
+
+def test_store_finalize_rejected_task_lease_marks_failed_without_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Unsafe rejection",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+
+    lease, attempt, refreshed_task = store.finalize_rejected_task_lease(
+        leased.lease.id,
+        reason_code="unsafe_metadata",
+        rejection_reasons=["Execution rejected by task metadata: requires_external_network."],
+        decision="execution_adapter_rejected",
+        adapter_id="dry_run",
+        owner="local_daemon:test:123",
+    )
+
+    assert lease.status == TaskLeaseStatus.RELEASED
+    assert lease.released_at is not None
+    assert lease.metadata["reason_code"] == "unsafe_metadata"
+    assert lease.metadata["terminal_task_status"] == "failed"
+    assert attempt is not None
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.run_id is None
+    assert attempt.finished_at is not None
+    assert attempt.failure_code == "unsafe_metadata"
+    assert refreshed_task is not None
+    assert refreshed_task.id == task.id
+    assert refreshed_task.status == TaskStatus.FAILED
+    transition = store.list_task_transitions(task.id)[-1]
+    assert transition.reason == "adapter_rejection_failed"
+    assert transition.to_status == TaskStatus.FAILED
+
+
+def test_store_finalize_rejected_task_lease_skips_duplicate_run_context(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Duplicate run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:123", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    run = store.start_attempt_run(
+        leased.lease.id,
+        task_type="phase_1a_test",
+        backend=None,
+        approval_id=None,
+        owner="local_daemon:test:123",
+    )
+
+    lease, attempt, refreshed_task = store.finalize_rejected_task_lease(
+        leased.lease.id,
+        reason_code="duplicate_run",
+        rejection_reasons=["Task attempt is already linked to a run."],
+        decision="execution_duplicate_rejected",
+        adapter_id="dry_run",
+        owner="local_daemon:test:123",
+    )
+
+    assert lease.status == TaskLeaseStatus.ACTIVE
+    assert attempt is not None
+    assert attempt.status == TaskStatus.RUNNING
+    assert attempt.run_id == run.id
+    assert refreshed_task is not None
+    assert refreshed_task.id == task.id
+    assert refreshed_task.status == TaskStatus.RUNNING
+
+
 def test_store_daemon_execute_dry_run_rejects_duplicate_and_ineligible_tasks(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -676,39 +1182,121 @@ def test_store_daemon_execute_dry_run_rejects_duplicate_and_ineligible_tasks(tmp
         store.execute_dry_run_lease(leased_missing.lease.id, owner="local_daemon:test:123")
 
 
+def test_store_daemon_execute_dry_run_requires_lease_owner(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+
+    with pytest.raises(ValueError, match="Lease owner mismatch"):
+        store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:other")
+
+    assert store.list_runs() == []
+    assert store.get_task(task.id).status == TaskStatus.LEASED
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.LEASED
+    assert attempt.run_id is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.ACTIVE
+
+
+def test_store_daemon_execute_dry_run_rolls_back_if_lease_is_lost_during_start(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    insert_run = store._insert_run_in_conn
+
+    def release_lease_after_run_insert(conn, **kwargs):
+        insert_run(conn, **kwargs)
+        conn.execute(
+            "UPDATE task_leases SET status = ?, released_at = ? WHERE id = ?",
+            (TaskLeaseStatus.RELEASED.value, "2026-01-01T00:00:00+00:00", leased.lease.id),
+        )
+
+    monkeypatch.setattr(store, "_insert_run_in_conn", release_lease_after_run_insert)
+
+    with pytest.raises(ValueError, match="Dry-run execution requires active lease owned by local_daemon:test:owner"):
+        store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:owner")
+
+    assert store.list_runs() == []
+    assert store.get_task(task.id).status == TaskStatus.LEASED
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.LEASED
+    assert attempt.run_id is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.ACTIVE
+
+
+def test_store_daemon_execute_dry_run_rejects_stale_lease_before_terminal_success(tmp_path, monkeypatch) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Dry run",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    initialize_run_artifacts = store.initialize_run_artifacts
+
+    def release_lease_after_start(run_id):
+        paths = initialize_run_artifacts(run_id)
+        with store.connect() as conn:
+            conn.execute(
+                "UPDATE task_leases SET status = ?, released_at = ? WHERE id = ?",
+                (TaskLeaseStatus.RELEASED.value, "2026-01-01T00:00:00+00:00", leased.lease.id),
+            )
+        return paths
+
+    monkeypatch.setattr(store, "initialize_run_artifacts", release_lease_after_start)
+
+    with pytest.raises(ValueError, match="Dry-run finalization requires active lease owned by local_daemon:test:owner"):
+        store.execute_dry_run_lease(leased.lease.id, owner="local_daemon:test:owner")
+
+    runs = store.list_runs()
+    assert len(runs) == 1
+    assert runs[0].status == "running"
+    assert store.get_task(task.id).status == TaskStatus.RUNNING
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.RUNNING
+    assert attempt.run_id == runs[0].id
+    assert attempt.finished_at is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.RELEASED
+
+
 def test_store_daemon_execute_dry_run_rejects_approvals_wrong_type_and_forbidden_metadata(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
-    wrong_type = store.create_task(
-        title="Wrong type",
-        priority=10,
-        metadata={"execution_adapter": "dry_run", "task_type": "read_only_repo_summary"},
-    )
-    forbidden = store.create_task(
-        title="Forbidden",
-        priority=5,
-        metadata={
-            "execution_adapter": "dry_run",
-            "task_type": "phase_1a_test",
-            "requires_external_network": True,
-        },
-    )
+    with pytest.raises(ValueError, match="Unsupported task_type for dry_run: read_only_repo_summary"):
+        store.create_task(
+            title="Wrong type",
+            priority=10,
+            metadata={"execution_adapter": "dry_run", "task_type": "read_only_repo_summary"},
+        )
+    with pytest.raises(ValueError, match="requires_external_network"):
+        store.create_task(
+            title="Forbidden",
+            priority=5,
+            metadata={
+                "execution_adapter": "dry_run",
+                "task_type": "phase_1a_test",
+                "requires_external_network": True,
+            },
+        )
     approval = store.create_task(
         title="Approval",
         metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
         required_approvals=["hosted_provider"],
     )
-
-    wrong_type_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
-    assert wrong_type_selection is not None
-    with pytest.raises(ValueError, match="Dry-run execution requires task_type=phase_1a_test"):
-        store.execute_dry_run_lease(wrong_type_selection["lease"].id, owner="local_daemon:test:123")
-
-    forbidden_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
-    assert forbidden_selection is not None
-    assert forbidden_selection["task"].id == forbidden.id
-    with pytest.raises(ValueError, match="requires_external_network"):
-        store.execute_dry_run_lease(forbidden_selection["lease"].id, owner="local_daemon:test:123")
 
     assert store.get_task(approval.id).status == TaskStatus.WAITING_APPROVAL
     with pytest.raises(KeyError, match="Task lease not found: missing_lease"):
@@ -757,6 +1345,7 @@ def test_store_daemon_inspect_lease_reports_dry_run_linkage_without_mutation(tmp
 def test_store_read_only_lease_validation_and_inspection(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
+    _approve_hosted_adapter(tmp_path, "read_only_summary", "read_only_repo_summary")
     task = store.create_task(
         title="Read-only",
         metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
@@ -778,6 +1367,7 @@ def test_store_read_only_lease_validation_and_inspection(tmp_path) -> None:
 def test_store_read_only_start_and_recovery_reconcile_completed_partial_state(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
+    _approve_hosted_adapter(tmp_path, "read_only_summary", "read_only_repo_summary")
     backend = default_config().backends["local_openai_compatible"]
     task = store.create_task(
         title="Read-only",
@@ -806,6 +1396,7 @@ def test_store_read_only_start_and_recovery_reconcile_completed_partial_state(tm
 def test_store_read_only_recovery_reconciles_failed_partial_state(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
+    _approve_hosted_adapter(tmp_path, "read_only_summary", "read_only_repo_summary")
     backend = default_config().backends["local_openai_compatible"]
     task = store.create_task(
         title="Read-only",
@@ -836,6 +1427,7 @@ def test_store_read_only_recovery_reconciles_failed_partial_state(tmp_path) -> N
 def test_store_read_only_recovery_fails_expired_active_nonterminal_run(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
+    _approve_hosted_adapter(tmp_path, "read_only_summary", "read_only_repo_summary")
     backend = default_config().backends["local_openai_compatible"]
     task = store.create_task(
         title="Read-only",
@@ -869,6 +1461,226 @@ def test_store_read_only_recovery_fails_expired_active_nonterminal_run(tmp_path)
     assert len(store.list_runs()) == 1
 
 
+def test_store_finish_attempt_run_requires_active_lease_owner(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Session plan",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    run = store.start_attempt_run(
+        leased.lease.id,
+        task_type="session_plan",
+        backend=backend,
+        approval_id=None,
+        owner="local_daemon:test:owner",
+    )
+
+    with pytest.raises(ValueError, match="Lease owner mismatch"):
+        store.finish_attempt_run(
+            leased.lease.id,
+            run_id=run.id,
+            owner="local_daemon:test:other",
+            success=True,
+            decision="completed",
+            run_status="completed",
+        )
+
+    assert store.get_run(run.id).status == "running"
+    assert store.get_task(task.id).status == TaskStatus.RUNNING
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.RUNNING
+    assert attempt.finished_at is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.ACTIVE
+
+
+def test_store_finish_attempt_run_rejects_stale_released_lease_without_mutating_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Session plan",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    run = store.start_attempt_run(
+        leased.lease.id,
+        task_type="session_plan",
+        backend=backend,
+        approval_id=None,
+        owner="local_daemon:test:owner",
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, released_at = ? WHERE id = ?",
+            (TaskLeaseStatus.RELEASED.value, "2026-01-01T00:00:00+00:00", leased.lease.id),
+        )
+
+    with pytest.raises(ValueError, match="Execution finalization requires active lease: released"):
+        store.finish_attempt_run(
+            leased.lease.id,
+            run_id=run.id,
+            owner="local_daemon:test:owner",
+            success=True,
+            decision="completed",
+            run_status="completed",
+        )
+
+    assert store.get_run(run.id).status == "running"
+    assert store.get_task(task.id).status == TaskStatus.RUNNING
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.RUNNING
+    assert attempt.finished_at is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.RELEASED
+
+
+def test_store_finish_read_only_lease_run_rejects_stale_released_lease_without_marking_success(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    _approve_hosted_adapter(tmp_path, "read_only_summary", "read_only_repo_summary")
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Read-only",
+        metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
+    )
+    leased = store.daemon_run_once("local_daemon:test:owner", pid=123)
+    assert leased.lease is not None
+    assert leased.attempt is not None
+    run = store.start_read_only_lease_run(
+        leased.lease.id,
+        backend=backend,
+        owner="local_daemon:test:owner",
+    )
+    store.update_run_status(run.id, "completed")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, released_at = ? WHERE id = ?",
+            (TaskLeaseStatus.RELEASED.value, "2026-01-01T00:00:00+00:00", leased.lease.id),
+        )
+
+    with pytest.raises(ValueError, match="Read-only execution finalization requires active lease: released"):
+        store.finish_read_only_lease_run(
+            leased.lease.id,
+            run_id=run.id,
+            owner="local_daemon:test:owner",
+            success=True,
+        )
+
+    assert store.get_run(run.id).status == "completed"
+    assert store.get_task(task.id).status == TaskStatus.RUNNING
+    attempt = store.get_task_attempt(leased.attempt.id)
+    assert attempt.status == TaskStatus.RUNNING
+    assert attempt.finished_at is None
+    assert store.get_task_lease(leased.lease.id).status == TaskLeaseStatus.RELEASED
+
+
+def test_store_daemon_recovery_reconciles_completed_generic_execution_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Session plan",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert leased is not None
+
+    run = store.start_attempt_run(
+        leased["lease"].id,
+        task_type="session_plan",
+        backend=backend,
+        approval_id=None,
+        owner="local_daemon:test:123",
+    )
+    store.update_run_status(run.id, "completed")
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, expires_at = ?, released_at = NULL WHERE id = ?",
+            (TaskLeaseStatus.ACTIVE.value, "2026-01-01T00:00:00+00:00", leased["lease"].id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert recovery.expired_leases == []
+    assert [item.id for item in recovery.recovered_tasks] == [task.id]
+    assert recovery.events[0].event_type == "recover_execution"
+    assert store.get_task(task.id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_attempt(leased["attempt"].id).status == TaskStatus.SUCCEEDED
+    assert store.get_task_lease(leased["lease"].id).status == TaskLeaseStatus.RELEASED
+    assert store.get_run(run.id).status == "completed"
+
+
+def test_store_daemon_recovery_fails_expired_generic_execution_nonterminal_run(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    backend = default_config().backends["local_openai_compatible"]
+    task = store.create_task(
+        title="Session plan",
+        metadata={"execution_adapter": "session_read_tools", "task_type": "session_plan"},
+    )
+    leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert leased is not None
+
+    run = store.start_attempt_run(
+        leased["lease"].id,
+        task_type="session_plan",
+        backend=backend,
+        approval_id=None,
+        owner="local_daemon:test:123",
+    )
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, expires_at = ?, released_at = NULL WHERE id = ?",
+            (TaskLeaseStatus.ACTIVE.value, "2026-01-01T00:00:00+00:00", leased["lease"].id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert [lease.id for lease in recovery.expired_leases] == [leased["lease"].id]
+    assert [item.id for item in recovery.recovered_tasks] == [task.id]
+    assert recovery.events[0].event_type == "recover_execution"
+    assert recovery.events[0].metadata["reason"] == "nonterminal_linked_run"
+    assert store.get_run(run.id).status == "running"
+    assert store.get_task(task.id).status == TaskStatus.FAILED
+    attempt = store.get_task_attempt(leased["attempt"].id)
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.failure_code == "execution_recovery_required"
+    assert store.get_task_lease(leased["lease"].id).status == TaskLeaseStatus.EXPIRED
+
+
+def test_store_daemon_recovery_expires_inconsistent_active_lease_without_requeueing_terminal_task(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(title="Drifted")
+    leased = store.select_next_task_for_lease(owner="local_daemon:test:123")
+    assert leased is not None
+
+    store.update_task_status(task.id, TaskStatus.FAILED)
+    with store.connect() as conn:
+        conn.execute(
+            "UPDATE task_leases SET status = ?, expires_at = ?, released_at = NULL WHERE id = ?",
+            (TaskLeaseStatus.ACTIVE.value, "2026-01-01T00:00:00+00:00", leased["lease"].id),
+        )
+
+    recovery = store.recover_daemon_leases("local_daemon:test:123", pid=123)
+
+    assert [lease.id for lease in recovery.expired_leases] == [leased["lease"].id]
+    assert recovery.recovered_tasks == []
+    assert recovery.events[0].event_type == "recover_inconsistent_lease"
+    assert recovery.events[0].metadata["reason"] == "task_status_failed"
+    assert store.get_task(task.id).status == TaskStatus.FAILED
+    attempt = store.get_task_attempt(leased["attempt"].id)
+    assert attempt.status == TaskStatus.FAILED
+    assert attempt.failure_code == "inconsistent_expired_lease"
+    assert store.get_task_lease(leased["lease"].id).status == TaskLeaseStatus.EXPIRED
+
+
 def test_store_read_only_validation_rejects_existing_run_id_approvals_and_forbidden_metadata(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -878,16 +1690,17 @@ def test_store_read_only_validation_rejects_existing_run_id_approvals_and_forbid
         priority=20,
         metadata={"execution_adapter": "read_only_summary", "task_type": "read_only_repo_summary"},
     )
-    forbidden = store.create_task(
-        title="Forbidden",
-        priority=10,
-        metadata={
-            "execution_adapter": "read_only_summary",
-            "task_type": "read_only_repo_summary",
-            "requires_active_repo_write": True,
-            "requires_docker": True,
-        },
-    )
+    with pytest.raises(ValueError, match="requires_active_repo_write, requires_docker"):
+        store.create_task(
+            title="Forbidden",
+            priority=10,
+            metadata={
+                "execution_adapter": "read_only_summary",
+                "task_type": "read_only_repo_summary",
+                "requires_active_repo_write": True,
+                "requires_docker": True,
+            },
+        )
     approval = store.create_task(
         title="Approval",
         priority=5,
@@ -904,11 +1717,6 @@ def test_store_read_only_validation_rejects_existing_run_id_approvals_and_forbid
     assert store.get_task(linked.id).run_id == run.id
     with pytest.raises(ValueError, match="Task attempt already has run_id"):
         store.validate_read_only_lease_for_execution(linked_selection["lease"].id)
-
-    forbidden_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
-    assert forbidden_selection is not None
-    with pytest.raises(ValueError, match="requires_active_repo_write, requires_docker"):
-        store.validate_read_only_lease_for_execution(forbidden_selection["lease"].id)
 
     approval_selection = store.select_next_task_for_lease(owner="local_daemon:test:123")
     assert approval_selection is not None
@@ -1317,6 +2125,182 @@ def test_store_creates_lists_and_gets_objectives(tmp_path) -> None:
         raise AssertionError("missing objective should raise")
 
 
+def test_store_updates_objective_status_with_lifecycle_metadata(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective(title="Lifecycle objective")
+
+    suspended = store.update_objective_status(
+        objective.id,
+        ObjectiveStatus.SUSPENDED,
+        reason="operator paused OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz",
+        actor="tester",
+        metadata={"source": "unit"},
+    )
+
+    assert suspended.status == ObjectiveStatus.SUSPENDED
+    event = suspended.metadata["last_lifecycle_event"]
+    assert event["from_status"] == "active"
+    assert event["to_status"] == "suspended"
+    assert event["actor"] == "tester"
+    assert event["metadata"] == {"source": "unit"}
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in json.dumps(suspended.metadata)
+    assert "[REDACTED_SECRET]" in json.dumps(suspended.metadata)
+
+    resumed = store.update_objective_status(
+        suspended.id,
+        ObjectiveStatus.ACTIVE,
+        reason="operator resumed",
+        actor="tester",
+        metadata={"source": "unit"},
+    )
+
+    assert resumed.status == ObjectiveStatus.ACTIVE
+    assert resumed.metadata["last_lifecycle_event"]["from_status"] == "suspended"
+    assert resumed.metadata["last_lifecycle_event"]["to_status"] == "active"
+
+    waiting = store.update_objective_status(
+        resumed.id,
+        ObjectiveStatus.WAITING_APPROVAL,
+        reason="checkpoint pending",
+        actor="tester",
+        metadata={"source": "unit"},
+    )
+    assert waiting.status == ObjectiveStatus.WAITING_APPROVAL
+    assert waiting.metadata["last_lifecycle_event"]["from_status"] == "active"
+    assert waiting.metadata["last_lifecycle_event"]["to_status"] == "waiting_approval"
+
+    resumed = store.update_objective_status(waiting.id, ObjectiveStatus.ACTIVE, reason="approval received", actor="tester")
+    assert resumed.status == ObjectiveStatus.ACTIVE
+    assert resumed.metadata["last_lifecycle_event"]["from_status"] == "waiting_approval"
+    assert resumed.metadata["last_lifecycle_event"]["to_status"] == "active"
+
+    cancelled = store.update_objective_status(
+        resumed.id,
+        ObjectiveStatus.CANCELLED,
+        reason="operator stopped",
+        actor="tester",
+        metadata={"source": "unit"},
+    )
+
+    assert cancelled.status == ObjectiveStatus.CANCELLED
+    event = cancelled.metadata["last_lifecycle_event"]
+    assert event["from_status"] == "active"
+    assert event["to_status"] == "cancelled"
+    assert event["actor"] == "tester"
+    assert event["metadata"] == {"source": "unit"}
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in json.dumps(cancelled.metadata)
+    assert "[REDACTED_SECRET]" in json.dumps(cancelled.metadata)
+
+    with pytest.raises(ValueError, match="Invalid objective transition: cancelled -> active"):
+        store.update_objective_status(cancelled.id, ObjectiveStatus.ACTIVE)
+
+    second = store.create_objective(title="Suspended objective")
+    suspended_second = store.update_objective_status(second.id, ObjectiveStatus.SUSPENDED)
+    with pytest.raises(ValueError, match="Invalid objective transition: suspended -> completed"):
+        store.update_objective_status(suspended_second.id, ObjectiveStatus.COMPLETED)
+    with pytest.raises(ValueError, match="Invalid objective transition: suspended -> waiting_approval"):
+        store.update_objective_status(suspended_second.id, ObjectiveStatus.WAITING_APPROVAL)
+    timed_out = store.update_objective_status(suspended_second.id, ObjectiveStatus.TIMED_OUT, reason="deadline exceeded")
+    assert timed_out.status == ObjectiveStatus.TIMED_OUT
+    assert timed_out.metadata["last_lifecycle_event"]["from_status"] == "suspended"
+    assert timed_out.metadata["last_lifecycle_event"]["to_status"] == "timed_out"
+    with pytest.raises(ValueError, match="Invalid objective transition: timed_out -> active"):
+        store.update_objective_status(timed_out.id, ObjectiveStatus.ACTIVE)
+
+
+def test_store_create_objective_can_start_from_created_state(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    created = store.create_objective(title="Draft objective", status=ObjectiveStatus.CREATED)
+
+    assert created.status == ObjectiveStatus.CREATED
+    started = store.update_objective_status(
+        created.id,
+        ObjectiveStatus.ACTIVE,
+        reason="ready to dispatch",
+        actor="tester",
+        metadata={"source": "unit"},
+    )
+    assert started.status == ObjectiveStatus.ACTIVE
+    assert started.metadata["last_lifecycle_event"]["from_status"] == "created"
+    assert started.metadata["last_lifecycle_event"]["to_status"] == "active"
+    assert started.metadata["last_lifecycle_event"]["metadata"] == {"source": "unit"}
+
+    cancelled = store.create_objective(title="Cancelled draft", status="created")
+    cancelled = store.update_objective_status(cancelled.id, ObjectiveStatus.CANCELLED, reason="superseded")
+    assert cancelled.status == ObjectiveStatus.CANCELLED
+    assert cancelled.metadata["last_lifecycle_event"]["from_status"] == "created"
+
+    with pytest.raises(ValueError, match="Objective creation supports only created or active status"):
+        store.create_objective(title="Invalid initial state", status=ObjectiveStatus.TIMED_OUT)
+
+    with pytest.raises(ValueError, match="Invalid objective transition: created -> suspended"):
+        suspended = store.create_objective(title="Invalid draft transition", status=ObjectiveStatus.CREATED)
+        store.update_objective_status(suspended.id, ObjectiveStatus.SUSPENDED)
+
+
+def test_store_retry_objective_requeues_failed_tasks_with_lifecycle_metadata(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective("Retry objective")
+    failed = store.create_task(
+        title="Failed retryable task",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    ready = store.create_task(
+        title="Still ready task",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+    store.update_task_status(failed.id, TaskStatus.RUNNING)
+    store.update_task_status(failed.id, TaskStatus.FAILED)
+    store.update_objective_status(objective.id, ObjectiveStatus.TIMED_OUT, reason="deadline")
+
+    retried_objective, retried_tasks = store.retry_objective(
+        objective.id,
+        reason="try again",
+        actor="tester",
+        metadata={"source": "unit"},
+    )
+
+    assert retried_objective.status == ObjectiveStatus.ACTIVE
+    assert [task.id for task in retried_tasks] == [failed.id]
+    assert store.get_task(failed.id).status == TaskStatus.READY
+    assert store.get_task(ready.id).status == TaskStatus.READY
+    lifecycle_events = retried_objective.metadata["lifecycle_events"]
+    assert lifecycle_events[-2]["from_status"] == "timed_out"
+    assert lifecycle_events[-2]["to_status"] == "retrying"
+    assert lifecycle_events[-2]["metadata"]["retried_task_ids"] == [failed.id]
+    assert lifecycle_events[-1]["from_status"] == "retrying"
+    assert lifecycle_events[-1]["to_status"] == "active"
+    assert lifecycle_events[-1]["metadata"]["retried_task_statuses"] == {failed.id: "ready"}
+
+
+def test_store_retry_objective_enforces_task_replay_policy_before_lifecycle_mutation(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    objective = store.create_objective("Retry blocked objective")
+    record_only = store.create_task(
+        title="Record-only child task",
+        objective_id=objective.id,
+        metadata={"execution_adapter": "session_child_task", "task_type": "session_delegate"},
+    )
+    store.update_task_status(record_only.id, TaskStatus.RUNNING)
+    store.update_task_status(record_only.id, TaskStatus.FAILED)
+    timed_out = store.update_objective_status(objective.id, ObjectiveStatus.TIMED_OUT, reason="deadline")
+
+    with pytest.raises(ValueError, match="replay_policy=not_replayable"):
+        store.retry_objective(objective.id, reason="unsafe retry", actor="tester")
+
+    still_timed_out = store.get_objective(objective.id)
+    assert still_timed_out.status == ObjectiveStatus.TIMED_OUT
+    assert still_timed_out.metadata["last_lifecycle_event"] == timed_out.metadata["last_lifecycle_event"]
+    assert store.get_task(record_only.id).status == TaskStatus.FAILED
+
+
 def test_store_normalizes_legacy_task_statuses(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -1436,6 +2420,22 @@ def test_store_tasks_reject_unknown_references_and_dependency_cycles(tmp_path) -
         raise AssertionError("dependency cycle should raise")
 
 
+def test_store_rejects_invalid_registered_execution_task_metadata(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+
+    with pytest.raises(ValueError, match="Unknown execution adapter: unknown_adapter"):
+        store.create_task(
+            title="Unknown adapter",
+            metadata={"execution_adapter": "unknown_adapter", "task_type": "phase_1a_test"},
+        )
+    with pytest.raises(ValueError, match="requires task_type"):
+        store.create_task(
+            title="Incomplete execution metadata",
+            metadata={"execution_adapter": "dry_run"},
+        )
+
+
 def test_store_task_errors_are_stable_for_unknown_or_invalid_status(tmp_path) -> None:
     store = SQLiteStore(tmp_path)
     store.initialize()
@@ -1514,6 +2514,113 @@ def test_store_retry_task_targets_ready_blocked_or_waiting_approval(tmp_path) ->
         assert "Task retry requires failed status: ready" in str(exc)
     else:
         raise AssertionError("retry from non-failed should raise")
+
+
+def test_store_retry_task_enforces_registered_adapter_replay_policy(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    record_only = store.create_task(
+        title="Record-only child task",
+        metadata={"execution_adapter": "session_child_task", "task_type": "session_delegate"},
+    )
+    hosted_retry = store.create_task(
+        title="Hosted planning retry",
+        metadata={"execution_adapter": "repo_planning", "task_type": "repo_planning"},
+    )
+    for task_id in [record_only.id, hosted_retry.id]:
+        store.update_task_status(task_id, TaskStatus.RUNNING)
+        store.update_task_status(task_id, TaskStatus.FAILED)
+
+    with pytest.raises(ValueError, match="replay_policy=not_replayable"):
+        store.retry_task(record_only.id)
+    assert store.get_task(record_only.id).status == TaskStatus.FAILED
+
+    with pytest.raises(ValueError, match="Task retry requires fresh approval for repo_planning: hosted_provider_codex"):
+        store.retry_task(hosted_retry.id)
+    assert store.get_task(hosted_retry.id).status == TaskStatus.FAILED
+
+    ApprovalStore(tmp_path).add(
+        "codex_cli",
+        "hosted_provider",
+        ["repo_planning"],
+        duration_hours=1,
+        allowed_adapters=["repo_planning"],
+    )
+
+    retried = store.retry_task(hosted_retry.id)
+
+    assert retried.status == TaskStatus.READY
+    assert retried.idempotency_key == hosted_retry.idempotency_key
+    retry_transition = store.list_task_transitions(hosted_retry.id)[-1]
+    retry_receipt = retry_transition.metadata["replay_receipt"]
+    assert retry_transition.reason == "task_retry_authorized"
+    assert retry_receipt["schema_version"] == "harness.task_replay_receipt/v1"
+    assert retry_receipt["receipt_kind"] == "retry_authorization"
+    assert retry_receipt["task_id"] == hosted_retry.id
+    assert retry_receipt["task_idempotency_key"] == hosted_retry.idempotency_key
+    assert retry_receipt["replay_policy"] == "requires_fresh_approval"
+    assert retry_receipt["retry_gate"] == "fresh_approval_revalidated"
+    assert retry_receipt["retry_allowed"] is True
+    assert retry_receipt["fresh_approval_required"] is True
+    assert retry_receipt["fresh_approval_revalidated"] is True
+
+
+def test_store_task_attempts_include_replay_guard_receipts(tmp_path) -> None:
+    store = SQLiteStore(tmp_path)
+    store.initialize()
+    task = store.create_task(
+        title="Replay receipt",
+        metadata={"execution_adapter": "dry_run", "task_type": "phase_1a_test"},
+    )
+
+    first = store.select_next_guarded_task_for_lease(owner="test-runner")
+    assert first[0] is not None
+    first_selection = first[0]
+    first_attempt = first_selection["attempt"]
+    first_receipt = first_attempt.metadata["replay_receipt"]
+    assert first_receipt["schema_version"] == "harness.task_replay_receipt/v1"
+    assert first_receipt["receipt_kind"] == "attempt_replay_guard"
+    assert first_receipt["task_id"] == task.id
+    assert first_receipt["task_idempotency_key"] == task.idempotency_key
+    assert first_receipt["attempt_number"] == 1
+    assert first_receipt["attempt_idempotency_key"].endswith(":attempt:1")
+    assert first_receipt["prior_attempt_count"] == 0
+    assert first_receipt["active_lease_duplicate_guard"] == "active_lease_exclusion_before_attempt_insert"
+    assert first_receipt["replay_policy"] == "idempotent_with_key"
+    assert first_receipt["retry_gate"] == "safe_replay_policy"
+    assert first_receipt["retry_allowed"] is True
+
+    run = store.start_attempt_run(
+        first_selection["lease"].id,
+        task_type="phase_1a_test",
+        backend=None,
+        approval_id=None,
+        owner="test-runner",
+    )
+    store.finish_attempt_run(
+        first_selection["lease"].id,
+        run_id=run.id,
+        owner="test-runner",
+        success=False,
+        decision="simulated_failure",
+        run_status="failed",
+        failure_code="simulated_failure",
+    )
+
+    retried = store.retry_task(task.id)
+    assert retried.status == TaskStatus.READY
+    retry_receipt = store.list_task_transitions(task.id)[-1].metadata["replay_receipt"]
+    assert retry_receipt["receipt_kind"] == "retry_authorization"
+    assert retry_receipt["prior_attempt_count"] == 1
+    second = store.select_next_guarded_task_for_lease(owner="test-runner")
+    assert second[0] is not None
+    second_attempt = second[0]["attempt"]
+    second_receipt = second_attempt.metadata["replay_receipt"]
+    assert second_attempt.attempt_number == 2
+    assert second_receipt["attempt_number"] == 2
+    assert second_receipt["attempt_idempotency_key"].endswith(":attempt:2")
+    assert second_receipt["prior_attempt_count"] == 1
+    assert second_receipt["task_idempotency_key"] == task.idempotency_key
 
 
 def test_store_select_next_task_uses_priority_and_dependencies(tmp_path) -> None:

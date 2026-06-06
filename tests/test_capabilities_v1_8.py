@@ -21,8 +21,15 @@ def test_build_capability_catalog_matches_registered_adapters(tmp_path) -> None:
     assert by_id["repo_planning"].supported_task_types == ["repo_planning"]
     assert by_id["read_only_summary"].readiness == "requires_approval_before_execution"
     assert by_id["read_only_summary"].sandbox_profile["id"] == "read_only_codex"
+    assert by_id["read_only_summary"].delegate_budget["schema_version"] == "harness.delegate_budget/v1"
+    assert by_id["read_only_summary"].delegate_budget["filesystem_scope"] == "project_read_only"
+    assert by_id["read_only_summary"].delegate_budget["max_cpu_seconds"] == 900
+    assert by_id["read_only_summary"].delegate_budget["max_memory_mb"] == 1024
     assert by_id["codex_isolated_edit"].required_approvals == ["hosted_provider_codex"]
     assert by_id["codex_isolated_edit"].sandbox_profile["id"] == "isolated_workspace_codex"
+    assert by_id["codex_isolated_edit"].delegate_budget["active_repo_write"] == "approval_required"
+    assert by_id["codex_isolated_edit"].delegate_budget["max_cpu_seconds"] == 1800
+    assert by_id["codex_isolated_edit"].delegate_budget["max_memory_mb"] == 2048
 
 
 def test_capabilities_cli_list_and_inspect_are_read_only_without_init(tmp_path, monkeypatch) -> None:
@@ -56,6 +63,10 @@ def test_capabilities_cli_list_and_inspect_are_read_only_without_init(tmp_path, 
     assert inspected_payload["id"] == "dry_run"
     assert inspected_payload["supported_task_types"] == ["phase_1a_test"]
     assert inspected_payload["sandbox_profile"]["id"] == "none"
+    assert inspected_payload["delegate_budget"]["schema_version"] == "harness.delegate_budget/v1"
+    assert inspected_payload["delegate_budget"]["max_runtime_invocations"] == 0
+    assert inspected_payload["delegate_budget"]["max_cpu_seconds"] == 0
+    assert inspected_payload["delegate_budget"]["max_memory_mb"] == 0
     assert not (tmp_path / ".harness").exists()
 
 
